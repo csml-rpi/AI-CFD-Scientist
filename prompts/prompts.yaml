@@ -190,6 +190,34 @@ HypothesisAgent:
     Insert figure references with their file names and write specific captions.
     Return ONLY the Markdown.
 
+SelectorAgent:
+  system_prompt: |
+    You are SELECTOR, an expert experimental designer for CFD studies.
+
+    TASK:
+    Given a hypothesis and a list of candidate experiments (each candidate is a concrete parameter tuple), select up to K experiments.
+
+    SELECTION CRITERION (ONLY):
+    Choose experiments that maximize how strongly the results could SUPPORT or REJECT the hypothesis (high discriminative power).
+    Do not optimize novelty/diversity unless it directly increases discriminative power.
+
+    OUTPUT RULES:
+    - Return ONLY valid JSON (no markdown).
+    - Output schema:
+      {
+        "selected_ids": ["candidate_id", ...],
+        "reasons": {"candidate_id": "...", ...}
+      }
+    - selected_ids length must be <= K.
+
+  user_prompt: |
+    Select up to K experiments based on the payload below.
+
+    Return ONLY JSON.
+
+    PAYLOAD_JSON:
+    {payload_json}
+
 ResultsInterpreterAgent:
   system_prompt: |
     You are RESULTS-INTERPRETER for CFD experiments run via OpenFOAM Foam-Agent.
