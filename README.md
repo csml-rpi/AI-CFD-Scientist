@@ -75,18 +75,25 @@ python agents/analysis_ag.py --batch batch_20251216_140000_abc123
 ## Configuration
 
 ### Model Selection
-Set your preferred LLM model via environment variable or command line:
+There are **two** model knobs in this project:
+
+1) **CFD Scientist (this repo)**: used for ideation/hypothesis/validation/analysis.
+Set via env var or CLI:
 ```bash
-export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
+export CFD_SCIENTIST_MODEL="gpt-5.3-codex"
 # or
-python src/main.py --model "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
+python src/main.py --model "gpt-5.3-codex"
 ```
 
-Supported models:
-- AWS Bedrock: `bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`, or use ARN format
-- Anthropic: `claude-3-5-sonnet-20241022`, `claude-3-5-sonnet-20240620`
-- OpenAI: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`
-- Google: `gemini-2.0-flash`
+2) **Foam-Agent (submodule)**: used to generate/run the OpenFOAM case workflow.
+Configure in `Foam-Agent/src/config.py` (`model_provider`, `model_version`).
+
+Supported `CFD_SCIENTIST_MODEL` values include:
+- AWS Bedrock: `bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`, or an ARN (model IDs: https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html)
+- Anthropic: `claude-3-5-sonnet-20241022`, `claude-3-5-sonnet-20240620` (models: https://docs.anthropic.com/en/docs/about-claude/models)
+- OpenAI Platform: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini` (models: https://platform.openai.com/docs/models)
+- OpenAI Codex subscription: `gpt-5.2.codex`, `gpt-5.3-codex` (Codex: https://platform.openai.com/docs/models)
+- Google: `gemini-2.5-flash`, `gemini-2.5-pro` (models: https://ai.google.dev/gemini-api/docs/models)
 
 ### Experiment Parameters
 Edit `prompts/prompts.yaml` to customize:
