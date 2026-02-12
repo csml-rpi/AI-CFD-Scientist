@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local runs / data artifacts
+data/
+
+# IDE
+.vscode/
+.idea/
