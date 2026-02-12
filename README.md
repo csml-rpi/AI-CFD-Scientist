@@ -8,7 +8,7 @@
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/blitzionic/cfd-scientist.git
+git clone https://github.com/csml-rpi/cfd-scientist.git
 cd cfd-scientist
 ```
 
@@ -21,10 +21,8 @@ pip install -r requirements.txt
 
 3. **Set up Foam-Agent dependency:**
 ```bash
-# Clone Foam-Agent in the same parent directory
-cd ..
-git clone https://github.com/csml-rpi/Foam-Agent.git
-cd cfd-scientist
+# Foam-Agent is included as a git submodule in this repo
+git submodule update --init --recursive
 ```
 
 4. **Configure environment variables:**
