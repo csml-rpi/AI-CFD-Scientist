@@ -1,0 +1,26 @@
+[
+  {
+    "name": "wave-structure-interaction-optimization",
+    "long_description": "This simulation study aims to evaluate the performance of the updated overset mesh solver in OpenFOAM v2212 for complex wave-structure interaction scenarios. The configuration will model a 3-D hemispherical wave energy converter subjected to focused wave interactions. Key geometrical features of the wave energy converter will be defined, and the simulation will investigate the efficiency and accuracy of the new hole-cutting procedure introduced in the solver. Boundary conditions will include wave generation at the inlet using a focused wave maker and a free surface condition at the outlet. Temporal discretization will be refined to ensure stability and accuracy, setting a timestep of 0.01 seconds with output written every 0.1 seconds. The study will particularly focus on the computational time and accuracy metrics of the results to understand the benefits brought by the improved overset solver.",
+    "short_description": "Optimizing the overset solver in OpenFOAM for wave energy converter interactions.",
+    "hypothesis": "The updated hole-cutting procedure will improve the accuracy of solutions for the wave energy converter, although computational time will remain unchanged.",
+    "variables": {
+      "independent": [
+        "wave height",
+        "wave period"
+      ],
+      "dependent": [
+        "computational time",
+        "solution accuracy"
+      ],
+      "controls": [
+        "mesh resolution",
+        "solver settings",
+        "timestep"
+      ]
+    },
+    "metric": "Accuracy will be measured by comparing simulation results to analytical predictions and computational time will be logged during the simulation run.",
+    "pilot": "Conduct a preliminary simulation with a simplified geometry of the wave energy converter to validate the accuracy of the overset mesh solver.",
+    "example_prompt": "Set up a 3D model of a hemispherical wave energy converter in OpenFOAM with focused wave interactions. Apply the updated overset mesh solver with the new hole-cutting procedure. Use wave generation BC at the inlet and free surface BC at the outlet. Set timestep to 0.01s and write output every 0.1s. Adjust wave height and period as independent variables."
+  }
+]

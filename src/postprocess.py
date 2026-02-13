@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -27,15 +28,15 @@ os.environ.setdefault("PYVISTA_OFF_SCREEN", "true")
 
 try:
     import pyvista as pv
+    _PYVISTA_IMPORT_ERROR = None
 except Exception as e:  # pragma: no cover
-    raise RuntimeError(
-        "pyvista is required for postprocess.py. Ensure you run this with the same env used by Foam-Agent (e.g., openfoamAgent-v2)."
-    ) from e
+    pv = None  # type: ignore[assignment]
+    _PYVISTA_IMPORT_ERROR = e
 
 
 @dataclass
 class PostprocessConfig:
-    times: Sequence[float] = (0.10, 0.50, 1.00)
+    times: Sequence[float] = (0.10, 0.50, 1.00, 2.00, 3.00)
     slice_z: float = 0.0
     centerline_x: float = 0.0
     centerline_z: float = 0.0
@@ -51,24 +52,58 @@ _TIME_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d+|\d+)(?:[eE][-+]?\d+)?")
+
 
 def parse_times_from_requirement(user_requirement: str) -> List[float]:
+    """Extract requested visualization times from a natural-language requirement.
+
+    Handles patterns like:
+      - "at t=0.10 s, 0.50 s, 1.00 s"
+      - "at t=0.10, 0.50, 1.00, 2.00, 3.00 s"
+
+    Strategy:
+      1) Find each "t=<number>" anchor.
+      2) From the anchor, parse subsequent comma/and-separated numbers in a short window.
+
+    Returns a de-duped list in discovery order.
+    """
     if not user_requirement:
         return []
-    times = []
+
+    found: List[float] = []
+
     for m in _TIME_RE.finditer(user_requirement):
+        # Anchor time
         try:
-            times.append(float(m.group(1)))
+            found.append(float(m.group(1)))
         except Exception:
             continue
-    # common pattern: "at t=0.05 s, 0.50 s, and 1.00 s"; the regex above catches those.
-    # de-dupe while preserving order
-    out = []
+
+        # Look ahead for additional times like ", 0.50 s, 1.00 s".
+        tail = user_requirement[m.end() : m.end() + 120]
+        # Stop early on obvious hard boundaries to avoid pulling unrelated numbers.
+        # NOTE: do NOT split on '.' because that breaks decimal numbers like 0.50.
+        for sep in ["\n", ";"]:
+            if sep in tail:
+                tail = tail.split(sep, 1)[0]
+        for fm in _FLOAT_RE.finditer(tail):
+            try:
+                v = float(fm.group(0))
+            except Exception:
+                continue
+            # Heuristic: plausible visualization times (seconds)
+            if 0.0 <= v <= 1.0e3:
+                found.append(v)
+
+    # De-dupe preserving order
+    out: List[float] = []
     seen = set()
-    for t in times:
-        if t not in seen:
-            out.append(t)
-            seen.add(t)
+    for t in found:
+        if t in seen:
+            continue
+        out.append(t)
+        seen.add(t)
     return out
 
 
@@ -140,6 +175,39 @@ def _read_mesh(foam_path: Path, time_value: Optional[float] = None):
     return mesh, tvals
 
 
+def _apply_bounds_based_geometry(cfg: PostprocessConfig, mesh) -> dict:
+    """Update cfg in-place using mesh bounds and return a metadata dict."""
+    meta = {}
+    try:
+        bounds = getattr(mesh, "bounds", None)
+    except Exception:
+        bounds = None
+
+    if not bounds or len(bounds) != 6:
+        return meta
+
+    xmin, xmax, ymin, ymax, zmin, zmax = [float(x) for x in bounds]
+    vals = [xmin, xmax, ymin, ymax, zmin, zmax]
+    if not all(np.isfinite(v) for v in vals):
+        return meta
+
+    x_mid = 0.5 * (xmin + xmax)
+    z_mid = 0.5 * (zmin + zmax)
+
+    cfg.slice_z = z_mid
+    cfg.centerline_x = x_mid
+    cfg.centerline_z = z_mid
+    cfg.centerline_y0 = ymin
+    cfg.centerline_y1 = ymax
+
+    meta = {
+        "bounds": {"xmin": xmin, "xmax": xmax, "ymin": ymin, "ymax": ymax, "zmin": zmin, "zmax": zmax},
+        "x_mid": x_mid,
+        "z_mid": z_mid,
+    }
+    return meta
+
+
 def _plot_slice_png(mesh, scalar_name: Optional[str], out_png: Path, *, cfg: PostprocessConfig):
     plotter = pv.Plotter(off_screen=True, window_size=cfg.image_size)
     plotter.set_background("white")
@@ -193,6 +261,13 @@ def _export_centerline_csv(mesh, out_csv: Path, *, cfg: PostprocessConfig):
 
 
 def postprocess_case(output_dir: Path, *, user_requirement: str = "", cfg: Optional[PostprocessConfig] = None) -> dict:
+    if pv is None:
+        return {
+            "success": False,
+            "error": "pyvista is required for deterministic post-processing. Run in the Foam-Agent environment (where pyvista is installed).",
+            "import_error": str(_PYVISTA_IMPORT_ERROR),
+        }
+
     cfg = cfg or PostprocessConfig()
     output_dir = Path(output_dir).resolve()
 
@@ -221,44 +296,76 @@ def postprocess_case(output_dir: Path, *, user_requirement: str = "", cfg: Optio
     except Exception:
         pass
 
-    # Latest visualization
+    # Read latest mesh to (a) discover available times and (b) infer geometry from bounds.
     mesh_latest, tvals = _read_mesh(foam_path, time_value=None)
     mesh_latest, scalar = _compute_umag(mesh_latest)
+
+    geom_meta = _apply_bounds_based_geometry(cfg, mesh_latest)
+
+    # Keep a "latest" visualization for human debugging, but downstream evaluation should
+    # prefer the time-stamped images.
     latest_png = output_dir / "visualization.png"
     _plot_slice_png(mesh_latest, scalar, latest_png, cfg=cfg)
 
+    def _time_tag(tt: float) -> str:
+        return f"{float(tt):.2f}".replace(".", "p")
+
     artifacts = {
-        "visualization_png": str(latest_png),
-        "umag_pngs": [],
-        "uy_csvs": [],
-        "requested_times": req_times,
-        "available_times": tvals,
+        "requested_times": [float(x) for x in req_times],
+        "available_times": [float(x) for x in tvals],
         "used_times": {},
+        "time_errors": {},
+        "geometry": {
+            "slice_z": float(cfg.slice_z),
+            "centerline": {
+                "x": float(cfg.centerline_x),
+                "y0": float(cfg.centerline_y0),
+                "y1": float(cfg.centerline_y1),
+                "z": float(cfg.centerline_z),
+                "n": int(cfg.centerline_n),
+            },
+            "bounds_meta": geom_meta,
+        },
+        "files": {
+            "latest_png": str(latest_png),
+            "umag_pngs": [],
+            "uy_csvs": [],
+        },
     }
 
-    # Per-requested-time outputs
-    for t in req_times:
-        tn = _nearest_time(float(t), tvals) if tvals else None
-        if tn is None:
+    # Per-requested-time outputs (snap to nearest written time and record what happened).
+    # For writeInterval=0.1, a half-interval tolerance is ~0.05.
+    tol = 0.051
+
+    for t_req in [float(x) for x in req_times]:
+        t_used = _nearest_time(t_req, tvals) if tvals else None
+        if t_used is None:
+            artifacts["used_times"][str(t_req)] = None
+            artifacts["time_errors"][str(t_req)] = None
             continue
 
-        mesh_t, _ = _read_mesh(foam_path, time_value=tn)
+        artifacts["used_times"][str(t_req)] = float(t_used)
+        artifacts["time_errors"][str(t_req)] = float(abs(float(t_used) - float(t_req)))
+
+        mesh_t, _ = _read_mesh(foam_path, time_value=float(t_used))
         mesh_t, scalar_t = _compute_umag(mesh_t)
 
-        # sanitize time for filename
-        t_tag = f"{float(t):.2f}".replace(".", "p")
-        tn_tag = f"{float(tn):.6g}".replace(".", "p")
-        artifacts["used_times"][str(t)] = float(tn)
-
-        umag_png = output_dir / f"umag_req_t{t_tag}_used_t{tn_tag}.png"
+        t_tag = _time_tag(t_req)
+        umag_png = output_dir / f"umag_t{t_tag}.png"
         _plot_slice_png(mesh_t, scalar_t, umag_png, cfg=cfg)
-        artifacts["umag_pngs"].append(str(umag_png))
+        artifacts["files"]["umag_pngs"].append({"t": float(t_req), "path": str(umag_png), "used_t": float(t_used)})
 
-        uy_csv = output_dir / f"uy_centerline_req_t{t_tag}_used_t{tn_tag}.csv"
+        uy_csv = output_dir / f"uy_centerline_t{t_tag}.csv"
         _export_centerline_csv(mesh_t, uy_csv, cfg=cfg)
-        artifacts["uy_csvs"].append(str(uy_csv))
+        artifacts["files"]["uy_csvs"].append({"t": float(t_req), "path": str(uy_csv), "used_t": float(t_used)})
 
-    return {"success": True, "artifacts": artifacts}
+    artifacts_path = output_dir / "artifacts.json"
+    try:
+        artifacts_path.write_text(json.dumps(artifacts, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+    return {"success": True, "artifacts": artifacts, "artifacts_path": str(artifacts_path)}
 
 
 def main():

@@ -120,6 +120,9 @@ class HypothesisAgent:
             'case_name': simulation.get('case_name', ''),
             'simulation_id': simulation.get('simulation_id', ''),
             'parameter_value': simulation.get('parameter_value', ''),
+            'inlet_box': simulation.get('inlet_box', ''),
+            'inlet_box_width': simulation.get('inlet_box_width', ''),
+            'inlet_box_height': simulation.get('inlet_box_height', ''),
             'simulation_description': simulation.get('description', ''),
             'visualization': simulation.get('visualization', ''),
             'case_dimensions': case_data.get('dimensions', []),
@@ -145,6 +148,12 @@ class HypothesisAgent:
                 '{simulation_id}', experiment_concept['simulation_id']
             ).replace(
                 '{parameter_value}', str(experiment_concept['parameter_value'])
+            ).replace(
+                '{inlet_box}', str(experiment_concept.get('inlet_box', ''))
+            ).replace(
+                '{inlet_box_width}', str(experiment_concept.get('inlet_box_width', ''))
+            ).replace(
+                '{inlet_box_height}', str(experiment_concept.get('inlet_box_height', ''))
             ).replace(
                 '{simulation_description}', experiment_concept['simulation_description']
             ).replace(

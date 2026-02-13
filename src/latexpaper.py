@@ -4,7 +4,10 @@ import time
 from typing import List, Dict, Optional, Union
 from dataclasses import dataclass, asdict
 from datetime import datetime
-import openai
+try:
+    import openai  # legacy mode
+except Exception:  # pragma: no cover
+    openai = None
 from abc import ABC, abstractmethod
 import re
 
@@ -937,5 +940,264 @@ def main():
         print("3. Query returning no results")
         print("Please check your connection and try again.")
 
-if __name__ == "__main__":
+def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_md: str = None) -> None:
+    """Generate a beautiful single-case study document from a batch folder.
+
+    This is a deterministic report generator (no LLM calls).
+
+    Expected artifacts (produced by src/postprocess.py):
+      - run_*/output/umag_t*.png
+      - run_*/output/uy_centerline_t*.csv
+      - run_*/output/artifacts.json
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    import numpy as _np
+
+    # matplotlib is available in openfoamAgent-v2
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as _plt
+
+    repo_root = _Path(__file__).resolve().parent.parent
+    batch_dir = repo_root / "data" / "experiments" / batch_name
+    if not batch_dir.exists():
+        raise FileNotFoundError(f"Batch directory not found: {batch_dir}")
+
+    exp_dirs = sorted([d for d in batch_dir.iterdir() if d.is_dir() and d.name.startswith("sim_")])
+    if not exp_dirs:
+        raise RuntimeError(f"No sim_* experiment directories found under: {batch_dir}")
+    exp_dir = exp_dirs[0]
+
+    run_dirs = sorted([d for d in exp_dir.iterdir() if d.is_dir() and d.name.startswith("run_")])
+    if not run_dirs:
+        raise RuntimeError(f"No run_* directories found under: {exp_dir}")
+    run_dir = run_dirs[0]
+
+    out_dir = run_dir / "output"
+    artifacts_path = out_dir / "artifacts.json"
+    if not artifacts_path.exists():
+        raise RuntimeError(f"Missing artifacts.json at: {artifacts_path}")
+
+    artifacts = _json.loads(artifacts_path.read_text(encoding="utf-8"))
+
+    # Optional: selection + experiment_results metadata
+    selection = {}
+    sel_path = batch_dir / "selector_selection.json"
+    if sel_path.exists():
+        try:
+            selection = _json.loads(sel_path.read_text(encoding="utf-8"))
+        except Exception:
+            selection = {}
+
+    exp_results = {}
+    exp_results_path = batch_dir / "experiment_results.json"
+    if exp_results_path.exists():
+        try:
+            exp_results = _json.loads(exp_results_path.read_text(encoding="utf-8"))
+        except Exception:
+            exp_results = {}
+
+    ur = ""
+    ur_path = run_dir / "user_requirement.txt"
+    if ur_path.exists():
+        ur = ur_path.read_text(encoding="utf-8")
+
+    # Build Uy overlay plot
+    uy_png = out_dir / "uy_centerline_overlay.png"
+    uy_items = (artifacts.get("files", {}) or {}).get("uy_csvs", []) or []
+    if uy_items:
+        _plt.figure(figsize=(6.5, 4.2), dpi=200)
+        for item in uy_items:
+            t = item.get("t")
+            csv_path = _Path(item.get("path"))
+            try:
+                data = _np.genfromtxt(csv_path, delimiter=",", names=True)
+                y = _np.asarray(data["y"], dtype=float)
+                Uy = _np.asarray(data["Uy"], dtype=float)
+                _plt.plot(y, Uy, linewidth=1.6, label=f"t={float(t):.2f}s")
+            except Exception:
+                continue
+
+        _plt.xlabel("y [m]")
+        _plt.ylabel("Uy [m/s]")
+        _plt.title("Centerline vertical velocity Uy")
+        _plt.grid(True, alpha=0.3)
+        _plt.legend(fontsize=8)
+        _plt.tight_layout()
+        _plt.savefig(uy_png)
+        _plt.close()
+
+    # Resolve time-stamped UMag images
+    umag_items = (artifacts.get("files", {}) or {}).get("umag_pngs", []) or []
+    # sort by requested time
+    umag_items = sorted(umag_items, key=lambda d: float(d.get("t") or 0.0))
+
+    def _rel(p: str) -> str:
+        try:
+            return str(_Path(p).resolve().relative_to(batch_dir.resolve())).replace("\\", "/")
+        except Exception:
+            return str(p).replace("\\", "/")
+
+    title = f"2D Small Pool Fire — Hero Case Study ({batch_name})"
+
+    hero = (selection.get("hero") or {}) if isinstance(selection, dict) else {}
+    hero_line = ""
+    if hero:
+        hero_line = (
+            f"Hero candidate: {hero.get('candidate_id','')}  "
+            f"(fuel_velocity={hero.get('fuel_velocity','')}, box={hero.get('box','')})"
+        )
+
+    sim_desc = str(exp_results.get("simulation_description", "")).strip()
+    sim_instr = str(exp_results.get("simulation_instructions", "")).strip()
+
+    # Write Markdown (useful for quick viewing)
+    if out_md is None:
+        out_md_path = batch_dir / "case_study.md"
+    else:
+        out_md_path = _Path(out_md)
+
+    md_lines = [
+        f"# {title}",
+        "",
+        hero_line,
+        "",
+        ("## Study context\n\n" + sim_desc) if sim_desc else "## Study context\n\n(TBD)",
+        "",
+        ("## Analysis instructions\n\n" + sim_instr) if sim_instr else "## Analysis instructions\n\n(TBD)",
+        "",
+        "## UMag snapshots (mid-plane)",
+        "",
+    ]
+    for item in umag_items:
+        t = float(item.get("t") or 0.0)
+        md_lines.append(f"### t = {t:.2f} s")
+        md_lines.append(f"![]({_rel(item.get('path',''))})")
+        md_lines.append("")
+
+    if uy_png.exists():
+        md_lines += [
+            "## Centerline Uy overlay",
+            "",
+            f"![]({_rel(str(uy_png))})",
+            "",
+        ]
+
+    if ur:
+        md_lines += [
+            "## Foam-Agent user requirement (verbatim)",
+            "",
+            "```",
+            ur.strip(),
+            "```",
+            "",
+        ]
+
+    md_lines += [
+        "## Artifacts manifest",
+        "",
+        "```json",
+        _json.dumps(artifacts, indent=2),
+        "```",
+        "",
+    ]
+
+    out_md_path.write_text("\n".join([ln for ln in md_lines if ln is not None]), encoding="utf-8")
+
+    # Write LaTeX (for "beautiful" paper-like output)
+    if out_tex is None:
+        out_tex_path = batch_dir / "case_study.tex"
+    else:
+        out_tex_path = _Path(out_tex)
+
+    tex_lines = []
+    tex_lines.append(r"\documentclass[11pt]{article}")
+    tex_lines.append(r"\usepackage[margin=1in]{geometry}")
+    tex_lines.append(r"\usepackage[utf8]{inputenc}")
+    tex_lines.append(r"\usepackage{graphicx}")
+    tex_lines.append(r"\usepackage{subcaption}")
+    tex_lines.append(r"\usepackage{hyperref}")
+    tex_lines.append(r"\usepackage{verbatim}")
+    tex_lines.append(r"\title{" + title.replace("_", r"\_") + r"}")
+    tex_lines.append(r"\author{" + "TBD" + r"}")
+    tex_lines.append(r"\date{" + "" + r"}")
+    tex_lines.append(r"\begin{document}")
+    tex_lines.append(r"\maketitle")
+    if hero_line:
+        tex_lines.append(r"\noindent " + hero_line.replace("_", r"\_") + r"\\")
+
+    tex_lines.append(r"\section*{Study context}")
+    tex_lines.append((sim_desc or "TBD").replace("_", r"\_"))
+
+    tex_lines.append(r"\section*{Analysis instructions}")
+    tex_lines.append((sim_instr or "TBD").replace("_", r"\_"))
+
+    tex_lines.append(r"\section*{UMag snapshots (mid-plane)}")
+    # 5 subfigures, 3+2 layout
+    tex_lines.append(r"\begin{figure}[ht]")
+    tex_lines.append(r"\centering")
+    for idx, item in enumerate(umag_items):
+        t = float(item.get("t") or 0.0)
+        relp = _rel(item.get("path", ""))
+        width = "0.32\\textwidth" if idx < 3 else "0.48\\textwidth"
+        tex_lines.append(r"\begin{subfigure}{" + width + r"}")
+        tex_lines.append(r"\centering")
+        tex_lines.append(r"\includegraphics[width=\linewidth]{" + relp.replace("_", r"\_") + r"}")
+        tex_lines.append(r"\caption{$t=" + f"{t:.2f}" + r"\,\mathrm{s}$}")
+        tex_lines.append(r"\end{subfigure}")
+        if idx == 2:
+            tex_lines.append(r"\\")
+
+    tex_lines.append(r"\caption{Velocity magnitude $|U|$ (UMag) on the mid-plane slice at requested timesteps.}")
+    tex_lines.append(r"\end{figure}")
+
+    if uy_png.exists():
+        tex_lines.append(r"\section*{Centerline Uy overlay}")
+        tex_lines.append(r"\begin{figure}[ht]")
+        tex_lines.append(r"\centering")
+        tex_lines.append(r"\includegraphics[width=0.75\linewidth]{" + _rel(str(uy_png)).replace("_", r"\_") + r"}")
+        tex_lines.append(r"\caption{Centerline vertical velocity $U_y$ along the geometric centerline for all requested timesteps.}")
+        tex_lines.append(r"\end{figure}")
+
+    if ur:
+        tex_lines.append(r"\section*{Foam-Agent user requirement (verbatim)}")
+        tex_lines.append(r"\begin{verbatim}")
+        tex_lines.append(ur.strip())
+        tex_lines.append(r"\end{verbatim}")
+
+    tex_lines.append(r"\section*{Artifacts manifest}")
+    tex_lines.append(r"\begin{verbatim}")
+    tex_lines.append(_json.dumps(artifacts, indent=2))
+    tex_lines.append(r"\end{verbatim}")
+
+    tex_lines.append(r"\end{document}")
+
+    out_tex_path.write_text("\n".join(tex_lines), encoding="utf-8")
+
+    print(f"Wrote: {out_md_path}")
+    print(f"Wrote: {out_tex_path}")
+    if uy_png.exists():
+        print(f"Wrote: {uy_png}")
+
+
+def main_cli():
+    import argparse
+
+    ap = argparse.ArgumentParser(description="latexpaper.py (legacy literature tool + batch case-study generator)")
+    ap.add_argument("--batch", type=str, default=None, help="Batch name under data/experiments/ (e.g., batch_YYYYMMDD_HHMMSS_id)")
+    ap.add_argument("--out-tex", type=str, default=None, help="Optional output .tex path")
+    ap.add_argument("--out-md", type=str, default=None, help="Optional output .md path")
+    args, unknown = ap.parse_known_args()
+
+    if args.batch:
+        generate_case_study_from_batch(args.batch, out_tex=args.out_tex, out_md=args.out_md)
+        return
+
+    # Legacy behavior
     main()
+
+
+if __name__ == "__main__":
+    main_cli()

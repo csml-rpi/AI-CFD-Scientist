@@ -104,18 +104,51 @@ def collect_batch_info(batch_dir: Path, max_experiments: Optional[int] = None):
                 run_info["user_requirement"] = read_text_safe(ur)
                 run_info["paths"]["user_requirement"] = str(ur)
 
-            # Look for visualization image (PNG)
-            viz_image_path = run / "output" / "visualization.png"
-            if viz_image_path.exists():
-                image_base64 = encode_image_to_base64(viz_image_path)
-                if image_base64:
-                    run_info["visualization_image"] = {
-                        "path": str(viz_image_path),
+            # Collect postprocess time-stamped UMag images (preferred evaluator inputs)
+            out_dir = run / "output"
+            if out_dir.exists():
+                umag_paths = list(out_dir.glob("umag_t*.png"))
+                timestep_images = []
+
+                def _parse_umag_time(p: Path):
+                    # filename: umag_t0p10.png -> 0.10
+                    try:
+                        tag = p.stem.split("umag_t", 1)[1]
+                        return float(tag.replace("p", "."))
+                    except Exception:
+                        return None
+
+                umag_paths.sort(key=lambda p: (_parse_umag_time(p) is None, _parse_umag_time(p) or 0.0, p.name))
+
+                for p in umag_paths:
+                    image_base64 = encode_image_to_base64(p)
+                    if not image_base64:
+                        continue
+                    tval = _parse_umag_time(p)
+                    timestep_images.append({
+                        "path": str(p),
                         "base64": image_base64,
-                        "format": "png"
-                    }
-                    print(f"   📸 Found visualization image: {viz_image_path}")
-            
+                        "format": "png",
+                        "t": tval,
+                    })
+
+                if timestep_images:
+                    run_info["timestep_images"] = timestep_images
+                    print(f"   📸 Found {len(timestep_images)} timestep visualization image(s) under: {out_dir}")
+
+                    # Representative image for cross-case batch summary (use final time if present)
+                    rep = out_dir / "umag_t3p00.png"
+                    if not rep.exists():
+                        rep = Path(timestep_images[-1]["path"])
+
+                    rep64 = encode_image_to_base64(rep)
+                    if rep64:
+                        run_info["visualization_image"] = {
+                            "path": str(rep),
+                            "base64": rep64,
+                            "format": "png",
+                        }
+
             # possible visualization scripts in run root or output folder
             viz_candidates = []
             viz_candidates += list(run.glob("visualization*.py"))
@@ -156,27 +189,23 @@ def build_prompt_for_batch(batch_name: str, batch_summary, simulation_descriptio
     
     # Build enhanced header with study context
     header = (
-        f"You are an expert CFD analysis assistant specializing in lid-driven cavity flow analysis.\n"
-        f"You will analyze a batch of simulation experiments named '{batch_name}'.\n"
+        f"You are an expert CFD analysis assistant.\n"
+        f"You will analyze a batch of simulation runs named '{batch_name}'.\n"
     )
-    
+
     if simulation_description:
         header += f"\nSTUDY CONTEXT: {simulation_description}\n"
-    
+
     if simulation_instructions:
         header += f"\nANALYSIS INSTRUCTIONS:\n{simulation_instructions}\n"
-    
+
     header += (
         "\nFor this batch analysis, provide:\n"
-        "1. INDIVIDUAL CASE ANALYSIS: For each simulation case, analyze the flow physics, vortex structures, and phenomena\n"
-        "2. CROSS-CASE COMPARATIVE ANALYSIS: Compare results across all Reynolds numbers, identifying trends and transitions\n"
-        "3. REYNOLDS NUMBER EFFECTS: Analyze how increasing Re affects primary vortex strength, secondary vortex formation, boundary layer behavior\n"
-        "4. FLOW STRUCTURE EVOLUTION: Document the progression of flow complexity as Reynolds number increases\n"
-        "5. BENCHMARK COMPARISON: Where applicable, compare with known literature results (e.g., Ghia et al. 1982)\n"
-        "6. GRID RESOLUTION ASSESSMENT: Evaluate if grid resolution is adequate for each Reynolds number\n"
-        "7. NUMERICAL ACCURACY: Assess convergence, time step adequacy, and potential numerical artifacts\n"
-        "8. PHYSICS VALIDATION: Verify that results are physically reasonable and consistent with cavity flow theory\n"
-        "\nProvide accuracy scores (/10) for each case and overall study completeness.\n\n"
+        "1. INDIVIDUAL RUN ANALYSIS: For each run, assess whether outputs match the user requirement and note numerical/physical issues.\n"
+        "2. CROSS-CASE COMPARISON: Compare outcomes across the parameter sweep(s) and identify trends and outliers.\n"
+        "3. ARTIFACT COMPLETENESS: Verify required visualizations/exports are present and consistent across runs.\n"
+        "4. NUMERICAL QUALITY: Comment on stability, convergence/steadiness, and whether mesh/time step/sim time appear adequate.\n"
+        "\nProvide accuracy scores (/10) for each run and an overall study assessment.\n\n"
     )
 
     # Enhanced per-experiment blocks with case metadata
@@ -221,36 +250,20 @@ def build_prompt_for_batch(batch_name: str, batch_summary, simulation_descriptio
 
 === CROSS-CASE COMPARATIVE ANALYSIS REQUIREMENTS ===
 
-After analyzing individual cases, provide a comprehensive comparative analysis:
+After analyzing individual runs, provide a concise comparative analysis across the study:
 
-1. REYNOLDS NUMBER PROGRESSION:
-   - How does the flow structure evolve from Re=100 to Re=10000?
-   - At what Reynolds numbers do secondary vortices appear?
-   - How does the primary vortex strength and position change?
+1. PARAMETER → RESPONSE TRENDS:
+   - What qualitative changes occur as parameters vary (e.g., inlet/fuel settings, geometry changes)?
 
-2. BOUNDARY LAYER ANALYSIS:
-   - Compare boundary layer thickness across Reynolds numbers
-   - Assess grid resolution adequacy for capturing boundary layers
+2. CONSISTENCY & OUTLIERS:
+   - Identify runs that look inconsistent with the rest (possible numerical issues or setup mistakes).
 
-3. VORTEX STRUCTURE COMPARISON:
-   - Primary vortex center movement with increasing Re
-   - Secondary vortex formation and growth patterns
-   - Corner eddy development and characteristics
+3. ARTIFACT/POSTPROCESS COMPLETENESS:
+   - Note any missing or inconsistent visualization/export artifacts across runs.
 
-4. NUMERICAL CONVERGENCE:
-   - Compare time step adequacy across different Reynolds numbers
-   - Identify any cases requiring longer simulation times
-   - Assess spatial resolution requirements
-
-5. BENCHMARK VALIDATION:
-   - Compare centerline velocity profiles with literature data
-   - Validate vortex center locations against known benchmarks
-   - Identify any discrepancies requiring investigation
-
-6. RECOMMENDATIONS:
-   - Suggest parameter adjustments for improved accuracy
-   - Recommend additional Reynolds numbers to study
-   - Identify cases needing finer grids or longer simulation times
+4. RECOMMENDATIONS:
+   - Suggest reruns with concrete requirement fixes if needed.
+   - Suggest next experiments if the sweep is insufficient to support/reject the hypothesis.
 
 Conclude with an overall study assessment and next steps.
 """
@@ -274,7 +287,7 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
     header = (
         f"🔬 COMPREHENSIVE CROSS-CASE CFD ANALYSIS\n"
         f"Batch: {batch_name}\n\n"
-        f"You are analyzing a complete Reynolds number study with {len(all_images)} visualization images.\n"
+        f"You are analyzing a CFD study with {len(all_images)} visualization images.\n"
     )
     
     if simulation_description:
@@ -285,13 +298,13 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
     
     header += (
         f"🖼️ MULTIMODAL ANALYSIS INSTRUCTIONS:\n"
-        f"You will receive {len(all_images)} visualization images showing flow fields at different Reynolds numbers.\n"
+        f"You will receive {len(all_images)} visualization images showing flow fields for different cases/parameters.\n"
         f"For each image, provide:\n"
         f"1. Flow structure description (vortices, boundary layers, separation)\n"
-        f"2. Reynolds number effects visible in the visualization\n"
+        f"2. Parameter/case effects visible in the visualization\n"
         f"3. Numerical accuracy assessment\n\n"
         f"Then provide COMPREHENSIVE CROSS-CASE COMPARATIVE ANALYSIS:\n"
-        f"1. Reynolds number progression effects\n"
+        f"1. Parameter progression effects\n"
         f"2. Primary vortex evolution (location, strength, size)\n"
         f"3. Secondary vortex development\n"
         f"4. Boundary layer thickness comparison\n"
@@ -324,36 +337,23 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
     
     cross_analysis_requirements = """
 
-CROSS-Case Analysis REQUIREMENTS:
+CROSS-CASE ANALYSIS REQUIREMENTS:
 
-1. REYNOLDS NUMBER EFFECTS MATRIX:
-   - Create a progression analysis showing how each flow feature evolves with Re
-   - Identify critical Reynolds numbers where flow transitions occur
+1. PARAMETER/CASING EFFECTS MATRIX:
+   - Describe how key qualitative flow features change across cases/parameters.
 
-2. VORTEX DYNAMICS COMPARISON:
-   - Track primary vortex center movement across Re range
-   - Document secondary vortex emergence and growth
-   - Compare vortex strength indicators across cases
+2. TEMPORAL/STEADINESS CHECK (if applicable):
+   - If the provided images represent different cases at a single time, note consistency.
 
-3. BOUNDARY LAYER ASSESSMENT:
-   - Evaluate boundary layer resolution adequacy for each Re
-   - Identify cases needing finer grids near walls
-   - Assess wall shear stress accuracy implications
+3. NUMERICAL QUALITY:
+   - Identify signs of instability, excessive diffusion, nonphysical artifacts, or mesh imprinting.
 
-4. NUMERICAL VALIDATION:
-   - Check for grid convergence indicators in the visualizations
-   - Identify potential numerical artifacts or instabilities
-   - Assess time step adequacy from flow field characteristics
+4. STUDY COMPLETENESS:
+   - Are the chosen cases sufficient to support/reject the stated hypothesis? What is missing?
 
-5. PHYSICS VALIDATION:
-   - Compare with expected lid-driven cavity flow physics
-   - Validate against benchmark studies (Ghia et al. if applicable)
-   - Identify any unphysical flow features
-
-6. STUDY COMPLETENESS:
-   - Assess Reynolds number range coverage
-   - Recommend additional cases or parameter studies
-   - Suggest experimental validation opportunities
+5. RECOMMENDATIONS:
+   - Suggest reruns with concrete fixes.
+   - Suggest next experiments to strengthen discriminative power.
 
 Provide detailed, physics-based analysis with specific observations from each image.
 """
@@ -394,10 +394,10 @@ def perform_multimodal_cross_case_analysis(prompt: str, all_images: list, model:
     
     # System message for multimodal analysis
     system_message = (
-        "You are a world-class CFD expert specializing in lid-driven cavity flows and Reynolds number studies. "
+        "You are a world-class CFD expert. "
         "Analyze the visualization images with deep physics understanding. "
-        "Provide comprehensive cross-case comparisons, identify Reynolds number effects, and assess numerical accuracy. "
-        "Be specific about flow structures, vortex dynamics, and boundary layer behavior visible in each image."
+        "Provide cross-case comparisons, identify parameter/case effects, and assess numerical accuracy. "
+        "Be specific about structures/patterns visible in each image and whether they match the stated requirements."
     )
     
     try:
@@ -606,7 +606,7 @@ def analyze_batch(batch_dir: Path, model: str = DEFAULT_MODEL, temperature: floa
             )
             client, model_name = create_client(model)
             analysis_text, _ = get_response_from_llm(prompt, client, model_name, 
-                                                   "You are a CFD expert specializing in lid-driven cavity flow analysis.", 
+                                                   "You are a CFD expert. Analyze simulations against their user requirements.", 
                                                    print_debug=False, temperature=temperature)
     else:
         # No images found, use text-only analysis
@@ -619,7 +619,7 @@ def analyze_batch(batch_dir: Path, model: str = DEFAULT_MODEL, temperature: floa
         )
         client, model_name = create_client(model)
         analysis_text, _ = get_response_from_llm(prompt, client, model_name,
-                                               "You are a CFD expert specializing in lid-driven cavity flow analysis.",
+                                               "You are a CFD expert. Analyze simulations against their user requirements.",
                                                print_debug=False, temperature=temperature)
 
     # Ensure client and model_name are defined for rerun analysis
@@ -1326,59 +1326,84 @@ def _analyze_and_collect_rerun_suggestions(
                 first_line = first_line[:117] + "..."
             print(f"   🧪 Run {run_name}: {first_line}")
             
-            # Build comprehensive analysis prompt with image
-            viz_image = run.get("visualization_image")
+            # Build comprehensive analysis prompt with images
+            timestep_images = run.get("timestep_images", []) or []
             viz_snippets = []
             for v in run.get("visualizations", [])[:2]:
                 viz_snippets.append(f"Path: {v['path']}\n{v['content']}")
             viz_block = "\n\n".join(viz_snippets) if viz_snippets else "<no visualization scripts>"
             out_list = ", ".join([f[0] for f in run.get("output_files", [])[:15]]) or "<no outputs listed>"
-            
+
+            img_index_block = ""
+            if timestep_images:
+                ordered_for_prompt = sorted(
+                    timestep_images,
+                    key=lambda d: (
+                        d.get("t") is None,
+                        float(d.get("t") or 0.0),
+                        str(d.get("path") or ""),
+                    ),
+                )
+                lines = []
+                for i_img, d in enumerate(ordered_for_prompt, 1):
+                    tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
+                    fname = Path(d.get("path", "")).name
+                    lines.append(f"{i_img}. {tstr} — {fname}")
+                img_index_block = "\nIMAGES PROVIDED (order):\n" + "\n".join(lines) + "\n"
+
             image_instruction = ""
-            if viz_image:
-                print(f"      📸 Visualization image: {viz_image['path']}")
+            if timestep_images:
+                # Keep a stable ordering for the LLM: sort by time if available, else by path.
+                ordered_imgs = sorted(
+                    timestep_images,
+                    key=lambda d: (
+                        d.get("t") is None,
+                        float(d.get("t") or 0.0),
+                        str(d.get("path") or ""),
+                    ),
+                )
+                times_str = ", ".join(
+                    [
+                        (f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?")
+                        + ": "
+                        + str(Path(d.get("path", "")).name)
+                        for d in ordered_imgs
+                    ]
+                )
+                print(f"      📸 Timestep images ({len(ordered_imgs)}): {times_str}")
+
                 image_instruction = (
-                    "\n\n🖼️ CRITICAL: A VISUALIZATION IMAGE IS PROVIDED showing the actual simulation results.\n\n"
-                    "CAREFULLY ANALYZE THE IMAGE:\n"
-                    "1. Flow Physics - Describe what you see:\n"
-                    "   - Primary vortex structure, location, and strength\n"
-                    "   - Corner eddies and secondary vortices\n"
-                    "   - Recirculation zones and their extent\n"
-                    "   - Boundary layer behavior and separation points\n"
-                    "   - Flow symmetry or asymmetry\n"
-                    "   - Transient vs steady-state appearance\n\n"
-                    "2. Velocity/Pressure Field:\n"
-                    "   - Velocity magnitude distribution and gradients\n"
-                    "   - Pressure contours and gradients\n"
-                    "   - Streamlines and flow direction\n"
-                    "   - High/low velocity regions\n\n"
-                    "3. Physical Correctness:\n"
-                    "   - Does the flow match expected Reynolds number behavior?\n"
-                    "   - Are boundary conditions properly reflected (inlet, outlet, walls)?\n"
-                    "   - Is the mesh resolution adequate (smooth contours vs pixelated)?\n"
-                    "   - Are there any unphysical artifacts?\n\n"
-                    "4. Requirement Matching:\n"
-                    "   - Does the geometry match the requirement?\n"
-                    "   - Are dimensions and domain size correct?\n"
-                    "   - Is the visualization showing what was requested?\n"
-                    "   - Is the user requirement clear about what should be visualized?\n\n"
+                    "\n\n🖼️ CRITICAL: MULTIPLE VISUALIZATION IMAGES ARE PROVIDED for the SAME run at multiple times.\n"
+                    "Each image is a UMag (|U|) contour on a mid-plane slice at the time indicated.\n\n"
+                    "CAREFULLY ANALYZE ALL IMAGES TOGETHER:\n"
+                    "1. Requirement matching:\n"
+                    "   - Are the requested field(s) and slice/plane consistent with the requirement?\n"
+                    "   - Do the times provided align with the requested timesteps (or are they missing/mismatched)?\n"
+                    "2. Temporal behavior:\n"
+                    "   - Does the flow evolve smoothly over time without obvious numerical blow-up or artifacts?\n"
+                    "   - Do late-time images appear converged/steady if the requirement implies steady behavior?\n"
+                    "3. Physical plausibility:\n"
+                    "   - Do boundary conditions (inlet/outlet/walls) appear reflected in the field patterns?\n"
+                    "   - Are magnitudes and gradients qualitatively reasonable for the described setup?\n"
+                    "4. Quality indicators:\n"
+                    "   - Signs of instability, excessive diffusion, checkerboarding, or mesh imprinting.\n\n"
                 )
             else:
-                print(f"      ⚠️  No visualization image found")
+                print("      ⚠️  No timestep visualization images (umag_t*.png) found")
             
             analysis_prompt = (
                 f"Analyze this CFD simulation run and determine if it matches the user requirement.\n\n"
                 f"PRIMARY TASKS:\n"
-                f"1. Describe the flow physics you observe in the visualization image\n"
-                f"2. Compare the visualization against the user requirement\n"
+                f"1. Describe the flow physics you observe in the visualization image(s)\n"
+                f"2. Compare the visualization image(s) against the user requirement\n"
                 f"3. Identify any errors, discrepancies, or issues\n"
                 f"4. If issues found, propose a COMPLETE corrected user requirement\n\n"
                 f"CRITICAL REQUIREMENTS:\n"
                 f"- The user requirement MUST clearly state what should be visualized (e.g., 'Visualize velocity magnitude contours with streamlines')\n"
                 f"- If the visualization statement is unclear or missing, add it to your proposed requirement\n"
                 f"- If geometry, mesh, or physics parameters are wrong, specify exact corrections\n"
-                f"- Be specific about Reynolds number, boundary conditions, domain size, mesh resolution\n"
-                f"{image_instruction}\n"
+                f"- Be specific about boundary conditions, domain size, mesh resolution, and any key parameters\n"
+                f"{img_index_block}{image_instruction}\n"
                 f"IF ANY ISSUES ARE FOUND:\n"
                 f"- Set 'accurate' to false if significant problems exist\n"
                 f"- Give accuracy score from 1-10 (1=poor, 10=excellent) based on overall quality\n"
@@ -1403,63 +1428,95 @@ def _analyze_and_collect_rerun_suggestions(
                 f"OUTPUT FILES (sample): {out_list}\n"
             )
             
-            try:
-                # If image is available and using Bedrock, send multimodal content
-                if viz_image and "bedrock" in str(type(client)).lower():
-                    # Bedrock multimodal format
-                    # Decode base64 to raw bytes for Bedrock 'bytes' source
-                    try:
-                        _image_bytes = base64.b64decode(viz_image.get('base64', ''))
-                    except Exception:
-                        _image_bytes = None
+            if not timestep_images:
+                # Missing evaluator artifacts: treat as non-evaluable.
+                # To keep existing rerun machinery working, propose rerunning with the same requirement.
+                stub = {
+                    "analysis": "Missing timestep visualization images (umag_t*.png). Run is not evaluable.",
+                    "accurate": False,
+                    "accuracy": 0,
+                    "explanation": "Required timestep images were not found. Ensure deterministic postprocess runs and produces umag_t*.png outputs (umag_t0p10..umag_t3p00).",
+                    "visualization_matches_requirement": False,
+                    "visualization_statement_clear": False,
+                    "proposed_user_requirement": ur or None,
+                }
+                response_text = "```json\n" + json.dumps(stub, indent=2) + "\n```"
+            else:
+                try:
+                    # If timestep images are available and using Bedrock, send ONE multimodal call with ALL images.
+                    if "bedrock" in str(type(client)).lower():
+                        ordered_imgs = sorted(
+                            timestep_images,
+                            key=lambda d: (
+                                d.get("t") is None,
+                                float(d.get("t") or 0.0),
+                                str(d.get("path") or ""),
+                            ),
+                        )
 
-                    if _image_bytes:
-                        print("Processing image input....")
-                        messages = [{
-                            "role": "user",
-                            "content": [
+                        content = []
+                        bad = 0
+                        for d in ordered_imgs:
+                            try:
+                                img_bytes = base64.b64decode(d.get("base64", "") or "")
+                            except Exception:
+                                img_bytes = None
+                            if not img_bytes:
+                                bad += 1
+                                continue
+                            content.append(
                                 {
                                     "image": {
-                                        "format": viz_image.get("format", "png"),
-                                        "source": {"bytes": _image_bytes}
+                                        "format": d.get("format", "png"),
+                                        "source": {"bytes": img_bytes},
                                     }
+                                }
+                            )
+
+                        # Append the text prompt last so the model sees the images first.
+                        content.append({"text": analysis_prompt})
+
+                        if len(content) <= 1:
+                            print("      ⚠️  No valid image bytes could be prepared; falling back to text-only")
+                            response_text, _ = get_response_from_llm(
+                                analysis_prompt,
+                                client,
+                                model_name,
+                                system_message,
+                                print_debug=False,
+                                temperature=temperature,
+                            )
+                        else:
+                            if bad:
+                                print(f"      ⚠️  Skipped {bad} timestep image(s) due to invalid base64")
+                            print(f"Processing {len(content)-1} timestep image(s) in one LLM call...")
+
+                            messages = [{"role": "user", "content": content}]
+                            response = client.converse(
+                                modelId=model_name,
+                                messages=messages,
+                                system=[{"text": system_message}],
+                                inferenceConfig={
+                                    "temperature": temperature,
+                                    "maxTokens": 4096,
                                 },
-                                {"text": analysis_prompt}
-                            ]
-                        }]
+                            )
+                            response_text = response["output"]["message"]["content"][0]["text"]
                     else:
-                        # Fallback to text-only if image bytes could not be prepared
-                        messages = [{
-                            "role": "user",
-                            "content": [{"text": "[Image unavailable or invalid] \n" + analysis_prompt}]
-                        }]
-                    
-                    # Use Bedrock converse API directly
-                    response = client.converse(
-                        modelId=model_name,
-                        messages=messages,
-                        system=[{"text": system_message}],
-                        inferenceConfig={
-                            "temperature": temperature,
-                            "maxTokens": 4096
-                        }
-                    )
-                    response_text = response['output']['message']['content'][0]['text']
-                else:
-                    # Fallback to text-only
-                    response_text, _ = get_response_from_llm(
-                        analysis_prompt, 
-                        client, 
-                        model_name, 
-                        system_message, 
-                        print_debug=False, 
-                        temperature=temperature
-                    )
-            except Exception as e:
-                print(f"      ❌ LLM analysis failed: {e}")
-                import traceback
-                traceback.print_exc()
-                continue
+                        # Text-only fallback for non-multimodal clients.
+                        response_text, _ = get_response_from_llm(
+                            analysis_prompt,
+                            client,
+                            model_name,
+                            system_message,
+                            print_debug=False,
+                            temperature=temperature,
+                        )
+                except Exception as e:
+                    print(f"      ❌ LLM analysis failed: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
             
             data = extract_json_between_markers(response_text) or {}
             analysis_text = data.get("analysis", "")
@@ -1512,8 +1569,9 @@ def _analyze_and_collect_rerun_suggestions(
             except Exception as e:
                 print(f"      ⚠️  Failed to write analysis: {e}")
 
-            # Check if rerun is needed - use accuracy as primary criteria
-            should_rerun = (accuracy < rerun_threshold) and isinstance(proposed, str) and proposed.strip()
+            # Check if rerun is needed - missing evaluator artifacts always triggers rerun.
+            missing_artifacts = not bool(timestep_images)
+            should_rerun = missing_artifacts or ((accuracy < rerun_threshold) and isinstance(proposed, str) and proposed.strip())
             
             # Additional check for critical visualization issues 
             critical_viz_issue = (not viz_matches) or (not viz_statement_clear and accuracy < 8.0)

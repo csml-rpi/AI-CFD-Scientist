@@ -335,7 +335,7 @@ def main():
         rerun_failed_experiments(args.rerun_batch)
         return
   
-    print("=== CFD SCIENTIST - LID-DRIVEN CAVITY STUDY ===")
+    print("=== CFD SCIENTIST - SMALL POOL FIRE CASE STUDY ===")
     
     # Create unique experiment directory for this batch of runs under data/experiments
     from datetime import datetime 
@@ -446,71 +446,69 @@ def main():
 
     print(f"🧪 Ideation generated {len(candidate_sims)} candidate experiment(s)")
 
-    # Selector chooses up to 10 candidates based on hypothesis-testing power.
-    from agents.selector_ag import SelectorAgent
-
+    # Choose ONE "hero" case for a beautiful single-case study.
     hypothesis_text = "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire."
 
-    selector_candidates = [
-        {
-            "candidate_id": c["candidate_id"],
-            "fuel_velocity": c["fuel_velocity"],
-            "box": c["box"],
-            "box_width": c["box_width"],
-            "box_height": c["box_height"],
-        }
-        for c in candidate_sims
-    ]
+    def _nearly_equal(a, b, tol=1e-12):
+        try:
+            return abs(float(a) - float(b)) <= tol
+        except Exception:
+            return False
 
-    selection = None
-    try:
-        selector = SelectorAgent(model=os.environ.get("CFD_SCIENTIST_MODEL"))
-        selection = selector.select_experiments(
-            hypothesis_text=hypothesis_text,
-            idea_json=idea_json,
-            candidates=selector_candidates,
-            k=10,
-        )
-    except Exception as e:
-        print(f"⚠️  SelectorAgent failed ({e}); falling back to first 10 candidates")
-
-    selected_ids = selection.get("selected_ids", []) if isinstance(selection, dict) else []
-    if not isinstance(selected_ids, list):
-        selected_ids = []
-
-    # Filter out hallucinated IDs. Preserve selector ordering.
     cand_by_id = {c["candidate_id"]: c for c in candidate_sims}
-    invalid_ids = [str(x) for x in selected_ids if str(x) not in cand_by_id]
-    if invalid_ids:
-        print(f"⚠️  Selector returned {len(invalid_ids)} unknown candidate_id(s); ignoring: {invalid_ids}")
 
-    seen = set()
-    selected_candidates = []
-    for x in selected_ids:
-        cid = str(x)
-        if cid in cand_by_id and cid not in seen:
-            selected_candidates.append(cand_by_id[cid])
-            seen.add(cid)
-        if len(selected_candidates) >= 10:
-            break
+    hero_candidate = None
+    hero_reason = None
 
-    if not selected_candidates:
-        # Fallback: take the first up to 10 deterministically.
-        selected_candidates = candidate_sims[: min(10, len(candidate_sims))]
-        print(f"⚠️  Selector returned no valid selections; falling back to first {len(selected_candidates)} candidates")
+    try:
+        case0 = (case_list[0] if isinstance(case_list, list) and case_list else {})
+        fuels = case0.get("fuel_speed_list") or []
+        boxes = case0.get("box_size_list") or []
 
-    print(f"✅ Selector kept {len(selected_candidates)} experiment(s) for execution")
-    print("Selected candidate IDs:", ", ".join([c["candidate_id"] for c in selected_candidates]))
+        # Choose the middle settings: 3rd of 5 fuel speeds and 2nd of 3 box sizes.
+        fuel_mid = fuels[len(fuels) // 2] if isinstance(fuels, list) and fuels else None
+        box_mid = boxes[len(boxes) // 2] if isinstance(boxes, list) and boxes else None
+
+        if fuel_mid is not None and box_mid is not None:
+            for c in candidate_sims:
+                if _nearly_equal(c.get("fuel_velocity"), fuel_mid) and str(c.get("box")) == str(box_mid):
+                    hero_candidate = c
+                    hero_reason = "middle fuel speed + middle inlet box from ideation lists"
+                    break
+    except Exception:
+        hero_candidate = None
+
+    if hero_candidate is None:
+        # Fallback: choose the median candidate in the deterministic enumeration.
+        if candidate_sims:
+            hero_candidate = candidate_sims[len(candidate_sims) // 2]
+            hero_reason = "fallback median candidate"
+
+    if hero_candidate is None:
+        raise RuntimeError("No candidates available to run")
+
+    selected_candidates = [hero_candidate]
+
+    print("✅ Selected 1 hero experiment for execution:", hero_candidate["candidate_id"])
+    if hero_reason:
+        print("Selection rationale:", hero_reason)
 
     # Save selection for reproducibility/debugging.
     try:
         (batch_dir / "selector_selection.json").write_text(
             json.dumps(
                 {
+                    "mode": "hero_single_case",
                     "hypothesis": hypothesis_text,
-                    "selected_ids": [c["candidate_id"] for c in selected_candidates],
-                    "selection": selection,
-                    "invalid_ids": invalid_ids,
+                    "selected_ids": [hero_candidate["candidate_id"]],
+                    "reason": hero_reason,
+                    "hero": {
+                        "candidate_id": hero_candidate.get("candidate_id"),
+                        "fuel_velocity": hero_candidate.get("fuel_velocity"),
+                        "box": hero_candidate.get("box"),
+                        "box_width": hero_candidate.get("box_width"),
+                        "box_height": hero_candidate.get("box_height"),
+                    },
                 },
                 indent=2,
             ),
@@ -528,6 +526,9 @@ def main():
             "case_name": cand["case_name"],
             "simulation_id": f"sim_{i:03d}",
             "parameter_value": cand["fuel_velocity"],
+            "inlet_box": cand["box"],
+            "inlet_box_width": cand.get("box_width"),
+            "inlet_box_height": cand.get("box_height"),
             "description": f"Small pool fire param sweep. fuel_velocity={cand['fuel_velocity']}, inlet_box={cand['box']}",
             "visualization": str(idea_json.get("post", {}).get("visualization", "")),
             "case_data": {
