@@ -36,7 +36,7 @@ except Exception as e:  # pragma: no cover
 
 @dataclass
 class PostprocessConfig:
-    times: Sequence[float] = (0.10, 0.50, 1.00, 2.00, 3.00)
+    times: Sequence[float] = (0.10, 0.50, 1.00, 1.50, 2.00, 3.00)
     slice_z: float = 0.0
     centerline_x: float = 0.0
     centerline_z: float = 0.0
@@ -208,7 +208,16 @@ def _apply_bounds_based_geometry(cfg: PostprocessConfig, mesh) -> dict:
     return meta
 
 
-def _plot_slice_png(mesh, scalar_name: Optional[str], out_png: Path, *, cfg: PostprocessConfig):
+def _plot_slice_png(
+    mesh,
+    scalar_name: Optional[str],
+    out_png: Path,
+    *,
+    cfg: PostprocessConfig,
+    title_text: str = "",
+    scalar_bar_title: str = "",
+):
+    """Render a z-slice with axis labels + units."""
     plotter = pv.Plotter(off_screen=True, window_size=cfg.image_size)
     plotter.set_background("white")
 
@@ -220,9 +229,64 @@ def _plot_slice_png(mesh, scalar_name: Optional[str], out_png: Path, *, cfg: Pos
         to_plot = mesh
 
     if scalar_name:
-        plotter.add_mesh(to_plot, scalars=scalar_name, cmap=cfg.cmap, show_scalar_bar=True)
+        sbar_args = {
+            "title": scalar_bar_title,
+            "title_font_size": 12,
+            "label_font_size": 10,
+            "n_labels": 4,
+            "fmt": "%.2g",
+            # Force a vertical colorbar on the right.
+            "vertical": True,
+            "position_x": 0.87,
+            "position_y": 0.18,
+            "height": 0.70,
+            "width": 0.08,
+        }
+        plotter.add_mesh(
+            to_plot,
+            scalars=scalar_name,
+            cmap=cfg.cmap,
+            show_scalar_bar=True,
+            scalar_bar_args=sbar_args,
+        )
     else:
         plotter.add_mesh(to_plot, color="lightgray")
+
+    # Axis labels + units
+    try:
+        plotter.show_bounds(
+            grid=None,
+            location="outer",
+            use_2d=True,
+            show_zaxis=False,
+            show_zlabels=False,
+            bold=False,
+            font_size=10,
+            xtitle="x [m]",
+            ytitle="y [m]",
+            ztitle="z [m]",
+            n_xlabels=5,
+            n_ylabels=5,
+            ticks="outside",
+            all_edges=False,
+            padding=0.03,
+        )
+    except Exception:
+        try:
+            plotter.show_bounds()
+        except Exception:
+            pass
+
+    if title_text:
+        try:
+            plotter.add_text(title_text, position="upper_left", font_size=12, color="black")
+        except Exception:
+            pass
+
+    try:
+        plotter.enable_parallel_projection()
+    except Exception:
+        pass
 
     plotter.view_xy()
     plotter.show(auto_close=False)
@@ -281,9 +345,11 @@ def postprocess_case(output_dir: Path, *, user_requirement: str = "", cfg: Optio
     if not foam_path.exists():
         return {"success": False, "error": f"No .foam file found in {output_dir}"}
 
-    # parse requested times; fall back to cfg.times
-    req_times = parse_times_from_requirement(user_requirement)
-    if not req_times:
+    # parse requested times; enforce at least cfg.times length for a consistent case-study grid
+    parsed_times = parse_times_from_requirement(user_requirement)
+    if parsed_times and len(parsed_times) >= len(cfg.times):
+        req_times = parsed_times
+    else:
         req_times = list(cfg.times)
 
     # Make sure PyVista is in off-screen mode
@@ -329,6 +395,7 @@ def postprocess_case(output_dir: Path, *, user_requirement: str = "", cfg: Optio
         "files": {
             "latest_png": str(latest_png),
             "umag_pngs": [],
+            "p_pngs": [],
             "uy_csvs": [],
         },
     }
@@ -348,13 +415,42 @@ def postprocess_case(output_dir: Path, *, user_requirement: str = "", cfg: Optio
         artifacts["time_errors"][str(t_req)] = float(abs(float(t_used) - float(t_req)))
 
         mesh_t, _ = _read_mesh(foam_path, time_value=float(t_used))
-        mesh_t, scalar_t = _compute_umag(mesh_t)
 
         t_tag = _time_tag(t_req)
+
+        # UMag (|U|) image
+        mesh_u, scalar_u = _compute_umag(mesh_t)
         umag_png = output_dir / f"umag_t{t_tag}.png"
-        _plot_slice_png(mesh_t, scalar_t, umag_png, cfg=cfg)
+        _plot_slice_png(
+            mesh_u,
+            scalar_u,
+            umag_png,
+            cfg=cfg,
+            title_text=f"|U| (UMag) at t={float(t_used):.2f} s",
+            scalar_bar_title="|U| [m/s]",
+        )
         artifacts["files"]["umag_pngs"].append({"t": float(t_req), "path": str(umag_png), "used_t": float(t_used)})
 
+        # Pressure image (if available)
+        has_p = False
+        try:
+            has_p = (hasattr(mesh_t, "point_data") and "p" in mesh_t.point_data) or (hasattr(mesh_t, "cell_data") and "p" in mesh_t.cell_data)
+        except Exception:
+            has_p = False
+
+        if has_p:
+            p_png = output_dir / f"p_t{t_tag}.png"
+            _plot_slice_png(
+                mesh_t,
+                "p",
+                p_png,
+                cfg=cfg,
+                title_text=f"p at t={float(t_used):.2f} s",
+                scalar_bar_title="p [Pa]",
+            )
+            artifacts["files"]["p_pngs"].append({"t": float(t_req), "path": str(p_png), "used_t": float(t_used)})
+
+        # Centerline Uy CSV
         uy_csv = output_dir / f"uy_centerline_t{t_tag}.csv"
         _export_centerline_csv(mesh_t, uy_csv, cfg=cfg)
         artifacts["files"]["uy_csvs"].append({"t": float(t_req), "path": str(uy_csv), "used_t": float(t_used)})

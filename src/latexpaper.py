@@ -1029,10 +1029,13 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
         _plt.savefig(uy_png)
         _plt.close()
 
-    # Resolve time-stamped UMag images
+    # Resolve time-stamped UMag and pressure images
     umag_items = (artifacts.get("files", {}) or {}).get("umag_pngs", []) or []
+    p_items = (artifacts.get("files", {}) or {}).get("p_pngs", []) or []
+
     # sort by requested time
     umag_items = sorted(umag_items, key=lambda d: float(d.get("t") or 0.0))
+    p_items = sorted(p_items, key=lambda d: float(d.get("t") or 0.0))
 
     def _rel(p: str) -> str:
         try:
@@ -1077,6 +1080,17 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
         md_lines.append(f"![]({_rel(item.get('path',''))})")
         md_lines.append("")
 
+    if p_items:
+        md_lines += [
+            "## Pressure p snapshots (mid-plane)",
+            "",
+        ]
+        for item in p_items:
+            t = float(item.get("t") or 0.0)
+            md_lines.append(f"### t = {t:.2f} s")
+            md_lines.append(f"![]({_rel(item.get('path',''))})")
+            md_lines.append("")
+
     if uy_png.exists():
         md_lines += [
             "## Centerline Uy overlay",
@@ -1119,7 +1133,7 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
     tex_lines.append(r"\usepackage{graphicx}")
     tex_lines.append(r"\usepackage{subcaption}")
     tex_lines.append(r"\usepackage{hyperref}")
-    tex_lines.append(r"\usepackage{verbatim}")
+    # (verbatim removed to keep PDF clean)
     tex_lines.append(r"\title{" + title.replace("_", r"\_") + r"}")
     tex_lines.append(r"\author{" + "TBD" + r"}")
     tex_lines.append(r"\date{" + "" + r"}")
@@ -1135,23 +1149,40 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
     tex_lines.append((sim_instr or "TBD").replace("_", r"\_"))
 
     tex_lines.append(r"\section*{UMag snapshots (mid-plane)}")
-    # 5 subfigures, 3+2 layout
+    # 6 subfigures, 2x3 layout (2 columns, 3 rows)
     tex_lines.append(r"\begin{figure}[ht]")
     tex_lines.append(r"\centering")
-    for idx, item in enumerate(umag_items):
+    for idx, item in enumerate(umag_items[:6]):
         t = float(item.get("t") or 0.0)
         relp = _rel(item.get("path", ""))
-        width = "0.32\\textwidth" if idx < 3 else "0.48\\textwidth"
-        tex_lines.append(r"\begin{subfigure}{" + width + r"}")
+        tex_lines.append("\\begin{subfigure}{0.48\\textwidth}")
         tex_lines.append(r"\centering")
         tex_lines.append(r"\includegraphics[width=\linewidth]{" + relp.replace("_", r"\_") + r"}")
         tex_lines.append(r"\caption{$t=" + f"{t:.2f}" + r"\,\mathrm{s}$}")
         tex_lines.append(r"\end{subfigure}")
-        if idx == 2:
+        if idx in (1, 3, 5):
             tex_lines.append(r"\\")
 
-    tex_lines.append(r"\caption{Velocity magnitude $|U|$ (UMag) on the mid-plane slice at requested timesteps.}")
+    tex_lines.append(r"\caption{Velocity magnitude $|U|$ (UMag) on the mid-plane slice at six timesteps. Axes are in meters and the colorbar is in m/s.}")
     tex_lines.append(r"\end{figure}")
+
+    if p_items:
+        tex_lines.append(r"\section*{Pressure snapshots (mid-plane)}")
+        tex_lines.append(r"\begin{figure}[ht]")
+        tex_lines.append(r"\centering")
+        for idx, item in enumerate(p_items[:6]):
+            t = float(item.get("t") or 0.0)
+            relp = _rel(item.get("path", ""))
+            tex_lines.append("\\begin{subfigure}{0.48\\textwidth}")
+            tex_lines.append(r"\centering")
+            tex_lines.append(r"\includegraphics[width=\linewidth]{" + relp.replace("_", r"\_") + r"}")
+            tex_lines.append(r"\caption{$t=" + f"{t:.2f}" + r"\,\mathrm{s}$}")
+            tex_lines.append(r"\end{subfigure}")
+            if idx in (1, 3, 5):
+                tex_lines.append(r"\\")
+
+        tex_lines.append(r"\caption{Pressure $p$ on the mid-plane slice at six timesteps. Axes are in meters and the colorbar is in Pa.}")
+        tex_lines.append(r"\end{figure}")
 
     if uy_png.exists():
         tex_lines.append(r"\section*{Centerline Uy overlay}")
@@ -1161,16 +1192,15 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
         tex_lines.append(r"\caption{Centerline vertical velocity $U_y$ along the geometric centerline for all requested timesteps.}")
         tex_lines.append(r"\end{figure}")
 
-    if ur:
-        tex_lines.append(r"\section*{Foam-Agent user requirement (verbatim)}")
-        tex_lines.append(r"\begin{verbatim}")
-        tex_lines.append(ur.strip())
-        tex_lines.append(r"\end{verbatim}")
-
-    tex_lines.append(r"\section*{Artifacts manifest}")
-    tex_lines.append(r"\begin{verbatim}")
-    tex_lines.append(_json.dumps(artifacts, indent=2))
-    tex_lines.append(r"\end{verbatim}")
+    # Keep the PDF clean: do not dump large verbatim blocks.
+    # Instead, point to the source files in the batch folder.
+    tex_lines.append(r"\section*{Reproducibility files}")
+    tex_lines.append(
+        ("This report is generated from deterministic artifacts in the batch folder. "
+         "See the following files in the project for full details: "
+         "(1) run_001/user_requirement.txt, (2) run_001/output/artifacts.json, "
+         "(3) run_001/output/uy_centerline_t*.csv.").replace("_", r"\_")
+    )
 
     tex_lines.append(r"\end{document}")
 
