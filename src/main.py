@@ -446,8 +446,14 @@ def main():
 
     print(f"🧪 Ideation generated {len(candidate_sims)} candidate experiment(s)")
 
-    # Choose ONE "hero" case for a beautiful single-case study.
+    # Choose up to 5 candidates deterministically for a compact study that can test main effects.
+    # With 5 fuel speeds and 3 boxes from ideation, select:
+    #   - center point (mid fuel, mid box)
+    #   - +/- 1 fuel step at mid box
+    #   - small/large box at mid fuel
     hypothesis_text = "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire."
+
+    MAX_SELECTED = 5
 
     def _nearly_equal(a, b, tol=1e-12):
         try:
@@ -455,60 +461,99 @@ def main():
         except Exception:
             return False
 
-    cand_by_id = {c["candidate_id"]: c for c in candidate_sims}
+    def _find_candidate(fuel, box_str):
+        for c in candidate_sims:
+            if _nearly_equal(c.get("fuel_velocity"), fuel) and str(c.get("box")) == str(box_str):
+                return c
+        return None
 
-    hero_candidate = None
-    hero_reason = None
+    selected_candidates = []
+    selected_reasons = {}
 
     try:
         case0 = (case_list[0] if isinstance(case_list, list) and case_list else {})
         fuels = case0.get("fuel_speed_list") or []
         boxes = case0.get("box_size_list") or []
 
-        # Choose the middle settings: 3rd of 5 fuel speeds and 2nd of 3 box sizes.
-        fuel_mid = fuels[len(fuels) // 2] if isinstance(fuels, list) and fuels else None
-        box_mid = boxes[len(boxes) // 2] if isinstance(boxes, list) and boxes else None
+        if isinstance(fuels, list) and fuels and isinstance(boxes, list) and boxes:
+            fi_mid = len(fuels) // 2
+            bi_mid = len(boxes) // 2
 
-        if fuel_mid is not None and box_mid is not None:
-            for c in candidate_sims:
-                if _nearly_equal(c.get("fuel_velocity"), fuel_mid) and str(c.get("box")) == str(box_mid):
-                    hero_candidate = c
-                    hero_reason = "middle fuel speed + middle inlet box from ideation lists"
-                    break
+            # 1) center
+            c = _find_candidate(fuels[fi_mid], boxes[bi_mid])
+            if c:
+                selected_candidates.append(c)
+                selected_reasons[c["candidate_id"]] = "center point (mid fuel, mid box)"
+
+            # 2) fuel -1 at mid box
+            if fi_mid - 1 >= 0:
+                c = _find_candidate(fuels[fi_mid - 1], boxes[bi_mid])
+                if c and c not in selected_candidates:
+                    selected_candidates.append(c)
+                    selected_reasons[c["candidate_id"]] = "fuel step down (mid box)"
+
+            # 3) fuel +1 at mid box
+            if fi_mid + 1 < len(fuels):
+                c = _find_candidate(fuels[fi_mid + 1], boxes[bi_mid])
+                if c and c not in selected_candidates:
+                    selected_candidates.append(c)
+                    selected_reasons[c["candidate_id"]] = "fuel step up (mid box)"
+
+            # 4) small box at mid fuel
+            c = _find_candidate(fuels[fi_mid], boxes[0])
+            if c and c not in selected_candidates:
+                selected_candidates.append(c)
+                selected_reasons[c["candidate_id"]] = "small box (mid fuel)"
+
+            # 5) large box at mid fuel
+            c = _find_candidate(fuels[fi_mid], boxes[-1])
+            if c and c not in selected_candidates:
+                selected_candidates.append(c)
+                selected_reasons[c["candidate_id"]] = "large box (mid fuel)"
     except Exception:
-        hero_candidate = None
+        # If anything goes wrong, fall back below.
+        selected_candidates = []
+        selected_reasons = {}
 
-    if hero_candidate is None:
-        # Fallback: choose the median candidate in the deterministic enumeration.
-        if candidate_sims:
-            hero_candidate = candidate_sims[len(candidate_sims) // 2]
-            hero_reason = "fallback median candidate"
+    if not selected_candidates:
+        # Fallback: pick the first up to MAX_SELECTED deterministically.
+        selected_candidates = candidate_sims[: min(MAX_SELECTED, len(candidate_sims))]
+        selected_reasons = {c["candidate_id"]: "fallback deterministic order" for c in selected_candidates}
 
-    if hero_candidate is None:
-        raise RuntimeError("No candidates available to run")
+    # Fill if we have fewer than MAX_SELECTED (due to missing matches / duplicates)
+    if len(selected_candidates) < min(MAX_SELECTED, len(candidate_sims)):
+        seen_ids = {c["candidate_id"] for c in selected_candidates}
+        for c in candidate_sims:
+            if c["candidate_id"] in seen_ids:
+                continue
+            selected_candidates.append(c)
+            selected_reasons[c["candidate_id"]] = "fill to reach max_selected"
+            if len(selected_candidates) >= MAX_SELECTED:
+                break
 
-    selected_candidates = [hero_candidate]
-
-    print("✅ Selected 1 hero experiment for execution:", hero_candidate["candidate_id"])
-    if hero_reason:
-        print("Selection rationale:", hero_reason)
+    print(f"✅ Selected {len(selected_candidates)} experiment(s) for execution (max {MAX_SELECTED})")
+    print("Selected candidate IDs:", ", ".join([c["candidate_id"] for c in selected_candidates]))
 
     # Save selection for reproducibility/debugging.
     try:
         (batch_dir / "selector_selection.json").write_text(
             json.dumps(
                 {
-                    "mode": "hero_single_case",
+                    "mode": "deterministic_main_effects",
+                    "max_selected": MAX_SELECTED,
                     "hypothesis": hypothesis_text,
-                    "selected_ids": [hero_candidate["candidate_id"]],
-                    "reason": hero_reason,
-                    "hero": {
-                        "candidate_id": hero_candidate.get("candidate_id"),
-                        "fuel_velocity": hero_candidate.get("fuel_velocity"),
-                        "box": hero_candidate.get("box"),
-                        "box_width": hero_candidate.get("box_width"),
-                        "box_height": hero_candidate.get("box_height"),
-                    },
+                    "selected_ids": [c["candidate_id"] for c in selected_candidates],
+                    "reasons": selected_reasons,
+                    "selected": [
+                        {
+                            "candidate_id": c.get("candidate_id"),
+                            "fuel_velocity": c.get("fuel_velocity"),
+                            "box": c.get("box"),
+                            "box_width": c.get("box_width"),
+                            "box_height": c.get("box_height"),
+                        }
+                        for c in selected_candidates
+                    ],
                 },
                 indent=2,
             ),

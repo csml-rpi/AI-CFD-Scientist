@@ -104,42 +104,61 @@ def collect_batch_info(batch_dir: Path, max_experiments: Optional[int] = None):
                 run_info["user_requirement"] = read_text_safe(ur)
                 run_info["paths"]["user_requirement"] = str(ur)
 
-            # Collect postprocess time-stamped UMag images (preferred evaluator inputs)
+            # Collect postprocess time-stamped images for BOTH velocity magnitude (UMag) and pressure (p)
             out_dir = run / "output"
             if out_dir.exists():
-                umag_paths = list(out_dir.glob("umag_t*.png"))
-                timestep_images = []
 
-                def _parse_umag_time(p: Path):
-                    # filename: umag_t0p10.png -> 0.10
+                def _parse_time_from_stem(stem: str, prefix: str):
+                    # e.g., stem='umag_t0p10' prefix='umag_t' -> 0.10
                     try:
-                        tag = p.stem.split("umag_t", 1)[1]
+                        tag = stem.split(prefix, 1)[1]
                         return float(tag.replace("p", "."))
                     except Exception:
                         return None
 
-                umag_paths.sort(key=lambda p: (_parse_umag_time(p) is None, _parse_umag_time(p) or 0.0, p.name))
+                def _collect_images(pattern: str, prefix: str, field: str):
+                    paths = list(out_dir.glob(pattern))
 
-                for p in umag_paths:
-                    image_base64 = encode_image_to_base64(p)
-                    if not image_base64:
-                        continue
-                    tval = _parse_umag_time(p)
-                    timestep_images.append({
-                        "path": str(p),
-                        "base64": image_base64,
-                        "format": "png",
-                        "t": tval,
-                    })
+                    def _t(p: Path):
+                        return _parse_time_from_stem(p.stem, prefix)
 
+                    paths.sort(key=lambda p: (_t(p) is None, _t(p) or 0.0, p.name))
+                    imgs = []
+                    for p in paths:
+                        image_base64 = encode_image_to_base64(p)
+                        if not image_base64:
+                            continue
+                        imgs.append(
+                            {
+                                "field": field,
+                                "path": str(p),
+                                "base64": image_base64,
+                                "format": "png",
+                                "t": _t(p),
+                            }
+                        )
+                    return imgs
+
+                umag_imgs = _collect_images("umag_t*.png", "umag_t", "umag")
+                p_imgs = _collect_images("p_t*.png", "p_t", "p")
+
+                if umag_imgs:
+                    run_info["timestep_images_umag"] = umag_imgs
+                if p_imgs:
+                    run_info["timestep_images_p"] = p_imgs
+
+                # For backward compatibility, keep a combined list.
+                timestep_images = umag_imgs + p_imgs
                 if timestep_images:
                     run_info["timestep_images"] = timestep_images
-                    print(f"   📸 Found {len(timestep_images)} timestep visualization image(s) under: {out_dir}")
+                    print(
+                        f"   📸 Found timestep images under: {out_dir} (umag={len(umag_imgs)}, p={len(p_imgs)})"
+                    )
 
-                    # Representative image for cross-case batch summary (use final time if present)
+                    # Representative image for cross-case batch summary: prefer UMag at final time.
                     rep = out_dir / "umag_t3p00.png"
-                    if not rep.exists():
-                        rep = Path(timestep_images[-1]["path"])
+                    if not rep.exists() and umag_imgs:
+                        rep = Path(umag_imgs[-1]["path"])
 
                     rep64 = encode_image_to_base64(rep)
                     if rep64:
@@ -1328,6 +1347,8 @@ def _analyze_and_collect_rerun_suggestions(
             
             # Build comprehensive analysis prompt with images
             timestep_images = run.get("timestep_images", []) or []
+            timestep_umag = run.get("timestep_images_umag", []) or [x for x in timestep_images if x.get("field") == "umag"]
+            timestep_p = run.get("timestep_images_p", []) or [x for x in timestep_images if x.get("field") == "p"]
             viz_snippets = []
             for v in run.get("visualizations", [])[:2]:
                 viz_snippets.append(f"Path: {v['path']}\n{v['content']}")
@@ -1335,61 +1356,79 @@ def _analyze_and_collect_rerun_suggestions(
             out_list = ", ".join([f[0] for f in run.get("output_files", [])[:15]]) or "<no outputs listed>"
 
             img_index_block = ""
-            if timestep_images:
-                ordered_for_prompt = sorted(
-                    timestep_images,
-                    key=lambda d: (
-                        d.get("t") is None,
-                        float(d.get("t") or 0.0),
-                        str(d.get("path") or ""),
-                    ),
-                )
+            if timestep_umag or timestep_p:
+                def _order(xs):
+                    return sorted(
+                        xs,
+                        key=lambda d: (
+                            d.get("t") is None,
+                            float(d.get("t") or 0.0),
+                            str(d.get("path") or ""),
+                        ),
+                    )
+
+                ordered_umag = _order(timestep_umag)
+                ordered_p = _order(timestep_p)
+
                 lines = []
-                for i_img, d in enumerate(ordered_for_prompt, 1):
-                    tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
-                    fname = Path(d.get("path", "")).name
-                    lines.append(f"{i_img}. {tstr} — {fname}")
+                i_img = 0
+                if ordered_umag:
+                    lines.append("UMAG (|U|) images:")
+                    for d in ordered_umag:
+                        i_img += 1
+                        tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
+                        fname = Path(d.get("path", "")).name
+                        lines.append(f"{i_img}. {tstr} — {fname}")
+
+                if ordered_p:
+                    lines.append("PRESSURE (p) images:")
+                    for d in ordered_p:
+                        i_img += 1
+                        tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
+                        fname = Path(d.get("path", "")).name
+                        lines.append(f"{i_img}. {tstr} — {fname}")
+
                 img_index_block = "\nIMAGES PROVIDED (order):\n" + "\n".join(lines) + "\n"
 
             image_instruction = ""
-            if timestep_images:
-                # Keep a stable ordering for the LLM: sort by time if available, else by path.
-                ordered_imgs = sorted(
-                    timestep_images,
-                    key=lambda d: (
-                        d.get("t") is None,
-                        float(d.get("t") or 0.0),
-                        str(d.get("path") or ""),
-                    ),
-                )
-                times_str = ", ".join(
-                    [
-                        (f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?")
-                        + ": "
-                        + str(Path(d.get("path", "")).name)
-                        for d in ordered_imgs
-                    ]
-                )
-                print(f"      📸 Timestep images ({len(ordered_imgs)}): {times_str}")
+            if timestep_umag and timestep_p:
+                def _order(xs):
+                    return sorted(
+                        xs,
+                        key=lambda d: (
+                            d.get("t") is None,
+                            float(d.get("t") or 0.0),
+                            str(d.get("path") or ""),
+                        ),
+                    )
+
+                ordered_umag = _order(timestep_umag)
+                ordered_p = _order(timestep_p)
+
+                print(f"      📸 UMag images: {len(ordered_umag)}, p images: {len(ordered_p)}")
 
                 image_instruction = (
                     "\n\n🖼️ CRITICAL: MULTIPLE VISUALIZATION IMAGES ARE PROVIDED for the SAME run at multiple times.\n"
-                    "Each image is a UMag (|U|) contour on a mid-plane slice at the time indicated.\n\n"
+                    "You are given two fields at matching times:\n"
+                    "  - UMag (|U|) contours\n"
+                    "  - pressure p contours\n\n"
                     "CAREFULLY ANALYZE ALL IMAGES TOGETHER:\n"
                     "1. Requirement matching:\n"
-                    "   - Are the requested field(s) and slice/plane consistent with the requirement?\n"
-                    "   - Do the times provided align with the requested timesteps (or are they missing/mismatched)?\n"
-                    "2. Temporal behavior:\n"
-                    "   - Does the flow evolve smoothly over time without obvious numerical blow-up or artifacts?\n"
-                    "   - Do late-time images appear converged/steady if the requirement implies steady behavior?\n"
-                    "3. Physical plausibility:\n"
-                    "   - Do boundary conditions (inlet/outlet/walls) appear reflected in the field patterns?\n"
-                    "   - Are magnitudes and gradients qualitatively reasonable for the described setup?\n"
+                    "   - Are both requested fields present (UMag and p) at the requested times?\n"
+                    "   - Are slice/plane and domain consistent with the requirement?\n"
+                    "2. Temporal behavior (within each field):\n"
+                    "   - Does UMag evolve smoothly over time without obvious numerical blow-up or artifacts?\n"
+                    "   - Does p evolve consistently (no unphysical jumps between frames)?\n"
+                    "3. Cross-field consistency:\n"
+                    "   - Are high-|U| regions consistent with expected pressure gradients near inlet/outlet?\n"
                     "4. Quality indicators:\n"
                     "   - Signs of instability, excessive diffusion, checkerboarding, or mesh imprinting.\n\n"
                 )
             else:
-                print("      ⚠️  No timestep visualization images (umag_t*.png) found")
+                if not timestep_umag:
+                    print("      ⚠️  Missing UMag timestep images (umag_t*.png)")
+                if not timestep_p:
+                    print("      ⚠️  Missing pressure timestep images (p_t*.png)")
             
             analysis_prompt = (
                 f"Analyze this CFD simulation run and determine if it matches the user requirement.\n\n"
@@ -1428,14 +1467,23 @@ def _analyze_and_collect_rerun_suggestions(
                 f"OUTPUT FILES (sample): {out_list}\n"
             )
             
-            if not timestep_images:
+            missing_umag = not bool(timestep_umag)
+            missing_p = not bool(timestep_p)
+            if missing_umag or missing_p:
                 # Missing evaluator artifacts: treat as non-evaluable.
                 # To keep existing rerun machinery working, propose rerunning with the same requirement.
+                missing_parts = []
+                if missing_umag:
+                    missing_parts.append("umag_t*.png")
+                if missing_p:
+                    missing_parts.append("p_t*.png")
+                missing_str = ", ".join(missing_parts)
+
                 stub = {
-                    "analysis": "Missing timestep visualization images (umag_t*.png). Run is not evaluable.",
+                    "analysis": f"Missing timestep visualization images ({missing_str}). Run is not evaluable.",
                     "accurate": False,
                     "accuracy": 0,
-                    "explanation": "Required timestep images were not found. Ensure deterministic postprocess runs and produces umag_t*.png outputs (umag_t0p10..umag_t3p00).",
+                    "explanation": f"Required timestep images were not found: {missing_str}. Ensure deterministic postprocess runs and produces both UMag and p time-stamped PNG outputs.",
                     "visualization_matches_requirement": False,
                     "visualization_statement_clear": False,
                     "proposed_user_requirement": ur or None,
@@ -1444,15 +1492,19 @@ def _analyze_and_collect_rerun_suggestions(
             else:
                 try:
                     # If timestep images are available and using Bedrock, send ONE multimodal call with ALL images.
+                    # Ordering: all UMag images (sorted by time) then all p images (sorted by time).
                     if "bedrock" in str(type(client)).lower():
-                        ordered_imgs = sorted(
-                            timestep_images,
-                            key=lambda d: (
-                                d.get("t") is None,
-                                float(d.get("t") or 0.0),
-                                str(d.get("path") or ""),
-                            ),
-                        )
+                        def _order(xs):
+                            return sorted(
+                                xs,
+                                key=lambda d: (
+                                    d.get("t") is None,
+                                    float(d.get("t") or 0.0),
+                                    str(d.get("path") or ""),
+                                ),
+                            )
+
+                        ordered_imgs = _order(timestep_umag) + _order(timestep_p)
 
                         content = []
                         bad = 0
@@ -1489,7 +1541,7 @@ def _analyze_and_collect_rerun_suggestions(
                         else:
                             if bad:
                                 print(f"      ⚠️  Skipped {bad} timestep image(s) due to invalid base64")
-                            print(f"Processing {len(content)-1} timestep image(s) in one LLM call...")
+                            print(f"Processing {len(content)-1} timestep image(s) (UMag+p) in one LLM call...")
 
                             messages = [{"role": "user", "content": content}]
                             response = client.converse(
@@ -1541,6 +1593,10 @@ def _analyze_and_collect_rerun_suggestions(
                 "original_requirement": ur,
                 "updated_requirement": proposed,
                 "response_raw": response_text,
+                "evidence_files": {
+                    "umag_images": [x.get("path") for x in timestep_umag],
+                    "p_images": [x.get("path") for x in timestep_p],
+                },
             }
             
             # Save combined analysis to experiment directory
@@ -1570,7 +1626,7 @@ def _analyze_and_collect_rerun_suggestions(
                 print(f"      ⚠️  Failed to write analysis: {e}")
 
             # Check if rerun is needed - missing evaluator artifacts always triggers rerun.
-            missing_artifacts = not bool(timestep_images)
+            missing_artifacts = (not bool(timestep_umag)) or (not bool(timestep_p))
             should_rerun = missing_artifacts or ((accuracy < rerun_threshold) and isinstance(proposed, str) and proposed.strip())
             
             # Additional check for critical visualization issues 

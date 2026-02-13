@@ -1054,34 +1054,7 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
     umag_items = (artifacts.get("files", {}) or {}).get("umag_pngs", []) or []
     p_items = (artifacts.get("files", {}) or {}).get("p_pngs", []) or []
 
-    # Parse solver log for numeric stability evidence (Courant, dt, runtime)
-    log_stats = {}
-    try:
-        import re as _re
-
-        log_path = out_dir / "log.pimpleFoam"
-        if log_path.exists():
-            txt = log_path.read_text(errors="ignore")
-            means = []
-            maxs = []
-            for m in _re.finditer(r"Courant Number mean:\s*([0-9.eE+-]+)\s*max:\s*([0-9.eE+-]+)", txt):
-                means.append(float(m.group(1)))
-                maxs.append(float(m.group(2)))
-            dts = [float(x) for x in _re.findall(r"deltaT\s*=\s*([0-9.eE+-]+)", txt)]
-            ex = _re.findall(r"ExecutionTime\s*=\s*([0-9.]+)\s*s", txt)
-            log_stats = {
-                "courant_entries": len(maxs),
-                "co_mean_median": float(_np.median(means)) if means else None,
-                "co_mean_max": float(max(means)) if means else None,
-                "co_max_median": float(_np.median(maxs)) if maxs else None,
-                "co_max_peak": float(max(maxs)) if maxs else None,
-                "deltaT_min": float(min(dts)) if dts else None,
-                "deltaT_median": float(_np.median(dts)) if dts else None,
-                "deltaT_max": float(max(dts)) if dts else None,
-                "execution_time_s": float(ex[-1]) if ex else None,
-            }
-    except Exception:
-        log_stats = {}
+    # (Deliberately do not auto-analyze solver logs here; the scientist should interpret evidence.)
 
     # sort by requested time
     umag_items = sorted(umag_items, key=lambda d: float(d.get("t") or 0.0))
@@ -1149,54 +1122,29 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
             "",
         ]
 
-    # Evidence-based analysis (no LLM): show what we can support with artifacts/logs.
+    # Scientist-written analysis template (fill in after reviewing the figures and CSVs)
     md_lines += [
-        "## Evidence-based analysis",
+        "## Scientist analysis (fill in)",
         "",
-        "### 1) Artifact completeness",
-        f"- UMag snapshots: {len(umag_items)} image(s) (expected 6)",
-        f"- Pressure snapshots: {len(p_items)} image(s) (expected 6)",
-        f"- Centerline Uy CSVs: {len(uy_items)} file(s) (expected 6)",
+        "### What I observe in the figures",
+        "- (Write observations comparing UMag vs p over time; note plume/jet core, spreading, symmetry, recirculation regions)",
         "",
-    ]
-
-    if log_stats:
-        md_lines += [
-            "### 2) Numerical stability evidence (from log.pimpleFoam)",
-            f"- Courant max peak: {log_stats.get('co_max_peak')} (target < 1)",
-            f"- Courant max median: {log_stats.get('co_max_median')}",
-            f"- Courant mean median: {log_stats.get('co_mean_median')}",
-            f"- deltaT range: [{log_stats.get('deltaT_min')}, {log_stats.get('deltaT_max')}] s",
-            f"- ExecutionTime: {log_stats.get('execution_time_s')} s",
-            "",
-        ]
-
-    if uy_stats:
-        md_lines += [
-            "### 3) Quantitative centerline evidence (Uy)",
-            "(Values sampled along the geometric centerline at x≈0.10 m, z≈0.005 m)",
-            "",
-        ]
-        for d in uy_stats:
-            md_lines.append(
-                f"- t={d['t']:.2f}s: Uy_min={d['Uy_min']:.3g}, Uy_max={d['Uy_max']:.3g}, "
-                f"Uy(y=0)={d['Uy_y0']:.3g}, Uy(y=0.10)={d['Uy_yMid']:.3g}, Uy(y=0.20)={d['Uy_yTop']:.3g}"
-            )
-        md_lines.append("")
-
-    md_lines += [
-        "### 4) Conclusion (what the evidence supports)",
-        "- The run is numerically stable over 0–3 s (Courant peak < 1; smooth dt adaptation).",
-        "- The UMag snapshots show a temporally smooth evolution consistent with a bottom-centered inlet-driven upward jet/plume in a confined 2D box.",
-        "- The centerline Uy profiles quantify the transient development and late-time upward transport along the domain centerline.",
-        "- This batch contains one hero case only, so it does not (yet) support or refute the broader parametric hypothesis about fuel speed/box-size effects.",
+        "### Evidence I rely on",
+        "- Which figure(s) support each claim (cite times explicitly: t=0.10, 0.50, 1.00, 1.50, 2.00, 3.00)",
+        "- Which centerline Uy CSV(s) support each quantitative claim",
+        "",
+        "### Quantitative summary (numbers)",
+        "- (Record a few key metrics from uy_centerline_t*.csv: peak Uy, Uy at y=0.10 m, etc.)",
+        "",
+        "### Conclusion",
+        "- (State what is supported by evidence, and what remains uncertain)",
         "",
         "## Reproducibility files",
         "",
-        "This report is generated from deterministic artifacts in the batch folder. For full details, see:",
         "- run_001/user_requirement.txt",
         "- run_001/output/artifacts.json",
         "- run_001/output/uy_centerline_t*.csv",
+        "- run_001/output/log.pimpleFoam",
         "",
     ]
 
@@ -1274,55 +1222,23 @@ def generate_case_study_from_batch(batch_name: str, *, out_tex: str = None, out_
         tex_lines.append(r"\caption{Centerline vertical velocity $U_y$ along the geometric centerline for all requested timesteps.}")
         tex_lines.append(r"\end{figure}")
 
-    # Keep the PDF clean: do not dump large verbatim blocks.
-    # Instead, point to the source files in the batch folder.
-    tex_lines.append(r"\section*{Evidence-based analysis}")
-    tex_lines.append(r"\subsection*{1) Artifact completeness}")
-    tex_lines.append(f"UMag snapshots: {len(umag_items)} image(s) (expected 6).".replace("_", r"\_"))
-    tex_lines.append(f"Pressure snapshots: {len(p_items)} image(s) (expected 6).".replace("_", r"\_"))
-    tex_lines.append(f"Centerline Uy CSVs: {len(uy_items)} file(s) (expected 6).".replace("_", r"\_"))
+    # Scientist-written analysis template (fill in after reviewing the figures and CSVs)
+    tex_lines.append(r"\section*{Scientist analysis (fill in)}")
+    tex_lines.append(r"\subsection*{What I observe in the figures}")
+    tex_lines.append(r"\textit{[Write observations comparing UMag vs p over time; note jet/plume core, spreading, symmetry, recirculation regions.]}")
 
-    if log_stats:
-        tex_lines.append(r"\subsection*{2) Numerical stability evidence (from log.pimpleFoam)}")
-        tex_lines.append(
-            (
-                f"Courant max peak = {log_stats.get('co_max_peak')} (target < 1); "
-                f"Courant max median = {log_stats.get('co_max_median')}; "
-                f"Courant mean median = {log_stats.get('co_mean_median')}. "
-                f"deltaT range = [{log_stats.get('deltaT_min')}, {log_stats.get('deltaT_max')}] s. "
-                f"ExecutionTime = {log_stats.get('execution_time_s')} s."
-            ).replace("_", r"\_")
-        )
+    tex_lines.append(r"\subsection*{Evidence I rely on}")
+    tex_lines.append(r"\textit{[For each claim, cite the specific figure(s) and times (0.10, 0.50, 1.00, 1.50, 2.00, 3.00 s) and any CSV-derived values.]}")
 
-    if uy_stats:
-        tex_lines.append(r"\subsection*{3) Quantitative centerline evidence (Uy)}")
-        tex_lines.append(r"Values sampled along the geometric centerline at $x\approx 0.10\,\mathrm{m}$, $z\approx 0.005\,\mathrm{m}$.\par")
-        tex_lines.append(r"\begin{itemize}")
-        for d in uy_stats:
-            tex_lines.append(
-                (
-                    f"\\item $t={d['t']:.2f}\,\\mathrm{{s}}$: "
-                    f"$U_y^{{\\min}}={d['Uy_min']:.3g}$, $U_y^{{\\max}}={d['Uy_max']:.3g}$, "
-                    f"$U_y(y=0)={d['Uy_y0']:.3g}$, $U_y(y=0.10)={d['Uy_yMid']:.3g}$, $U_y(y=0.20)={d['Uy_yTop']:.3g}$"
-                ).replace("_", r"\_")
-            )
-        tex_lines.append(r"\end{itemize}")
+    tex_lines.append(r"\subsection*{Quantitative summary (numbers)}")
+    tex_lines.append(r"\textit{[Record a few key metrics from uy_centerline\_t*.csv (peak $U_y$, $U_y$ at $y=0.10\,\mathrm{m}$, etc.)]}")
 
-    tex_lines.append(r"\subsection*{4) Conclusion (supported by evidence)}")
-    tex_lines.append(
-        (
-            "The run remains numerically stable over 0--3 s (Courant peak < 1 with smooth time-step adaptation). "
-            "The UMag snapshots show temporally smooth evolution consistent with a bottom-centered inlet-driven upward jet/plume in a confined 2D box. "
-            "The centerline $U_y$ profiles quantify transient development and late-time upward transport along the domain centerline. "
-            "Because this batch contains a single hero case only, it does not yet support or refute the broader parametric hypothesis about fuel speed and inlet box size effects."
-        ).replace("_", r"\_")
-    )
+    tex_lines.append(r"\subsection*{Conclusion}")
+    tex_lines.append(r"\textit{[State what is supported by evidence, and what remains uncertain.]} ")
 
     tex_lines.append(r"\section*{Reproducibility files}")
     tex_lines.append(
-        ("This report is generated from deterministic artifacts in the batch folder. "
-         "See: (1) run_001/user_requirement.txt, (2) run_001/output/artifacts.json, "
-         "(3) run_001/output/uy_centerline_t*.csv.").replace("_", r"\_")
+        ("See: run\_001/user\_requirement.txt; run\_001/output/artifacts.json; run\_001/output/uy\_centerline\_t*.csv; run\_001/output/log.pimpleFoam.")
     )
 
     tex_lines.append(r"\end{document}")
