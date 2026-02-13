@@ -478,16 +478,26 @@ def main():
     if not isinstance(selected_ids, list):
         selected_ids = []
 
-    selected_set = {str(x) for x in selected_ids}
-    selected_candidates = [c for c in candidate_sims if c["candidate_id"] in selected_set]
+    # Filter out hallucinated IDs. Preserve selector ordering.
+    cand_by_id = {c["candidate_id"]: c for c in candidate_sims}
+    invalid_ids = [str(x) for x in selected_ids if str(x) not in cand_by_id]
+    if invalid_ids:
+        print(f"⚠️  Selector returned {len(invalid_ids)} unknown candidate_id(s); ignoring: {invalid_ids}")
+
+    seen = set()
+    selected_candidates = []
+    for x in selected_ids:
+        cid = str(x)
+        if cid in cand_by_id and cid not in seen:
+            selected_candidates.append(cand_by_id[cid])
+            seen.add(cid)
+        if len(selected_candidates) >= 10:
+            break
 
     if not selected_candidates:
         # Fallback: take the first up to 10 deterministically.
         selected_candidates = candidate_sims[: min(10, len(candidate_sims))]
         print(f"⚠️  Selector returned no valid selections; falling back to first {len(selected_candidates)} candidates")
-    else:
-        # Enforce hard cap.
-        selected_candidates = selected_candidates[:10]
 
     print(f"✅ Selector kept {len(selected_candidates)} experiment(s) for execution")
     print("Selected candidate IDs:", ", ".join([c["candidate_id"] for c in selected_candidates]))
@@ -500,6 +510,7 @@ def main():
                     "hypothesis": hypothesis_text,
                     "selected_ids": [c["candidate_id"] for c in selected_candidates],
                     "selection": selection,
+                    "invalid_ids": invalid_ids,
                 },
                 indent=2,
             ),
