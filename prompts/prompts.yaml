@@ -5,16 +5,19 @@ IdeationAgent:
     Keep things very simple and focus on small pool fire problems only.
 
     Constraints:
-    - Design small pool fire experiments with varying fuel velocities and inlet box sizes
-    - Create multiple cases with different combinations of fuel velocity and inlet box sizes.
-    - Each case should have different combinations of these entities
-    - Idea is to study the effect of these entities in the simulation
-    - Keep mesh simple: ≤ 10,000 cells total. Use 100x100 cells in x and y direction
+    - Design small pool fire experiments with varying fuel velocities and inlet box sizes.
+    - Keep this as ONE parametric case (1 item in "cases").
+    - For that case, output EXACTLY:
+      * 5 fuel velocities in "fuel_speed_list" (span low→high, strictly increasing)
+      * 3 inlet boxes in "box_size_list" (span small→large)
+      This yields 15 candidate experiments total.
+    - Inlet box position must stay fixed; only change box width/height.
+    - box_size_list entries must be valid OpenFOAM box strings: "(x0 y0 z0)(x1 y1 z1)".
+    - Keep mesh simple: ≤ 10,000 cells total. Use 100x100 cells in x and y direction.
     - Units: SI everywhere. No placeholders like "TBD".
-    - Use fuel velocity and box sizes as parameter to study
     - All simulations must be 2D.
     - Output MUST be valid JSON matching the EXACT skeleton below. Return ONLY the JSON (no prose, no markdown).
-    - Visualize at multiple timesteps in simulation (beginning, mid and end)
+    - Visualize at multiple timesteps in simulation (beginning, mid and end).
         
     Research this topic: "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire."
     
@@ -25,20 +28,22 @@ IdeationAgent:
       "description": "string",
       "cases": [
         {
-          "name": "string (e.g., fire_case_1, fire_case_2)",
+          "name": "string (e.g., fire_case_1)",
           "dimensions": [number, number, number],
           "topology": "string (2d|3d)",
-          "fuel speed": "number",
-          "box size": "number (eg. box     (-0.0529 -0.001 -0.1)(0.0529 0.002 0.1)",
-          "fuel_speed_list": [array of numbers]
-          "box_size_list":[array of dimensions]
+          "fuel_speed_list": [number, number, number, number, number],
+          "box_size_list": [
+            "(x0 y0 z0)(x1 y1 z1)",
+            "(x0 y0 z0)(x1 y1 z1)",
+            "(x0 y0 z0)(x1 y1 z1)"
+          ]
         }
       ],
       "solver": "string (icoFoam|simpleFoam|pisoFoam|pimpleFoam|interFoam)",
       "target_CFL": "number",
       "post": {
         "objective": "string",
-        "visualization": "string (MUST explicitly name fields, locations, and times; e.g., 'Visualize velocity magnitude |U| (UMag) contour on plane z=0 at t=0.05, 0.50, 1.00 s (PNGs) and export centerline Uy at x=0,z=0 at the same times (CSVs).')"
+        "visualization": "string (MUST explicitly name fields, locations, and times; e.g., 'Visualize velocity magnitude |U| (UMag) contour on plane z=0 at t=0.10, 0.50, 1.00 s (PNGs) and export centerline Uy at x=0,z=0 at the same times (CSVs).')"
       }
     }
 
@@ -93,7 +98,7 @@ HypothesisAgent:
        - At minimum, ALWAYS request:
          * velocity magnitude |U| (UMag)
          * centerline vertical velocity Uy (export as CSV)
-       - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.05 s, 0.50 s, 1.00 s.
+       - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s.
        - Specify plane/line: z=0 plane for contours; centerline at x=0, z=0 for Uy.
        - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
        - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
@@ -147,8 +152,8 @@ HypothesisAgent:
     Return ONLY the user requirement paragraph for Foam-Agent.
 
     The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
-    - Visualize velocity magnitude |U| (UMag) on the z=0 plane at t=0.05 s, 0.50 s, 1.00 s (separate PNGs)
-    - Export centerline Uy along x=0, z=0 at t=0.05 s, 0.50 s, 1.00 s (separate CSVs)
+    - Visualize velocity magnitude |U| (UMag) on the z=0 plane at t=0.10 s, 0.50 s, 1.00 s (separate PNGs)
+    - Export centerline Uy along x=0, z=0 at t=0.10 s, 0.50 s, 1.00 s (separate CSVs)
 
   writer_system_prompt: |
     You are an ambitious AI researcher who is looking to publish a paper that will contribute significantly to the field.

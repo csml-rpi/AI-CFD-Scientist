@@ -35,7 +35,7 @@ except Exception as e:  # pragma: no cover
 
 @dataclass
 class PostprocessConfig:
-    times: Sequence[float] = (0.05, 0.50, 1.00)
+    times: Sequence[float] = (0.10, 0.50, 1.00)
     slice_z: float = 0.0
     centerline_x: float = 0.0
     centerline_z: float = 0.0
