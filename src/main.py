@@ -604,11 +604,32 @@ def main():
         
         # Pass experiment directory to ensure all runs go to the same experiment folder
         result = run_foam(
-            user_requirement.strip(), 
-            show_output=True, 
-            run_index=i, 
+            user_requirement.strip(),
+            show_output=True,
+            run_index=i,
             experiment_dir=current_experiment_dir
         )
+
+        # Deterministic post-processing to produce requirement-compliant artifacts.
+        try:
+            from src.postprocess import postprocess_case
+            out_dir = Path(result.get('output_dir', ''))
+            req_path = Path(result.get('run_dir', '')) / 'user_requirement.txt'
+            req_text = ''
+            try:
+                if req_path.exists():
+                    req_text = req_path.read_text(encoding='utf-8')
+            except Exception:
+                req_text = user_requirement
+
+            pp = postprocess_case(out_dir, user_requirement=req_text)
+            result['postprocess'] = pp
+            if pp.get('success'):
+                print(f"🧾 Postprocess artifacts written under: {out_dir}")
+            else:
+                print(f"⚠️  Postprocess skipped/failed: {pp.get('error')}")
+        except Exception as e:
+            print(f"⚠️  Postprocess exception: {e}")
         
         result_entry = {
             'requirement_index': i,
