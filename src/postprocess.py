@@ -4,9 +4,11 @@
 Goal: produce requirement-compliant artifacts even when Foam-Agent's visualization is generic.
 
 Artifacts (if possible):
-- visualization.png: velocity magnitude |U| (UMag) at the latest available time on z=0 slice.
+- visualization.png: velocity magnitude |U| (UMag) at the latest available time.
 - umag_t<...>.png: |U| at requested times (nearest available time).
-- uy_centerline_t<...>.csv: Uy along centerline (x=0, z=0) at requested times.
+- p_t<...>.png: pressure at requested times (nearest available time, if p exists).
+- uy_centerline_t<...>.csv: Uy along centerline at requested times.
+- artifacts.json: manifest of what was produced.
 
 This module is intentionally standalone and uses only runtime dependencies already present
 in the OpenFOAM/Foam-Agent environment (pyvista, numpy).
@@ -58,13 +60,13 @@ _FLOAT_RE = re.compile(r"[-+]?(?:\d+\.\d+|\d+)(?:[eE][-+]?\d+)?")
 def parse_times_from_requirement(user_requirement: str) -> List[float]:
     """Extract requested visualization times from a natural-language requirement.
 
-    Handles patterns like:
-      - "at t=0.10 s, 0.50 s, 1.00 s"
-      - "at t=0.10, 0.50, 1.00, 2.00, 3.00 s"
+    Important: be strict. We only treat values as *times* when they are explicitly
+    written as times (e.g. "t=0.10 s" or "t={0.10,0.50,1.00}").
 
-    Strategy:
-      1) Find each "t=<number>" anchor.
-      2) From the anchor, parse subsequent comma/and-separated numbers in a short window.
+    This avoids accidentally parsing unrelated numbers like:
+      - "12 PNGs total"
+      - "z=0.005 m"
+      - "0.20 m x 0.20 m"
 
     Returns a de-duped list in discovery order.
     """
@@ -73,28 +75,45 @@ def parse_times_from_requirement(user_requirement: str) -> List[float]:
 
     found: List[float] = []
 
-    for m in _TIME_RE.finditer(user_requirement):
-        # Anchor time
+    def _add_from_block(block: str):
+        for fm in _FLOAT_RE.finditer(block or ""):
+            try:
+                v = float(fm.group(0))
+            except Exception:
+                continue
+            if 0.0 <= v <= 1.0e3:
+                found.append(v)
+
+    # 1) Brace form: t={0.10, 0.50, 1.00}
+    for m in re.finditer(r"\bt\s*=\s*\{([^}]*)\}", user_requirement, flags=re.IGNORECASE):
+        _add_from_block(m.group(1))
+
+    # 2) Explicit seconds tokens: t=0.10 s, 0.50 s, 1.00 s
+    for m in re.finditer(
+        r"\bt\s*=\s*([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|second|seconds)\b",
+        user_requirement,
+        flags=re.IGNORECASE,
+    ):
         try:
             found.append(float(m.group(1)))
         except Exception:
             continue
 
-        # Look ahead for additional times like ", 0.50 s, 1.00 s".
-        tail = user_requirement[m.end() : m.end() + 120]
-        # Stop early on obvious hard boundaries to avoid pulling unrelated numbers.
-        # NOTE: do NOT split on '.' because that breaks decimal numbers like 0.50.
+        tail = user_requirement[m.end() : m.end() + 200]
         for sep in ["\n", ";"]:
             if sep in tail:
                 tail = tail.split(sep, 1)[0]
-        for fm in _FLOAT_RE.finditer(tail):
+
+        # Only accept additional times if they also carry an explicit seconds token.
+        for m2 in re.finditer(
+            r"[,\s]+([0-9]+(?:\.[0-9]+)?)\s*(?:s|sec|secs|second|seconds)\b",
+            tail,
+            flags=re.IGNORECASE,
+        ):
             try:
-                v = float(fm.group(0))
+                found.append(float(m2.group(1)))
             except Exception:
                 continue
-            # Heuristic: plausible visualization times (seconds)
-            if 0.0 <= v <= 1.0e3:
-                found.append(v)
 
     # De-dupe preserving order
     out: List[float] = []
