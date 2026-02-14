@@ -1775,6 +1775,21 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
                 # Move temp rerun to replace original
                 shutil.move(str(temp_rerun_dir), str(original_run_dir))
                 
+                # Run deterministic post-processing after rerun replacement.
+                # This produces requirement-compliant artifacts (umag_t*.png, p_t*.png, uy_centerline_*.csv, artifacts.json).
+                postprocess_result = None
+                try:
+                    from src.postprocess import postprocess_case
+                    out_dir = original_run_dir / "output"
+                    postprocess_result = postprocess_case(out_dir, user_requirement=updated_requirement)
+                    if postprocess_result.get('success'):
+                        print(f"   🧾 Postprocess artifacts written under: {out_dir}")
+                    else:
+                        print(f"   ⚠️  Postprocess skipped/failed: {postprocess_result.get('error')}")
+                except Exception as e:
+                    print(f"   ⚠️  Postprocess exception: {e}")
+                    postprocess_result = {"success": False, "error": str(e)}
+
                 # Save replacement metadata in the new run directory
                 replacement_info = {
                     "replaced_on": datetime.now().isoformat(),
@@ -1783,6 +1798,7 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
                     "original_requirement": case['original_requirement'],
                     "updated_requirement": updated_requirement,
                     "foam_agent_success": True,
+                    "postprocess": postprocess_result,
                     "replacement_reason": f"Auto-rerun due to accuracy score {accuracy:.1f}/10 < 5.0"
                 }
                 

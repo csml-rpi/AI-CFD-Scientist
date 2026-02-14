@@ -267,12 +267,26 @@ def rerun_failed_experiments(batch_name: str, analyze_after: bool = False):
                 experiment_dir=exp_dir,
                 original_run_name=original_run_name
             )
-            
+
+            # Deterministic post-processing for reruns (to generate umag_t*.png, p_t*.png, uy_centerline_*.csv, artifacts.json)
+            try:
+                from src.postprocess import postprocess_case
+                out_dir = Path(result.get('output_dir', ''))
+                pp = postprocess_case(out_dir, user_requirement=updated_req)
+                result['postprocess'] = pp
+                if pp.get('success'):
+                    print(f"   🧾 Postprocess artifacts written under: {out_dir}")
+                else:
+                    print(f"   ⚠️  Postprocess skipped/failed: {pp.get('error')}")
+            except Exception as e:
+                print(f"   ⚠️  Postprocess exception: {e}")
+
             rerun_results.append({
                 **suggestion,
                 "rerun_success": result.get("success", False),
                 "rerun_dir": str(result.get("run_dir", "")),
-                "rerun_error": result.get("error", None)
+                "rerun_error": result.get("error", None),
+                "postprocess": result.get('postprocess', None)
             })
             
             if result.get("success"):
