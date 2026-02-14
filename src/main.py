@@ -43,7 +43,7 @@ args = parse_args()
 os.environ["CFD_SCIENTIST_MODEL"] = args.model
 print(f"[CFD Scientist] Using LLM model: {args.model}")
 
-def run_foam(user_requirement: str, show_output: bool = False, run_index: int = None, experiment_dir: Path = None, original_run_name: str = None):
+def run_foam(user_requirement: str, show_output: bool = False, run_index: int = None, experiment_dir: Path = None, original_run_name: str = None, run_dir_name: str = None):
     """
     Run Foam-Agent with a user requirement.
     
@@ -52,7 +52,8 @@ def run_foam(user_requirement: str, show_output: bool = False, run_index: int = 
         show_output (bool): Whether to show output in terminal
         run_index (int): Optional run index for unique naming
         experiment_dir (Path): Optional specific experiment directory to use
-        original_run_name (str): If this is a rerun, the name of the original run (e.g., "run_001")
+        original_run_name (str): If this is a rerun, the name of the original run directory
+        run_dir_name (str): Optional explicit run directory name (for self-describing runs)
     
     Returns:
         dict: Result dictionary with success status and paths
@@ -88,6 +89,8 @@ def run_foam(user_requirement: str, show_output: bool = False, run_index: int = 
         # This is a rerun - create a clearly named rerun directory
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         run_dir = experiment_dir / f"{original_run_name}_rerun_{timestamp}"
+    elif run_dir_name is not None and str(run_dir_name).strip() != "":
+        run_dir = experiment_dir / str(run_dir_name).strip()
     elif run_index is not None:
         run_dir = experiment_dir / f"run_{run_index:03d}"
     else:
@@ -103,6 +106,8 @@ def run_foam(user_requirement: str, show_output: bool = False, run_index: int = 
             # For reruns, add a counter to the rerun name
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             run_dir = experiment_dir / f"{original_run_name}_rerun_{timestamp}_{counter:02d}"
+        elif run_dir_name is not None and str(run_dir_name).strip() != "":
+            run_dir = experiment_dir / f"{str(run_dir_name).strip()}__{counter:02d}"
         elif run_index is not None:
             run_dir = experiment_dir / f"run_{run_index:03d}_{counter:02d}"
         else:
@@ -372,6 +377,51 @@ def main():
     print(f"📁 Created batch directory: {batch_dir}")
     print(f"📁 Created experiment directory: {current_experiment_dir}")
     print(f"🔬 Experiment: {experiment_name}")
+
+    def _write_batch_readme(stage: str = "created"):
+        """Write a small README.md inside the batch folder for zip/share usability."""
+        try:
+            readme_path = batch_dir / "README.md"
+            # List current top-level files for quick inspection
+            top_files = sorted([p.name for p in batch_dir.iterdir() if p.is_file()])
+            sim_dirs = sorted([p.name for p in batch_dir.iterdir() if p.is_dir() and p.name.startswith("sim_")])
+
+            lines = []
+            lines.append(f"# CFD-Scientist Batch: {batch_name}\n")
+            lines.append(f"- Stage: {stage}")
+            lines.append(f"- Created: {datetime.now().isoformat()}")
+            lines.append(f"- Experiment dir: {experiment_name}")
+            lines.append("")
+            lines.append("## Layout")
+            lines.append("- sim_*/run_*: individual runs (each contains user_requirement.txt + output/) ")
+            lines.append("- NOTE: run folders are named to reflect key parameters (U, inlet width/height) when available.")
+            lines.append("")
+            lines.append("## Common commands")
+            lines.append(f"- Analyze: `python agents/analysis_ag.py --batch {batch_name}`")
+            lines.append(f"- Auto-retry analyze: `python agents/analysis_ag.py --batch {batch_name} --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3`")
+            lines.append(f"- Manual rerun suggested cases: `python src/main.py --rerun-batch {batch_name}`")
+            lines.append(f"- Case study PDF/TeX: `python src/latexpaper.py --batch {batch_name}`")
+            lines.append(f"- Bundle for writer: `python src/batch_bundle.py --batch {batch_name} --study-goal \"<study goal>\"`")
+            lines.append("")
+            lines.append("## Current top-level batch files")
+            if top_files:
+                for f in top_files:
+                    lines.append(f"- {f}")
+            else:
+                lines.append("(none yet)")
+            lines.append("")
+            lines.append("## sim_* directories")
+            if sim_dirs:
+                for d in sim_dirs:
+                    lines.append(f"- {d}")
+            else:
+                lines.append("(none yet)")
+
+            readme_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        except Exception as e:
+            print(f"⚠️  Could not write batch README.md: {e}")
+
+    _write_batch_readme(stage="created")
     
     # User requirements are generated by ideation (once) into multiple parametric experiments.
     # We keep the rest of the pipeline the same: validate requirements -> run Foam-Agent -> analyze.
@@ -604,9 +654,11 @@ def main():
         user_req = hypothesis_agent.generate_user_requirement(idea_json, simulation)
         simulation_configs.append(
             {
-                "case_id": cand["candidate_id"],
+                "case_id": cand.get("candidate_id"),
                 "profile_id": "IDEATION",
-                "reynolds_number": None,
+                "fuel_velocity": cand.get("fuel_velocity"),
+                "inlet_box_width": cand.get("box_width"),
+                "inlet_box_height": cand.get("box_height"),
                 "geometry": f"{cand['topology'].upper()} {cand['dims']}",
                 "user_requirement": user_req,
             }
@@ -657,9 +709,9 @@ def main():
             case_id = sim_config['case_id']
             print(f" Running Foam-Agent for case {case_id} ({i}/{len(user_requirements)})...")
             print(f" Case ID: {case_id}")
-            print(f" Profile: {sim_config['profile_id']}")
-            print(f" Reynolds Number: {sim_config['reynolds_number']}")
-            print(f" Geometry: {sim_config['geometry']}")
+            print(f" Profile: {sim_config.get('profile_id')}")
+            print(f" Reynolds Number: {sim_config.get('reynolds_number')}")
+            print(f" Geometry: {sim_config.get('geometry')}")
         else:
             print(f" Running Foam-Agent for requirement {i}/{len(user_requirements)}...")
         
@@ -667,11 +719,30 @@ def main():
         print(user_requirement.strip())
         print("\n" + "-"*30 + "\n")
         
+        # Build a self-describing run folder name from the study parameters.
+        run_dir_name = None
+        if sim_config is not None:
+            def _tag(x, ndp: int = 3) -> str:
+                try:
+                    v = float(x)
+                except Exception:
+                    return "NA"
+                s = f"{v:.{ndp}f}"
+                s = s.replace("-", "m").replace(".", "p")
+                return s
+
+            run_dir_name = (
+                f"run_{i:03d}__U{_tag(sim_config.get('fuel_velocity'))}"
+                f"__W{_tag(sim_config.get('inlet_box_width'))}"
+                f"__H{_tag(sim_config.get('inlet_box_height'))}"
+            )
+
         # Pass experiment directory to ensure all runs go to the same experiment folder
         result = run_foam(
             user_requirement.strip(),
             show_output=True,
             run_index=i,
+            run_dir_name=run_dir_name,
             experiment_dir=current_experiment_dir
         )
 
@@ -854,6 +925,9 @@ def main():
         print("🧩 Wrote batch bundle JSONs:", _bundle_paths)
     except Exception as e:
         print(f"⚠️  Could not write batch bundle JSONs: {e}")
+
+    # Refresh README.md with the final file list (best-effort).
+    _write_batch_readme(stage="final")
 
     return {
         'batch_name': batch_name,

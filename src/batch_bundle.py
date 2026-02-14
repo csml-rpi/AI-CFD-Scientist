@@ -165,9 +165,14 @@ def build_writer_input(
         run_dir = Path(result.get("run_dir") or "")
         out_dir = Path(result.get("output_dir") or "")
         if not run_dir.exists():
-            # fallback to sim_dir/run_###
+            # fallback: locate run dir by prefix (supports names like run_001__U0p200__W0p020__H0p010)
             if isinstance(req_i, int):
-                run_dir = sim_dir / f"run_{int(req_i):03d}"
+                prefix = f"run_{int(req_i):03d}"
+                candidates = sorted([d for d in sim_dir.iterdir() if d.is_dir() and d.name.startswith(prefix)])
+                if candidates:
+                    run_dir = candidates[0]
+                else:
+                    run_dir = sim_dir / prefix
         if not out_dir.exists():
             out_dir = run_dir / "output"
 

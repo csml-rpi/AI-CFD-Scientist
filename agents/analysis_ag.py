@@ -19,6 +19,7 @@ import json
 import os
 import textwrap
 import base64
+import re
 from typing import Optional
 
 # Ensure project root is on sys.path for absolute imports BEFORE importing project modules
@@ -96,7 +97,8 @@ def collect_batch_info(batch_dir: Path, max_experiments: Optional[int] = None):
 
     for exp in experiments:
         exp_info = {"experiment": exp.name, "runs": []}
-        for run in sorted([d for d in exp.iterdir() if d.is_dir()]):
+        # Only analyze actual run directories. Ignore backups/temp reruns (e.g. backup_run_*, temp_rerun_*).
+        for run in sorted([d for d in exp.iterdir() if d.is_dir() and d.name.startswith('run_')]):
             run_info = {"run": run.name, "paths": {}}
             # primary user requirement
             ur = run / "user_requirement.txt"
@@ -1031,10 +1033,9 @@ def _execute_study_recommendations(batch_dir: Path):
         run_numbers = []
         for run_dir in existing_runs:
             try:
-                # Extract number from run_XXX format
-                run_num_str = run_dir.name.split('_')[1]
-                if run_num_str.isdigit():
-                    run_numbers.append(int(run_num_str))
+                m = re.match(r"^run_(\d{3})", run_dir.name)
+                if m:
+                    run_numbers.append(int(m.group(1)))
             except:
                 continue
         next_run_number = max(run_numbers) + 1 if run_numbers else 1
@@ -1695,6 +1696,13 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
     for i, case in enumerate(auto_rerun_cases, 1):
         exp_name = case['experiment']
         run_name = case['run']
+
+        # Safety: auto-rerun should only operate on canonical run directories (run_###).
+        # Never attempt to rerun backup/temp directories.
+        import re as _re
+        if not _re.match(r"^run_\d{3}(?:__.*)?$", str(run_name)):
+            print(f"   ⏭️  Skipping non-canonical run directory for auto-rerun: {run_name}")
+            continue
         updated_requirement = case['updated_requirement']
         accuracy = case['accuracy']
         
