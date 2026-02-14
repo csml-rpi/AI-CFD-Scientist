@@ -541,7 +541,7 @@ def main():
                 {
                     "mode": "deterministic_main_effects",
                     "max_selected": MAX_SELECTED,
-                    "hypothesis": hypothesis_text,
+                    "study_goal": hypothesis_text,
                     "selected_ids": [c["candidate_id"] for c in selected_candidates],
                     "reasons": selected_reasons,
                     "selected": [
@@ -561,6 +561,12 @@ def main():
         )
     except Exception as e:
         print(f"⚠️  Could not write selector_selection.json: {e}")
+
+    # Persist raw ideation JSON for downstream interpretation/writing.
+    try:
+        (batch_dir / "idea.json").write_text(json.dumps(idea_json, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"⚠️  Could not write idea.json: {e}")
 
     # Convert selected candidates -> Foam-Agent user requirements.
     hypothesis_agent = HypothesisAgent(model=os.environ.get("CFD_SCIENTIST_MODEL"))
@@ -824,6 +830,18 @@ def main():
         analysis_text = None 
         rerun_suggestions = []  
     
+    # Bundle outputs into stable JSON artifacts for interpretation and downstream writing.
+    try:
+        from src.batch_bundle import write_all as _bundle_write_all
+        _bundle_paths = _bundle_write_all(
+            batch_dir=batch_dir,
+            study_goal=hypothesis_text,
+            idea_json=idea_json if isinstance(idea_json, dict) else None,
+        )
+        print("🧩 Wrote batch bundle JSONs:", _bundle_paths)
+    except Exception as e:
+        print(f"⚠️  Could not write batch bundle JSONs: {e}")
+
     return {
         'batch_name': batch_name,
         'experiment_name': experiment_name,

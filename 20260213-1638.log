@@ -1,0 +1,1931 @@
+[CFD Scientist] Using LLM model: gpt-5.3-codex
+=== CFD SCIENTIST - SMALL POOL FIRE CASE STUDY ===
+📁 Created batch directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc
+📁 Created experiment directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc
+🔬 Experiment: sim_20260213_164231_8e3a44cc
+🧠 Running ideation to generate parametric experiments...
+IdeationAgent initialized with model: gpt-5.3-codex
+PROMPT in ideation agent: You are an experienced AI researcher in Computational Fluid Dynamics (CFD).
+Your job is to propose ONE impactful but realistically executable CFD research idea for small pool fire in 2D.
+Keep things very simple and focus on small pool fire problems only.
+
+Constraints:
+- Design small pool fire experiments with varying fuel velocities and inlet box sizes.
+- Keep this as ONE parametric case (1 item in "cases").
+- For that case, output EXACTLY:
+  * 5 fuel velocities in "fuel_speed_list" (span low→high, strictly increasing)
+  * 3 inlet boxes in "box_size_list" (span small→large)
+  This yields 15 candidate experiments total.
+- Inlet box position must stay fixed; only change box width/height.
+- box_size_list entries must be valid OpenFOAM box strings: "(x0 y0 z0)(x1 y1 z1)".
+- Keep mesh simple: ≤ 10,000 cells total. Use 100x100 cells in x and y direction.
+- Use a fixed rectangular domain with dimensions [0.20, 0.20, 0.01] meters and coordinate bounds from (0 0 0) to (0.20 0.20 0.01).
+- Inlet boxes MUST lie inside the domain and be anchored at the bottom boundary (y0=0.0). Use z0=0.0 and z1=0.01 for all boxes. Keep inlet centered near x=0.10.
+- Units: SI everywhere. No placeholders like "TBD".
+- All simulations must be 2D.
+- Output MUST be valid JSON matching the EXACT skeleton below. Return ONLY the JSON (no prose, no markdown).
+- Visualize at multiple timesteps in simulation (beginning, mid and end).
+    
+Research this topic: "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire."
+
+Return ONLY the research idea JSON:
+
+{
+  "study_id": "string (e.g., small pool fire_sweep_v1)",
+  "description": "string",
+  "cases": [
+    {
+      "name": "string (e.g., fire_case_1)",
+      "dimensions": [number, number, number],
+      "topology": "string (2d|3d)",
+      "fuel_speed_list": [number, number, number, number, number],
+      "box_size_list": [
+        "(x0 y0 z0)(x1 y1 z1)",
+        "(x0 y0 z0)(x1 y1 z1)",
+        "(x0 y0 z0)(x1 y1 z1)"
+      ]
+    }
+  ],
+  "solver": "string (icoFoam|simpleFoam|pisoFoam|pimpleFoam|interFoam)",
+  "target_CFL": "number",
+  "post": {
+    "objective": "string",
+    "visualization": "string (MUST explicitly name fields, locations, and times; e.g., 'Visualize velocity magnitude |U| (UMag) contour and pressure p contour on a z=mid-plane slice at t=0.10, 0.50, 1.00, 1.50, 2.00, 3.00 s (separate PNGs for each field and time) and export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at the same times (separate CSVs).')"
+  }
+}
+
+Making API call 1/1...
+Raw response from call 1:
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "cases": [
+    {
+      "name": "fire_case_1",
+      "dimensions": [0.20, 0.20, 0.01],
+      "topology": "2d",
+      "fuel_speed_list": [0.05, 0.10, 0.20, 0.35, 0.50],
+      "box_size_list": [
+        "(0.095 0.0 0.0)(0.105 0.005 0.01)",
+        "(0.090 0.0 0.0)(0.110 0.010 0.01)",
+        "(0.085 0.0 0.0)(0.115 0.015 0.01)"
+      ]
+    }
+  ],
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+--------------------------------------------------
+Extracted JSON string: {
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "cases": [
+    {
+      "name": "fire_case_1",
+      "dimensions": [0.20, 0.20, 0.01],
+      "topology": "2d",
+      "fuel_speed_list": [0.05, 0.10, 0.20, 0.35, 0.50],
+      "box_size_list": [
+        "(0.095 0.0 0.0)(0.105 0.005 0.01)",
+        "(0.090 0.0 0.0)(0.110 0.010 0.01)",
+        "(0.085 0.0 0.0)(0.115 0.015 0.01)"
+      ]
+    }
+  ],
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+Call 1 generated 1 idea
+Total ideas generated across 1 calls: 1
+🧪 Ideation generated 15 candidate experiment(s)
+✅ Selected 5 experiment(s) for execution (max 5)
+Selected candidate IDs: fire_case_1_008, fire_case_1_005, fire_case_1_011, fire_case_1_007, fire_case_1_009
+HypothesisAgent initialized with model: gpt-5.3-codex
+Debug - Successfully formatted prompts
+Formatted system prompt: You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+
+MISSION:
+Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+
+INPUT:
+- idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
+- selected_simulation: One simulation from a case to convert
+
+CONVERSION RULES:
+1) GEOMETRY & DOMAIN
+   - Use case.dimensions [x, y, z] for small pool fire dimensions
+   - Use case.topology (2d|3d) to determine mesh type
+   - For 2D simulations: z_cells = 1, front/back = empty
+   - For 3D simulations: use full 3D mesh
+
+2) PHYSICS & SOLVER
+   - Use study.solver
+   - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
+   - Use study.target_CFL for time step calculation
+   - Standard fluid properties: density = 1.0 kg/m³
+
+3) FUEL AND INLET BOX SIZE PARAMETER
+   - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
+
+4) BOUNDARY CONDITIONS
+   - Specify all boundary conditions in detail
+   - For 2D: frontAndBack = empty
+   - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
+
+5) SIMULATION SETTINGS
+   - Use study.target_CFL to calculate time step
+   - End time: Use 3s as final time 
+   - Write interval: every 0.1 seconds for visualization
+   - Mesh: structured mesh with appropriate cell count
+
+6) POST-PROCESSING
+   - Include study.post requirements (centerline, residuals, courant)
+   - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
+   - Extract centerline vertical velocity profiles Uy
+
+7) VISUALIZATION
+   - Include the visualization instruction from selected_simulation.visualization.
+   - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
+   - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
+   - At minimum, ALWAYS request:
+     * velocity magnitude |U| (UMag)
+     * centerline vertical velocity Uy (export as CSV)
+   - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
+   - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
+   - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
+   - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
+
+8) UNITS & ASSUMPTIONS
+  - SI units everywhere. No placeholders (no “TBD”).
+  - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
+
+OUTPUT FORMAT:
+- Return EXACTLY ONE paragraph of plain English
+- No lists, JSON, YAML, or Markdown
+- Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
+- Use SI units everywhere
+- If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
+
+
+Rules:
+- Keep geometry simple (blockMesh for rectangular cavities).
+- Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
+- Provide concrete values for:
+    – box dimension
+    – fuel velocity
+    – fluid properties (ρ, ν)
+    – run control (startTime, endTime, deltaT, writeInterval)
+- If a value is missing, insert a *reasonable* default and mark it with
+  “# ASSUMPTION”.
+
+
+Here is the experiment to be converted into a simulation requirement: 
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "case_name": "fire_case_1",
+  "simulation_id": "sim_001",
+  "parameter_value": 0.2,
+  "inlet_box": "(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "inlet_box_width": 0.020000000000000004,
+  "inlet_box_height": 0.01,
+  "simulation_description": "Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.",
+  "case_dimensions": [
+    0.2,
+    0.2,
+    0.01
+  ],
+  "case_topology": "2d",
+  "lid_axis": "",
+  "lid_speed": 0,
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post_processing": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+
+Output format
+Return **exactly one paragraph of plain text**.
+It should contain *no* YAML/JSON/Markdown fences.
+The paragraph must read like a human user’s request to Foam‑Agent.
+
+Formatted user prompt: Convert this small pool fire simulation into a Foam-Agent user requirement:
+
+Study: small_pool_fire_sweep_v1
+Description: Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).
+Case: fire_case_1
+
+Selected Simulation:
+- Simulation ID: sim_001
+- fuel velocity: 0.2
+- inlet box (OpenFOAM box string): (0.090 0.0 0.0)(0.110 0.010 0.01)
+- inlet box width: 0.020000000000000004
+- inlet box height: 0.01
+- Description: Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)
+- Visualization: Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.
+
+Return ONLY the user requirement paragraph for Foam-Agent.
+
+The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
+- Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
+- Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+
+Debug - Successfully formatted prompts
+Formatted system prompt: You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+
+MISSION:
+Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+
+INPUT:
+- idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
+- selected_simulation: One simulation from a case to convert
+
+CONVERSION RULES:
+1) GEOMETRY & DOMAIN
+   - Use case.dimensions [x, y, z] for small pool fire dimensions
+   - Use case.topology (2d|3d) to determine mesh type
+   - For 2D simulations: z_cells = 1, front/back = empty
+   - For 3D simulations: use full 3D mesh
+
+2) PHYSICS & SOLVER
+   - Use study.solver
+   - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
+   - Use study.target_CFL for time step calculation
+   - Standard fluid properties: density = 1.0 kg/m³
+
+3) FUEL AND INLET BOX SIZE PARAMETER
+   - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
+
+4) BOUNDARY CONDITIONS
+   - Specify all boundary conditions in detail
+   - For 2D: frontAndBack = empty
+   - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
+
+5) SIMULATION SETTINGS
+   - Use study.target_CFL to calculate time step
+   - End time: Use 3s as final time 
+   - Write interval: every 0.1 seconds for visualization
+   - Mesh: structured mesh with appropriate cell count
+
+6) POST-PROCESSING
+   - Include study.post requirements (centerline, residuals, courant)
+   - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
+   - Extract centerline vertical velocity profiles Uy
+
+7) VISUALIZATION
+   - Include the visualization instruction from selected_simulation.visualization.
+   - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
+   - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
+   - At minimum, ALWAYS request:
+     * velocity magnitude |U| (UMag)
+     * centerline vertical velocity Uy (export as CSV)
+   - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
+   - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
+   - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
+   - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
+
+8) UNITS & ASSUMPTIONS
+  - SI units everywhere. No placeholders (no “TBD”).
+  - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
+
+OUTPUT FORMAT:
+- Return EXACTLY ONE paragraph of plain English
+- No lists, JSON, YAML, or Markdown
+- Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
+- Use SI units everywhere
+- If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
+
+
+Rules:
+- Keep geometry simple (blockMesh for rectangular cavities).
+- Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
+- Provide concrete values for:
+    – box dimension
+    – fuel velocity
+    – fluid properties (ρ, ν)
+    – run control (startTime, endTime, deltaT, writeInterval)
+- If a value is missing, insert a *reasonable* default and mark it with
+  “# ASSUMPTION”.
+
+
+Here is the experiment to be converted into a simulation requirement: 
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "case_name": "fire_case_1",
+  "simulation_id": "sim_002",
+  "parameter_value": 0.1,
+  "inlet_box": "(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "inlet_box_width": 0.020000000000000004,
+  "inlet_box_height": 0.01,
+  "simulation_description": "Small pool fire param sweep. fuel_velocity=0.1, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.",
+  "case_dimensions": [
+    0.2,
+    0.2,
+    0.01
+  ],
+  "case_topology": "2d",
+  "lid_axis": "",
+  "lid_speed": 0,
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post_processing": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+
+Output format
+Return **exactly one paragraph of plain text**.
+It should contain *no* YAML/JSON/Markdown fences.
+The paragraph must read like a human user’s request to Foam‑Agent.
+
+Formatted user prompt: Convert this small pool fire simulation into a Foam-Agent user requirement:
+
+Study: small_pool_fire_sweep_v1
+Description: Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).
+Case: fire_case_1
+
+Selected Simulation:
+- Simulation ID: sim_002
+- fuel velocity: 0.1
+- inlet box (OpenFOAM box string): (0.090 0.0 0.0)(0.110 0.010 0.01)
+- inlet box width: 0.020000000000000004
+- inlet box height: 0.01
+- Description: Small pool fire param sweep. fuel_velocity=0.1, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)
+- Visualization: Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.
+
+Return ONLY the user requirement paragraph for Foam-Agent.
+
+The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
+- Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
+- Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+
+Debug - Successfully formatted prompts
+Formatted system prompt: You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+
+MISSION:
+Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+
+INPUT:
+- idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
+- selected_simulation: One simulation from a case to convert
+
+CONVERSION RULES:
+1) GEOMETRY & DOMAIN
+   - Use case.dimensions [x, y, z] for small pool fire dimensions
+   - Use case.topology (2d|3d) to determine mesh type
+   - For 2D simulations: z_cells = 1, front/back = empty
+   - For 3D simulations: use full 3D mesh
+
+2) PHYSICS & SOLVER
+   - Use study.solver
+   - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
+   - Use study.target_CFL for time step calculation
+   - Standard fluid properties: density = 1.0 kg/m³
+
+3) FUEL AND INLET BOX SIZE PARAMETER
+   - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
+
+4) BOUNDARY CONDITIONS
+   - Specify all boundary conditions in detail
+   - For 2D: frontAndBack = empty
+   - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
+
+5) SIMULATION SETTINGS
+   - Use study.target_CFL to calculate time step
+   - End time: Use 3s as final time 
+   - Write interval: every 0.1 seconds for visualization
+   - Mesh: structured mesh with appropriate cell count
+
+6) POST-PROCESSING
+   - Include study.post requirements (centerline, residuals, courant)
+   - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
+   - Extract centerline vertical velocity profiles Uy
+
+7) VISUALIZATION
+   - Include the visualization instruction from selected_simulation.visualization.
+   - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
+   - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
+   - At minimum, ALWAYS request:
+     * velocity magnitude |U| (UMag)
+     * centerline vertical velocity Uy (export as CSV)
+   - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
+   - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
+   - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
+   - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
+
+8) UNITS & ASSUMPTIONS
+  - SI units everywhere. No placeholders (no “TBD”).
+  - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
+
+OUTPUT FORMAT:
+- Return EXACTLY ONE paragraph of plain English
+- No lists, JSON, YAML, or Markdown
+- Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
+- Use SI units everywhere
+- If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
+
+
+Rules:
+- Keep geometry simple (blockMesh for rectangular cavities).
+- Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
+- Provide concrete values for:
+    – box dimension
+    – fuel velocity
+    – fluid properties (ρ, ν)
+    – run control (startTime, endTime, deltaT, writeInterval)
+- If a value is missing, insert a *reasonable* default and mark it with
+  “# ASSUMPTION”.
+
+
+Here is the experiment to be converted into a simulation requirement: 
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "case_name": "fire_case_1",
+  "simulation_id": "sim_003",
+  "parameter_value": 0.35,
+  "inlet_box": "(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "inlet_box_width": 0.020000000000000004,
+  "inlet_box_height": 0.01,
+  "simulation_description": "Small pool fire param sweep. fuel_velocity=0.35, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)",
+  "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.",
+  "case_dimensions": [
+    0.2,
+    0.2,
+    0.01
+  ],
+  "case_topology": "2d",
+  "lid_axis": "",
+  "lid_speed": 0,
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post_processing": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+
+Output format
+Return **exactly one paragraph of plain text**.
+It should contain *no* YAML/JSON/Markdown fences.
+The paragraph must read like a human user’s request to Foam‑Agent.
+
+Formatted user prompt: Convert this small pool fire simulation into a Foam-Agent user requirement:
+
+Study: small_pool_fire_sweep_v1
+Description: Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).
+Case: fire_case_1
+
+Selected Simulation:
+- Simulation ID: sim_003
+- fuel velocity: 0.35
+- inlet box (OpenFOAM box string): (0.090 0.0 0.0)(0.110 0.010 0.01)
+- inlet box width: 0.020000000000000004
+- inlet box height: 0.01
+- Description: Small pool fire param sweep. fuel_velocity=0.35, inlet_box=(0.090 0.0 0.0)(0.110 0.010 0.01)
+- Visualization: Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.
+
+Return ONLY the user requirement paragraph for Foam-Agent.
+
+The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
+- Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
+- Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+
+Debug - Successfully formatted prompts
+Formatted system prompt: You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+
+MISSION:
+Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+
+INPUT:
+- idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
+- selected_simulation: One simulation from a case to convert
+
+CONVERSION RULES:
+1) GEOMETRY & DOMAIN
+   - Use case.dimensions [x, y, z] for small pool fire dimensions
+   - Use case.topology (2d|3d) to determine mesh type
+   - For 2D simulations: z_cells = 1, front/back = empty
+   - For 3D simulations: use full 3D mesh
+
+2) PHYSICS & SOLVER
+   - Use study.solver
+   - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
+   - Use study.target_CFL for time step calculation
+   - Standard fluid properties: density = 1.0 kg/m³
+
+3) FUEL AND INLET BOX SIZE PARAMETER
+   - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
+
+4) BOUNDARY CONDITIONS
+   - Specify all boundary conditions in detail
+   - For 2D: frontAndBack = empty
+   - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
+
+5) SIMULATION SETTINGS
+   - Use study.target_CFL to calculate time step
+   - End time: Use 3s as final time 
+   - Write interval: every 0.1 seconds for visualization
+   - Mesh: structured mesh with appropriate cell count
+
+6) POST-PROCESSING
+   - Include study.post requirements (centerline, residuals, courant)
+   - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
+   - Extract centerline vertical velocity profiles Uy
+
+7) VISUALIZATION
+   - Include the visualization instruction from selected_simulation.visualization.
+   - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
+   - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
+   - At minimum, ALWAYS request:
+     * velocity magnitude |U| (UMag)
+     * centerline vertical velocity Uy (export as CSV)
+   - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
+   - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
+   - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
+   - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
+
+8) UNITS & ASSUMPTIONS
+  - SI units everywhere. No placeholders (no “TBD”).
+  - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
+
+OUTPUT FORMAT:
+- Return EXACTLY ONE paragraph of plain English
+- No lists, JSON, YAML, or Markdown
+- Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
+- Use SI units everywhere
+- If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
+
+
+Rules:
+- Keep geometry simple (blockMesh for rectangular cavities).
+- Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
+- Provide concrete values for:
+    – box dimension
+    – fuel velocity
+    – fluid properties (ρ, ν)
+    – run control (startTime, endTime, deltaT, writeInterval)
+- If a value is missing, insert a *reasonable* default and mark it with
+  “# ASSUMPTION”.
+
+
+Here is the experiment to be converted into a simulation requirement: 
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "case_name": "fire_case_1",
+  "simulation_id": "sim_004",
+  "parameter_value": 0.2,
+  "inlet_box": "(0.095 0.0 0.0)(0.105 0.005 0.01)",
+  "inlet_box_width": 0.009999999999999995,
+  "inlet_box_height": 0.005,
+  "simulation_description": "Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.095 0.0 0.0)(0.105 0.005 0.01)",
+  "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.",
+  "case_dimensions": [
+    0.2,
+    0.2,
+    0.01
+  ],
+  "case_topology": "2d",
+  "lid_axis": "",
+  "lid_speed": 0,
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post_processing": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+
+Output format
+Return **exactly one paragraph of plain text**.
+It should contain *no* YAML/JSON/Markdown fences.
+The paragraph must read like a human user’s request to Foam‑Agent.
+
+Formatted user prompt: Convert this small pool fire simulation into a Foam-Agent user requirement:
+
+Study: small_pool_fire_sweep_v1
+Description: Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).
+Case: fire_case_1
+
+Selected Simulation:
+- Simulation ID: sim_004
+- fuel velocity: 0.2
+- inlet box (OpenFOAM box string): (0.095 0.0 0.0)(0.105 0.005 0.01)
+- inlet box width: 0.009999999999999995
+- inlet box height: 0.005
+- Description: Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.095 0.0 0.0)(0.105 0.005 0.01)
+- Visualization: Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.
+
+Return ONLY the user requirement paragraph for Foam-Agent.
+
+The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
+- Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
+- Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+
+Debug - Successfully formatted prompts
+Formatted system prompt: You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+
+MISSION:
+Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+
+INPUT:
+- idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
+- selected_simulation: One simulation from a case to convert
+
+CONVERSION RULES:
+1) GEOMETRY & DOMAIN
+   - Use case.dimensions [x, y, z] for small pool fire dimensions
+   - Use case.topology (2d|3d) to determine mesh type
+   - For 2D simulations: z_cells = 1, front/back = empty
+   - For 3D simulations: use full 3D mesh
+
+2) PHYSICS & SOLVER
+   - Use study.solver
+   - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
+   - Use study.target_CFL for time step calculation
+   - Standard fluid properties: density = 1.0 kg/m³
+
+3) FUEL AND INLET BOX SIZE PARAMETER
+   - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
+
+4) BOUNDARY CONDITIONS
+   - Specify all boundary conditions in detail
+   - For 2D: frontAndBack = empty
+   - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
+
+5) SIMULATION SETTINGS
+   - Use study.target_CFL to calculate time step
+   - End time: Use 3s as final time 
+   - Write interval: every 0.1 seconds for visualization
+   - Mesh: structured mesh with appropriate cell count
+
+6) POST-PROCESSING
+   - Include study.post requirements (centerline, residuals, courant)
+   - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
+   - Extract centerline vertical velocity profiles Uy
+
+7) VISUALIZATION
+   - Include the visualization instruction from selected_simulation.visualization.
+   - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
+   - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
+   - At minimum, ALWAYS request:
+     * velocity magnitude |U| (UMag)
+     * centerline vertical velocity Uy (export as CSV)
+   - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
+   - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
+   - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
+   - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
+
+8) UNITS & ASSUMPTIONS
+  - SI units everywhere. No placeholders (no “TBD”).
+  - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
+
+OUTPUT FORMAT:
+- Return EXACTLY ONE paragraph of plain English
+- No lists, JSON, YAML, or Markdown
+- Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
+- Use SI units everywhere
+- If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
+
+
+Rules:
+- Keep geometry simple (blockMesh for rectangular cavities).
+- Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
+- Provide concrete values for:
+    – box dimension
+    – fuel velocity
+    – fluid properties (ρ, ν)
+    – run control (startTime, endTime, deltaT, writeInterval)
+- If a value is missing, insert a *reasonable* default and mark it with
+  “# ASSUMPTION”.
+
+
+Here is the experiment to be converted into a simulation requirement: 
+{
+  "study_id": "small_pool_fire_sweep_v1",
+  "description": "Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).",
+  "case_name": "fire_case_1",
+  "simulation_id": "sim_005",
+  "parameter_value": 0.2,
+  "inlet_box": "(0.085 0.0 0.0)(0.115 0.015 0.01)",
+  "inlet_box_width": 0.03,
+  "inlet_box_height": 0.015,
+  "simulation_description": "Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.085 0.0 0.0)(0.115 0.015 0.01)",
+  "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.",
+  "case_dimensions": [
+    0.2,
+    0.2,
+    0.01
+  ],
+  "case_topology": "2d",
+  "lid_axis": "",
+  "lid_speed": 0,
+  "solver": "pimpleFoam",
+  "target_CFL": 0.5,
+  "post_processing": {
+    "objective": "Assess how increasing fuel injection speed and inlet footprint size alter near-source jet development and plume structure in a 2D small pool fire setup.",
+    "visualization": "Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files."
+  }
+}
+
+Output format
+Return **exactly one paragraph of plain text**.
+It should contain *no* YAML/JSON/Markdown fences.
+The paragraph must read like a human user’s request to Foam‑Agent.
+
+Formatted user prompt: Convert this small pool fire simulation into a Foam-Agent user requirement:
+
+Study: small_pool_fire_sweep_v1
+Description: Parametric 2D small pool fire study in a fixed 0.20 x 0.20 x 0.01 m domain using a centered bottom fuel inlet with fixed position and varying inlet box size and fuel speed to quantify flow/plume sensitivity under a simple mesh (100x100 in x-y, 1 cell in z).
+Case: fire_case_1
+
+Selected Simulation:
+- Simulation ID: sim_005
+- fuel velocity: 0.2
+- inlet box (OpenFOAM box string): (0.085 0.0 0.0)(0.115 0.015 0.01)
+- inlet box width: 0.03
+- inlet box height: 0.015
+- Description: Small pool fire param sweep. fuel_velocity=0.2, inlet_box=(0.085 0.0 0.0)(0.115 0.015 0.01)
+- Visualization: Visualize velocity magnitude |U| (UMag) contour and pressure p contour on the z=0.005 mid-plane across the full domain at t=0.02 s (beginning), t=0.50 s (mid), and t=1.00 s (end) with separate PNGs for each field and time; additionally export vertical velocity Uy along the centerline x=0.10, z=0.005 and horizontal velocity Ux along y=0.10, z=0.005 at the same times as separate CSV files.
+
+Return ONLY the user requirement paragraph for Foam-Agent.
+
+The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
+- Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
+- Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+Loading FAISS indices from: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/database/faiss/text-embedding-3-small with model: text-embedding-3-small
+args: Namespace(prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt', output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output', custom_mesh_path=None)
+config: Config(max_loop=10, batchsize=10, searchdocs=2, run_times=1, database_path=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/database'), run_directory=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/runs'), case_dir='', max_time_limit=3600, input_writer_generation_mode='parallel_no_context', model_provider='openai-codex', model_version='gpt-5.3-codex', temperature=1, embedding_provider='openai', embedding_model='text-embedding-3-small')
+No custom mesh path provided.
+Starting Foam-Agent...
+Parsed case name: 2D_small_pool_fire_flow_simulation_in_rectangular_domain_with_centered_bottom_fuel_inlet
+Parsed case domain: incompressible
+Parsed case category: laminar
+Parsed case solver: pimpleFoam
+Created case directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Retrieved similar case structure: <dir>directory name: .. File names in this directory: [Allclean]</dir>
+<dir>directory name: 0. File names in this directory: [CH4, FSDomega, G, IDefault, N2, O2, T, U, Ydefault, alphat, k, nut, p, p_rgh, ph_rgh.orig, soot]</dir>
+<dir>directory name: system. File names in this directory: [blockMeshDict, controlDict, createPatchDict, fvSchemes, fvSolution, topoSetDict]</dir>
+<dir>directory name: constant. File names in this directory: [combustionProperties, fvModels, g, hRef, momentumTransport, pRef, physicalProperties, radiationProperties, reaction, thermo.compressibleGas]</dir>
+Generated 13 subtasks.
+Warning: Case directory /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output already exists. Overwriting.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/similar_case.txt
+Planner determined: Standard mesh generation.
+Planner set mesh_type to: standard_mesh
+Router: Standard mesh generation. Routing to input_writer node.
+============================== Initial Write Agent ==============================
+============================== Initial Write Mode ==============================
+Input writer mode: parallel_no_context (no cross-file context)
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/./Allclean
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/constant/momentumTransport
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/topoSetDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/createPatchDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/constant/physicalProperties
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/controlDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/constant/g
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/p
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/fvSchemes
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/fvSolution
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/./Allrun
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/blockMeshDict
+Need 4 commands.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for base\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/p/boundaryField from line 17 to line 48.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = double; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}, {'file': 'log.createPatch', 'error_content': 'ERROR: \nFace 89 specified in set f0 is not an external face of the mesh.\nThis application can only repatch existing boundary faces.\n\n    From function int main(int, char**)\n    in file createPatch.C at line 696.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+The run is failing from a **mesh/patch naming mismatch** between `blockMesh/createPatch` and your `0/*` field files.
+
+- In `log.createPatch`: `Face 89 specified in set f0 is not an external face` means your `topoSet` box is selecting at least one **internal** face (likely because the box spans through both sides of the inlet patch region). `createPatch` can only use boundary faces.
+- In `log.pimpleFoam`: `Cannot find patchField entry for base` in `0/p` means the final mesh still has a `base` patch, but `0/p` does not define it (it defines `bottomLeft/bottomRight/left/right/top` instead).
+
+How to fix (without changing your requested physical parameters):
+- Keep the domain and resolution as requested, but make patch names consistent end-to-end.
+- Easiest robust route: define bottom as three boundary patches directly in `system/blockMeshDict` (`bottomLeft`, `inlet`, `bottomRight`) and remove dependence on `topoSet/createPatch` for inlet creation.
+- Or, if keeping `createPatch`, tighten `system/topoSetDict` so `f0` contains only external faces on the bottom boundary (no internal faces), then run `topoSet` and `createPatch -overwrite`.
+- Ensure **all** `0/*` fields (`U`, `p`, and any others present) include exactly the mesh patch names that exist after meshing (including `base` if it remains).
+- Also align side/top naming: if mesh has `sides`/`outlet`, use those names in `0/U` and `0/p`; if you want `left/right/top`, define those patches in `blockMeshDict`.
+
+Suggested consistent patch set for your requirement:
+- `inlet` (center bottom strip): `U fixedValue (0 0.2 0)`, `p zeroGradient`
+- `bottomLeft`, `bottomRight`, `left`, `right`: `U fixedValue (0 0 0)`, `p zeroGradient`
+- `top`: `U zeroGradient`, `p fixedValue 0`
+- `frontAndBack`: `empty`
+
+Execution sequence after fixes:
+1. `blockMesh`
+2. (if used) `topoSet`
+3. (if used) `createPatch -overwrite`
+4. `checkMesh`
+5. `pimpleFoam`
+
+This will remove both reported errors and keep your setup aligned with the user requirement.
+Loop 2: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/system/blockMeshDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/p
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for left\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/U/boundaryField from line 17 to line 46.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = Foam::Vector<double>; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}, {'file': 'log.createPatch', 'error_content': 'ERROR: \nFace 89 specified in set f0 is not an external face of the mesh.\nThis application can only repatch existing boundary faces.\n\n    From function int main(int, char**)\n    in file createPatch.C at line 696.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You’re closer now; the current failure is still a **patch-consistency workflow issue**, but different from the first error.
+
+- `log.pimpleFoam`: `Cannot find patchField entry for left` in `0/U` means the mesh at run time has a patch named `left`, but `0/U` currently uses `sides` instead of `left/right` (or vice versa after `createPatch`).  
+- `log.createPatch`: `Face 89 ... is not an external face` confirms `topoSetDict` is still selecting internal faces, so `createPatch` is failing and leaving an unexpected boundary layout.
+
+Different approach (robust and simpler): **remove dependence on `topoSet/createPatch` entirely** and define final patches directly in `blockMeshDict`, then keep all `0/*` fields matched to those names.
+
+What to do:
+
+- In `system/blockMeshDict`, keep boundary names exactly as required: `inlet`, `bottomLeft`, `bottomRight`, `left`, `right`, `top`, `frontAndBack` (your file already looks aligned for this).
+- In `0/U`, define entries for **all** those patches (`left` and `right` explicitly), not `sides`.
+- In `0/p`, also define the same full patch list (which you already largely do).
+- In `Allrun`, skip `topoSet` and `createPatch -overwrite`; run:
+  1) `blockMesh`  
+  2) `checkMesh`  
+  3) `pimpleFoam`
+- Keep `frontAndBack` as `empty` in every field (already consistent with 2D requirement).
+
+If you prefer to keep `createPatch`, then the only safe way is: redefine `topoSetDict` so `f0` contains **only external bottom faces** in the inlet strip; right now it captures internal faces and will keep failing.
+
+Also one important consistency fix for your requirement:
+- `system/blockMeshDict` currently uses `(45 5 1)+(10 5 1)+(45 5 1)` and `(45 95 1)+(10 95 1)+(45 95 1)` blocks, totaling **100×100×1** globally (good). Keep that unchanged.
+
+After this, the specific `left` patch error should disappear because mesh patches and field patch entries will be one-to-one.
+Loop 4: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/./Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/Allrun
+Warning: file log.pimpleFoam contains 'error' but does not match expected format.
+Workflow failed with error: [Errno 21] Is a directory: '/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output/logs'
+Namespace(openfoam_path='/mnt/sda1/openfoam10', output='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output', prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt', custom_mesh_path=None)
+Main workflow command: python src/main.py --prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt' --output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output'
+Starting workflow...
+Error running command: Command '['python', 'src/main.py', '--prompt_path=/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt', '--output_dir=/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output']' returned non-zero exit status 1.
+Loading FAISS indices from: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/database/faiss/text-embedding-3-small with model: text-embedding-3-small
+args: Namespace(prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/user_requirement.txt', output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output', custom_mesh_path=None)
+config: Config(max_loop=10, batchsize=10, searchdocs=2, run_times=1, database_path=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/database'), run_directory=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/runs'), case_dir='', max_time_limit=3600, input_writer_generation_mode='parallel_no_context', model_provider='openai-codex', model_version='gpt-5.3-codex', temperature=1, embedding_provider='openai', embedding_model='text-embedding-3-small')
+No custom mesh path provided.
+Starting Foam-Agent...
+Parsed case name: 2D_small_pool_fire-style_flow_in_rectangular_domain_with_centered_fuel_inlet
+Parsed case domain: incompressible
+Parsed case category: laminar
+Parsed case solver: pimpleFoam
+Created case directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Retrieved similar case structure: <dir>directory name: .. File names in this directory: [Allclean]</dir>
+<dir>directory name: 0. File names in this directory: [CH4, FSDomega, G, IDefault, N2, O2, T, U, Ydefault, alphat, k, nut, p, p_rgh, ph_rgh.orig, soot]</dir>
+<dir>directory name: system. File names in this directory: [blockMeshDict, controlDict, createPatchDict, fvSchemes, fvSolution, topoSetDict]</dir>
+<dir>directory name: constant. File names in this directory: [combustionProperties, fvModels, g, hRef, momentumTransport, pRef, physicalProperties, radiationProperties, reaction, thermo.compressibleGas]</dir>
+Generated 11 subtasks.
+Warning: Case directory /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output already exists. Overwriting.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/similar_case.txt
+Planner determined: Standard mesh generation.
+Planner set mesh_type to: standard_mesh
+Router: Standard mesh generation. Routing to input_writer node.
+============================== Initial Write Agent ==============================
+============================== Initial Write Mode ==============================
+Input writer mode: parallel_no_context (no cross-file context)
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/constant/momentumTransport
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/createPatchDict
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/./Allclean
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/topoSetDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/p
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/fvSchemes
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/controlDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/constant/physicalProperties
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/fvSolution
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/blockMeshDict
+Need 4 commands.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for bottomWall\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/U/boundaryField from line 17 to line 40.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = Foam::Vector<double>; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}, {'file': 'log.createPatch', 'error_content': 'ERROR: \nFace 89 specified in set f0 is not an external face of the mesh.\nThis application can only repatch existing boundary faces.\n\n    From function int main(int, char**)\n    in file createPatch.C at line 696.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You have two setup consistency errors, both before solver physics:
+
+- `createPatch` fails first: `Face 89 specified in set f0 is not an external face`.
+- `pimpleFoam` then fails on BC parsing: `Cannot find patchField entry for bottomWall` in `0/U`.
+
+How to fix them (without changing your required physics/targets):
+
+- In `system/topoSetDict`, your `boxToFace` currently captures faces that are not strictly boundary-only (it intersects internal faces at the block interface around `x=0.09` and `x=0.11`), which `createPatch` cannot repatch.
+- Constrain `topoSetDict` so `f0` contains only boundary faces on the *bottom plane* (`y=0`) in the inlet span `x=0.090..0.110`, `z=0..0.01`.  
+  Practical approach: use a boundary-face selection source (or a two-step filter) so only external faces are in `f0` before `createPatch`.
+- Keep `createPatchDict` patch name as `inlet` (this matches your requirement), but ensure the selected set contains only those bottom boundary faces.
+
+Second error is pure patch-name mismatch:
+
+- `0/U` defines patches `inlet`, `base`, `outlet`, `sides`, `frontAndBack`, but your mesh has `inlet`, `bottomWall`, `left`, `right`, `top`, `frontAndBack`.
+- Add/fix `0/U` boundary entries so they match mesh patch names exactly:
+  - `inlet`: `fixedValue (0 0.10 0)` (already required)
+  - `bottomWall`: `noSlip`
+  - `left`, `right`, `top`: outlet-style velocity (`zeroGradient` is consistent with your stated requirement)
+  - `frontAndBack`: `empty`
+- Do the same name alignment in `0/p` (must also use `bottomWall`, `left`, `right`, `top`, `inlet`, `frontAndBack` exactly).
+
+Recommended rerun order after edits:
+
+1. `blockMesh`
+2. `topoSet`
+3. `createPatch -overwrite`
+4. check patches with `checkMesh -constant -allTopology`
+5. run `pimpleFoam`
+
+If another “Cannot find patchField entry for …” appears, it means one of `0/*` files still has old patch names; make all field files consistent with final mesh boundary names.
+Loop 2: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/system/topoSetDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/0/U
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for bottomWall\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/U/boundaryField from line 17 to line 40.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = Foam::Vector<double>; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You’re now hitting a pure boundary-name consistency issue in `0/U` for the mesh that `pimpleFoam` actually reads.
+
+- Error says missing `bottomWall` in `0/U/boundaryField`.
+- In your provided files, there are **two U files** listed (`U` and `0/U`), and one of them still uses old patch names (`base/outlet/sides`) while mesh uses `bottomWall/left/right/top`.
+- OpenFOAM reads `0/U`; if that file is not the corrected one at runtime, you get exactly this error.
+
+Use this different approach (robust, avoids relying on createPatch state):
+
+- Ensure mesh boundary names are exactly: `inlet`, `bottomWall`, `left`, `right`, `top`, `frontAndBack` (from `system/blockMeshDict`).
+- In **every** initial field file used by solver (`0/U`, `0/p`, and any other `0/*` present), define all six patch entries with exact same names.
+- For `0/U`, keep:
+  - `inlet` = `fixedValue uniform (0 0.10 0)`
+  - `bottomWall` = `noSlip`
+  - `left/right/top` = `zeroGradient`
+  - `frontAndBack` = `empty`
+- For `0/p`, keep:
+  - `inlet` = `zeroGradient`
+  - `bottomWall` = `zeroGradient`
+  - `left/right/top` = `fixedValue uniform 0`
+  - `frontAndBack` = `empty`
+
+Given prior `createPatch` failure, also avoid stale mesh/time data:
+
+- Run clean sequence: `blockMesh` only (skip `topoSet/createPatch` for now if inlet is already explicit in `blockMeshDict`).
+- Delete old time directories except `0` (or use `Allclean` then regenerate).
+- Run `checkMesh` and confirm boundary list includes `bottomWall`.
+- Then run `pimpleFoam`.
+
+Key point: your current case already has an explicit `inlet` patch in `blockMeshDict`, so `createPatch` is unnecessary and was a source of inconsistency in previous attempts. This is consistent with your requirements and avoids changing required physical parameters.
+Loop 4: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/0/U
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/Allrun
+Warning: file log.pimpleFoam contains 'error' but does not match expected format.
+Allrun executed successfully without errors.
+============================== Visualization (PyVista) ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output/visualization.py
+Workflow completed successfully!
+
+<LLM Service Statistics>
+Total calls: 5
+Failed calls: 0
+Total retries: 0
+Total prompt tokens: 3394
+Total completion tokens: 11
+Total tokens: 3405
+Average prompt tokens per call: 678.80
+Average completion tokens per call: 2.20
+Average tokens per call: 681.00
+
+</LLM Service Statistics>
+Namespace(openfoam_path='/mnt/sda1/openfoam10', output='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output', prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/user_requirement.txt', custom_mesh_path=None)
+Main workflow command: python src/main.py --prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/user_requirement.txt' --output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output'
+Starting workflow...
+Finished command: Return Code 0
+Workflow completed successfully.
+
+🧾 Generated 5 Foam-Agent user requirement(s) after selection
+📝 FINISHED IDEATION CONFIGS AND Starting simulations for generated cases...
+
+🔍 Validating user requirements...
+HypothesisAgent initialized with model: gpt-5.3-codex
+✅ Requirement 1 looks good
+✅ Requirement 2 looks good
+✅ Requirement 3 looks good
+✅ Requirement 4 looks good
+✅ Requirement 5 looks good
+
+✅ All user requirements validated and corrected as needed
+
+==================================================
+
+ Running Foam-Agent for case fire_case_1_008 (1/5)...
+ Case ID: fire_case_1_008
+ Profile: IDEATION
+ Reynolds Number: None
+ Geometry: 2D [0.2, 0.2, 0.01]
+
+💼 User Requirement:
+Please set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m with topology 2D (blockMesh 100×100×1, total 10,000 cells, front and back patches set to empty), with a centered bottom fuel inlet box from (0.090, 0.000, 0.000) to (0.110, 0.010, 0.010) m (width 0.020 m, height 0.010 m) injecting upward fuel velocity Uy=0.2 m/s (Ux=Uz=0), density ρ=1.0 kg/m³, and kinematic viscosity ν=2.0e-4 m²/s #ASSUMPTION(ν from L=inlet width 0.02 m, U=0.2 m/s, Re=20), with boundary conditions: inlet fixedValue U=(0 0.2 0) and zeroGradient p, remaining bottom segments and side walls no-slip fixedValue U=(0 0 0) with zeroGradient p, top boundary pressure outlet fixedValue p=0 and zeroGradient U, and frontAndBack empty for all fields; use startTime=0 s, endTime=3 s, deltaT=0.005 s from target CFL 0.5 (Δt=CFL·Δx/U with Δx=0.002 m and U=0.2 m/s), writeInterval=0.1 s, and include post-processing for residual histories and Courant number evolution plus centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p on the z=0.005 m mid-plane slice over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export centerline vertical velocity Uy along x=Lx/2=0.10 m at z=z_mid=0.005 m (line over y from 0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+
+------------------------------
+
+📁 Created run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001
+📄 User requirement written to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt
+🚀 Running Foam-Agent: python /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py --openfoam_path /mnt/sda1/openfoam10 --output /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output --prompt_path /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/user_requirement.txt
+📁 Run folder: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001
+🔧 Working directory: /home/zhangt20/clawd/cfd-scientist
+🔧 Foam-Agent path: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py
+🔧 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+❌ Foam-Agent failed (exit code 1)
+⚠️  Postprocess skipped/failed: No .foam file found in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/output
+
+❌ Case fire_case_1_008 failed!
+Error: Unknown error
+Return code: 1
+
+==================================================
+
+ Running Foam-Agent for case fire_case_1_005 (2/5)...
+ Case ID: fire_case_1_005
+ Profile: IDEATION
+ Reynolds Number: None
+ Geometry: 2D [0.2, 0.2, 0.01]
+
+💼 User Requirement:
+Set up and run a 2D small pool fire-style flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (x,y,z) with topology 2d, structured blockMesh of 100×100×1 cells (10,000 cells), and a centered bottom fuel inlet patch defined by box (0.090 0.0 0.0) to (0.110 0.010 0.01) m where the imposed fuel velocity is uniform upward Uy=0.10 m/s (Ux=Uz=0), with fluid properties ρ=1.0 kg/m³ and kinematic viscosity ν=2.0e-4 m²/s #ASSUMPTION(Re not provided, chosen for stable laminar-like jet/plume development with U=0.1 m/s and L=0.2 m), boundary conditions as inlet fixedValue U=(0 0.10 0) and zeroGradient p, bottom wall regions outside inlet no-slip U=(0 0 0) and zeroGradient p, left/right and top boundaries as pressure outlets with U zeroGradient and p fixedValue 0 Pa #ASSUMPTION(open boundaries for plume venting), frontAndBack set to empty for all fields (2D), startTime=0 s, endTime=3 s, deltaT=0.005 s from target_CFL=0.5 using Δx=0.002 m and Umax=0.1 m/s, writeInterval=0.1 s, and include post-processing for residual histories, Courant number monitoring, and centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export vertical velocity Uy profiles along the geometric centerline x=Lx/2=0.10 m at z=0.005 m (line from y=0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+
+------------------------------
+
+📁 Created run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002
+📄 User requirement written to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/user_requirement.txt
+🚀 Running Foam-Agent: python /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py --openfoam_path /mnt/sda1/openfoam10 --output /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output --prompt_path /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/user_requirement.txt
+📁 Run folder: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002
+🔧 Working directory: /home/zhangt20/clawd/cfd-scientist
+🔧 Foam-Agent path: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py
+🔧 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+✅ Foam-Agent succeeded! Outputs in: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+🧾 Postprocess artifacts written under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+
+✅ Case fire_case_1_005 completed successfully!
+📁 Run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002
+📁 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output
+
+==================================================
+
+ Running Foam-Agent for case fire_case_1_011 (3/5)...
+ Case ID: fire_case_1_011
+ Profile: IDEATION
+ Reynolds Number: None
+ Geometry: 2D [0.2, 0.2, 0.01]
+
+💼 User Requirement:
+Set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam on a rectangular domain of 0.20 m × 0.20 m × 0.01 m (x,y,z) with blockMesh topology 2D (100×100×1 cells, front and back patches set to empty), fluid properties ρ=1.0 kg/m³ and ν=2.0e-4 m²/s #ASSUMPTION(Re not provided, chosen conservative for stable low-Re jet/plume test), and a centered bottom fuel inlet box exactly from (0.090 0.0 0.0) to (0.110 0.010 0.01) m (width 0.020 m, height 0.010 m) injecting upward fuel velocity Uy=0.35 m/s with Ux=0 and Uz=0; use no-slip walls on the remaining solid boundaries (left, right, and bottom outside inlet: U=(0 0 0)), pressure p zeroGradient at walls/inlet, and top boundary as pressure outlet (p=0 fixedValue, U zeroGradient); run from startTime=0 s to endTime=3 s with deltaT=0.001 s #ASSUMPTION(chosen from CFL≤0.5 with U=0.35 m/s and Δx=0.002 m giving Δt_max≈0.00286 s), writeInterval=0.1 s, and include post-processing of residuals and Courant number history plus centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field at each time, and export vertical centerline velocity Uy as CSV along the geometric centerline x=Lx/2=0.10 m at z=0.005 m (line over y=0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.Loading FAISS indices from: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/database/faiss/text-embedding-3-small with model: text-embedding-3-small
+args: Namespace(prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/user_requirement.txt', output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output', custom_mesh_path=None)
+config: Config(max_loop=10, batchsize=10, searchdocs=2, run_times=1, database_path=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/database'), run_directory=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/runs'), case_dir='', max_time_limit=3600, input_writer_generation_mode='parallel_no_context', model_provider='openai-codex', model_version='gpt-5.3-codex', temperature=1, embedding_provider='openai', embedding_model='text-embedding-3-small')
+No custom mesh path provided.
+Starting Foam-Agent...
+Parsed case name: 2D_Small_Pool_Fire_Flow_in_Rectangular_Domain_with_pimpleFoam
+Parsed case domain: basic
+Parsed case category: None
+Parsed case solver: pimpleFoam
+Created case directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Retrieved similar case structure: <dir>directory name: .. File names in this directory: [Allclean]</dir>
+<dir>directory name: 0. File names in this directory: [CH4, FSDomega, G, IDefault, N2, O2, T, U, Ydefault, alphat, k, nut, p, p_rgh, ph_rgh.orig, soot]</dir>
+<dir>directory name: system. File names in this directory: [blockMeshDict, controlDict, createPatchDict, fvSchemes, fvSolution, topoSetDict]</dir>
+<dir>directory name: constant. File names in this directory: [combustionProperties, fvModels, g, hRef, momentumTransport, pRef, physicalProperties, radiationProperties, reaction, thermo.compressibleGas]</dir>
+Generated 9 subtasks.
+Warning: Case directory /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output already exists. Overwriting.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/similar_case.txt
+Planner determined: Standard mesh generation.
+Planner set mesh_type to: standard_mesh
+Router: Standard mesh generation. Routing to input_writer node.
+============================== Initial Write Agent ==============================
+============================== Initial Write Mode ==============================
+Input writer mode: parallel_no_context (no cross-file context)
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/constant/momentumTransport
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/./Allclean
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/controlDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/0/p
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/fvSchemes
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/fvSolution
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/constant/physicalProperties
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/blockMeshDict
+Need 2 commands.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for left\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/0/p/boundaryField from line 17 to line 43.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = double; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+The run stops because patch names are inconsistent between mesh and initial fields.
+
+- In `system/blockMeshDict`, the mesh patches are: `inlet`, `bottomWall`, `left`, `right`, `top`, `frontAndBack`.
+- In `0/p`, you defined `leftWall` and `rightWall` (and no `left`/`right`), so OpenFOAM throws: `Cannot find patchField entry for left`.
+- In `0/U`, you defined `bottom`, but the mesh patch is `bottomWall`; this will trigger another patch mismatch next even after fixing `p`.
+
+How to fix (without changing required physics/settings):
+- In `0/p`, rename `leftWall` -> `left` and `rightWall` -> `right`.
+- In `0/U`, rename `bottom` -> `bottomWall`.
+- Keep boundary types as required:
+  - `inlet`: `U fixedValue (0 0.35 0)`, `p zeroGradient`
+  - `top`: `U zeroGradient`, `p fixedValue uniform 0`
+  - `left`, `right`, `bottomWall`: no-slip in `U` (`fixedValue uniform (0 0 0)`), `p zeroGradient`
+  - `frontAndBack`: `empty` in both fields
+
+Also verify all field files use exactly the same patch names as the mesh before rerun:
+- `blockMesh`
+- `checkMesh`
+- `pimpleFoam`
+
+If you want, I can also give you a quick patch-name consistency checklist for all future `0/*` files to avoid this class of error.
+Loop 2: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/0/p
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nkeyword div((nuEff*dev2(T(grad(U))))) is undefined in dictionary "/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/fvSchemes/divSchemes"\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/fvSchemes/divSchemes from line 21 to line 23.\n\n    From function const Foam::entry& Foam::dictionary::lookupEntry(const Foam::word&, bool, bool) const\n    in file db/dictionary/dictionary.C at line 831.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+Good progress — this is now a different issue than the earlier patch-name mismatch.
+
+The current failure is strictly from `system/fvSchemes` missing one required divergence entry for `pimpleFoam`:
+
+- Error says: `keyword div((nuEff*dev2(T(grad(U))))) is undefined`
+- So in `divSchemes`, you must **define exactly this keyword** (literal string), e.g.:
+
+```foam
+divSchemes
+{
+    default                             none;
+    div(phi,U)                          Gauss linearUpwind grad(U);
+    div((nuEff*dev2(T(grad(U)))))       Gauss linear;
+}
+```
+
+Why this works:
+- `pimpleFoam` momentum equation needs a discretization for the viscous stress divergence term.
+- You already defined `div(phi,U)`, but not the viscous term entry, so it aborts at startup.
+
+After adding that entry, rerun:
+1. `blockMesh`
+2. `checkMesh`
+3. `pimpleFoam`
+
+If another “keyword ... is undefined” appears, apply the same pattern: add that **exact** keyword under `divSchemes` (or corresponding scheme section) without altering required physics/settings.
+Loop 4: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/system/fvSchemes
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/Allrun
+Warning: file log.pimpleFoam contains 'error' but does not match expected format.
+Allrun executed successfully without errors.
+============================== Visualization (PyVista) ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output/visualization.py
+Workflow completed successfully!
+
+<LLM Service Statistics>
+Total calls: 5
+Failed calls: 0
+Total retries: 0
+Total prompt tokens: 3294
+Total completion tokens: 11
+Total tokens: 3305
+Average prompt tokens per call: 658.80
+Average completion tokens per call: 2.20
+Average tokens per call: 661.00
+
+</LLM Service Statistics>
+Namespace(openfoam_path='/mnt/sda1/openfoam10', output='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output', prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/user_requirement.txt', custom_mesh_path=None)
+Main workflow command: python src/main.py --prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/user_requirement.txt' --output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output'
+Starting workflow...
+Finished command: Return Code 0
+Workflow completed successfully.
+Loading FAISS indices from: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/database/faiss/text-embedding-3-small with model: text-embedding-3-small
+args: Namespace(prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/user_requirement.txt', output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output', custom_mesh_path=None)
+config: Config(max_loop=10, batchsize=10, searchdocs=2, run_times=1, database_path=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/database'), run_directory=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/runs'), case_dir='', max_time_limit=3600, input_writer_generation_mode='parallel_no_context', model_provider='openai-codex', model_version='gpt-5.3-codex', temperature=1, embedding_provider='openai', embedding_model='text-embedding-3-small')
+No custom mesh path provided.
+Starting Foam-Agent...
+Parsed case name: fire_case_1_sim_004
+Parsed case domain: basic
+Parsed case category: None
+Parsed case solver: pimpleFoam
+Created case directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Retrieved similar case structure: <dir>directory name: .. File names in this directory: [Allclean]</dir>
+<dir>directory name: 0. File names in this directory: [U.orig, p.orig]</dir>
+<dir>directory name: system. File names in this directory: [blockMeshDict, controlDict, fvSchemes, fvSolution]</dir>
+Generated 10 subtasks.
+Warning: Case directory /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output already exists. Overwriting.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/similar_case.txt
+Planner determined: Standard mesh generation.
+Planner set mesh_type to: standard_mesh
+Router: Standard mesh generation. Routing to input_writer node.
+============================== Initial Write Agent ==============================
+============================== Initial Write Mode ==============================
+Input writer mode: parallel_no_context (no cross-file context)
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/./Allclean
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/residuals
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/0/p.orig
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/0/U.orig
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/controlDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/fvSchemes
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/fvSolution
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/sampleDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/system/blockMeshDict
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/./Allrun
+Need 2 commands.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for topOutlet\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/0/p/boundaryField from line 16 to line 37.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = double; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+Root cause is a boundary-name mismatch between mesh patches and `0/p` boundary entries.
+
+- In `system/blockMeshDict`, the outlet patch is named `topOutlet`.
+- In `0/p.orig`, the pressure boundary uses `top` instead of `topOutlet`.
+- `pimpleFoam` reads `0/p` and fails with: `Cannot find patchField entry for topOutlet`.
+
+How to fix (without changing required physics/settings):
+- Add a `topOutlet` entry in `0/p.orig` `boundaryField` with the required outlet condition:
+  - `type fixedValue;`
+  - `value uniform 0;`
+- Keep side and bottom wall conditions as already specified (zeroGradient for `p`).
+- Keep `frontAndBack` as `empty` (already aligned with 2D requirement).
+
+Also apply the same naming consistency to velocity:
+- In `0/U.orig`, replace/add `topOutlet` (instead of `top`) with:
+  - `type zeroGradient;`
+This matches your requirement for open top boundary (`p` fixedValue 0, `U` zeroGradient).
+
+Recommended consistency check to avoid next errors:
+- Ensure every patch in `blockMeshDict` has a matching entry in both `0/U.orig` and `0/p.orig`: `fuelInlet`, `bottomWall`, `sideWalls`, `topOutlet`, `frontAndBack`.
+- Re-run `blockMesh` then `pimpleFoam` after regenerating `0/U` and `0/p` from `.orig` if your workflow uses that copy step.
+Loop 2: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/0/U.orig
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/0/p.orig
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \ncannot find file "/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/physicalProperties"\n\n    From function virtual Foam::autoPtr<Foam::ISstream> Foam::fileOperations::uncollatedFileOperation::readStream(Foam::regIOobject&, const Foam::fileName&, const Foam::word&, bool) const\n    in file global/fileOperations/uncollatedFileOperation/uncollatedFileOperation.C at line 539.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You fixed the patch-name issue, and now the new failure is different and earlier in startup:
+
+- `log.pimpleFoam` now stops at missing file: `constant/physicalProperties`.
+
+This means the case setup is incomplete for `pimpleFoam` (transport properties are required before solving).
+
+What to add (different approach from prior patch fix)
+- Create `constant/physicalProperties` and define the required fluid properties exactly per your requirement:
+  - `rho` = `1.0`
+  - `nu` = `1.0e-5`
+
+Use this minimal OpenFOAM dictionary structure:
+```foam
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      physicalProperties;
+}
+
+rho             1.0;
+nu              1.0e-5;
+```
+
+Why this resolves the current error
+- `pimpleFoam` reads transport/physical properties from `constant/physicalProperties` during initialization.
+- If the file is absent, solver exits before time loop, exactly as shown in your current log.
+
+Important consistency note
+- Your `Allclean` removes `constant` (`rm -rf constant`), so even if you created `physicalProperties` once, it will be deleted on the next clean.
+- Keep `constant/physicalProperties` as a persistent case file (and if needed, adjust cleaning workflow so it doesn’t remove required inputs).
+
+After this, rerun:
+- `blockMesh`
+- `pimpleFoam`
+
+If another error appears, share the new `log.pimpleFoam` and I’ll diagnose the next blocker.
+Loop 4: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/physicalProperties
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nkeyword viscosityModel is undefined in dictionary "/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/physicalProperties"\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/physicalProperties from line 9 to line 10.\n\n    From function const Foam::entry& Foam::dictionary::lookupEntry(const Foam::word&, bool, bool) const\n    in file db/dictionary/dictionary.C at line 831.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You’re very close — this is now a transport-model format issue, not a geometry/BC issue.
+
+`pimpleFoam` is reading `constant/physicalProperties` and expects the keyword `viscosityModel`, which is currently missing.  
+Given your error, the direct fix is to **define that exact keyword** in `constant/physicalProperties`.
+
+Use this structure (keeping your required `rho` and `nu` unchanged):
+
+```foam
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      physicalProperties;
+}
+
+viscosityModel  constant;
+
+rho             1.0;
+nu              1.0e-5;
+```
+
+Why this works:
+- The solver startup is explicitly failing on `keyword viscosityModel is undefined`.
+- Adding `viscosityModel` resolves that dictionary lookup while preserving your required fluid properties.
+
+Also, to avoid the same failure after cleaning:
+- Your `Allclean` currently removes generated data; make sure `constant/physicalProperties` remains present before running `pimpleFoam` (or is recreated by your setup workflow each run).
+
+Next step:
+1. Re-run `blockMesh`
+2. Re-run `pimpleFoam`
+3. If a new error appears, share the new `log.pimpleFoam` and I’ll diagnose the next blocker directly.
+Loop 6: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/physicalProperties
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \ncannot find file "/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/momentumTransport"\n\n    From function virtual Foam::autoPtr<Foam::ISstream> Foam::fileOperations::uncollatedFileOperation::readStream(Foam::regIOobject&, const Foam::fileName&, const Foam::word&, bool) const\n    in file global/fileOperations/uncollatedFileOperation/uncollatedFileOperation.C at line 539.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+Thanks — based on the new log, this is now a version/model-file mismatch issue, not a BC or mesh issue.
+
+- `pimpleFoam` is trying to read `constant/momentumTransport` and cannot find it.
+- Your case currently uses `constant/physicalProperties`, which is valid for some setups, but this solver/build is expecting the newer transport dictionary file.
+- Previous fixes addressed missing entries in `physicalProperties`; now the solver is failing earlier because it wants a different file name/interface.
+
+Use this approach (without changing your required physics values):
+- Keep `rho = 1.0` and `nu = 1.0e-5` exactly as required.
+- Add `constant/momentumTransport` with a laminar Newtonian setup and `nu 1e-5`.
+- Keep `constant/physicalProperties` present too (for compatibility with your workflow/tools), including `viscosityModel constant; rho; nu;`.
+- Ensure `Allclean` does not remove required `constant` inputs before run (or automatically recreate them before `pimpleFoam`).
+
+Minimal `constant/momentumTransport` template to add:
+```foam
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      momentumTransport;
+}
+
+simulationType laminar;
+
+laminar
+{
+    model           Newtonian;
+    nu              1e-05;
+}
+```
+
+Why this is the right “different approach” now:
+- Current fatal error is explicitly missing `constant/momentumTransport`.
+- Defining that required file addresses the exact startup lookup used by this solver build, while preserving all user-required parameters and 2D setup.
+
+After that, rerun:
+1. `blockMesh`
+2. regenerate/copy `0/U` and `0/p` from `.orig` if your workflow does this
+3. `pimpleFoam`
+
+If it fails again, the next log should be a more specific dictionary keyword issue, and we can resolve it directly.
+Loop 8: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/constant/momentumTransport
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nUnknown laminarModel type Newtonian\n\nValid laminarModel types:\n\n6\n(\nGiesekus\nMaxwell\nPTT\nStokes\ngeneralisedNewtonian\nlambdaThixotropic\n)\n\n\n    From function static Foam::autoPtr<Foam::laminarModel<BasicMomentumTransportModel> > Foam::laminarModel<BasicMomentumTransportModel>::New(const alphaField&, const rhoField&, const volVectorField&, const surfaceScalarField&, const surfaceScalarField&, const Foam::viscosity&) [with BasicMomentumTransportModel = Foam::incompressibleMomentumTransportModel; Foam::laminarModel<BasicMomentumTransportModel>::alphaField = Foam::geometricOneField; Foam::laminarModel<BasicMomentumTransportModel>::rhoField = Foam::geometricOneField; Foam::volVectorField = Foam::GeometricField<Foam::Vector<double>, Foam::fvPatchField, Foam::volMesh>; Foam::surfaceScalarField = Foam::GeometricField<double, Foam::fvsPatchField, Foam::surfaceMesh>]\n    in file ../momentumTransportModels/lnInclude/laminarModel.C at line 117.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+Good progress — this is now a **model-selection compatibility** issue in `constant/momentumTransport`.
+
+From your current error:
+- `Unknown laminarModel type Newtonian`
+- Valid types listed do **not** include `Newtonian`, but include `Stokes`.
+
+So in this OpenFOAM build, your laminar model keyword must match one of those valid entries.
+
+Use this adjusted `constant/momentumTransport` setup:
+```foam
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      momentumTransport;
+}
+
+simulationType  laminar;
+
+laminar
+{
+    model       Stokes;
+}
+```
+
+And keep `constant/physicalProperties` with your required properties (unchanged):
+```foam
+viscosityModel  constant;
+rho             1.0;
+nu              1.0e-5;
+```
+
+Why this is the right next step:
+- It follows the solver’s exact valid laminar model list from your log.
+- It does not change required user parameters (`rho`, `nu`, domain, BCs, time settings).
+- It is a different fix path than previous attempts (switching model type to one accepted by this specific installation).
+
+After this, rerun:
+1. `blockMesh`
+2. initialize `0/U` and `0/p` from `.orig` (if your workflow requires)
+3. `pimpleFoam`
+
+If another error appears, share the new `log.pimpleFoam`; at that point it should be a narrower dictionary/scheme/runtime item.
+Maximum loop count (10) reached. Ending workflow.
+============================== Visualization (PyVista) ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output/visualization.py
+Workflow completed successfully!
+
+<LLM Service Statistics>
+Total calls: 7
+Failed calls: 0
+Total retries: 0
+Total prompt tokens: 4414
+Total completion tokens: 15
+Total tokens: 4429
+Average prompt tokens per call: 630.57
+Average completion tokens per call: 2.14
+Average tokens per call: 632.71
+
+</LLM Service Statistics>
+Namespace(openfoam_path='/mnt/sda1/openfoam10', output='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output', prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/user_requirement.txt', custom_mesh_path=None)
+Main workflow command: python src/main.py --prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/user_requirement.txt' --output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output'
+Starting workflow...
+Finished command: Return Code 0
+Workflow completed successfully.
+
+
+------------------------------
+
+📁 Created run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003
+📄 User requirement written to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/user_requirement.txt
+🚀 Running Foam-Agent: python /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py --openfoam_path /mnt/sda1/openfoam10 --output /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output --prompt_path /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/user_requirement.txt
+📁 Run folder: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003
+🔧 Working directory: /home/zhangt20/clawd/cfd-scientist
+🔧 Foam-Agent path: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py
+🔧 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+✅ Foam-Agent succeeded! Outputs in: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+🧾 Postprocess artifacts written under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+
+✅ Case fire_case_1_011 completed successfully!
+📁 Run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003
+📁 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output
+
+==================================================
+
+ Running Foam-Agent for case fire_case_1_007 (4/5)...
+ Case ID: fire_case_1_007
+ Profile: IDEATION
+ Reynolds Number: None
+ Geometry: 2D [0.2, 0.2, 0.01]
+
+💼 User Requirement:
+Please set up and run a 2D small pool fire flow simulation for case fire_case_1, simulation sim_004, in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (topology: 2d) using pimpleFoam with a structured blockMesh of 100 × 100 × 1 cells (10,000 total), with front and back patches set to empty, fluid properties ρ = 1.0 kg/m³ and ν = 1.0e-5 m²/s #ASSUMPTION(missing_Re_default_for_airlike_flow), a centered bottom fuel inlet box from (0.095 0.0 0.0) to (0.105 0.005 0.01) m (width 0.01 m, height 0.005 m) prescribing fuel vertical velocity Uy = 0.2 m/s (Ux=0, Uz=0), no-slip walls on the remaining solid boundaries, and an open top boundary with pressure outlet (p fixedValue 0, U zeroGradient); use startTime = 0 s, endTime = 3 s, target CFL = 0.5 with Δt = 0.005 s based on Δx = 0.002 m and U = 0.2 m/s, and write results every 0.1 s; include post-processing for residual histories, Courant number history, and centerline profiles, and Visualize velocity magnitude |U| (UMag) and pressure p contours on the z = 0.005 m mid-plane over the full domain at t = 0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field at each time, and export vertical centerline velocity Uy as separate CSV files along x = Lx/2 = 0.10 m at z = z_mid = 0.005 m (varying y) at t = 0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s.
+
+------------------------------
+
+📁 Created run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004
+📄 User requirement written to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/user_requirement.txt
+🚀 Running Foam-Agent: python /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py --openfoam_path /mnt/sda1/openfoam10 --output /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output --prompt_path /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/user_requirement.txt
+📁 Run folder: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004
+🔧 Working directory: /home/zhangt20/clawd/cfd-scientist
+🔧 Foam-Agent path: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py
+🔧 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+✅ Foam-Agent succeeded! Outputs in: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+🧾 Postprocess artifacts written under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+
+✅ Case fire_case_1_007 completed successfully!
+📁 Run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004
+📁 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output
+
+==================================================
+
+ Running Foam-Agent for case fire_case_1_009 (5/5)...
+ Case ID: fire_case_1_009
+ Profile: IDEATION
+ Reynolds Number: None
+ Geometry: 2D [0.2, 0.2, 0.01]
+
+💼 User Requirement:
+Please run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (Lx×Ly×Lz) with topology set to 2D (single cell in z, frontAndBack patches set to empty), using a structured blockMesh of 100×100×1 cells (10,000 total), fluid properties ρ=1.0 kg/m³ and ν=0.03 m²/s computed from Re=1 #ASSUMPTION(reason=Re not provided, ν=L×U/Re with L=0.03 m inlet width and U=0.2 m/s), a centered bottom fuel inlet patch defined by box (0.085 0.0 0.0) to (0.115 0.015 0.01) with fixed velocity U=(0 0.2 0) m/s and zeroGradient p, bottom wall outside inlet as no-slip wall with zeroGradient p, side walls as no-slip with zeroGradient p, and top boundary as pressure outlet p=fixedValue 0 Pa with zeroGradient U; set transient controls to startTime=0 s, endTime=3 s, deltaT=0.005 s from target CFL=0.5 using Δx=0.002 m and Umax=0.2 m/s, and writeInterval=0.1 s; include post-processing for residual history, Courant number history, and centerline analysis, and Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export vertical velocity Uy along the geometric centerline x=Lx/2=0.10 m at z=0.005 m from y=0 to 0.20 m at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+
+------------------------------
+
+📁 Created run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005
+📄 User requirement written to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/user_requirement.txt
+🚀 Running Foam-Agent: python /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py --openfoam_path /mnt/sda1/openfoam10 --output /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output --prompt_path /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/user_requirement.txt
+📁 Run folder: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005
+🔧 Working directory: /home/zhangt20/clawd/cfd-scientist
+🔧 Foam-Agent path: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py
+🔧 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/outputLoading FAISS indices from: /home/zhangt20/clawd/cfd-scientist/Foam-Agent/database/faiss/text-embedding-3-small with model: text-embedding-3-small
+args: Namespace(prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/user_requirement.txt', output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output', custom_mesh_path=None)
+config: Config(max_loop=10, batchsize=10, searchdocs=2, run_times=1, database_path=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/database'), run_directory=PosixPath('/home/zhangt20/clawd/cfd-scientist/Foam-Agent/runs'), case_dir='', max_time_limit=3600, input_writer_generation_mode='parallel_no_context', model_provider='openai-codex', model_version='gpt-5.3-codex', temperature=1, embedding_provider='openai', embedding_model='text-embedding-3-small')
+No custom mesh path provided.
+Starting Foam-Agent...
+Parsed case name: 2D_small_pool_fire_flow_in_rectangular_domain_using_pimpleFoam
+Parsed case domain: combustion
+Parsed case category: None
+Parsed case solver: pimpleFoam
+Created case directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Retrieved similar case structure: <dir>directory name: .. File names in this directory: [Allclean]</dir>
+<dir>directory name: 0. File names in this directory: [CH4, FSDomega, G, IDefault, N2, O2, T, U, Ydefault, alphat, k, nut, p, p_rgh, ph_rgh.orig, soot]</dir>
+<dir>directory name: system. File names in this directory: [blockMeshDict, controlDict, createPatchDict, fvSchemes, fvSolution, topoSetDict]</dir>
+<dir>directory name: constant. File names in this directory: [combustionProperties, fvModels, g, hRef, momentumTransport, pRef, physicalProperties, radiationProperties, reaction, thermo.compressibleGas]</dir>
+Generated 14 subtasks.
+Warning: Case directory /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output already exists. Overwriting.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/similar_case.txt
+Planner determined: Standard mesh generation.
+Planner set mesh_type to: standard_mesh
+Router: Standard mesh generation. Routing to input_writer node.
+============================== Initial Write Agent ==============================
+============================== Initial Write Mode ==============================
+Input writer mode: parallel_no_context (no cross-file context)
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/constant/physicalProperties
+Warning: Could not parse context; returning original text.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/./Allclean
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/createPatchDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/controlDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/constant/momentumTransport
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/residuals
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/fvSchemes
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/0/p
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/topoSetDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/sampleDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/blockMeshDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/fvSolution
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/probes
+Need 4 commands.
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nCannot find patchField entry for base\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/0/p/boundaryField from line 17 to line 38.\n\n    From function void Foam::GeometricBoundaryField<Type, PatchField, GeoMesh>::readField(const Foam::DimensionedField<TypeR, GeoMesh>&, const Foam::dictionary&) [with Type = double; PatchField = Foam::fvPatchField; GeoMesh = Foam::volMesh]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/OpenFOAM/lnInclude/GeometricBoundaryField.C at line 187.\n\nFOAM exiting'}, {'file': 'log.createPatch', 'error_content': 'ERROR: \nFace 84 specified in set f0 is not an external face of the mesh.\nThis application can only repatch existing boundary faces.\n\n    From function int main(int, char**)\n    in file createPatch.C at line 696.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You have two setup-consistency errors, both caused by patch naming/topology mismatch (not by solver physics).
+
+- `log.createPatch`: `Face 84 specified in set f0 is not an external face`
+  - Root cause: the `boxToFace` selection in `system/topoSetDict` is selecting at least one internal face, so `createPatch` cannot convert it into boundary patch `inlet`.
+  - Fix: constrain the box so it only intersects the **bottom boundary faces** (y=0 plane) with a very thin y-range around the boundary, e.g. keep x/z as requested and use a tiny y slab near 0 so no interior face is captured.
+  - Then run in order: `blockMesh` → `topoSet` → `createPatch -overwrite`, and verify `constant/polyMesh/boundary` contains `inlet`.
+
+- `log.pimpleFoam`: `Cannot find patchField entry for base` in `0/p`
+  - Root cause: mesh boundary uses patch names from `blockMeshDict` (`base`, `outlet`, `sides`, `frontAndBack`, plus `inlet` after createPatch), but your `0/p` and `0/U` currently define different names (`top`, `bottomWall`, etc.).
+  - Fix: make `0/p` and `0/U` boundaryField entries match the actual mesh patch names exactly.
+  - For your required BCs, map as:
+    - `inlet`: `U fixedValue (0 0.2 0)`, `p zeroGradient`
+    - `base` (bottom excluding inlet): `U noSlip`, `p zeroGradient`
+    - `sides`: `U noSlip`, `p zeroGradient`
+    - `outlet` (top): `p fixedValue uniform 0`, `U zeroGradient`
+    - `frontAndBack`: `empty` for both.
+
+Also check this before rerun:
+
+- `system/createPatchDict`: the patch block should reference `set f0` exactly and create patch name `inlet`.
+- After `createPatch -overwrite`, re-open `constant/polyMesh/boundary` to confirm only expected patches and names are present.
+- If you see an undefined keyword error later (e.g. `div(phi,(p|rho)) is undefined`), add that **exact same keyword** to `system/fvSchemes` under `divSchemes` with an appropriate scheme entry, literally as printed in the error.
+
+Recommended rerun sequence:
+1. `blockMesh`
+2. `topoSet`
+3. `createPatch -overwrite`
+4. `checkMesh`
+5. `pimpleFoam`
+Loop 2: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/system/topoSetDict
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/./0/U
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/./0/p
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \nkeyword viscosityModel is undefined in dictionary "/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/constant/physicalProperties"\n\nfile: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/constant/physicalProperties from line 9 to line 10.\n\n    From function const Foam::entry& Foam::dictionary::lookupEntry(const Foam::word&, bool, bool) const\n    in file db/dictionary/dictionary.C at line 831.\n\nFOAM exiting'}]
+============================== Reviewer Analysis ==============================
+You fixed the patch-name issue, and now the run is failing at a different stage: transport model parsing.
+
+`pimpleFoam` in your setup is reading `constant/physicalProperties` as a **transport model dictionary**, not as simple `nu/rho` scalars. That is why it throws:
+
+- `keyword viscosityModel is undefined` in `constant/physicalProperties`
+
+What to change next (different approach from prior attempt)
+- In `constant/physicalProperties`, **define the missing keyword exactly**:
+  - `viscosityModel  constant;`
+- Keep your required fluid values unchanged (`rho=1.0`, `nu=0.03`) by placing them under the model coeffs block expected by this format, e.g.:
+  - `nu [0 2 -1 0 0 0 0] 0.03;`
+  - `rho [1 -3 0 0 0 0 0] 1.0;`
+- Ensure `constant/momentumTransport` remains compatible with `pimpleFoam` (laminar is fine per your requirement); don’t change the user-specified physics targets.
+
+Minimal target structure for `constant/physicalProperties` should be transport-model style (with `viscosityModel` present), not only two standalone scalars.
+
+After this fix, rerun in order
+1. `blockMesh`
+2. `topoSet`
+3. `createPatch -overwrite`
+4. `checkMesh`
+5. `pimpleFoam`
+
+If another “keyword is undefined” appears, apply the same rule: add that exact keyword literally where the solver expects it.
+Loop 4: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/constant/physicalProperties
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun
+Errors detected in the Allrun execution.
+[{'file': 'log.pimpleFoam', 'error_content': 'ERROR: \n\n    [U[0 1 -2 0 0 0 0] ] == [-grad(p)[1 -2 -2 0 0 0 0] ]\n\n    From function void Foam::checkMethod(const Foam::fvMatrix<Type>&, const Foam::DimensionedField<Type, Foam::volMesh>&, const char*) [with Type = Foam::Vector<double>]\n    in file /home/ubuntu/OpenFOAM/OpenFOAM-10/src/finiteVolume/lnInclude/fvMatrix.C at line 1419.\n\nFOAM aborting\n\n#0  Foam::error::printStack(Foam::Ostream&) at ??:?\n#1  Foam::error::abort() at ??:?\n#2  void Foam::checkMethod<Foam::Vector<double> >(Foam::fvMatrix<Foam::Vector<double> > const&, Foam::DimensionedField<Foam::Vector<double>, Foam::volMesh> const&, char const*) in "/mnt/sda1/openfoam10/platforms/linux64GccDPInt32Opt/bin/pimpleFoam"\n#3  ? in "/mnt/sda1/openfoam10/platforms/linux64GccDPInt32Opt/bin/pimpleFoam"\n#4  ? in "/mnt/sda1/openfoam10/platforms/linux64GccDPInt32Opt/bin/pimpleFoam"\n#5  ? in "/lib/x86_64-linux-gnu/libc.so.6"\n#6  __libc_start_main in "/lib/x86_64-linux-gnu/libc.so.6"\n#7  ? in "/mnt/sda1/openfoam10/platforms/linux64GccDPInt32Opt/bin/pimpleFoam"'}]
+============================== Reviewer Analysis ==============================
+You’re past the dictionary/patch-name stage; this new error is a **units inconsistency in the momentum equation**.
+
+- Error shows:
+  - `U` has dimension `[0 1 -2 ...]` (acceleration term from `ddt(U)` etc.)
+  - `-grad(p)` has dimension `[1 -2 -2 ...]` (pressure gradient divided by length, i.e. force/volume)
+- In `pimpleFoam` (incompressible form), pressure in the equation is **kinematic pressure** `p/rho`, so `grad(p)` must have acceleration dimension `[0 1 -2 ...]`.
+
+What to fix (without changing your required physical values):
+- In `0/p`, change pressure dimensions from dynamic pressure to kinematic pressure:
+  - from `[1 -1 -2 0 0 0 0]`
+  - to `[0 2 -2 0 0 0 0]`
+- Keep your BC types as you already aligned:
+  - inlet: `p zeroGradient`
+  - base/sides: `p zeroGradient`
+  - outlet: `p fixedValue uniform 0`
+  - frontAndBack: `empty`
+
+Why this is different from previous attempts:
+- Previous failures were mesh patch naming and missing dictionary keywords.
+- Current failure is strictly **field dimensional consistency** for `pimpleFoam`.
+
+Additional consistency checks (quick):
+- Ensure you are using the same `0/p` file version (you currently had both `0/p` and another `p` variant in provided list).
+- `constant/physicalProperties` should keep:
+  - `viscosityModel constant;`
+  - `nu [0 2 -1 0 0 0 0] 0.03;`
+  - `rho [1 -3 0 0 0 0 0] 1.0;`
+- Keep `application pimpleFoam;` and 2D `frontAndBack empty` as-is.
+
+Rerun sequence:
+1. `blockMesh`
+2. `topoSet`
+3. `createPatch -overwrite`
+4. `checkMesh`
+5. `pimpleFoam`
+
+If a new “keyword … is undefined” appears, add that **exact literal keyword** in the expected dictionary.
+Loop 6: Continuing to fix errors.
+============================== Rewrite Mode ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/0/p
+LLM determined: Local run requested. Routing to local_runner node.
+============================== Runner ==============================
+Removed files with prefix 'log' in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.err
+Removed file /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun.out
+Executing script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun in /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+Executed script /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/Allrun
+Warning: file log.pimpleFoam contains 'error' but does not match expected format.
+Allrun executed successfully without errors.
+============================== Visualization (PyVista) ==============================
+Saved file at /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output/visualization.py
+Workflow completed successfully!
+
+<LLM Service Statistics>
+Total calls: 6
+Failed calls: 0
+Total retries: 0
+Total prompt tokens: 3860
+Total completion tokens: 13
+Total tokens: 3873
+Average prompt tokens per call: 643.33
+Average completion tokens per call: 2.17
+Average tokens per call: 645.50
+
+</LLM Service Statistics>
+Namespace(openfoam_path='/mnt/sda1/openfoam10', output='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output', prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/user_requirement.txt', custom_mesh_path=None)
+Main workflow command: python src/main.py --prompt_path='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/user_requirement.txt' --output_dir='/home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output'
+Starting workflow...
+Finished command: Return Code 0
+Workflow completed successfully.
+
+✅ Foam-Agent succeeded! Outputs in: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+🧾 Postprocess artifacts written under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+
+✅ Case fire_case_1_009 completed successfully!
+📁 Run directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005
+📁 Output directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output
+
+==================================================
+
+📊 EXPERIMENT SUMMARY:
+   Experiment: sim_20260213_164231_8e3a44cc
+   Experiment directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc
+   Total requirements: 5
+   Successful runs: 4
+   Failed runs: 1
+   All results saved in: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc
+📋 Saved experiment summary to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/experiment_results.json
+
+============================================================
+🔬 Starting automatic analysis of batch...
+============================================================
+
+Scanning batch directory: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc
+   📸 Found timestep images under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/output (umag=6, p=6)
+   📸 Found timestep images under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/output (umag=6, p=6)
+   📸 Found timestep images under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/output (umag=6, p=6)
+   📸 Found timestep images under: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/output (umag=6, p=6)
+
+=== Analysis Plan ===
+• Experiment: sim_20260213_164231_8e3a44cc — 5 run(s)
+   - Run run_001: Please set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m with topology 2D (blockMesh 100×100×1, total 10,000 cells, front and back patches set to empty), with a centered bottom fuel inlet box from (0.090, 0.000, 0.000) to (0.110, 0.010, 0.010) m (width 0.020 m, height 0.010 m) injecting upward fuel velocity Uy=0.2 m/s (Ux=Uz=0), density ρ=1.0 kg/m³, and kinematic viscosity ν=2.0e-4 m²/s #ASSUMPTION(ν from L=inlet width 0.02 m, U=0.2 m/s, Re=20), with boundary conditions: inlet fixedValue U=(0 0.2 0) and zeroGradient p, remaining bottom segments and side walls no-slip fixedValue U=(0 0 0) with zeroGradient p, top boundary pressure outlet fixedValue p=0 and zeroGradient U, and frontAndBack empty for all fields; use startTime=0 s, endTime=3 s, deltaT=0.005 s from target CFL 0.5 (Δt=CFL·Δx/U with Δx=0.002 m and U=0.2 m/s), writeInterval=0.1 s, and include post-processing for residual histories and Courant number evolution plus centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p on the z=0.005 m mid-plane slice over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export centerline vertical velocity Uy along x=Lx/2=0.10 m at z=z_mid=0.005 m (line over y from 0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+   - Run run_002: Set up and run a 2D small pool fire-style flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (x,y,z) with topology 2d, structured blockMesh of 100×100×1 cells (10,000 cells), and a centered bottom fuel inlet patch defined by box (0.090 0.0 0.0) to (0.110 0.010 0.01) m where the imposed fuel velocity is uniform upward Uy=0.10 m/s (Ux=Uz=0), with fluid properties ρ=1.0 kg/m³ and kinematic viscosity ν=2.0e-4 m²/s #ASSUMPTION(Re not provided, chosen for stable laminar-like jet/plume development with U=0.1 m/s and L=0.2 m), boundary conditions as inlet fixedValue U=(0 0.10 0) and zeroGradient p, bottom wall regions outside inlet no-slip U=(0 0 0) and zeroGradient p, left/right and top boundaries as pressure outlets with U zeroGradient and p fixedValue 0 Pa #ASSUMPTION(open boundaries for plume venting), frontAndBack set to empty for all fields (2D), startTime=0 s, endTime=3 s, deltaT=0.005 s from target_CFL=0.5 using Δx=0.002 m and Umax=0.1 m/s, writeInterval=0.1 s, and include post-processing for residual histories, Courant number monitoring, and centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export vertical velocity Uy profiles along the geometric centerline x=Lx/2=0.10 m at z=0.005 m (line from y=0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+   - Run run_003: Set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam on a rectangular domain of 0.20 m × 0.20 m × 0.01 m (x,y,z) with blockMesh topology 2D (100×100×1 cells, front and back patches set to empty), fluid properties ρ=1.0 kg/m³ and ν=2.0e-4 m²/s #ASSUMPTION(Re not provided, chosen conservative for stable low-Re jet/plume test), and a centered bottom fuel inlet box exactly from (0.090 0.0 0.0) to (0.110 0.010 0.01) m (width 0.020 m, height 0.010 m) injecting upward fuel velocity Uy=0.35 m/s with Ux=0 and Uz=0; use no-slip walls on the remaining solid boundaries (left, right, and bottom outside inlet: U=(0 0 0)), pressure p zeroGradient at walls/inlet, and top boundary as pressure outlet (p=0 fixedValue, U zeroGradient); run from startTime=0 s to endTime=3 s with deltaT=0.001 s #ASSUMPTION(chosen from CFL≤0.5 with U=0.35 m/s and Δx=0.002 m giving Δt_max≈0.00286 s), writeInterval=0.1 s, and include post-processing of residuals and Courant number history plus centerline analysis; Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field at each time, and export vertical centerline velocity Uy as CSV along the geometric centerline x=Lx/2=0.10 m at z=0.005 m (line over y=0 to 0.20 m) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+   - Run run_004: Please set up and run a 2D small pool fire flow simulation for case fire_case_1, simulation sim_004, in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (topology: 2d) using pimpleFoam with a structured blockMesh of 100 × 100 × 1 cells (10,000 total), with front and back patches set to empty, fluid properties ρ = 1.0 kg/m³ and ν = 1.0e-5 m²/s #ASSUMPTION(missing_Re_default_for_airlike_flow), a centered bottom fuel inlet box from (0.095 0.0 0.0) to (0.105 0.005 0.01) m (width 0.01 m, height 0.005 m) prescribing fuel vertical velocity Uy = 0.2 m/s (Ux=0, Uz=0), no-slip walls on the remaining solid boundaries, and an open top boundary with pressure outlet (p fixedValue 0, U zeroGradient); use startTime = 0 s, endTime = 3 s, target CFL = 0.5 with Δt = 0.005 s based on Δx = 0.002 m and U = 0.2 m/s, and write results every 0.1 s; include post-processing for residual histories, Courant number history, and centerline profiles, and Visualize velocity magnitude |U| (UMag) and pressure p contours on the z = 0.005 m mid-plane over the full domain at t = 0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field at each time, and export vertical centerline velocity Uy as separate CSV files along x = Lx/2 = 0.10 m at z = z_mid = 0.005 m (varying y) at t = 0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s.
+   - Run run_005: Please run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20 m × 0.01 m (Lx×Ly×Lz) with topology set to 2D (single cell in z, frontAndBack patches set to empty), using a structured blockMesh of 100×100×1 cells (10,000 total), fluid properties ρ=1.0 kg/m³ and ν=0.03 m²/s computed from Re=1 #ASSUMPTION(reason=Re not provided, ν=L×U/Re with L=0.03 m inlet width and U=0.2 m/s), a centered bottom fuel inlet patch defined by box (0.085 0.0 0.0) to (0.115 0.015 0.01) with fixed velocity U=(0 0.2 0) m/s and zeroGradient p, bottom wall outside inlet as no-slip wall with zeroGradient p, side walls as no-slip with zeroGradient p, and top boundary as pressure outlet p=fixedValue 0 Pa with zeroGradient U; set transient controls to startTime=0 s, endTime=3 s, deltaT=0.005 s from target CFL=0.5 using Δx=0.002 m and Umax=0.2 m/s, and writeInterval=0.1 s; include post-processing for residual history, Courant number history, and centerline analysis, and Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 m mid-plane over the full domain at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s with separate PNG files for each field and time, and export vertical velocity Uy along the geometric centerline x=Lx/2=0.10 m at z=0.005 m from y=0 to 0.20 m at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, and 3.00 s as separate CSV files.
+Total runs summarized for batch-level analysis: 5
+🔬 Enhanced cross-case comparative analysis enabled
+   📊 Analyzing 5 simulation configurations
+🖼️  Found 4 visualization images for cross-case analysis
+🖼️ Performing multimodal analysis with 4 images...
+   📸 Added image 1: sim_20260213_164231_8e3a44cc / run_002
+   📸 Added image 2: sim_20260213_164231_8e3a44cc / run_003
+   📸 Added image 3: sim_20260213_164231_8e3a44cc / run_004
+   📸 Added image 4: sim_20260213_164231_8e3a44cc / run_005
+✅ Multimodal cross-case analysis completed successfully!
+Saved batch analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/analysis_summary.txt
+
+🔎 Analyzing experiment: sim_20260213_164231_8e3a44cc with 5 run(s)
+   🧪 Run run_001: Please set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0....
+      ⚠️  Missing UMag timestep images (umag_t*.png)
+      ⚠️  Missing pressure timestep images (p_t*.png)
+      → Accuracy: 0.0/10, Matches: False, Viz statement clear: False
+      💾 Saved analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_001/analysis.txt
+      🔥 CRITICAL: Auto-rerun needed (accuracy=0.0/10)
+   🧪 Run run_002: Set up and run a 2D small pool fire-style flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.2...
+      📸 UMag images: 6, p images: 6
+      → Accuracy: 4.2/10, Matches: False, Viz statement clear: True
+      💾 Saved analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_002/analysis.txt
+      🔥 CRITICAL: Auto-rerun needed (accuracy=4.2/10)
+   🧪 Run run_003: Set up and run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam on a rectangular domain of 0.20 m × ...
+      📸 UMag images: 6, p images: 6
+      → Accuracy: 3.0/10, Matches: False, Viz statement clear: True
+      💾 Saved analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_003/analysis.txt
+      🔥 CRITICAL: Auto-rerun needed (accuracy=3.0/10)
+   🧪 Run run_004: Please set up and run a 2D small pool fire flow simulation for case fire_case_1, simulation sim_004, in a rectangular...
+      📸 UMag images: 6, p images: 6
+      → Accuracy: 3.0/10, Matches: False, Viz statement clear: True
+      💾 Saved analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_004/analysis.txt
+      🔥 CRITICAL: Auto-rerun needed (accuracy=3.0/10)
+   🧪 Run run_005: Please run a 2D small pool fire flow simulation in OpenFOAM using pimpleFoam in a rectangular domain of 0.20 m × 0.20...
+      📸 UMag images: 6, p images: 6
+      → Accuracy: 5.8/10, Matches: False, Viz statement clear: True
+      💾 Saved analysis to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/sim_20260213_164231_8e3a44cc/run_005/analysis.txt
+      ⚠️  Rerun recommended (accuracy=5.8/10)
+
+📋 Saved 1 rerun suggestions to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/rerun_suggestions.json
+
+🔥 Saved 4 critical auto-rerun cases to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/auto_rerun_cases.json
+
+======================================================================
+📊 COMPREHENSIVE STUDY ANALYSIS & RECOMMENDATIONS
+======================================================================
+
+🔬 Generating comprehensive study recommendations...
+📋 Saved JSON recommendations to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/study_recommendations.json
+📄 Saved readable recommendations to /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/study_recommendations.txt
+
+ Study recommendations generated successfully!
+Check study_recommendations.txt for detailed suggestions
+
+✅ Analysis completed successfully!
+📄 Analysis saved to: /home/zhangt20/clawd/cfd-scientist/data/experiments/batch_20260213_164231_8e3a44cc/analysis_summary.txt
+
+============================================================
+⚠️  Found 1 experiments that still need reruns
+============================================================
+
+1. sim_20260213_164231_8e3a44cc/run_005
+   Accuracy: 5.8/10
+   Issue: Major requirement-compliance issue is in visualization delivery and scripting. The requirement expli...
+
+============================================================
+
+Do you want to rerun these experiments now? (yes/no): 
+💡 To rerun later, use:
+   python src/main.py --rerun-batch batch_20260213_164231_8e3a44cc
