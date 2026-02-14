@@ -1,8 +1,34 @@
+# CFD-Scientist
+A Lifelong Agent for Closed-Loop CFD Experimentation with OpenFOAM
+
 ## Prerequisites
 
-1. **OpenFOAM**: Install OpenFOAM v10 or later
-2. **Python**: Python 3.8+ with conda/pip
-3. **Foam-Agent**: Clone and set up the Foam-Agent repository (required for simulation execution)
+### OpenFOAM
+CFDScientist requires OpenFOAM v10. Please follow the official installation guide for your operating system:
+
+- Official installation: [https://openfoam.org/version/10/](https://openfoam.org/version/10/)
+
+Verify your installation with:
+
+```bash
+echo $WM_PROJECT_DIR
+```
+
+The result should be something like:
+
+```text
+/opt/openfoam10
+```
+
+`WM_PROJECT_DIR` is an environment variable that comes with your OpenFOAM installation, indicating the location of OpenFOAM on your computer.
+
+### conda
+https://www.anaconda.com/docs/getting-started/miniconda/install
+
+For a Linux server:
+```bash
+wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O ./Miniconda3-latest-Linux-x86_64.sh
+```
 
 ## Installation
 
@@ -14,9 +40,8 @@ cd cfd-scientist
 
 2. **Set up Python environment:**
 ```bash
-conda create -n cfd-scientist python=3.9
-conda activate cfd-scientist
-pip install -r requirements.txt  
+conda env create --file environment.yml
+conda activate CFDScientist
 ```
 
 3. **Set up Foam-Agent dependency:**
@@ -27,49 +52,7 @@ git submodule update --init --recursive
 
 4. **Configure environment variables:**
 ```bash
-# Copy example environment file
-cp .env.example .env
-
-# Edit .env with your API keys
-export OPENAI_API_KEY=your_openai_api_key_here
-export ANTHROPIC_API_KEY=your_anthropic_key_here 
-export AWS_ACCESS_KEY_ID=your_aws_key           
-export AWS_SECRET_ACCESS_KEY=your_aws_secret       
-```
-
-## Quick Start
-
-### 1. Basic Experiment Run
-```bash
-# Run with default settings (manual rerun prompts)
-python src/main.py
-
-# Run with automatic reruns for failed experiments
-python src/main.py --auto-rerun
-
-# Skip analysis phase
-python src/main.py --skip-analysis
-```
-
-### 2. Advanced Usage
-```bash
-# Rerun specific batch
-python src/main.py --rerun-batch batch_20251216_140000_abc123
-
-# Auto-execute study recommendations
-python src/main.py --auto-execute-recommendations
-
-# Custom rerun threshold and max iterations
-python src/main.py --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3
-```
-
-### 3. Analysis and Paper Generation
-```bash
-# Generate research paper from experiment batch
-python src/latexpaper.py --batch batch_20251216_140000_abc123
-
-# Run only analysis agent on existing results
-python agents/analysis_ag.py --batch batch_20251216_140000_abc123
+export OPENAI_API_KEY=your_openai_api_key_here # for embedding in FoamAgent  
 ```
 
 ## Configuration
@@ -100,6 +83,44 @@ Edit `prompts/prompts.yaml` to customize:
 - Agent behavior and prompting strategies
 - Validation criteria for physics parameters
 - Analysis evaluation metrics
+
+## Quick Start
+
+### 1. Basic Experiment Run
+```bash
+# Run with default settings (manual rerun prompts)
+python src/main.py
+
+# Run with automatic retries (analysis → rerun low-scoring cases → re-analyze)
+python src/main.py --auto-rerun
+
+# Control retry behavior (threshold + max retry iterations)
+python src/main.py --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3
+
+# Skip analysis phase
+python src/main.py --skip-analysis
+```
+
+### 2. Advanced Usage
+```bash
+# Rerun a specific batch later (uses <batch>/rerun_suggestions.json)
+python src/main.py --rerun-batch batch_20251216_140000_abc123
+
+# Auto-execute study recommendations
+python src/main.py --auto-execute-recommendations
+
+# Analyze an existing batch with automatic retries
+python agents/analysis_ag.py --batch batch_20251216_140000_abc123 --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3
+```
+
+### 3. Analysis and Paper Generation
+```bash
+# Generate research paper from experiment batch
+python src/latexpaper.py --batch batch_20251216_140000_abc123
+
+# Run analysis agent on existing results (no retries)
+python agents/analysis_ag.py --batch batch_20251216_140000_abc123
+```
 
 ## Workflow Overview
 

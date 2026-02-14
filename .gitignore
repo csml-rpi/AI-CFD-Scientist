@@ -4,6 +4,7 @@ __pycache__/
 
 # Local runs / data artifacts
 data/
+*.log
 
 # IDE
 .vscode/

@@ -1002,8 +1002,8 @@ def _execute_study_recommendations(batch_dir: Path):
     
     print(f"🎯 Found {len(high_priority_experiments)} high priority experiments to execute")
     
-    project_root = batch_dir.parent.parent  # Go up from data/experiments to project root
-    foam_bench = project_root / "Foam-Agent" / "foambench_main.py"
+    project_root = _project_root
+    foam_bench = (project_root / "Foam-Agent" / "foambench_main.py").resolve()
     
     if not foam_bench.exists():
         print(f"❌ Error: Foam-Agent not found at {foam_bench}. Cannot execute recommendations.")
@@ -1683,8 +1683,8 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
     import shutil
     from datetime import datetime
     
-    project_root = batch_dir.parent.parent  # Go up from data/experiments to project root
-    foam_bench = project_root / "Foam-Agent" / "foambench_main.py"
+    project_root = _project_root
+    foam_bench = (project_root / "Foam-Agent" / "foambench_main.py").resolve()
     
     if not foam_bench.exists():
         print(f"❌ Error: Foam-Agent not found at {foam_bench}. Cannot perform automatic reruns.")
