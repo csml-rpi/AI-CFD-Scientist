@@ -20,7 +20,20 @@ import os
 import textwrap
 import base64
 import re
+from io import BytesIO
 from typing import Optional
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+
+    _PIL_AVAILABLE = True
+    _PIL_IMPORT_ERROR = None
+except Exception as _e:
+    Image = None  # type: ignore
+    ImageDraw = None  # type: ignore
+    ImageFont = None  # type: ignore
+    _PIL_AVAILABLE = False
+    _PIL_IMPORT_ERROR = _e
 
 # Ensure project root is on sys.path for absolute imports BEFORE importing project modules
 import sys as _sys
@@ -61,6 +74,91 @@ def read_text_safe(p: Path, max_chars: int = MAX_SNIPPET_CHARS) -> str:
         return s
     except Exception as e:
         return f"[Error reading {p}: {e}]"
+
+
+def _make_montage_jpeg_bytes(
+    timestep_images: list,
+    *,
+    ncols: int = 3,
+    tile_w: int = 384,
+    tile_h: int = 384,
+    pad: int = 6,
+    label: bool = True,
+) -> Optional[bytes]:
+    """Create a JPEG montage from a list of timestep image dicts.
+
+    Each timestep_images entry should have keys like: base64, t, path.
+    Montage layout is time-order left-to-right, top-to-bottom.
+    """
+    if not timestep_images:
+        return None
+    if not _PIL_AVAILABLE:
+        return None
+
+    # Decode and load images
+    loaded = []
+    for d in timestep_images:
+        try:
+            raw = base64.b64decode(d.get("base64", "") or "")
+            if not raw:
+                continue
+            im = Image.open(BytesIO(raw)).convert("RGB")
+            im = im.resize((tile_w, tile_h))
+            loaded.append((d, im))
+        except Exception:
+            continue
+
+    if not loaded:
+        return None
+
+    n = len(loaded)
+    ncols = max(1, int(ncols))
+    nrows = (n + ncols - 1) // ncols
+
+    W = ncols * tile_w + (ncols + 1) * pad
+    H = nrows * tile_h + (nrows + 1) * pad
+
+    canvas = Image.new("RGB", (W, H), (255, 255, 255))
+
+    font = None
+    if label:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+
+    for idx, (d, im) in enumerate(loaded):
+        r = idx // ncols
+        c = idx % ncols
+        x0 = pad + c * (tile_w + pad)
+        y0 = pad + r * (tile_h + pad)
+        canvas.paste(im, (x0, y0))
+
+        if label:
+            try:
+                draw = ImageDraw.Draw(canvas)
+                t = d.get("t")
+                tstr = f"t={float(t):.2f}s" if t is not None else "t=?"
+                name = Path(d.get("path", "")).name if d.get("path") else ""
+                txt = f"{tstr} {name}".strip()
+                # Draw a white box behind text for readability
+                if font:
+                    bbox = draw.textbbox((0, 0), txt, font=font)
+                    tw = bbox[2] - bbox[0]
+                    th = bbox[3] - bbox[1]
+                else:
+                    tw, th = (len(txt) * 6, 12)
+                draw.rectangle([x0 + 4, y0 + 4, x0 + 8 + tw, y0 + 8 + th], fill=(255, 255, 255))
+                draw.text((x0 + 6, y0 + 6), txt, fill=(0, 0, 0), font=font)
+            except Exception:
+                pass
+
+    buf = BytesIO()
+    try:
+        canvas.save(buf, format="JPEG", quality=82, optimize=True)
+    except Exception:
+        canvas.save(buf, format="JPEG", quality=82)
+    return buf.getvalue()
 
 
 def choose_batch(base_dir: Path, batch_name: Optional[str]) -> Optional[Path]:
@@ -1392,7 +1490,7 @@ def _analyze_and_collect_rerun_suggestions(
                 img_index_block = "\nIMAGES PROVIDED (order):\n" + "\n".join(lines) + "\n"
 
             image_instruction = ""
-            if timestep_umag and timestep_p:
+            if timestep_umag:
                 def _order(xs):
                     return sorted(
                         xs,
@@ -1404,32 +1502,27 @@ def _analyze_and_collect_rerun_suggestions(
                     )
 
                 ordered_umag = _order(timestep_umag)
-                ordered_p = _order(timestep_p)
+                ordered_p = _order(timestep_p) if timestep_p else []
 
-                print(f"      📸 UMag images: {len(ordered_umag)}, p images: {len(ordered_p)}")
+                print(f"      📸 UMag images: {len(ordered_umag)} (pressure images ignored: {len(ordered_p)})")
 
                 image_instruction = (
-                    "\n\n🖼️ CRITICAL: MULTIPLE VISUALIZATION IMAGES ARE PROVIDED for the SAME run at multiple times.\n"
-                    "You are given two fields at matching times:\n"
-                    "  - UMag (|U|) contours\n"
-                    "  - pressure p contours\n\n"
-                    "CAREFULLY ANALYZE ALL IMAGES TOGETHER:\n"
-                    "1. Requirement matching:\n"
-                    "   - Are both requested fields present (UMag and p) at the requested times?\n"
-                    "   - Are slice/plane and domain consistent with the requirement?\n"
-                    "2. Temporal behavior (within each field):\n"
+                    "\n\n🖼️ CRITICAL: MULTIPLE VELOCITY VISUALIZATION IMAGES ARE PROVIDED for the SAME run at multiple times.\n"
+                    "You are given ONLY UMag (|U|) contours at multiple times.\n"
+                    "Pressure images may exist on disk but are intentionally EXCLUDED from this analysis.\n\n"
+                    "NOTE ON INPUT FORMAT:\n"
+                    "- The UMag frames may be provided as ONE montage image (time order left→right, top→bottom).\n"
+                    "- The same UMag montage may be sent twice (duplicate).\n\n"
+                    "CAREFULLY ANALYZE ALL PROVIDED VELOCITY IMAGES:\n"
+                    "1. Requirement matching (velocity-only):\n"
+                    "   - Do the velocity images correspond to the requested times and slice/plane?\n"
+                    "2. Temporal behavior:\n"
                     "   - Does UMag evolve smoothly over time without obvious numerical blow-up or artifacts?\n"
-                    "   - Does p evolve consistently (no unphysical jumps between frames)?\n"
-                    "3. Cross-field consistency:\n"
-                    "   - Are high-|U| regions consistent with expected pressure gradients near inlet/outlet?\n"
-                    "4. Quality indicators:\n"
+                    "3. Quality indicators:\n"
                     "   - Signs of instability, excessive diffusion, checkerboarding, or mesh imprinting.\n\n"
                 )
             else:
-                if not timestep_umag:
-                    print("      ⚠️  Missing UMag timestep images (umag_t*.png)")
-                if not timestep_p:
-                    print("      ⚠️  Missing pressure timestep images (p_t*.png)")
+                print("      ⚠️  Missing UMag timestep images (umag_t*.png)")
             
             analysis_prompt = (
                 f"Analyze this CFD simulation run and determine if it matches the user requirement.\n\n"
@@ -1443,6 +1536,7 @@ def _analyze_and_collect_rerun_suggestions(
                 f"- If the visualization statement is unclear or missing, add it to your proposed requirement\n"
                 f"- If geometry, mesh, or physics parameters are wrong, specify exact corrections\n"
                 f"- Be specific about boundary conditions, domain size, mesh resolution, and any key parameters\n"
+                f"- IMPORTANT FOR THIS EVALUATION: ignore pressure outputs (p images/fields). Do NOT penalize missing/incorrect pressure visualizations.\n"
                 f"{img_index_block}{image_instruction}\n"
                 f"IF ANY ISSUES ARE FOUND:\n"
                 f"- Set 'accurate' to false if significant problems exist\n"
@@ -1468,23 +1562,16 @@ def _analyze_and_collect_rerun_suggestions(
                 f"OUTPUT FILES (sample): {out_list}\n"
             )
             
+            # User request: ignore pressure during analysis (do not require or send p images).
             missing_umag = not bool(timestep_umag)
-            missing_p = not bool(timestep_p)
-            if missing_umag or missing_p:
+            if missing_umag:
                 # Missing evaluator artifacts: treat as non-evaluable.
                 # To keep existing rerun machinery working, propose rerunning with the same requirement.
-                missing_parts = []
-                if missing_umag:
-                    missing_parts.append("umag_t*.png")
-                if missing_p:
-                    missing_parts.append("p_t*.png")
-                missing_str = ", ".join(missing_parts)
-
                 stub = {
-                    "analysis": f"Missing timestep visualization images ({missing_str}). Run is not evaluable.",
+                    "analysis": "Missing timestep velocity visualization images (umag_t*.png). Run is not evaluable.",
                     "accurate": False,
                     "accuracy": 0,
-                    "explanation": f"Required timestep images were not found: {missing_str}. Ensure deterministic postprocess runs and produces both UMag and p time-stamped PNG outputs.",
+                    "explanation": "Required UMag timestep images were not found: umag_t*.png. Ensure deterministic postprocess runs and produces UMag time-stamped PNG outputs.",
                     "visualization_matches_requirement": False,
                     "visualization_statement_clear": False,
                     "proposed_user_requirement": ur or None,
@@ -1492,9 +1579,9 @@ def _analyze_and_collect_rerun_suggestions(
                 response_text = "```json\n" + json.dumps(stub, indent=2) + "\n```"
             else:
                 try:
-                    # If timestep images are available and using Bedrock, send ONE multimodal call with ALL images.
-                    # Ordering: all UMag images (sorted by time) then all p images (sorted by time).
-                    if "bedrock" in str(type(client)).lower():
+                    # If timestep images are available and using Bedrock, send ONE multimodal call.
+                    # User request: only send velocity (UMag) as a montage duplicated twice; exclude pressure.
+                    if hasattr(client, "converse"):  # Bedrock boto3 client
                         def _order(xs):
                             return sorted(
                                 xs,
@@ -1505,26 +1592,51 @@ def _analyze_and_collect_rerun_suggestions(
                                 ),
                             )
 
-                        ordered_imgs = _order(timestep_umag) + _order(timestep_p)
+                        ordered_umag = _order(timestep_umag)
+                        ordered_p = _order(timestep_p) if timestep_p else []
 
                         content = []
                         bad = 0
-                        for d in ordered_imgs:
-                            try:
-                                img_bytes = base64.b64decode(d.get("base64", "") or "")
-                            except Exception:
-                                img_bytes = None
-                            if not img_bytes:
-                                bad += 1
-                                continue
-                            content.append(
-                                {
-                                    "image": {
-                                        "format": d.get("format", "png"),
-                                        "source": {"bytes": img_bytes},
+
+                        # User request: exclude pressure from Claude context.
+                        # Combine velocity images into a single montage and send the SAME montage twice.
+                        umag_montage = _make_montage_jpeg_bytes(ordered_umag)
+
+                        if umag_montage:
+                            for _ in range(2):
+                                content.append(
+                                    {
+                                        "image": {
+                                            "format": "jpeg",
+                                            "source": {"bytes": umag_montage},
+                                        }
                                     }
-                                }
-                            )
+                                )
+                        else:
+                            # Fallback: send a single representative UMag frame twice.
+                            rep = ordered_umag[-1] if ordered_umag else None
+                            img_bytes = None
+                            if rep:
+                                try:
+                                    img_bytes = base64.b64decode(rep.get("base64", "") or "")
+                                except Exception:
+                                    img_bytes = None
+                            if img_bytes:
+                                for _ in range(2):
+                                    content.append(
+                                        {
+                                            "image": {
+                                                "format": rep.get("format", "png"),
+                                                "source": {"bytes": img_bytes},
+                                            }
+                                        }
+                                    )
+                            else:
+                                bad += len(ordered_umag)
+
+                        # Intentionally DO NOT send pressure frames.
+                        if ordered_p:
+                            print(f"      ℹ️  Not sending {len(ordered_p)} pressure image(s) (excluded by config)")
 
                         # Append the text prompt last so the model sees the images first.
                         content.append({"text": analysis_prompt})
@@ -1542,7 +1654,14 @@ def _analyze_and_collect_rerun_suggestions(
                         else:
                             if bad:
                                 print(f"      ⚠️  Skipped {bad} timestep image(s) due to invalid base64")
-                            print(f"Processing {len(content)-1} timestep image(s) (UMag+p) in one LLM call...")
+                            if umag_montage:
+                                print(
+                                    f"Processing {len(content)-1} image(s) in one LLM call (UMag montage duplicated; pressure excluded)..."
+                                )
+                            else:
+                                print(
+                                    f"Processing {len(content)-1} image(s) in one LLM call (single UMag frame duplicated; pressure excluded)..."
+                                )
 
                             messages = [{"role": "user", "content": content}]
                             response = client.converse(
@@ -1626,8 +1745,9 @@ def _analyze_and_collect_rerun_suggestions(
             except Exception as e:
                 print(f"      ⚠️  Failed to write analysis: {e}")
 
-            # Check if rerun is needed - missing evaluator artifacts always triggers rerun.
-            missing_artifacts = (not bool(timestep_umag)) or (not bool(timestep_p))
+            # Check if rerun is needed - missing velocity artifacts always triggers rerun.
+            # User request: ignore pressure during analysis.
+            missing_artifacts = (not bool(timestep_umag))
             should_rerun = missing_artifacts or ((accuracy < rerun_threshold) and isinstance(proposed, str) and proposed.strip())
             
             # Additional check for critical visualization issues 
