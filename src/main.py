@@ -60,7 +60,7 @@ def run_foam(user_requirement: str, show_output: bool = False, run_index: int = 
     # Ensure all paths are absolute and exist
     src_dir = Path(__file__).parent.resolve()
     project_root = src_dir.parent.resolve()
-    foam_bench = project_root / "Foam-Agent" / "foambench_main.py"
+    foam_bench = Path("/home/zhangt20/clawd/cfd-scientist/Foam-Agent/foambench_main.py")
     
     # Verify Foam-Agent exists
     if not foam_bench.exists():
