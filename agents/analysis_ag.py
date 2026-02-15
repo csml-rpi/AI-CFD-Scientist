@@ -1772,8 +1772,8 @@ Images provided (time order):
 {images_index}
 
 Task:
-- Decide whether this run did what the user requested.
-- Evaluate only against what the user requirement explicitly requests. Do not require extra deliverables.
+- Decide whether this run did what the user requested, but evaluate only the log health + image-based deliverables.
+- Ignore non-image exports even if the requirement mentions them (e.g., CSV profiles). Do not mention them.
 - Set "visualization_matches_requirement" based only on the visualization portion (the provided images vs requested visualizations).
 - Pressure images may be provided even if the requirement does not mention pressure; do not penalize the run for extra images.
   If pressure is explicitly requested and pressure images are missing, that is an issue.
@@ -1890,6 +1890,15 @@ Return strict JSON between ```json and ```:
             # Avoid auto-rerun for log failures; those often require template/config fixes.
             can_auto = (log_status == "ok") and (not missing_umag)
 
+            updated_requirement = proposed
+            if should_rerun and not (isinstance(updated_requirement, str) and updated_requirement.strip()):
+                updated_requirement = _synthesize_updated_requirement(
+                    original_requirement=ur,
+                    action_items=merged_items,
+                    log_evidence=log_evidence,
+                    log_status=log_status,
+                )
+
             decision = {
                 "experiment": exp_name,
                 "run": run_name,
@@ -1904,7 +1913,7 @@ Return strict JSON between ```json and ```:
                 "visualization_matches_requirement": viz_matches,
                 "visualization_statement_clear": viz_statement_clear,
                 "original_requirement": ur,
-                "updated_requirement": proposed,
+                "updated_requirement": updated_requirement,
                 "evidence_files": {
                     "umag_images": [x.get("path") for x in ordered_umag],
                     "p_images": [x.get("path") for x in ordered_p],
@@ -1964,6 +1973,47 @@ Return strict JSON between ```json and ```:
         print("\nNo reruns needed")
 
     return rerun_suggestions, auto_rerun_cases
+
+def _synthesize_updated_requirement(original_requirement: str, action_items: list, log_evidence: list, log_status: str) -> str:
+    """Build an 'updated requirement' prompt for reruns when the LLM didn't propose one.
+
+    We keep the original user requirement verbatim, and append a small, explicit
+    "RERUN FIXES" section derived from action_items/log evidence.
+    """
+    original_requirement = (original_requirement or "").rstrip()
+    items = [str(x).strip() for x in (action_items or []) if str(x).strip()]
+
+    # Add deterministic hints from common OpenFOAM fatal patterns.
+    try:
+        import re as _re
+        for ln in (log_evidence or []):
+            if not isinstance(ln, str):
+                continue
+            m = _re.search(r"keyword\s+(\S+)\s+is undefined in dictionary\s+\"([^\"]+)\"", ln)
+            if m:
+                key = m.group(1)
+                dct = m.group(2)
+                if key and key not in " ".join(items):
+                    items.insert(0, f"Fix OpenFOAM dictionary error: add missing keyword '{key}' in {dct} (the run is failing at startup).")
+    except Exception:
+        pass
+
+    if not items:
+        items = [
+            "Fix the startup/fatal errors shown in the OpenFOAM log, then rerun the case to completion (EndTime reached).",
+            "Regenerate the required visualization images (umag_t*.png, p_t*.png) after a successful run."
+        ]
+
+    lines = []
+    lines.append(original_requirement)
+    lines.append("")
+    lines.append("RERUN FIXES (must be applied before running):")
+    lines.append(f"- Log status: {log_status}")
+    for it in items:
+        # keep bullets single-line to reduce prompt noise
+        lines.append(f"- {it}")
+    return "\n".join(lines).strip() + "\n"
+
 
 def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
     """

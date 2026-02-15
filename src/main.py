@@ -250,13 +250,16 @@ def rerun_failed_experiments(batch_name: str, analyze_after: bool = False):
         exp_name = suggestion['experiment']
         run_name = suggestion['run']
         original_req = suggestion['original_requirement']
-        updated_req = suggestion['updated_requirement']
+        updated_req = suggestion.get('updated_requirement') or original_req
         accuracy = suggestion['accuracy']
         
         print(f"\n[{idx}/{len(rerun_suggestions)}] Rerunning: {exp_name}/{run_name}")
         print(f"   Original accuracy: {accuracy:.1f}/10")
-        print(f"   Original requirement: {original_req[:100]}...")
-        print(f"   Updated requirement: {updated_req[:100]}...")
+        print(f"   Original requirement: {str(original_req)[:100]}...")
+        if suggestion.get('updated_requirement'):
+            print(f"   Updated requirement: {str(updated_req)[:100]}...")
+        else:
+            print(f"   Updated requirement: <missing; using original requirement>")
         
         # Use the experiment directory for this specific experiment
         exp_dir = batch_dir / exp_name
@@ -942,7 +945,6 @@ def main():
         'analysis_completed': analysis_text is not None,
         'rerun_suggestions_count': len(rerun_suggestions) if rerun_suggestions else 0
     } 
-
 
 if __name__ == "__main__":
     main()

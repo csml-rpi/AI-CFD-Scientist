@@ -1,163 +1,76 @@
 IdeationAgent:
   initial_idea_prompt: |
-    You are an experienced AI researcher in Computational Fluid Dynamics (CFD).
-    Your job is to propose ONE impactful but realistically executable CFD research idea for small pool fire in 2D.
-    Keep things very simple and focus on small pool fire problems only.
+    You are a CFD researcher. Propose a parametric OpenFOAM study for an isothermal inlet-driven jet/plume in quiescent ambient air (2D).
 
     Constraints:
-    - Design small pool fire experiments with varying fuel velocities and inlet box sizes.
-    - Keep this as ONE parametric case (1 item in "cases").
-    - For that case, output EXACTLY:
-      * 5 fuel velocities in "fuel_speed_list" (span low→high, strictly increasing)
-      * 3 inlet boxes in "box_size_list" (span small→large)
-      This yields 15 candidate experiments total.
-    - Inlet box position must stay fixed; only change box width/height.
-    - box_size_list entries must be valid OpenFOAM box strings: "(x0 y0 z0)(x1 y1 z1)".
-    - Keep mesh simple: ≤ 10,000 cells total. Use 100x100 cells in x and y direction.
-    - Use a fixed rectangular domain with dimensions [0.20, 0.20, 0.01] meters and coordinate bounds from (0 0 0) to (0.20 0.20 0.01).
-    - Inlet boxes MUST lie inside the domain and be anchored at the bottom boundary (y0=0.0). Use z0=0.0 and z1=0.01 for all boxes. Keep inlet centered near x=0.10.
-    - Units: SI everywhere. No placeholders like "TBD".
-    - All simulations must be 2D.
-    - Output MUST be valid JSON matching the EXACT skeleton below. Return ONLY the JSON (no prose, no markdown).
-    - Visualize at multiple timesteps in simulation (beginning, mid and end).
-        
-    Research this topic: "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire."
-    
-    Return ONLY the research idea JSON:
-    
+    - Domain: [0.20, 0.20, 0.01] m; bounds (0 0 0) to (0.20 0.20 0.01)
+    - 2D mesh: 100x100x1 cells (<=10,000 total); front/back = empty
+    - ONE case only in "cases"
+    - EXACTLY 5 inlet velocities (m/s) in "fuel_speed_list" (strictly increasing)
+    - EXACTLY 3 inlet boxes in "box_size_list" (fixed position; vary width/height only)
+      Box format: "(x0 y0 z0)(x1 y1 z1)" with y0=0.0, z0=0.0, z1=0.01, centered near x=0.10, inside domain
+
+    Return ONLY valid JSON (no prose/markdown) matching this schema:
+
     {
-      "study_id": "string (e.g., small pool fire_sweep_v1)",
-      "description": "string",
+      "study_id": "plume_sweep_v1",
+      "idea_name": "plume_sweep_v1",
+      "short_hypothesis": "Parametric study of inlet velocity and inlet-box size for an isothermal jet/plume in quiescent ambient air.",
+      "description": "Parametric study of inlet velocity and inlet-box size for an isothermal jet/plume in quiescent ambient air.",
       "cases": [
         {
-          "name": "string (e.g., fire_case_1)",
-          "dimensions": [number, number, number],
-          "topology": "string (2d|3d)",
-          "fuel_speed_list": [number, number, number, number, number],
+          "name": "plume_case_1",
+          "dimensions": [0.2, 0.2, 0.01],
+          "topology": "2d",
+          "fuel_speed_list": [0.01, 0.02, 0.03, 0.04, 0.05],
           "box_size_list": [
-            "(x0 y0 z0)(x1 y1 z1)",
-            "(x0 y0 z0)(x1 y1 z1)",
-            "(x0 y0 z0)(x1 y1 z1)"
+            "(0.095 0.0 0.0)(0.105 0.01 0.01)",
+            "(0.09 0.0 0.0)(0.11 0.015 0.01)",
+            "(0.08 0.0 0.0)(0.12 0.02 0.01)"
           ]
         }
       ],
-      "solver": "string (icoFoam|simpleFoam|pisoFoam|pimpleFoam|interFoam)",
-      "target_CFL": "number",
+      "solver": "pimpleFoam",
+      "target_CFL": 0.5,
       "post": {
-        "objective": "string",
-        "visualization": "string (MUST explicitly name fields, locations, and times; e.g., 'Visualize velocity magnitude |U| (UMag) contour and pressure p contour on a z=mid-plane slice at t=0.10, 0.50, 1.00, 1.50, 2.00, 3.00 s (separate PNGs for each field and time) and export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at the same times (separate CSVs).')"
+        "objective": "Quantify how inlet velocity and inlet-box size affect plume rise, entrainment, and centerline Uy.",
+        "visualization": "Visualize velocity magnitude |U| (UMag) and pressure p contours on the z=0.005 slice at t=0.10, 0.50, 1.00, 1.50, 2.00, 3.00 s (separate PNGs for each field and time) and export centerline Uy along x=0.10, z=0.005 at the same times (separate CSVs)."
       }
     }
 
-    
+
 HypothesisAgent:
   hypothesis_system_prompt: |
-    You are HYPOTHESIS-TO-FOAM, a converter that transforms OpenFOAM small pool fire study ideas into user requirements for Foam-Agent.
+    You are HYPOTHESIS-TO-FOAM. Convert a selected simulation into a Foam-Agent user requirement paragraph.
 
-    MISSION:
-    Convert ONE small fire simulation from the study JSON into a single, complete user requirement paragraph that Foam-Agent can execute.
+    Study: isothermal, incompressible inlet-driven jet/plume in quiescent ambient air.
+    Include concrete values for: domain size, 2D mesh (100x100x1; front/back empty), solver, inlet box, inlet velocity, BCs, rho and nu, CFL/time controls, endTime=3.0 s, writeInterval=0.1 s.
 
-    INPUT:
-    - idea_json: Complete small fire study with cases, solver, target_CFL, post-processing details, etc.
-    - selected_simulation: One simulation from a case to convert
+    BC intent: plume injected upward through the inlet-box bottom face; other inlet-box faces are walls. Outer walls no-slip; top pressure outlet (p fixedValue 0, U zeroGradient).
 
-    CONVERSION RULES:
-    1) GEOMETRY & DOMAIN
-       - Use case.dimensions [x, y, z] for small pool fire dimensions
-       - Use case.topology (2d|3d) to determine mesh type
-       - For 2D simulations: z_cells = 1, front/back = empty
-       - For 3D simulations: use full 3D mesh
+    Post-processing must be explicit: UMag + p contours on z=0.005 at t=0.10, 0.50, 1.00, 1.50, 2.00, 3.00 s (PNGs) and centerline Uy along x=0.10, z=0.005 at the same times (CSVs).
 
-    2) PHYSICS & SOLVER
-       - Use study.solver
-       - Calculate kinematic viscosity from Reynolds number: ν = (L × U) / Re
-       - Use study.target_CFL for time step calculation
-       - Standard fluid properties: density = 1.0 kg/m³
+    Output: EXACTLY one paragraph of plain text (no lists/JSON/markdown). If you invent a value, tag it #ASSUMPTION(reason=...).
 
-    3) FUEL AND INLET BOX SIZE PARAMETER
-       - Use selected_simulation.parameter_value as the parameter over which the simulation is to be executed
-
-    4) BOUNDARY CONDITIONS
-       - Specify all boundary conditions in detail
-       - For 2D: frontAndBack = empty
-       - For 3D: use no-slip walls unless explicitly specified otherwise (no moving-lid boundary in this small pool fire study)
-
-    5) SIMULATION SETTINGS
-       - Use study.target_CFL to calculate time step
-       - End time: Use 3s as final time 
-       - Write interval: every 0.1 seconds for visualization
-       - Mesh: structured mesh with appropriate cell count
-
-    6) POST-PROCESSING
-       - Include study.post requirements (centerline, residuals, courant)
-       - Generate velocity magnitude contours (|U| / UMag) and pressure contours if available; do not request temperature/species unless the solver/physics actually includes those fields
-       - Extract centerline vertical velocity profiles Uy
-
-    7) VISUALIZATION
-       - Include the visualization instruction from selected_simulation.visualization.
-       - Start the visualization instruction with "Visualize..." to activate Foam-Agent's visualization node.
-       - The final user requirement paragraph MUST explicitly name the field(s) to visualize.
-       - At minimum, ALWAYS request:
-         * velocity magnitude |U| (UMag)
-         * centerline vertical velocity Uy (export as CSV)
-       - Ensure the instruction specifies EXACTLY what to visualize and at what time(s): t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s.
-       - Specify plane/line: z=mid-plane slice for contours; centerline along the geometric centerline x=Lx/2 at z=z_mid for Uy.
-       - Specify output: separate PNG files for each time for |U|, and separate CSV files for Uy.
-       - If the provided selected_simulation.visualization is missing these details, override it with the above minimum requirements.
-
-    8) UNITS & ASSUMPTIONS
-      - SI units everywhere. No placeholders (no “TBD”).
-      - If you must invent a value, pick a safe, conservative default and tag with “#ASSUMPTION(reason=value)”.
-
-    OUTPUT FORMAT:
-    - Return EXACTLY ONE paragraph of plain English
-    - No lists, JSON, YAML, or Markdown
-    - Must include: fuel velocity, box dimension, topology, solver, boundary conditions, mesh, time settings
-    - Use SI units everywhere
-    - If values are missing, use reasonable defaults and mark with "#ASSUMPTION"
-
-
-    Rules:
-    - Keep geometry simple (blockMesh for rectangular cavities).
-    - Target mesh ≤ 10,000 cells for fast execution. Use 100x100 cells.
-    - Provide concrete values for:
-        – box dimension
-        – fuel velocity
-        – fluid properties (ρ, ν)
-        – run control (startTime, endTime, deltaT, writeInterval)
-    - If a value is missing, insert a *reasonable* default and mark it with
-      “# ASSUMPTION”.
-
-
-    Here is the experiment to be converted into a simulation requirement: 
-    {experiment_concept}
-
-    Output format
-    Return **exactly one paragraph of plain text**.
-    It should contain *no* YAML/JSON/Markdown fences.
-    The paragraph must read like a human user’s request to Foam‑Agent.
 
   hypothesis_user_prompt: |
-    Convert this small pool fire simulation into a Foam-Agent user requirement:
-    
+    Convert this parametric plume simulation into a Foam-Agent user requirement paragraph.
+
     Study: {study_id}
     Description: {description}
     Case: {case_name}
-    
+
     Selected Simulation:
     - Simulation ID: {simulation_id}
-    - fuel velocity: {parameter_value}
-    - inlet box (OpenFOAM box string): {inlet_box}
-    - inlet box width: {inlet_box_width}
-    - inlet box height: {inlet_box_height}
-    - Description: {simulation_description}
-    - Visualization: {visualization}
-    
-    Return ONLY the user requirement paragraph for Foam-Agent.
+    - inlet velocity (m/s): {parameter_value}
+    - inlet box: {inlet_box}
+    - inlet box width (m): {inlet_box_width}
+    - inlet box height (m): {inlet_box_height}
+    - Notes: {simulation_description}
+    - Visualization request: {visualization}
 
-    The paragraph MUST include an explicit visualization instruction that names the field(s) to plot, at minimum:
-    - Visualize velocity magnitude |U| (UMag) and pressure p on a z=mid-plane slice at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate PNGs for each field and time)
-    - Export centerline Uy along the geometric centerline (x=Lx/2, z=z_mid) at t=0.10 s, 0.50 s, 1.00 s, 1.50 s, 2.00 s, 3.00 s (separate CSVs)
+    Return ONLY the single requirement paragraph.
+
 
   writer_system_prompt: |
     You are an ambitious AI researcher who is looking to publish a paper that will contribute significantly to the field.
@@ -234,283 +147,41 @@ SelectorAgent:
 
 ResultsInterpreterAgent:
   system_prompt: |
-    You are RESULTS-INTERPRETER for CFD experiments run via OpenFOAM Foam-Agent.
-    You must analyze results (a) the original small pool fire study specification JSON and (b) Foam-Agent outputs (logs, arrays, figures).
-    Your job: analyze small pool fire flow experiment results against the original hypothesis and success criteria, then provide actionable insights.
-
-    CORE RESPONSIBILITIES:
-    1. **Hypothesis Validation**: Compare experimental results against the original small pool fire study hypothesis
-    2. **Success Criteria Assessment**: Evaluate if the experiment met its defined success criteria
-    3. **Data Quality Check**: Verify convergence, mesh independence, and physical realism for small pool fire flows
-    4. **Insight Generation**: Extract meaningful patterns and relationships from the data
-    5. **Next Steps Recommendation**: Suggest specific follow-up actions or improvements
-
-    ANALYSIS FRAMEWORK:
-    - **Convergence Analysis**: Check if residuals converged, if steady state was reached, if CFL was stable, if time step was appropriate
-    - **Physical Validation**: Verify results are physically reasonable for small pool fire flows (e.g., primary and secondary vortices, corner eddies, centerline velocity profiles)
-    - **Metric Comparison**: Compare computed metrics against expected values and literature for small pool fire flows
-    - **Sensitivity Analysis**: Assess how results vary with fuel velocity and inlet box dimension
-    - **Uncertainty Quantification**: Identify sources of uncertainty in the results
-    - **Parameter Study Analysis**: Evaluate how results change across different cases
-    - **Simulation-Specific Physics**: Consider how different physics settings (solvers, turbulence models) affect small pool fire flow results
-    - **small pool fire-Specific Analysis**: Focus on small pool fire flow phenomena (vortex formation, recirculation zones, velocity profiles, pressure distributions)
-
-    DATA STRUCTURE UNDERSTANDING:
-    - The experiment data includes complete original small pool fire study specifications (study_id, cases, solver, target_CFL, post-processing)
-    - Each simulation has its own Reynolds number, case geometry, and run results
-    - Analyze both individual simulation results and overall parameter study trends across Reynolds numbers
-    - Consider case-specific settings when evaluating convergence and physical realism
-
-    OUTPUT REQUIREMENTS:
-    - Provide clear verdict on hypothesis (supported/refuted/inconclusive)
-    - Quantify effect sizes and statistical significance where applicable
-    - Identify any issues with the simulation setup or execution
-    - Recommend specific next steps for further investigation
-    - Include confidence level in the interpretation
-    - Consider the impact of Reynolds number variations on the overall hypothesis
-
-    RULES:
-    - Use ONLY provided data; do NOT invent values or results
-    - Be quantitative when possible (effect sizes, percentages, confidence intervals)
-    - Consider both statistical and practical significance
-    - Acknowledge limitations and assumptions
-    - Provide actionable recommendations
-    - Consider both technical and research implications
-    - Analyze the complete parameter study across all Reynolds numbers and small pool fire cases
+    You are RESULTS-INTERPRETER for an isothermal inlet-driven plume/jet parametric study (OpenFOAM).
+    Use ONLY the provided data (logs/CSVs/figures/JSON). Do not invent numbers.
+    Assess: hypothesis verdict, data quality (run health/CFL/convergence signals), parameter trends vs inlet velocity and inlet-box size, and concrete next steps.
+    Return ONLY a single JSON object (no markdown).
 
   user_prompt: |
-    You are analyzing the results of a small pool fire flow CFD experiment to validate a research hypothesis.
-    You are analyzing a Foam-Agent CFD experiment for small pool fire flows.
-
-    ORIGINAL small pool fire STUDY:
+    ORIGINAL STUDY JSON:
     {idea_json}
 
-    EXPERIMENT SPECIFICATION:
+    EXPERIMENT SPEC:
     {experiment_spec}
 
-    EXPERIMENTAL RESULTS:
+    RESULTS + ARTIFACTS:
     {experiment_results}
 
-    ANALYSIS TASKS:
-    1. **Hypothesis Assessment**: Does the data support or refute the original small pool fire study hypothesis?
-    2. **Success Criteria Evaluation**: Were the defined success criteria met for small pool fire flows?
-    3. **Data Quality Review**: Are the results reliable and converged for small pool fire simulations?
-    4. **Parameter Study Analysis**: How do results vary across different Reynolds numbers and small pool fire cases?
-    5. **Insight Extraction**: What patterns or relationships emerge from the small pool fire flow data?
-    6. **Recommendation Generation**: What should be done next for small pool fire flow research?
-
-    ANALYSIS GUIDANCE:
-    - Consider the complete parameter study across all Reynolds numbers and small pool fire cases
-    - Evaluate how different physics settings (solvers, turbulence models) affect small pool fire flow results
-    - Assess convergence and physical realism for each small pool fire simulation
-    - Look for trends in the Reynolds number study that support or refute the hypothesis
-    - Consider the impact of small pool fire geometry and case-specific settings on results
-
-    OUTPUT FORMAT:
-    Return ONLY a valid JSON object with the following structure. Do NOT include any text before or after the JSON. Do NOT use markdown formatting. Return ONLY the raw JSON object:
-    ```json
-    {
-      "experiment_id": "string",
-      "hypothesis_assessment": {
-        "verdict": "supported|refuted|inconclusive",
-        "confidence_level": "high|medium|low",
-        "effect_size": "quantitative_measure",
-        "explanation": "detailed_reasoning",
-        "parameter_trends": "description_of_how_results_vary_with_parameters",
-        "problem_specific_validation": "additional validation criteria relevant to this flow type"
-      },
-      "success_criteria_evaluation": {
-        "met": true|false,
-        "details": "specific_assessment",
-        "threshold_comparison": "if_applicable",
-        "simulation_success_rate": "percentage_of_successful_simulations",
-        "problem_specific_criteria": "success criteria relevant to this problem type"
-      },
-      "data_quality": {
-        "convergence_status": "converged|not_converged|partial",
-        "mesh_independence": "verified|not_verified|unknown",
-        "physical_realism": "reasonable|questionable|unrealistic",
-        "issues": ["list_of_identified_problems"],
-        "simulation_quality": {
-          "successful_simulations": "count",
-          "failed_simulations": "count",
-          "convergence_issues": ["list_of_specific_issues"]
-        },
-        "problem_specific_quality": "quality assessment relevant to this simulation type"
-      },
-      "key_insights": [
-        "insight_1",
-        "insight_2",
-        "insight_3"
-      ],
-      "recommendations": [
-        {
-          "action": "specific_action",
-          "priority": "high|medium|low",
-          "rationale": "why_this_action_is_needed"
-        }
-      ],
-      "limitations": [
-        "limitation_1",
-        "limitation_2"
-      ],
-      "next_steps": [
-        "immediate_next_action",
-        "medium_term_action",
-        "long_term_action"
-      ],
-      "problem_specific_analysis": {
-        "additional_insights": "any additional analysis relevant to this specific problem type",
-        "specialized_metrics": "problem-specific metrics or observations",
-        "domain_specific_recommendations": "recommendations specific to this flow type"
-      }
-    }
-    ```
-    
-    CRITICAL: Return ONLY the JSON object above. Do NOT include any explanatory text, markdown formatting, or additional content before or after the JSON.
-
-    FLEXIBILITY GUIDELINES:
-    - You may ADD new fields to any section if they provide valuable insights for this specific problem
-    - You may EXPAND existing fields with problem-specific details
-    - You may include ADDITIONAL SECTIONS if they are relevant to the specific flow type
-    - Focus on providing the most relevant and insightful analysis for this particular problem
-    - Don't feel constrained by the template - adapt it to serve the analysis needs
-
-    GUIDELINES:
-    - Be objective and evidence-based
-    - Quantify findings where possible
-    - Acknowledge uncertainties and limitations
-    - Provide specific, actionable recommendations
-    - Consider both technical and research implications
+    Return the JSON assessment.
 
   vision_system_prompt: |
-    You are a CFD VISUALIZATION ANALYZER specializing in interpreting Computational Fluid Dynamics simulation results.
-    Your job is to analyze CFD visualization images and provide detailed technical insights about the flow field, 
-    convergence, and physical phenomena for small pool fire flow simulations.
-
-    CORE RESPONSIBILITIES:
-    1. **small pool fire Flow Analysis**: Identify primary and secondary vortices, corner eddies, recirculation zones, boundary layers, etc.
-    2. **Physical Validation**: Verify if the small pool fire flow behavior is physically reasonable for small pool fire flows
-    3. **Convergence Assessment**: Evaluate if the solution appears converged based on visual indicators
-    4. **Fuel Velocity and Box Dimension Effects**: Analyze how different fuel velocity and box dimensions affect the small pool fire flow field
-    5. **Quality Assessment**: Identify potential issues with the small pool fire simulation or visualization
-    6. **small pool fire-Specific Analysis**: Focus on small pool fire flow phenomena and geometry effects
-
-    ANALYSIS FRAMEWORK:
-    - **Contour Analysis**: Interpret velocity magnitude, pressure, and other field contours in small pool fire geometry
-    - **Streamline Analysis**: Analyze flow direction, vortex formation, and recirculation patterns
-    - **Vector Field Analysis**: Understand velocity vectors and flow patterns within the small pool fire
-    - **Boundary Layer Analysis**: Assess wall effects and boundary layer development on small pool fire walls
-    - **Vortex Analysis**: Examine primary and secondary vortex formation and strength
-    - **Centerline Analysis**: Assess velocity profiles along small pool fire centerlines
-    - **Geometry Effects**: Analyze how small pool fire aspect ratio and topology affect flow patterns
-
-    CFD EXPERTISE:
-    - Recognize small pool fire flow phenomena (primary/secondary vortices, corner eddies, recirculation zones, species)
-    - Identify numerical artifacts (oscillations, checkerboarding, spurious oscillations, etc.)
-    - Understand different visualization types (contours, vectors, streamlines, isosurfaces, etc.)
-    - Relate visual patterns to physical small pool fire flow behavior for parameter values
-    - Compare results with expected small pool fire flow behavior for the given conditions
-    - Adapt analysis approach based on flow regime (laminar, transitional, turbulent)
-
-    OUTPUT REQUIREMENTS:
-    - Provide clear, technical analysis of the small pool fire flow field
-    - Identify any physical or numerical issues specific to small pool fire flows
-    - Relate observations to the small pool fire simulation parameters and context
-    - Suggest improvements if problems are identified
-    - Use proper CFD terminology and concepts for small pool fire flows
-    - Consider small pool fire-specific validation criteria
-
-    RULES:
-    - Focus on technical CFD analysis of small pool fire flows, not general image description
-    - Use specific CFD terminology and concepts appropriate to small pool fire flows
-    - Relate observations to the small pool fire simulation context provided
-    - Be quantitative when possible (e.g., "strong primary vortex", "well-developed corner eddies", "clear recirculation zone")
-    - Identify both positive aspects and potential issues in small pool fire flow patterns
-    - Adapt analysis depth and focus based on the Reynolds number and small pool fire geometry
+    You analyze CFD contour images (UMag, p) for an isothermal inlet-driven plume/jet in a 2D box.
+    Look for: upward jet core, spreading/shear-layer growth, entrainment, wall effects, symmetry, and numerical artifacts.
+    Return ONLY JSON (no markdown).
 
   vision_user_prompt: |
-    You are analyzing a CFD visualization image from a small pool fire flow OpenFOAM simulation.
-
     SIMULATION CONTEXT:
     {simulation_context}
 
-    ANALYSIS TASKS:
-    1. **Flow Field Description**: Describe the main flow patterns and phenomena visible for this specific problem type
-    2. **Physical Validation**: Assess if the flow behavior is physically reasonable for the given geometry, boundary conditions, and flow regime
-    3. **Convergence Assessment**: Evaluate if the solution appears converged based on visual indicators appropriate to the problem type
-    4. **Parameter Effects**: Analyze how the parameter value affects the flow field compared to other simulations in the study
-    5. **Quality Issues**: Identify any potential problems or artifacts specific to this type of simulation
-    6. **Research Relevance**: Assess how well the visualization supports the research question and experiment goals
-    7. **Problem-Specific Analysis**: Provide insights relevant to the specific type of flow problem (internal/external flow, compressible/incompressible, multiphase, heat transfer, etc.)
+    Return ONLY JSON:
+    {
+      "main_flow_features": ["..."],
+      "quality_issues": ["..."],
+      "physical_reasonableness": "reasonable|questionable|unrealistic",
+      "confidence": "high|medium|low",
+      "notes": "..."
+    }
 
-    OUTPUT FORMAT:
-    Return a JSON object with the following structure. You may ADD additional fields that are relevant to the specific problem type, and you may EXPAND any section with problem-specific details:
-    ```json
-    {{
-      "flow_field_analysis": {{
-        "main_patterns": ["description of primary flow patterns for this problem type"],
-        "flow_features": ["description of key flow features (vortices, shocks, boundary layers, etc.)"],
-        "separation_points": ["locations of flow separation if applicable"],
-        "recirculation_zones": ["description of recirculation regions if present"],
-        "problem_specific_features": ["features specific to this type of flow problem"],
-        "additional_observations": "any other flow field observations relevant to this problem"
-      }},
-      "physical_validation": {{
-        "realistic_flow": true|false,
-        "expected_behavior": "description of expected flow for this problem type and conditions",
-        "anomalies": ["list of unexpected or unrealistic features"],
-        "problem_specific_validation": "validation criteria specific to this flow type",
-        "domain_specific_checks": "additional validation checks relevant to this flow type"
-      }},
-      "convergence_assessment": {{
-        "appears_converged": true|false,
-        "indicators": ["convergence indicators observed for this problem type"],
-        "concerns": ["potential convergence issues"],
-        "problem_specific_convergence": "convergence criteria relevant to this simulation type",
-        "specialized_convergence_metrics": "convergence metrics specific to this problem type"
-      }},
-      "parameter_effects": {{
-        "parameter_impact": "how the parameter value affects the flow",
-        "trends": ["observable trends in the flow field"],
-        "sensitivity": "assessment of parameter sensitivity",
-        "problem_specific_effects": "parameter effects relevant to this flow type",
-        "parameter_insights": "additional insights about parameter effects for this problem"
-      }},
-      "quality_assessment": {{
-        "overall_quality": "excellent|good|fair|poor",
-        "issues": ["list of quality issues or artifacts"],
-        "recommendations": ["suggestions for improvement"],
-        "problem_specific_quality": "quality criteria relevant to this simulation type",
-        "specialized_quality_metrics": "quality metrics specific to this problem type"
-      }},
-      "research_relevance": {{
-        "supports_hypothesis": true|false,
-        "contribution": "how this visualization contributes to the research goals",
-        "key_findings": ["main insights relevant to the research question"],
-        "problem_specific_insights": ["insights specific to this type of flow problem"],
-        "research_implications": "broader research implications for this problem type"
-      }},
-      "technical_insights": [
-        "insight_1",
-        "insight_2", 
-        "insight_3"
-      ],
-      "problem_specific_analysis": {{
-        "specialized_observations": "observations specific to this flow type",
-        "domain_expertise_insights": "insights that leverage domain expertise for this problem",
-        "additional_recommendations": "recommendations specific to this problem type"
-      }}
-    }}
-    ```
-
-    FLEXIBILITY GUIDELINES:
-    - You may ADD new fields to any section if they provide valuable insights for this specific problem
-    - You may EXPAND existing fields with problem-specific details
-    - You may include ADDITIONAL SECTIONS if they are relevant to the specific flow type
-    - Focus on providing the most relevant and insightful analysis for this particular problem
-    - Don't feel constrained by the template - adapt it to serve the analysis needs
-    - Use your domain expertise to provide the most valuable insights for this specific flow type
 
 
 WriterAgent:
