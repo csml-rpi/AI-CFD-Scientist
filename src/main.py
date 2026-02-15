@@ -666,7 +666,7 @@ def main():
 
     print(f"🧾 Generated {len(simulation_configs)} Foam-Agent user requirement(s) after selection")
     
-    # (Legacy hardcoded lid-driven cavity simulation_configs removed; now generated via ideation.)
+    # (Legacy hardcoded example simulation_configs removed; now generated via ideation.)
 
     print("📝 FINISHED IDEATION CONFIGS AND Starting simulations for generated cases...")
     

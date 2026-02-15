@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.pyc
+*.venv/
 
 # Local runs / data artifacts
 data/

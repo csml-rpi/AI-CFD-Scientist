@@ -958,12 +958,11 @@ class CFDResearchPaperGenerator:
             cfd_terms.append("heat transfer")
         if "vortex" in combined_text:
             cfd_terms.append("vortex generators")
-        if "cavity" in combined_text:
-            cfd_terms.append("cavity flow")
+        # (Removed legacy case-specific query term)
         if "turbulent" in combined_text:
             cfd_terms.append("turbulent flow")
         if "rectangular" in combined_text:
-            cfd_terms.append("rectangular cavity")
+            cfd_terms.append("rectangular domain")
         if "enhancement" in combined_text:
             cfd_terms.append("enhancement")
         if "openfoam" in combined_text:

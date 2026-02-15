@@ -63,9 +63,9 @@ There are **two** model knobs in this project:
 1) **CFD Scientist (this repo)**: used for ideation/hypothesis/validation/analysis.
 Set via env var or CLI:
 ```bash
-export CFD_SCIENTIST_MODEL="gpt-5.3-codex"
+export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
 # or
-python src/main.py --model "gpt-5.3-codex"
+python src/main.py --model "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
 ```
 
 2) **Foam-Agent (submodule)**: used to generate/run the OpenFOAM case workflow.
@@ -75,7 +75,6 @@ Supported `CFD_SCIENTIST_MODEL` values include:
 - AWS Bedrock: `bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`, or an ARN (model IDs: https://docs.aws.amazon.com/bedrock/latest/userguide/model-ids.html)
 - Anthropic: `claude-3-5-sonnet-20241022`, `claude-3-5-sonnet-20240620` (models: https://docs.anthropic.com/en/docs/about-claude/models)
 - OpenAI Platform: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini` (models: https://platform.openai.com/docs/models)
-- OpenAI Codex subscription: `gpt-5.2.codex`, `gpt-5.3-codex` (Codex: https://platform.openai.com/docs/models)
 - Google: `gemini-2.5-flash`, `gemini-2.5-pro` (models: https://ai.google.dev/gemini-api/docs/models)
 
 ### Experiment Parameters
@@ -149,19 +148,15 @@ data/experiments/
 
 ## Example User Requirements
 
-### Basic Lid-Driven Cavity
+### 2D Inlet Jet in a Square Enclosure
 ```
-Do an incompressible lid driven cavity flow.
-The cavity is a square with dimensions normalized to 1 unit.
-Use a 20x20 grid with the top wall moving at 1 m/s.
-Run from time 0 to 10 with timestep 0.005.
-```
-
-### Advanced Turbulent Flow
-```
-Perform turbulent flow over a 2D diamond obstacle using pimpleFoam.
-Domain: x=[0,15], y=[0,5], z=[-0.5,0.5] (2D with 1 cell in z).
-Diamond obstacle centered at (2.5,2.5) with diagonal = 1 unit.
-Inlet velocity: 1 m/s, kinematic viscosity: 2×10⁻⁶ m²/s.
+Run an incompressible 2D transient OpenFOAM case in a 0.20 m × 0.20 m × 0.01 m box domain (front/back are empty).
+Use a structured mesh of 100 × 100 × 1.
+Boundary conditions:
+- Bottom-center inlet patch: fixedValue U=(0 0.2 0) m/s, zeroGradient p
+- Side walls and remaining bottom wall: no-slip (U=0), zeroGradient p
+- Top boundary: pressure outlet with fixedValue p=0, zeroGradient U
+Run from t=0 to t=3 s with adjustable time step targeting CFL<=0.5; write every 0.1 s.
+Visualization: export velocity magnitude |U| contours at the requested output times.
 ```
 

@@ -280,7 +280,7 @@ ResultsInterpreterAgent:
 
   user_prompt: |
     You are analyzing the results of a small pool fire flow CFD experiment to validate a research hypothesis.
-    You are analyzing a Foam-Agent CFD experiment for lid-driven small pool fire flows.
+    You are analyzing a Foam-Agent CFD experiment for small pool fire flows.
 
     ORIGINAL small pool fire STUDY:
     {idea_json}
@@ -386,7 +386,7 @@ ResultsInterpreterAgent:
   vision_system_prompt: |
     You are a CFD VISUALIZATION ANALYZER specializing in interpreting Computational Fluid Dynamics simulation results.
     Your job is to analyze CFD visualization images and provide detailed technical insights about the flow field, 
-    convergence, and physical phenomena for lid-driven small pool fire flow simulations.
+    convergence, and physical phenomena for small pool fire flow simulations.
 
     CORE RESPONSIBILITIES:
     1. **small pool fire Flow Analysis**: Identify primary and secondary vortices, corner eddies, recirculation zones, boundary layers, etc.
@@ -430,7 +430,7 @@ ResultsInterpreterAgent:
     - Adapt analysis depth and focus based on the Reynolds number and small pool fire geometry
 
   vision_user_prompt: |
-    You are analyzing a CFD visualization image from a lid-driven small pool fire flow OpenFOAM simulation.
+    You are analyzing a CFD visualization image from a small pool fire flow OpenFOAM simulation.
 
     SIMULATION CONTEXT:
     {simulation_context}

@@ -447,7 +447,8 @@ def collect_batch_info(batch_dir: Path, max_experiments: Optional[int] = None):
             # primary user requirement
             ur = run / "user_requirement.txt"
             if ur.exists():
-                run_info["user_requirement"] = read_text_safe(ur)
+                # User requirement is the primary spec; keep more context than other snippets.
+                run_info["user_requirement"] = read_text_safe(ur, max_chars=8000)
                 run_info["paths"]["user_requirement"] = str(ur)
 
             # Collect postprocess time-stamped images for BOTH velocity magnitude (UMag) and pressure (p)
@@ -1648,7 +1649,9 @@ def _analyze_and_collect_rerun_suggestions(
             # ------------------------------
             # Step 1: log triage (LLM call)
             # ------------------------------
-            log_info = _parse_pimplefoam_log(log_path)
+            log_info = run.get("log_info") if isinstance(run.get("log_info"), dict) else None
+            if not log_info:
+                log_info = _parse_pimplefoam_log(log_path)
 
             log_packet_lines = [
                 f"log_present: {log_path.exists()}",
@@ -1770,6 +1773,10 @@ Images provided (time order):
 
 Task:
 - Decide whether this run did what the user requested.
+- Evaluate only against what the user requirement explicitly requests. Do not require extra deliverables.
+- Set "visualization_matches_requirement" based only on the visualization portion (the provided images vs requested visualizations).
+- Pressure images may be provided even if the requirement does not mention pressure; do not penalize the run for extra images.
+  If pressure is explicitly requested and pressure images are missing, that is an issue.
 - If the log status is not ok, focus on how to fix the run rather than over-interpreting images.
 - Provide a score (0 to 10) using this rule:
   - 0 if the log indicates an error/fatal run

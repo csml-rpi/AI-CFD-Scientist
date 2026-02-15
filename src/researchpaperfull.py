@@ -90,7 +90,11 @@ class StudyConfiguration:
         # Parse for specific patterns
         for line in lines:
             line = line.strip()
-            if "dimension" in line.lower() or "cavity" in line.lower():
+            if (
+                "dimension" in line.lower()
+                or "domain" in line.lower()
+                or "geometry" in line.lower()
+            ):
                 geometry += line + " "
             elif "grid" in line.lower() or "cell" in line.lower():
                 mesh += line + " "
@@ -496,8 +500,7 @@ class CFDResearchPaperGenerator:
         
         # Common CFD terms to look for
         cfd_terms = []
-        if "lid driven cavity" in description:
-            cfd_terms.append("lid driven cavity")
+        # (Removed legacy case-specific query term)
         if "incompressible" in description:
             cfd_terms.append("incompressible flow")
         if "turbulence" in description:

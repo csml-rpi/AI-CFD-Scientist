@@ -1,22 +1,70 @@
 import json
 import os
 import re
+import base64
 from typing import Any, Optional, Tuple, List, Dict
 from pathlib import Path
 
 import requests
 
-import anthropic
-import backoff
-import openai
+# Optional dependencies. This repository can run in a minimal environment when using
+# the ChatGPT/Codex subscription backend via `requests`.
+try:
+    import anthropic  # type: ignore
+except Exception:  # pragma: no cover
+    anthropic = None  # type: ignore
 
 try:
-    import boto3
+    import openai  # type: ignore
+except Exception:  # pragma: no cover
+    openai = None  # type: ignore
+
+try:
+    import backoff  # type: ignore
+except Exception:  # pragma: no cover
+    backoff = None  # type: ignore
+
+try:
+    import boto3  # type: ignore
     BOTO3_AVAILABLE = True
-except ImportError:
+except Exception:
     BOTO3_AVAILABLE = False
 
 MAX_NUM_TOKENS = 4096
+
+
+def _get_exception(name: str):
+    return getattr(openai, name, None) if openai is not None else None
+
+
+def _get_anthropic_exception(name: str):
+    return getattr(anthropic, name, None) if anthropic is not None else None
+
+
+# backoff is optional; when unavailable, run without retries.
+def _maybe_backoff_on_exception(*args, **kwargs):
+    if backoff is not None:
+        return backoff.on_exception(*args, **kwargs)
+
+    def _decorator(fn):
+        return fn
+
+    return _decorator
+
+
+_OPENAI_BACKOFF_EXCS = tuple(
+    x
+    for x in (
+        _get_exception("RateLimitError"),
+        _get_exception("APITimeoutError"),
+        _get_exception("InternalServerError"),
+    )
+    if x is not None
+)
+
+_ANTHROPIC_BACKOFF_EXCS = tuple(
+    x for x in (_get_anthropic_exception("RateLimitError"),) if x is not None
+)
 
 AVAILABLE_LLMS = [
     "claude-3-5-sonnet-20240620",
@@ -100,11 +148,53 @@ class _CodexResponsesWrapper:
 
     @staticmethod
     def _to_responses_input(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Convert chat-style messages into Responses API input.
+
+        Supports:
+          - content as a plain string (treated as input_text)
+          - content as a list of already-typed items (input_text/input_image)
+          - a simplified Bedrock-like list where items are {"text": ...} or {"image": {format, source:{bytes}}}
+        """
         out: List[Dict[str, Any]] = []
         for m in messages:
             role = m.get("role")
             content = m.get("content", "")
-            out.append({"role": role, "content": [{"type": "input_text", "text": content}]})
+
+            items: List[Dict[str, Any]] = []
+
+            if isinstance(content, str):
+                items = [{"type": "input_text", "text": content}]
+            elif isinstance(content, list):
+                for it in content:
+                    if isinstance(it, dict):
+                        # Already in Responses format
+                        if it.get("type") in {"input_text", "input_image"}:
+                            items.append(it)
+                            continue
+                        # Bedrock-like text
+                        if "text" in it and isinstance(it.get("text"), str):
+                            items.append({"type": "input_text", "text": it.get("text", "")})
+                            continue
+                        # Bedrock-like image
+                        if "image" in it and isinstance(it.get("image"), dict):
+                            img = it.get("image") or {}
+                            fmt = str(img.get("format") or "png").lower()
+                            src = img.get("source") or {}
+                            b = src.get("bytes")
+                            if isinstance(b, (bytes, bytearray)) and b:
+                                b64 = base64.b64encode(bytes(b)).decode("utf-8")
+                                url = f"data:image/{fmt};base64,{b64}"
+                                items.append({"type": "input_image", "image_url": url})
+                                continue
+                        # Fallback: stringify
+                        items.append({"type": "input_text", "text": str(it)})
+                    else:
+                        items.append({"type": "input_text", "text": str(it)})
+            else:
+                items = [{"type": "input_text", "text": str(content)}]
+
+            out.append({"role": role, "content": items})
+
         return out
 
     @staticmethod
@@ -208,6 +298,29 @@ class _CodexResponsesWrapper:
 
         return "".join(chunks).strip()
 
+    # Bedrock-like helper for multimodal usage from this repo.
+    def converse(self, *, modelId: str, messages: List[Dict[str, Any]], system=None, inferenceConfig=None):
+        """Bedrock-compatible wrapper.
+
+        The rest of this repository expects a Bedrock-style `converse()` API for multimodal calls.
+        We translate the message content into Responses API input_text/input_image items.
+        """
+        sys_text = ""
+        if isinstance(system, list) and system:
+            # Bedrock uses system=[{"text": ...}]
+            if isinstance(system[0], dict) and isinstance(system[0].get("text"), str):
+                sys_text = system[0].get("text")
+        elif isinstance(system, str):
+            sys_text = system
+
+        msgs: List[Dict[str, Any]] = []
+        if sys_text:
+            msgs.append({"role": "system", "content": sys_text})
+        msgs.extend(messages)
+
+        text = self.invoke(msgs)
+        return {"output": {"message": {"content": [{"text": text}]}}}
+
 
 def _load_codex_access_token_from_auth_json(auth_json_path: Path) -> str:
     data = json.loads(auth_json_path.read_text(encoding="utf-8"))
@@ -293,14 +406,9 @@ def _load_codex_oauth() -> Tuple[str, Optional[str]]:
 
 
 # Get N responses from a single message, used for ensembling.
-@backoff.on_exception(
-    backoff.expo,
-    (
-        openai.RateLimitError,
-        openai.APITimeoutError,
-        openai.InternalServerError,
-        anthropic.RateLimitError,
-    ),
+@_maybe_backoff_on_exception(
+    (backoff.expo if backoff is not None else None),
+    tuple([*_OPENAI_BACKOFF_EXCS, *_ANTHROPIC_BACKOFF_EXCS]) or (Exception,),
 )
 def get_batch_responses_from_llm(
     prompt,
@@ -443,14 +551,9 @@ def make_llm_call(client, model, temperature, system_message, prompt):
         raise ValueError(f"Model {model} not supported.")
 
 
-@backoff.on_exception(
-    backoff.expo,
-    (
-        openai.RateLimitError,
-        openai.APITimeoutError,
-        openai.InternalServerError,
-        anthropic.RateLimitError,
-    ),
+@_maybe_backoff_on_exception(
+    (backoff.expo if backoff is not None else None),
+    tuple([*_OPENAI_BACKOFF_EXCS, *_ANTHROPIC_BACKOFF_EXCS]) or (Exception,),
 )
 def get_response_from_llm(
     prompt,
