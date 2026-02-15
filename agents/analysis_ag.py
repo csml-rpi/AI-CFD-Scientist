@@ -76,6 +76,252 @@ def read_text_safe(p: Path, max_chars: int = MAX_SNIPPET_CHARS) -> str:
         return f"[Error reading {p}: {e}]"
 
 
+def _load_artifacts_json(out_dir: Path) -> Optional[dict]:
+    try:
+        p = out_dir / "artifacts.json"
+        if not p.exists():
+            return None
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _time_tag(tt: float) -> str:
+    return f"{float(tt):.2f}".replace(".", "p")
+
+
+def _deterministic_velocity_deliverables_check(out_dir: Path) -> dict:
+    """Check that deterministic postprocess artifacts exist for velocity-only evaluation."""
+    tol = 0.051
+    det = {
+        "enabled": False,
+        "ok": None,
+        "requested_times": None,
+        "max_time_error": None,
+        "missing_umag": [],
+        "missing_uy": [],
+        "notes": [],
+    }
+
+    art = _load_artifacts_json(out_dir)
+    if not art:
+        det["ok"] = None
+        return det
+
+    det["enabled"] = True
+
+    req_times = art.get("requested_times") or []
+    times = []
+    for t in req_times:
+        try:
+            times.append(float(t))
+        except Exception:
+            continue
+    times = sorted(times)
+    det["requested_times"] = times
+
+    # Time errors
+    max_err = None
+    errs = art.get("time_errors") or {}
+    if isinstance(errs, dict):
+        for v in errs.values():
+            try:
+                if v is None:
+                    continue
+                fv = float(v)
+            except Exception:
+                continue
+            max_err = fv if max_err is None else max(max_err, fv)
+    det["max_time_error"] = max_err
+
+    for t in times:
+        ut = out_dir / f"umag_t{_time_tag(t)}.png"
+        ct = out_dir / f"uy_centerline_t{_time_tag(t)}.csv"
+        if not ut.exists():
+            det["missing_umag"].append(ut.name)
+        if not ct.exists():
+            det["missing_uy"].append(ct.name)
+
+    ok_files = (not det["missing_umag"]) and (not det["missing_uy"])
+    ok_times = (max_err is None) or (max_err <= tol)
+
+    if not ok_files:
+        det["notes"].append("Missing expected deterministic velocity artifacts (UMag PNGs and/or Uy CSVs).")
+    if not ok_times:
+        det["notes"].append(f"Requested times were not written closely enough (max |Δt|={max_err:.3g}s > {tol}).")
+
+    det["ok"] = bool(ok_files and ok_times)
+    return det
+
+
+def _parse_pimplefoam_log(log_path: Path) -> dict:
+    """Parse pimpleFoam log for run validity signals and key diagnostics.
+
+    This function scans the full log text (deterministically) and extracts:
+      - completion markers (End, last Time)
+      - fatal/error blocks (FOAM FATAL, Floating point exception, etc.)
+      - stability hints (Courant number, continuity errors)
+
+    Returns a dict with:
+      - status: ok|fatal|incomplete|missing
+      - last_time_s: float|None
+      - has_end: bool
+      - fatal_snippet: str|None
+      - warning_lines: list[str]
+      - courant_last: dict|None (mean,max)
+      - courant_max: float|None
+      - continuity_last: dict|None (local,global,cumulative)
+      - continuity_cumulative: float|None
+      - tail: str (last ~120 lines)
+    """
+
+    out = {
+        "status": "missing",
+        "last_time_s": None,
+        "has_end": False,
+        "fatal_snippet": None,
+        "warning_lines": [],
+        "courant_last": None,
+        "courant_max": None,
+        "continuity_last": None,
+        "continuity_cumulative": None,
+        "tail": "",
+    }
+
+    if not log_path.exists():
+        return out
+
+    try:
+        txt = log_path.read_text(errors="ignore")
+    except Exception:
+        return out
+
+    lines = txt.splitlines()
+    out["tail"] = "\n".join(lines[-120:])
+
+    # End marker
+    out["has_end"] = bool(re.search(r"^\s*End\s*$", txt, flags=re.MULTILINE))
+
+    # Last reported Time = ...
+    last_t = None
+    for m in re.finditer(r"^\s*Time\s*=\s*([0-9.eE+-]+)\s*s?\s*$", txt, flags=re.MULTILINE):
+        try:
+            last_t = float(m.group(1))
+        except Exception:
+            continue
+    out["last_time_s"] = last_t
+
+    # Courant number
+    courant_re = re.compile(
+        r"^\s*Courant Number\s+mean:\s*([0-9.eE+-]+)\s+max:\s*([0-9.eE+-]+)\s*$",
+        re.MULTILINE,
+    )
+    cmax = None
+    clast = None
+    for m in courant_re.finditer(txt):
+        try:
+            mean = float(m.group(1))
+            mx = float(m.group(2))
+        except Exception:
+            continue
+        clast = {"mean": mean, "max": mx}
+        cmax = mx if cmax is None else max(cmax, mx)
+    out["courant_last"] = clast
+    out["courant_max"] = cmax
+
+    # Continuity errors
+    cont_re = re.compile(
+        r"^\s*time step continuity errors\s*:\s*sum local\s*=\s*([0-9.eE+-]+),\s*global\s*=\s*([0-9.eE+-]+),\s*cumulative\s*=\s*([0-9.eE+-]+)\s*$",
+        re.MULTILINE,
+    )
+    cont_last = None
+    for m in cont_re.finditer(txt):
+        try:
+            loc = float(m.group(1))
+            glob = float(m.group(2))
+            cum = float(m.group(3))
+        except Exception:
+            continue
+        cont_last = {"local": loc, "global": glob, "cumulative": cum}
+    out["continuity_last"] = cont_last
+    out["continuity_cumulative"] = cont_last.get("cumulative") if cont_last else None
+
+    # Warnings (keep a small sample)
+    warn = []
+    for ln in lines:
+        if "FOAM Warning" in ln or "--> FOAM Warning" in ln:
+            warn.append(ln.strip())
+            if len(warn) >= 12:
+                break
+    out["warning_lines"] = warn
+
+    # Fatal/error markers: avoid false positives from sigFpe enabling line.
+    fatal_start_re = re.compile(
+        r"^\s*(-->)?\s*FOAM\s+(FATAL|ERROR)\b.*$|^\s*Floating point exception\b|^\s*Segmentation fault\b|^\s*MPI_ABORT\b",
+        re.IGNORECASE,
+    )
+
+    def _is_sigfpe_enabling(ln: str) -> bool:
+        return bool(re.search(r"^\s*sigFpe\s*:\s*Enabling floating point exception trapping", ln, re.IGNORECASE))
+
+    fatal_idx = None
+    for i, ln in enumerate(lines):
+        if _is_sigfpe_enabling(ln):
+            continue
+        if fatal_start_re.search(ln):
+            fatal_idx = i
+            break
+
+    if fatal_idx is not None:
+        out["status"] = "fatal"
+        snippet = lines[fatal_idx : min(len(lines), fatal_idx + 80)]
+        out["fatal_snippet"] = "\n".join(snippet).strip()
+        return out
+
+    out["status"] = "ok" if out["has_end"] else "incomplete"
+    return out
+
+
+def _deterministic_run_validity(out_dir: Path) -> dict:
+    """Combine log + artifacts.json into a deterministic validity verdict."""
+    det = {
+        "status": "unknown",  # ok|fatal|incomplete|time_mismatch|missing
+        "notes": [],
+        "log": None,
+        "deliverables": None,
+    }
+
+    log_info = _parse_pimplefoam_log(out_dir / "log.pimpleFoam")
+    det["log"] = log_info
+    if log_info.get("status") == "missing":
+        det["notes"].append("Missing log.pimpleFoam")
+    if log_info.get("status") == "fatal":
+        det["status"] = "fatal"
+        det["notes"].append("Solver crashed (FOAM FATAL).")
+        return det
+
+    # Deliverables/time mapping
+    d = _deterministic_velocity_deliverables_check(out_dir)
+    det["deliverables"] = d
+    if d.get("enabled") and d.get("ok") is False:
+        det["status"] = "time_mismatch"
+        det["notes"].extend(d.get("notes") or [])
+        return det
+
+    if log_info.get("status") == "incomplete":
+        det["status"] = "incomplete"
+        det["notes"].append("Solver did not reach a clean 'End' in log.")
+        return det
+
+    if d.get("enabled") and d.get("ok") is True and log_info.get("status") == "ok":
+        det["status"] = "ok"
+        return det
+
+    det["status"] = "unknown"
+    return det
+
+
 def _make_montage_jpeg_bytes(
     timestep_images: list,
     *,
@@ -268,31 +514,13 @@ def collect_batch_info(batch_dir: Path, max_experiments: Optional[int] = None):
                             "format": "png",
                         }
 
-            # possible visualization scripts in run root or output folder
-            viz_candidates = []
-            viz_candidates += list(run.glob("visualization*.py"))
-            viz_candidates += list((run / "output").glob("visualization*.py")) if (run / "output").exists() else []
-            if viz_candidates:
-                run_info["visualizations"] = []
-                for v in viz_candidates:
-                    run_info["visualizations"].append({
-                        "path": str(v),
-                        "content": read_text_safe(v)
-                    })
-
-            # collect a brief listing of output files
+            # OpenFOAM log summary (parsed deterministically)
             out_dir = run / "output"
             if out_dir.exists():
-                # list top-level files and sizes
-                files = []
-                for f in sorted(out_dir.rglob("*")):
-                    if f.is_file():
-                        try:
-                            files.append((str(f.relative_to(run)), f.stat().st_size))
-                        except Exception:
-                            files.append((str(f), 0))
-                run_info["output_files"] = files[:200]
                 run_info["paths"]["output"] = str(out_dir)
+
+                log_path = out_dir / "log.pimpleFoam"
+                run_info["log_info"] = _parse_pimplefoam_log(log_path)
 
             exp_info["runs"].append(run_info)
         batch_summary.append(exp_info)
@@ -347,20 +575,20 @@ def build_prompt_for_batch(batch_name: str, batch_summary, simulation_descriptio
             if "user_requirement" in run:
                 b.append("User Requirement:\n" + textwrap.indent(run["user_requirement"], "  "))
             
-            # Enhanced visualization handling
-            if "visualizations" in run:
-                b.append("Visualization Scripts Generated:")
-                for v in run["visualizations"]:
-                    b.append(f"  Script: {v['path']}")
-                    b.append(textwrap.indent(v["content"], "    "))
-                    
-            # Show output files for context
-            if "output_files" in run:
-                sample_files = ", ".join([f[0] for f in run["output_files"][:10]])
-                total_files = len(run["output_files"])
-                b.append(f"Output Files ({total_files} total): {sample_files}")
-                if total_files > 10:
-                    b.append("  ... and more")
+            # Log summary for context
+            log_info = run.get("log_info") or {}
+            if isinstance(log_info, dict) and log_info:
+                b.append("OpenFOAM log summary:")
+                b.append(f"  status: {log_info.get('status')}")
+                b.append(f"  has_end: {log_info.get('has_end')}")
+                b.append(f"  last_time_s: {log_info.get('last_time_s')}")
+                b.append(f"  courant_last: {log_info.get('courant_last')}")
+                b.append(f"  continuity_cumulative: {log_info.get('continuity_cumulative')}")
+                if log_info.get("fatal_snippet"):
+                    b.append("  fatal snippet (truncated):")
+                    sn = str(log_info.get("fatal_snippet"))
+                    sn = sn[:800] + ("\n  ...[truncated]..." if len(sn) > 800 else "")
+                    b.append(textwrap.indent(sn, "    "))
                     
         blocks.append("\n".join(b))
 
@@ -404,7 +632,7 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
     """
     
     header = (
-        f"🔬 COMPREHENSIVE CROSS-CASE CFD ANALYSIS\n"
+        f"Cross-case CFD analysis\n"
         f"Batch: {batch_name}\n\n"
         f"You are analyzing a CFD study with {len(all_images)} visualization images.\n"
     )
@@ -416,21 +644,16 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
         header += f"ANALYSIS INSTRUCTIONS:\n{simulation_instructions}\n\n"
     
     header += (
-        f"🖼️ MULTIMODAL ANALYSIS INSTRUCTIONS:\n"
+        f"Multimodal analysis instructions:\n"
         f"You will receive {len(all_images)} visualization images showing flow fields for different cases/parameters.\n"
         f"For each image, provide:\n"
-        f"1. Flow structure description (vortices, boundary layers, separation)\n"
-        f"2. Parameter/case effects visible in the visualization\n"
-        f"3. Numerical accuracy assessment\n\n"
-        f"Then provide COMPREHENSIVE CROSS-CASE COMPARATIVE ANALYSIS:\n"
+        f"1. What is shown (field, slice/plane, time) and whether it matches the requirement\n"
+        f"2. Notable numerical issues visible (if any)\n\n"
+        f"Then provide cross-case comparative analysis:\n"
         f"1. Parameter progression effects\n"
-        f"2. Primary vortex evolution (location, strength, size)\n"
-        f"3. Secondary vortex development\n"
-        f"4. Boundary layer thickness comparison\n"
-        f"5. Flow transition phenomena\n"
-        f"6. Grid resolution adequacy across Re range\n"
-        f"7. Benchmark validation opportunities\n"
-        f"8. Overall study assessment and recommendations\n\n"
+        f"2. Consistency and outliers\n"
+        f"3. Overall study assessment and recommendations\n\n"
+        f"Base your conclusions on the user requirements, OpenFOAM logs, and the images. Do not rely on visualization scripts.\n\n"
     )
     
     # Build case-by-case descriptions
@@ -445,36 +668,52 @@ def build_multimodal_cross_case_prompt(batch_name: str, batch_summary, all_image
                 f"Geometry: {config.get('geometry', 'Unknown')}\n"
             )
         
+        log_info = img_data.get('log_info') or {}
+        log_block = ""
+        if isinstance(log_info, dict) and log_info:
+            log_block = (
+                "OpenFOAM log summary:\n"
+                f"  status: {log_info.get('status')}\n"
+                f"  has_end: {log_info.get('has_end')}\n"
+                f"  last_time_s: {log_info.get('last_time_s')}\n"
+                f"  courant_last: {log_info.get('courant_last')}\n"
+            )
+            if log_info.get('fatal_snippet'):
+                sn = str(log_info.get('fatal_snippet'))
+                sn = sn[:600] + ("\n  ...[truncated]..." if len(sn) > 600 else "")
+                log_block += "  fatal excerpt (truncated):\n" + textwrap.indent(sn, "    ") + "\n"
+
         desc = (
-            f"=== IMAGE {i+1}: {img_data['experiment']} ===\n"
+            f"=== image {i+1}: {img_data['experiment']} ===\n"
             f"{case_info}"
             f"Run: {img_data['run']}\n"
-            f"Visualization: {img_data['image_data']['path']}\n"
-            f"User Requirement:\n{textwrap.indent(img_data['user_requirement'], '  ')}\n"
+            f"Visualization image: {img_data['image_data']['path']}\n"
+            f"{log_block}"
+            f"User requirement:\n{textwrap.indent(img_data['user_requirement'], '  ')}\n"
         )
         case_descriptions.append(desc)
     
     cross_analysis_requirements = """
 
-CROSS-CASE ANALYSIS REQUIREMENTS:
+Cross-case analysis requirements:
 
-1. PARAMETER/CASING EFFECTS MATRIX:
-   - Describe how key qualitative flow features change across cases/parameters.
+1. Parameter → response effects:
+   - Describe how key qualitative features change across cases/parameters.
 
-2. TEMPORAL/STEADINESS CHECK (if applicable):
+2. Temporal/steadiness check (if applicable):
    - If the provided images represent different cases at a single time, note consistency.
 
-3. NUMERICAL QUALITY:
+3. Numerical quality:
    - Identify signs of instability, excessive diffusion, nonphysical artifacts, or mesh imprinting.
 
-4. STUDY COMPLETENESS:
-   - Are the chosen cases sufficient to support/reject the stated hypothesis? What is missing?
+4. Study completeness:
+   - Are the chosen cases sufficient to support or reject the stated hypothesis? What is missing?
 
-5. RECOMMENDATIONS:
+5. Recommendations:
    - Suggest reruns with concrete fixes.
    - Suggest next experiments to strengthen discriminative power.
 
-Provide detailed, physics-based analysis with specific observations from each image.
+Be specific and base conclusions on the requirements, logs, and images.
 """
     
     prompt = header + "\n\n".join(case_descriptions) + cross_analysis_requirements
@@ -513,10 +752,10 @@ def perform_multimodal_cross_case_analysis(prompt: str, all_images: list, model:
     
     # System message for multimodal analysis
     system_message = (
-        "You are a world-class CFD expert. "
-        "Analyze the visualization images with deep physics understanding. "
-        "Provide cross-case comparisons, identify parameter/case effects, and assess numerical accuracy. "
-        "Be specific about structures/patterns visible in each image and whether they match the stated requirements."
+        "You are a CFD analysis assistant. "
+        "Analyze the visualization images and the provided OpenFOAM log summaries to assess whether each run "
+        "matches its user requirement. Provide cross-case comparisons, identify parameter/case effects, and "
+        "suggest concrete rerun improvements where needed."
     )
     
     try:
@@ -691,7 +930,8 @@ def analyze_batch(batch_dir: Path, model: str = DEFAULT_MODEL, temperature: floa
                     'experiment': exp['experiment'],
                     'run': run['run'], 
                     'image_data': run['visualization_image'],
-                    'user_requirement': run.get('user_requirement', '')
+                    'user_requirement': run.get('user_requirement', ''),
+                    'log_info': run.get('log_info', {}),
                 })
     
     print(f"🖼️  Found {len(all_images)} visualization images for cross-case analysis")
@@ -979,18 +1219,19 @@ OUTPUT FORMAT: Return ONLY a valid JSON object with this exact structure:
   }},
   "high_priority_experiments": [
     {{
-      "experiment_id": "gap_reynolds_400",
-      "description": "Critical Reynolds number transition case",
+      "experiment_id": "gap_grid_refinement",
+      "description": "Grid refinement / sensitivity case on the current baseline flow",
       "parameters": {{
-        "reynolds_number": 400,
-        "geometry": "2D square cavity 1x1x0.1",
-        "boundary_conditions": "moving lid, no-slip walls",
-        "mesh_size": "70x70",
-        "solver_settings": "steady-state, SIMPLE"
+        "domain": "2D square enclosure 0.20x0.20x0.01 m (front/back empty)",
+        "inlet": "bottom-center inlet with fixedValue U=(0 0.2 0) m/s",
+        "walls": "no-slip side/bottom walls",
+        "outlet": "top pressure outlet p=0",
+        "mesh_size": "200x200x1",
+        "solver_settings": "transient, CFL-controlled time step, write every 0.1 s"
       }},
-      "scientific_justification": "Captures first bifurcation and secondary vortex formation",
+      "scientific_justification": "Establishes numerical robustness and separates discretization error from physics",
       "computational_cost_hours": 3,
-      "priority_reason": "Missing critical flow transition regime"
+      "priority_reason": "Needed to support claims with a basic grid sensitivity check"
     }}
   ]
 }}
@@ -1294,104 +1535,51 @@ def _execute_study_recommendations(batch_dir: Path):
 
 
 def _convert_recommendation_to_user_requirement(exp_rec: dict) -> str:
+    """Convert a study recommendation JSON into a Foam-Agent prompt.
+
+    This repository previously carried legacy demo conversion logic; that conversion logic has
+    been removed. We now generate a generic, execution-safe requirement text from whatever fields the
+    recommender provides.
+
+    Priority order:
+      1) exp_rec['user_requirement'|'requirement'|'prompt'] if present
+      2) parameters['user_requirement'|'requirement'|'prompt'] if present
+      3) Otherwise, serialize description + parameters into a concise prompt.
     """
-    Convert a study recommendation JSON to a user requirement string that Foam-Agent can execute.
-    
-    Args:
-        exp_rec: Experiment recommendation dictionary from JSON
-        
-    Returns:
-        str: Formatted user requirement for Foam-Agent
-    """
-    params = exp_rec.get('parameters', {})
-    description = exp_rec.get('description', 'CFD simulation')
-    
-    reynolds_number = params.get('reynolds_number', 1000)
-    geometry = params.get('geometry', '2D square cavity 1x1x0.1')
-    boundary_conditions = params.get('boundary_conditions', 'moving lid, no-slip walls')
-    mesh_size = params.get('mesh_size', '35x35')
-    solver_settings = params.get('solver_settings', 'steady-state')
-    
-    nu = 1.0 / reynolds_number
-    
-    # Parse mesh size
-    if 'x' in str(mesh_size).lower():
-        mesh_parts = str(mesh_size).lower().replace('x', ' ').split()
-        if len(mesh_parts) >= 2:
-            try:
-                mesh_x = int(mesh_parts[0])
-                mesh_y = int(mesh_parts[1])
-            except:
-                mesh_x = mesh_y = 35
-        else:
-            mesh_x = mesh_y = 35
-    else:
-        try:
-            mesh_x = mesh_y = int(str(mesh_size))
-        except:
-            mesh_x = mesh_y = 35
-    
-    # Determine simulation time and time step based on Reynolds number
-    if reynolds_number <= 100:
-        sim_time = 10
-        dt = 0.00025
-    elif reynolds_number <= 400:
-        sim_time = 25  
-        dt = 0.0015
-    elif reynolds_number <= 1000:
-        sim_time = 50
-        dt = 0.0015
-    elif reynolds_number <= 2000:
-        sim_time = 70
-        dt = 0.0015
-    else:
-        sim_time = 100
-        dt = 0.001
-    
-    # Generate user requirement based on geometry type detected from description/parameters
-    geometry_lower = geometry.lower()
-    
-    if '2d' in geometry_lower and ('square' in geometry_lower or 'cavity' in geometry_lower):
-        # 2D square cavity case
-        user_requirement = f'''Do an incompressible lid-driven cavity flow.
-The cavity is a square with dimensions 1 (x) × 1 (y) and very thin in z (0.1), making it effectively 2D.
-Use a grid of {mesh_x} × {mesh_y} in x and y, and 1 cell in z. The front and back faces are 'empty'.
-The top wall ('movingWall') at y=1 moves in +x with U=1 m/s.
-All other walls ('fixedWalls') are no-slip (U=0).
-Run from time=0 to time={sim_time} with time step Δt = {dt}; write results every 100 steps.
-Set kinematic viscosity nu = {nu:.6f} m^2/s (Reynolds number = {reynolds_number}).
-Visualize velocity magnitude contours and streamlines'''
-    
-    elif '3d' in geometry_lower and ('cube' in geometry_lower or 'cubic' in geometry_lower):
-        # 3D cubic cavity case
-        user_requirement = f'''Do an incompressible lid-driven cavity flow in 3D.
-Cube 1 (x) × 1 (y) × 1 (z). Grid: {mesh_x} × {mesh_y} × {mesh_x}.
-Top face at z=1 ('movingWall') moves in +x with U=1 m/s. All other faces no-slip.
-Run time = 0 to time = {sim_time} with Δt = {dt}; write every 100 steps.
-nu = {nu:.6f} m^2/s (Reynolds number = {reynolds_number}).
-Visualize velocity magnitude contours and streamlines'''
-    
-    elif 'rectangle' in geometry_lower or 'rectangular' in geometry_lower:
-        # Rectangular cavity case
-        user_requirement = f'''Incompressible lid-driven cavity, rectangle 1×2, thin z (0.1), 2D.
-Grid: {mesh_x} × {mesh_y*2} × 1; front/back 'empty'.
-Lid y=2 U=1 m/s in +x; other walls no-slip.
-Run time=0 to time={sim_time} with Δt = {dt}; write every 100 steps.
-nu = {nu:.6f} m^2/s (Reynolds number = {reynolds_number}).
-Visualize velocity magnitude contours and streamlines'''
-    
-    else:
-        # Default to 2D square cavity
-        user_requirement = f'''Do an incompressible lid-driven cavity flow.
-The cavity is a square with dimensions 1 (x) × 1 (y) and very thin in z (0.1), making it effectively 2D.
-Use a grid of {mesh_x} × {mesh_y} in x and y, and 1 cell in z. The front and back faces are 'empty'.
-The top wall ('movingWall') at y=1 moves in +x with U=1 m/s.
-All other walls ('fixedWalls') are no-slip (U=0).
-Run from time=0 to time={sim_time} with time step Δt = {dt}; write results every 100 steps.
-Set kinematic viscosity nu = {nu:.6f} m^2/s (Reynolds number = {reynolds_number}).
-Visualize velocity magnitude contours and streamlines'''
-    
-    return user_requirement.strip()
+
+    for k in ("user_requirement", "requirement", "prompt"):
+        v = exp_rec.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    params = exp_rec.get("parameters")
+    if not isinstance(params, dict):
+        params = {}
+
+    for k in ("user_requirement", "requirement", "prompt"):
+        v = params.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    description = exp_rec.get("description")
+    if not isinstance(description, str) or not description.strip():
+        description = "CFD simulation"
+
+    lines: list[str] = [description.strip()]
+
+    # Render parameters in a stable order for readability.
+    if params:
+        lines.append("")
+        lines.append("Parameters:")
+        for key in sorted(params.keys(), key=lambda x: str(x)):
+            val = params.get(key)
+            lines.append(f"- {key}: {val}")
+
+    # Always include a minimal visualization statement so downstream tooling has a clear target.
+    lines.append("")
+    lines.append("Visualization: export velocity magnitude |U| contours at the requested output times.")
+
+    return "\n".join([ln for ln in lines if ln is not None]).strip()
 
 
 def _analyze_and_collect_rerun_suggestions(
@@ -1403,308 +1591,306 @@ def _analyze_and_collect_rerun_suggestions(
     rerun_threshold: float = 7.0,
     auto_rerun_threshold: float = 5.0,
 ) -> tuple[list, list]:
+    """Analyze each run and decide whether a rerun is needed.
+
+    Two-step analysis (two LLM calls per run):
+      1) log triage (OpenFOAM log.pimpleFoam)
+      2) image vs requirement evaluation (velocity images)
+
+    LLM inputs are limited to: images, user requirement, and OpenFOAM logs.
+    Visualization scripts are never passed to the LLM.
     """
-    Analyze each experiment run with visualization image and determine if rerun is needed.
-    Combines analysis and validation into a single LLM call per run.
-    
-    Args:
-        rerun_threshold: Threshold below which cases are flagged for manual rerun (default: 7.0)
-        auto_rerun_threshold: Threshold below which cases are flagged for automatic rerun (default: 5.0)
-    
-    Returns:
-        tuple: (rerun_suggestions, auto_rerun_cases)
-            rerun_suggestions: List of dicts with standard rerun info
-            auto_rerun_cases: List of dicts for cases needing immediate automatic rerun
-    """
-    system_message = (
-        "You are a precise CFD validation expert with expertise in visual analysis of flow simulations. "
-        "Your task is to:\n"
-        "1. Analyze the visualization image to understand the flow physics\n"
-        "2. Compare the visualization against the user requirement\n"
-        "3. Determine if the simulation matches what was requested\n"
-        "4. If errors are found, propose a complete corrected user requirement\n\n"
-        "IMPORTANT: The user requirement must clearly state what should be visualized. "
-        "If the visualization statement is unclear or missing, include it in your corrected requirement."
+
+    log_system = (
+        "You are an OpenFOAM troubleshooting assistant. "
+        "Given a user requirement and an OpenFOAM solver log, determine if the run completed, "
+        "and propose concrete steps to make a rerun succeed. Focus on actionable improvements."
     )
 
-    rerun_suggestions = []
-    auto_rerun_cases = []
+    vision_system = (
+        "You are a CFD run evaluator. Given the user requirement and velocity visualization images, "
+        "decide whether the run did what the user requested. You do not know ground truth; judge only "
+        "against the requirement and obvious numerical issues. Provide a score and concrete actions to "
+        "improve a rerun if needed."
+    )
+
+    rerun_suggestions: list = []
+    auto_rerun_cases: list = []
+
+    # Always include pressure images when available.
+    def _order_images(xs: list) -> list:
+        return sorted(
+            xs,
+            key=lambda d: (
+                d.get("t") is None,
+                float(d.get("t") or 0.0),
+                str(d.get("path") or ""),
+            ),
+        )
 
     for exp in batch_summary:
-        exp_name = exp["experiment"]
-        exp_dir = batch_dir / exp_name
-        
-        print(f"\n🔎 Analyzing experiment: {exp_name} with {len(exp.get('runs', []))} run(s)")
-        
-        for run in exp.get("runs", []):
-            run_name = run["run"]
+        exp_name = exp.get("experiment")
+        exp_dir = batch_dir / str(exp_name)
+        runs = exp.get("runs", []) or []
+        print(f"\nAnalyzing experiment: {exp_name} with {len(runs)} run(s)")
+
+        for run in runs:
+            run_name = run.get("run")
             ur = (run.get("user_requirement", "") or "").strip()
             first_line = next((ln.strip() for ln in ur.splitlines() if ln.strip()), "<missing user requirement>")
             if len(first_line) > 120:
                 first_line = first_line[:117] + "..."
-            print(f"   🧪 Run {run_name}: {first_line}")
-            
-            # Build comprehensive analysis prompt with images
+            print(f"   Run {run_name}: {first_line}")
+
+            out_dir = Path(exp_dir / str(run_name) / "output")
+            log_path = out_dir / "log.pimpleFoam"
+
+            # ------------------------------
+            # Step 1: log triage (LLM call)
+            # ------------------------------
+            log_info = _parse_pimplefoam_log(log_path)
+
+            log_packet_lines = [
+                f"log_present: {log_path.exists()}",
+                f"log_status_guess: {log_info.get('status')}",
+                f"has_end: {log_info.get('has_end')}",
+                f"last_time_s: {log_info.get('last_time_s')}",
+                f"courant_last: {log_info.get('courant_last')}",
+                f"courant_max: {log_info.get('courant_max')}",
+                f"continuity_last: {log_info.get('continuity_last')}",
+                f"continuity_cumulative: {log_info.get('continuity_cumulative')}",
+            ]
+
+            warning_lines = log_info.get("warning_lines") or []
+            if isinstance(warning_lines, list) and warning_lines:
+                log_packet_lines += ["", "warnings (sample):"]
+                for w in warning_lines[:12]:
+                    log_packet_lines.append(str(w))
+
+            fatal_snip = (log_info.get("fatal_snippet") or "").strip()
+            if fatal_snip:
+                log_packet_lines += ["", "fatal_or_error_excerpt:", fatal_snip]
+
+            tail = (log_info.get("tail") or "").strip()
+            if tail:
+                log_packet_lines += ["", "log_tail:", tail]
+
+            log_packet = "\n".join(log_packet_lines).strip()
+
+            log_prompt = f"""User requirement:
+{ur}
+
+OpenFOAM log excerpts:
+{log_packet}
+
+Task:
+- Determine run_status = ok|incomplete|fatal|unknown from the log.
+- If rerun is needed, propose ordered, concrete action_items to make the rerun succeed.
+- Include short evidence lines from the log.
+
+Return strict JSON between ```json and ```:
+{{
+  \"run_status\": string,
+  \"rerun_needed\": boolean,
+  \"summary\": string,
+  \"evidence\": string[],
+  \"action_items\": string[]
+}}
+"""
+
+            try:
+                log_response_text, _ = get_response_from_llm(
+                    prompt=log_prompt,
+                    client=client,
+                    model=model_name,
+                    system_message=log_system,
+                    temperature=temperature,
+                    print_debug=False,
+                )
+            except Exception as e:
+                print(f"      log triage LLM failed: {e}")
+                continue
+
+            log_data = extract_json_between_markers(log_response_text) or {}
+
+            # Use deterministic parser status as ground truth for run health.
+            det_status = str(log_info.get("status") or "").strip().lower()
+            if det_status in {"ok", "incomplete", "fatal"}:
+                log_status = det_status
+            else:
+                log_status = str(log_data.get("run_status") or "unknown").strip().lower()
+                if log_status not in {"ok", "incomplete", "fatal", "unknown"}:
+                    log_status = "unknown"
+
+            log_rerun_needed = bool(log_data.get("rerun_needed", log_status != "ok"))
+            log_summary = str(log_data.get("summary") or "").strip()
+
+            log_evidence = log_data.get("evidence")
+            if not isinstance(log_evidence, list):
+                log_evidence = []
+            log_evidence = [str(x) for x in log_evidence if isinstance(x, (str, int, float))]
+
+            log_action_items = log_data.get("action_items")
+            if not isinstance(log_action_items, list):
+                log_action_items = []
+            log_action_items = [str(x) for x in log_action_items if isinstance(x, (str, int, float))]
+
+            # ------------------------------
+            # Step 2: images vs requirement (LLM call)
+            # ------------------------------
             timestep_images = run.get("timestep_images", []) or []
             timestep_umag = run.get("timestep_images_umag", []) or [x for x in timestep_images if x.get("field") == "umag"]
             timestep_p = run.get("timestep_images_p", []) or [x for x in timestep_images if x.get("field") == "p"]
-            viz_snippets = []
-            for v in run.get("visualizations", [])[:2]:
-                viz_snippets.append(f"Path: {v['path']}\n{v['content']}")
-            viz_block = "\n\n".join(viz_snippets) if viz_snippets else "<no visualization scripts>"
-            out_list = ", ".join([f[0] for f in run.get("output_files", [])[:15]]) or "<no outputs listed>"
 
-            img_index_block = ""
-            if timestep_umag or timestep_p:
-                def _order(xs):
-                    return sorted(
-                        xs,
-                        key=lambda d: (
-                            d.get("t") is None,
-                            float(d.get("t") or 0.0),
-                            str(d.get("path") or ""),
-                        ),
+            ordered_umag = _order_images(timestep_umag)
+            ordered_p = _order_images(timestep_p)
+
+            missing_umag = not bool(ordered_umag)
+
+            img_lines = []
+            for d in ordered_umag:
+                tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
+                fname = Path(d.get("path", "")).name
+                img_lines.append(f"umag: {tstr} {fname}")
+            for d in ordered_p:
+                tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
+                fname = Path(d.get("path", "")).name
+                img_lines.append(f"p: {tstr} {fname}")
+            images_index = "\n".join(img_lines).strip() or "<no images indexed>"
+
+            # Vision prompt is stable across runs. If log isn't ok or images missing, the model should
+            # still return a score and focus on rerun improvements.
+            vision_prompt = f"""User requirement:
+{ur}
+
+OpenFOAM log status (from step 1): {log_status}
+
+Images provided (time order):
+{images_index}
+
+Task:
+- Decide whether this run did what the user requested.
+- If the log status is not ok, focus on how to fix the run rather than over-interpreting images.
+- Provide a score (0 to 10) using this rule:
+  - 0 if the log indicates an error/fatal run
+  - <3 if the log did not reach End
+  - 3-10 for visualization correctness when the log is ok
+- If rerun is needed, provide ordered action_items to improve the rerun.
+
+Return strict JSON between ```json and ```:
+{{
+  \"analysis\": string,
+  \"accurate\": boolean,
+  \"accuracy\": number,
+  \"explanation\": string,
+  \"action_items\": string[],
+  \"visualization_matches_requirement\": boolean,
+  \"visualization_statement_clear\": boolean,
+  \"proposed_user_requirement\": string|null
+}}
+"""
+
+            # Prepare a multimodal request only when we have velocity images and a multimodal client.
+            vision_response_text = None
+            try:
+                if hasattr(client, "converse") and (not missing_umag):
+                    content = []
+                    umag_montage = _make_montage_jpeg_bytes(ordered_umag)
+                    if umag_montage:
+                        content.append({"image": {"format": "jpeg", "source": {"bytes": umag_montage}}})
+
+                    if ordered_p:
+                        p_montage = _make_montage_jpeg_bytes(ordered_p)
+                        if p_montage:
+                            content.append({"image": {"format": "jpeg", "source": {"bytes": p_montage}}})
+
+                    content.append({"text": vision_prompt})
+                    messages = [{"role": "user", "content": content}]
+                    response = client.converse(
+                        modelId=model_name,
+                        messages=messages,
+                        system=[{"text": vision_system}],
+                        inferenceConfig={
+                            "temperature": temperature,
+                            "maxTokens": 4096,
+                        },
                     )
-
-                ordered_umag = _order(timestep_umag)
-                ordered_p = _order(timestep_p)
-
-                lines = []
-                i_img = 0
-                if ordered_umag:
-                    lines.append("UMAG (|U|) images:")
-                    for d in ordered_umag:
-                        i_img += 1
-                        tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
-                        fname = Path(d.get("path", "")).name
-                        lines.append(f"{i_img}. {tstr} — {fname}")
-
-                if ordered_p:
-                    lines.append("PRESSURE (p) images:")
-                    for d in ordered_p:
-                        i_img += 1
-                        tstr = f"t={float(d['t']):.2f}s" if d.get("t") is not None else "t=?"
-                        fname = Path(d.get("path", "")).name
-                        lines.append(f"{i_img}. {tstr} — {fname}")
-
-                img_index_block = "\nIMAGES PROVIDED (order):\n" + "\n".join(lines) + "\n"
-
-            image_instruction = ""
-            if timestep_umag:
-                def _order(xs):
-                    return sorted(
-                        xs,
-                        key=lambda d: (
-                            d.get("t") is None,
-                            float(d.get("t") or 0.0),
-                            str(d.get("path") or ""),
-                        ),
+                    vision_response_text = response["output"]["message"]["content"][0]["text"]
+                else:
+                    # Text-only fallback (still a second LLM call)
+                    vision_response_text, _ = get_response_from_llm(
+                        prompt=vision_prompt,
+                        client=client,
+                        model=model_name,
+                        system_message=vision_system,
+                        temperature=temperature,
+                        print_debug=False,
                     )
+            except Exception as e:
+                print(f"      vision LLM failed: {e}")
+                continue
 
-                ordered_umag = _order(timestep_umag)
-                ordered_p = _order(timestep_p) if timestep_p else []
+            vision_data = extract_json_between_markers(vision_response_text) or {}
 
-                print(f"      📸 UMag images: {len(ordered_umag)} (pressure images ignored: {len(ordered_p)})")
+            accurate = bool(vision_data.get("accurate", False))
+            try:
+                accuracy = float(vision_data.get("accuracy", 0.0))
+            except Exception:
+                accuracy = 0.0
 
-                image_instruction = (
-                    "\n\n🖼️ CRITICAL: MULTIPLE VELOCITY VISUALIZATION IMAGES ARE PROVIDED for the SAME run at multiple times.\n"
-                    "You are given ONLY UMag (|U|) contours at multiple times.\n"
-                    "Pressure images may exist on disk but are intentionally EXCLUDED from this analysis.\n\n"
-                    "NOTE ON INPUT FORMAT:\n"
-                    "- The UMag frames may be provided as ONE montage image (time order left→right, top→bottom).\n"
-                    "- The same UMag montage may be sent twice (duplicate).\n\n"
-                    "CAREFULLY ANALYZE ALL PROVIDED VELOCITY IMAGES:\n"
-                    "1. Requirement matching (velocity-only):\n"
-                    "   - Do the velocity images correspond to the requested times and slice/plane?\n"
-                    "2. Temporal behavior:\n"
-                    "   - Does UMag evolve smoothly over time without obvious numerical blow-up or artifacts?\n"
-                    "3. Quality indicators:\n"
-                    "   - Signs of instability, excessive diffusion, checkerboarding, or mesh imprinting.\n\n"
-                )
-            else:
-                print("      ⚠️  Missing UMag timestep images (umag_t*.png)")
-            
-            analysis_prompt = (
-                f"Analyze this CFD simulation run and determine if it matches the user requirement.\n\n"
-                f"PRIMARY TASKS:\n"
-                f"1. Describe the flow physics you observe in the visualization image(s)\n"
-                f"2. Compare the visualization image(s) against the user requirement\n"
-                f"3. Identify any errors, discrepancies, or issues\n"
-                f"4. If issues found, propose a COMPLETE corrected user requirement\n\n"
-                f"CRITICAL REQUIREMENTS:\n"
-                f"- The user requirement MUST clearly state what should be visualized (e.g., 'Visualize velocity magnitude contours with streamlines')\n"
-                f"- If the visualization statement is unclear or missing, add it to your proposed requirement\n"
-                f"- If geometry, mesh, or physics parameters are wrong, specify exact corrections\n"
-                f"- Be specific about boundary conditions, domain size, mesh resolution, and any key parameters\n"
-                f"- IMPORTANT FOR THIS EVALUATION: ignore pressure outputs (p images/fields). Do NOT penalize missing/incorrect pressure visualizations.\n"
-                f"{img_index_block}{image_instruction}\n"
-                f"IF ANY ISSUES ARE FOUND:\n"
-                f"- Set 'accurate' to false if significant problems exist\n"
-                f"- Give accuracy score from 1-10 (1=poor, 10=excellent) based on overall quality\n"
-                f"- Accuracy >= 7.0 means good quality (accurate=true, no rerun needed)\n"
-                f"- Accuracy 5.0-6.9 means moderate quality (accurate=false, manual review)\n"
-                f"- Accuracy < 5.0 means poor quality (accurate=false, auto-rerun needed)\n"
-                f"- Provide detailed 'explanation' of what is wrong\n"
-                f"- Provide 'analysis' describing the flow physics you observe\n"
-                f"- Provide 'proposed_user_requirement' only if significant corrections needed\n\n"
-                f"Return STRICT JSON between ```json and ``` with fields:\n"
-                f"{{\n"
-                f"  \"analysis\": string,  // Describe flow physics and phenomena observed in visualization\n"
-                f"  \"accurate\": boolean,  // false only if accuracy < 7.0 (significant issues)\n"
-                f"  \"accuracy\": number,    // 1-10 score (7.0+ = good, 5.0-6.9 = moderate, <5.0 = poor)\n"
-                f"  \"explanation\": string, // What issues exist (can be empty if accuracy >= 7.0)\n"
-                f"  \"visualization_matches_requirement\": boolean,  // Does image match what was requested?\n"
-                f"  \"visualization_statement_clear\": boolean,  // Is 'what to visualize' clearly stated in requirement?\n"
-                f"  \"proposed_user_requirement\": string|null  // Corrected requirement (null if accuracy >= 7.0)\n"
-                f"}}\n\n"
-                f"USER REQUIREMENT:\n{ur}\n\n"
-                f"VISUALIZATION SCRIPT CODE:\n{viz_block}\n\n"
-                f"OUTPUT FILES (sample): {out_list}\n"
-            )
-            
-            # User request: ignore pressure during analysis (do not require or send p images).
-            missing_umag = not bool(timestep_umag)
-            if missing_umag:
-                # Missing evaluator artifacts: treat as non-evaluable.
-                # To keep existing rerun machinery working, propose rerunning with the same requirement.
-                stub = {
-                    "analysis": "Missing timestep velocity visualization images (umag_t*.png). Run is not evaluable.",
-                    "accurate": False,
-                    "accuracy": 0,
-                    "explanation": "Required UMag timestep images were not found: umag_t*.png. Ensure deterministic postprocess runs and produces UMag time-stamped PNG outputs.",
-                    "visualization_matches_requirement": False,
-                    "visualization_statement_clear": False,
-                    "proposed_user_requirement": ur or None,
-                }
-                response_text = "```json\n" + json.dumps(stub, indent=2) + "\n```"
-            else:
-                try:
-                    # If timestep images are available and using Bedrock, send ONE multimodal call.
-                    # User request: only send velocity (UMag) as a montage duplicated twice; exclude pressure.
-                    if hasattr(client, "converse"):  # Bedrock boto3 client
-                        def _order(xs):
-                            return sorted(
-                                xs,
-                                key=lambda d: (
-                                    d.get("t") is None,
-                                    float(d.get("t") or 0.0),
-                                    str(d.get("path") or ""),
-                                ),
-                            )
+            # Enforce global scoring policy:
+            # - 0 if log indicates fatal/error
+            # - <3 if log did not reach End (incomplete)
+            # - 3-10 for visualization correctness when log is ok
+            if log_status == "fatal":
+                accuracy = 0.0
+                accurate = False
+            elif log_status in {"incomplete", "unknown"}:
+                accuracy = max(0.0, min(2.9, accuracy))
+                accurate = False
+            else:  # ok
+                accuracy = max(3.0, min(10.0, accuracy))
 
-                        ordered_umag = _order(timestep_umag)
-                        ordered_p = _order(timestep_p) if timestep_p else []
+            analysis_text = str(vision_data.get("analysis", "") or "")
+            explanation = str(vision_data.get("explanation", "") or "")
 
-                        content = []
-                        bad = 0
+            v_action_items = vision_data.get("action_items")
+            if not isinstance(v_action_items, list):
+                v_action_items = []
+            v_action_items = [str(x) for x in v_action_items if isinstance(x, (str, int, float))]
 
-                        # User request: exclude pressure from Claude context.
-                        # Combine velocity images into a single montage and send the SAME montage twice.
-                        umag_montage = _make_montage_jpeg_bytes(ordered_umag)
+            viz_matches = bool(vision_data.get("visualization_matches_requirement", False))
+            viz_statement_clear = bool(vision_data.get("visualization_statement_clear", bool(ur.strip())))
+            proposed = vision_data.get("proposed_user_requirement")
 
-                        if umag_montage:
-                            for _ in range(2):
-                                content.append(
-                                    {
-                                        "image": {
-                                            "format": "jpeg",
-                                            "source": {"bytes": umag_montage},
-                                        }
-                                    }
-                                )
-                        else:
-                            # Fallback: send a single representative UMag frame twice.
-                            rep = ordered_umag[-1] if ordered_umag else None
-                            img_bytes = None
-                            if rep:
-                                try:
-                                    img_bytes = base64.b64decode(rep.get("base64", "") or "")
-                                except Exception:
-                                    img_bytes = None
-                            if img_bytes:
-                                for _ in range(2):
-                                    content.append(
-                                        {
-                                            "image": {
-                                                "format": rep.get("format", "png"),
-                                                "source": {"bytes": img_bytes},
-                                            }
-                                        }
-                                    )
-                            else:
-                                bad += len(ordered_umag)
-
-                        # Intentionally DO NOT send pressure frames.
-                        if ordered_p:
-                            print(f"      ℹ️  Not sending {len(ordered_p)} pressure image(s) (excluded by config)")
-
-                        # Append the text prompt last so the model sees the images first.
-                        content.append({"text": analysis_prompt})
-
-                        if len(content) <= 1:
-                            print("      ⚠️  No valid image bytes could be prepared; falling back to text-only")
-                            response_text, _ = get_response_from_llm(
-                                analysis_prompt,
-                                client,
-                                model_name,
-                                system_message,
-                                print_debug=False,
-                                temperature=temperature,
-                            )
-                        else:
-                            if bad:
-                                print(f"      ⚠️  Skipped {bad} timestep image(s) due to invalid base64")
-                            if umag_montage:
-                                print(
-                                    f"Processing {len(content)-1} image(s) in one LLM call (UMag montage duplicated; pressure excluded)..."
-                                )
-                            else:
-                                print(
-                                    f"Processing {len(content)-1} image(s) in one LLM call (single UMag frame duplicated; pressure excluded)..."
-                                )
-
-                            messages = [{"role": "user", "content": content}]
-                            response = client.converse(
-                                modelId=model_name,
-                                messages=messages,
-                                system=[{"text": system_message}],
-                                inferenceConfig={
-                                    "temperature": temperature,
-                                    "maxTokens": 4096,
-                                },
-                            )
-                            response_text = response["output"]["message"]["content"][0]["text"]
-                    else:
-                        # Text-only fallback for non-multimodal clients.
-                        response_text, _ = get_response_from_llm(
-                            analysis_prompt,
-                            client,
-                            model_name,
-                            system_message,
-                            print_debug=False,
-                            temperature=temperature,
-                        )
-                except Exception as e:
-                    print(f"      ❌ LLM analysis failed: {e}")
-                    import traceback
-                    traceback.print_exc()
+            # Merge action items (dedupe while preserving order)
+            merged_items = []
+            for it in log_action_items + v_action_items:
+                if not it:
                     continue
-            
-            data = extract_json_between_markers(response_text) or {}
-            analysis_text = data.get("analysis", "")
-            accurate = bool(data.get("accurate", False))
-            accuracy = float(data.get("accuracy", 0))
-            proposed = data.get("proposed_user_requirement")
-            explanation = data.get("explanation", "")
-            viz_matches = bool(data.get("visualization_matches_requirement", True))
-            viz_statement_clear = bool(data.get("visualization_statement_clear", True))
-            
-            print(f"      → Accuracy: {accuracy:.1f}/10, Matches: {viz_matches}, Viz statement clear: {viz_statement_clear}")
+                if it not in merged_items:
+                    merged_items.append(it)
+
+            should_rerun = (
+                log_rerun_needed
+                or (log_status != "ok")
+                or missing_umag
+                or (accuracy < rerun_threshold)
+                or (not viz_matches)
+                or (not viz_statement_clear)
+            )
+
+            # Avoid auto-rerun for log failures; those often require template/config fixes.
+            can_auto = (log_status == "ok") and (not missing_umag)
 
             decision = {
                 "experiment": exp_name,
                 "run": run_name,
+                "run_status": log_status,
+                "log_summary": log_summary,
+                "log_evidence": log_evidence,
                 "analysis": analysis_text,
+                "action_items": merged_items,
                 "accurate": accurate,
                 "accuracy": accuracy,
                 "explanation": explanation,
@@ -1712,83 +1898,65 @@ def _analyze_and_collect_rerun_suggestions(
                 "visualization_statement_clear": viz_statement_clear,
                 "original_requirement": ur,
                 "updated_requirement": proposed,
-                "response_raw": response_text,
                 "evidence_files": {
-                    "umag_images": [x.get("path") for x in timestep_umag],
-                    "p_images": [x.get("path") for x in timestep_p],
+                    "umag_images": [x.get("path") for x in ordered_umag],
+                    "p_images": [x.get("path") for x in ordered_p],
+                    "log": str(log_path) if log_path.exists() else None,
                 },
             }
-            
-            # Save combined analysis to experiment directory
-            try:
-                analysis_file = exp_dir / run_name / "analysis.txt"
-                analysis_file.parent.mkdir(parents=True, exist_ok=True)
-                
-                # Write human-readable analysis
-                analysis_content = f"Run: {run_name}\n\n"
-                analysis_content += f"Flow Physics Analysis:\n{analysis_text}\n\n"
-                analysis_content += f"Accuracy: {accuracy:.1f}/10\n"
-                analysis_content += f"Matches Requirement: {viz_matches}\n"
-                analysis_content += f"Visualization Statement Clear: {viz_statement_clear}\n\n"
-                if explanation:
-                    analysis_content += f"Issues Found:\n{explanation}\n\n"
-                if proposed:
-                    analysis_content += f"Proposed Corrected Requirement:\n{proposed}\n"
-                
-                analysis_file.write_text(analysis_content, encoding="utf-8")
-                
-                # Also save JSON verdict
-                verdict_file = exp_dir / run_name / "analysis_verdict.json"
-                verdict_file.write_text(json.dumps(decision, indent=2), encoding="utf-8")
-                
-                print(f"      💾 Saved analysis to {analysis_file}")
-            except Exception as e:
-                print(f"      ⚠️  Failed to write analysis: {e}")
 
-            # Check if rerun is needed - missing velocity artifacts always triggers rerun.
-            # User request: ignore pressure during analysis.
-            missing_artifacts = (not bool(timestep_umag))
-            should_rerun = missing_artifacts or ((accuracy < rerun_threshold) and isinstance(proposed, str) and proposed.strip())
-            
-            # Additional check for critical visualization issues 
-            critical_viz_issue = (not viz_matches) or (not viz_statement_clear and accuracy < 8.0)
-            if critical_viz_issue and isinstance(proposed, str) and proposed.strip():
-                should_rerun = True
-            
+            # Write per-run outputs
+            try:
+                analysis_file = exp_dir / str(run_name) / "analysis.txt"
+                blocks = []
+                blocks.append(f"Run status: {log_status}")
+                if log_summary:
+                    blocks.append("\nLog summary:\n" + log_summary)
+                if log_evidence:
+                    blocks.append("\nLog evidence:\n" + "\n".join([f"- {x}" for x in log_evidence]))
+                blocks.append(f"\nAccuracy: {accuracy:.1f}/10")
+                blocks.append(f"Matches requirement: {viz_matches}")
+                blocks.append(f"Visualization statement clear: {viz_statement_clear}")
+                if explanation:
+                    blocks.append("\nExplanation:\n" + explanation)
+                if analysis_text:
+                    blocks.append("\nAnalysis:\n" + analysis_text)
+                if merged_items:
+                    blocks.append("\nAction items:\n" + "\n".join([f"{i}. {it}" for i, it in enumerate(merged_items, 1)]))
+                if proposed:
+                    blocks.append("\nProposed corrected requirement:\n" + str(proposed))
+
+                analysis_file.write_text("\n".join(blocks).strip() + "\n", encoding="utf-8")
+
+                verdict_file = exp_dir / str(run_name) / "analysis_verdict.json"
+                verdict_file.write_text(json.dumps(decision, indent=2), encoding="utf-8")
+            except Exception as e:
+                print(f"      failed to write analysis outputs: {e}")
+
             if should_rerun:
-                # Cases with very low scores get automatic rerun
-                if accuracy < auto_rerun_threshold:
-                    print(f"      🔥 CRITICAL: Auto-rerun needed (accuracy={accuracy:.1f}/10)")
+                if can_auto and accuracy < auto_rerun_threshold:
+                    print(f"      auto-rerun needed (accuracy={accuracy:.1f}/10)")
                     auto_rerun_cases.append(decision)
                 else:
-                    print(f"      ⚠️  Rerun recommended (accuracy={accuracy:.1f}/10)")
+                    print(f"      rerun recommended (accuracy={accuracy:.1f}/10, status={log_status})")
                     rerun_suggestions.append(decision)
             else:
-                print(f"      ✅ Run is satisfactory")
+                print("      run is satisfactory")
 
     # Save consolidated rerun suggestions
     total_reruns = len(rerun_suggestions) + len(auto_rerun_cases)
     if total_reruns > 0:
         try:
-            # Save regular rerun suggestions
             if rerun_suggestions:
-                suggestions_file = batch_dir / "rerun_suggestions.json"
-                suggestions_file.write_text(json.dumps(rerun_suggestions, indent=2), encoding="utf-8")
-                print(f"\n📋 Saved {len(rerun_suggestions)} rerun suggestions to {suggestions_file}")
-            
-            # Save auto-rerun cases separately
+                (batch_dir / "rerun_suggestions.json").write_text(json.dumps(rerun_suggestions, indent=2), encoding="utf-8")
             if auto_rerun_cases:
-                auto_rerun_file = batch_dir / "auto_rerun_cases.json"
-                auto_rerun_file.write_text(json.dumps(auto_rerun_cases, indent=2), encoding="utf-8")
-                print(f"\n🔥 Saved {len(auto_rerun_cases)} critical auto-rerun cases to {auto_rerun_file}")
-                
+                (batch_dir / "auto_rerun_cases.json").write_text(json.dumps(auto_rerun_cases, indent=2), encoding="utf-8")
         except Exception as e:
             print(f"Failed to write rerun suggestions: {e}")
     else:
-        print("\n✅ No reruns needed - all experiments meet quality threshold!")
+        print("\nNo reruns needed")
 
     return rerun_suggestions, auto_rerun_cases
-
 
 def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
     """
@@ -1800,7 +1968,6 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
         auto_rerun_cases: List of cases that need immediate rerun
     """
     import subprocess
-    import uuid
     import shutil
     from datetime import datetime
     
@@ -1823,12 +1990,16 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
         if not _re.match(r"^run_\d{3}(?:__.*)?$", str(run_name)):
             print(f"   ⏭️  Skipping non-canonical run directory for auto-rerun: {run_name}")
             continue
-        updated_requirement = case['updated_requirement']
-        accuracy = case['accuracy']
+        updated_requirement = case.get('updated_requirement') or case.get('original_requirement')
+        accuracy = float(case.get('accuracy') or 0.0)
         
         print(f"\n[{i}/{len(auto_rerun_cases)}] 🔄 Auto-rerunning: {exp_name}/{run_name}")
         print(f"   Original accuracy: {accuracy:.1f}/10")
-        print(f"   Updated requirement: {updated_requirement[:100]}...")
+        if isinstance(updated_requirement, str) and updated_requirement.strip():
+            print(f"   Requirement used for rerun: {updated_requirement[:100]}...")
+        else:
+            print("   ❌ No usable requirement found in verdict; skipping auto-rerun")
+            continue
         
         # Get paths
         exp_dir = batch_dir / exp_name
@@ -1891,7 +2062,7 @@ def _execute_automatic_reruns(batch_dir: Path, auto_rerun_cases: list):
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=3600  # 1 hour timeout
+                timeout=600 # 10 minutes timeout
             )
             
             if result.returncode == 0:
