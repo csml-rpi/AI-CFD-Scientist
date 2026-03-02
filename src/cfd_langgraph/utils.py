@@ -1,4 +1,4 @@
-"""Shared utilities for cfd_langchain."""
+"""Shared utilities for cfd_langgraph."""
 
 from __future__ import annotations
 

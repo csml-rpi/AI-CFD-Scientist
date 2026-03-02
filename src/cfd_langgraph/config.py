@@ -5,6 +5,9 @@ from pathlib import Path
 from pydantic import BaseModel
 
 
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 class Settings(BaseModel):
     model: str = os.environ.get(
         "CFD_SCIENTIST_MODEL",
@@ -13,13 +16,13 @@ class Settings(BaseModel):
     prompts_path: Path = Path(
         os.environ.get(
             "CFD_PROMPTS_PATH",
-            "/home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain/prompts/prompts.yaml",
+            str(_REPO_ROOT / "prompts" / "prompts.yaml"),
         )
     )
     foam_agent_main: Path = Path(
         os.environ.get(
             "FOAM_AGENT_MAIN",
-            "/home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain/Foam-Agent/foambench_main.py",
+            str(_REPO_ROOT / "Foam-Agent" / "foambench_main.py"),
         )
     )
     openfoam_path: str = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam10")

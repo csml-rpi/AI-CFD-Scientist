@@ -6,7 +6,7 @@ from typing import Any, Dict, List
 import requests
 from langchain_core.prompts import ChatPromptTemplate
 
-from cfd_langchain.llm.factory import create_langchain_llm
+from cfd_langgraph.llm.factory import create_langchain_llm
 
 
 class LiteratureSurveyAgent:

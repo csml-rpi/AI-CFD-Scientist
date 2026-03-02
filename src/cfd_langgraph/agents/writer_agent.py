@@ -1,3 +1,9 @@
+"""Writer agent: LaTeX paper generation with Sakana AI Scientist v2–aligned features.
+
+Includes: standard sections (Abstract–Conclusion), claim–evidence table,
+figure–text alignment, multi-round citations, reproducibility appendix,
+failure/negative results section, and mandatory AI-disclosure sentence.
+"""
 from __future__ import annotations
 
 import json
@@ -5,21 +11,36 @@ from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 
-from cfd_langchain.llm.factory import create_langchain_llm
-from cfd_langchain.prompts.loader import PromptLoader
-from cfd_langchain.agents.literature_agent import LiteratureSurveyAgent
-from cfd_langchain.utils import strip_json_fences
+from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.prompts.loader import PromptLoader
+from cfd_langgraph.agents.literature_agent import LiteratureSurveyAgent
+from cfd_langgraph.utils import strip_json_fences
 
 
-AI_SCIENTIST_STYLE_CHECKLIST = """
-Incorporate modern autonomous-science writing best practices inspired by AI Scientist-style workflows:
-1) Explicit novelty positioning vs closest prior work.
-2) Claim-evidence mapping (each major claim tied to an experiment/figure/result).
-3) Transparent negative results and failure analysis.
-4) Ablation/sensitivity discussion and robustness caveats.
-5) Reproducibility-first reporting (exact config, seeds, environment, solver/version).
-6) Limitations and concrete next-experiment proposals.
-7) Avoid overclaiming; calibrate conclusions to evidence strength.
+# Writer features aligned with Sakana AI Scientist v2: standard sections, claim–evidence,
+# VLM-style figure–text alignment, multi-round citations, reproducibility, and mandatory disclosure.
+AI_SCIENTIST_V2_STYLE_CHECKLIST = """
+Sakana AI Scientist v2–style manuscript requirements (peer-review oriented):
+
+Structure:
+1) Standard sections in order: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion, plus appendices as needed.
+2) Explicit novelty positioning vs closest prior work in Related Work / Introduction.
+3) Claim–evidence mapping: include an explicit Claim–Evidence table (LaTeX tabular) tying each major claim to specific experiments, figures, and quantitative results. No unsupported claims.
+4) Transparent negative results and failure analysis: dedicate a subsection (e.g. Failure Cases / Negative Results) to failed or inconclusive runs, syntax/execution issues, and what was learned.
+5) Ablation/sensitivity discussion and robustness caveats where applicable.
+6) Limitations and concrete next-experiment proposals (what would you run next and why).
+
+Reproducibility (reproducibility-first reporting):
+7) Reproducibility appendix or section: exact solver name and version, OpenFOAM/case setup, mesh/resolution, boundary conditions, time step and end time, and how to run the case (e.g. Foam-Agent or allRun script). No vague “as in code” without specifics.
+8) Environment and config: mention WM_PROJECT_DIR / OpenFOAM version if relevant, and any env vars or paths a reader would need.
+
+Figures and consistency (VLM-style alignment):
+9) Every figure must be referenced in the main text; figure captions must accurately describe what is shown (field, slice/contour type, time step, case). Text interpretation must match the actual analysis and visualization evidence—no hallucinated numbers or mismatched descriptions.
+10) Use LaTeX \\ref{fig:...} for all figures; ensure numbering and captions are complete.
+
+Ethics and calibration:
+11) Avoid overclaiming; calibrate conclusions to evidence strength. Do not state implications not supported by the experiments.
+12) Mandatory disclosure: in the Abstract or Methods section, include a single clear sentence that this draft was generated with an automated CFD Scientist pipeline (or “AI-assisted workflow”) and that results and figures come from the provided experiments and analysis.
 """.strip()
 
 
@@ -115,8 +136,9 @@ class WriterAgent:
                     "fetch_error": str(e),
                 }
 
+        # Multi-round citation (AI Scientist v2–style) for better coverage.
         try:
-            citations = self.collect_citations(citation_context=topic, total_rounds=2)
+            citations = self.collect_citations(citation_context=topic, total_rounds=3)
         except Exception:
             citations = []
 
@@ -129,17 +151,16 @@ class WriterAgent:
             "Topic:\n{topic}\n\n"
             "Context (including analysis summaries):\n{section_context}\n\n"
             "Literature survey bundle:\n{lit_bundle}\n\n"
-            "Candidate citations:\n{citations}\n\n"
-            "Visualization bundle (figures and plot descriptions):\n{viz_bundle}\n\n"
-            "Additional mandatory style checklist:\n{checklist}\n\n"
+            "Candidate citations (use these; add \\cite{} where appropriate):\n{citations}\n\n"
+            "Visualization bundle (figures and plot descriptions—every figure listed here must appear in the paper with a caption and be referenced in the text):\n{viz_bundle}\n\n"
+            "Mandatory style checklist (Sakana AI Scientist v2–aligned):\n{checklist}\n\n"
             "Requirements:\n"
-            "- Use evidence-grounded claims only.\n"
-            "- Include a Related Work section with concrete comparison positioning.\n"
-            "- Include an explicit Claim-Evidence table (can be LaTeX tabular) that ties claims to specific experiments, analysis findings, and figures.\n"
-            "- Include Failure Cases / Negative Results section.\n"
-            "- Include Reproducibility appendix.\n"
-            "- When appropriate, refer to generated figures using LaTeX-style references (e.g., Figure~\\ref{fig:...}) and ensure the text interpretation matches the analysis and visualization evidence.\n"
-            "Return ONLY LaTeX."
+            "- Structure: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion; add Reproducibility appendix and Claim–Evidence table.\n"
+            "- Use evidence-grounded claims only; every claim must map to an experiment, figure, or number in the analysis.\n"
+            "- Include a Failure Cases / Negative Results subsection.\n"
+            "- Include mandatory disclosure in Abstract or Methods: one sentence that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results/figures come from the provided experiments and analysis.\n"
+            "- Reference every figure with \\ref{fig:...}; ensure captions and in-text descriptions match the actual visualization data (no hallucinated values).\n"
+            "Return ONLY LaTeX (no markdown, no explanation outside comments)."
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -155,7 +176,7 @@ class WriterAgent:
                 "section_context": section_context,
                 "lit_bundle": json.dumps(lit_bundle),
                 "citations": json.dumps(citations),
-                "checklist": AI_SCIENTIST_STYLE_CHECKLIST,
+                "checklist": AI_SCIENTIST_V2_STYLE_CHECKLIST,
                 "viz_bundle": json.dumps(visualization_bundle or []),
             }
         ).content

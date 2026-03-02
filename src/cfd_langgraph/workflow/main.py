@@ -4,14 +4,16 @@ import argparse
 import json
 from pathlib import Path
 
-from cfd_langchain.config import get_settings
-from cfd_langchain.ideation import run_ideation
-from cfd_langchain.prompts.loader import PromptLoader
-from cfd_langchain.workflow.graph import CFDWorkflow
+from cfd_langgraph.config import get_settings
+from cfd_langgraph.ideation import run_ideation
+from cfd_langgraph.prompts.loader import PromptLoader
+from cfd_langgraph.workflow.graph import CFDWorkflow
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CFD Scientist LangChain workflow")
+    parser = argparse.ArgumentParser(
+        description="CFD Scientist workflow (LangGraph-orchestrated)"
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_ideate = sub.add_parser("ideate", help="Run literature-aware ideation only")

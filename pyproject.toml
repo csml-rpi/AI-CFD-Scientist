@@ -3,15 +3,16 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cfd-langchain"
+name = "cfd-scientist"
 version = "0.1.0"
-description = "LangChain modular CFD scientist agents"
+description = "Agentic CFD scientist workflow orchestrated by LangGraph"
 requires-python = ">=3.10"
 dependencies = [
     "langchain>=0.3.0",
     "langchain-openai>=0.2.0",
     "langchain-anthropic>=0.3.0",
     "langchain-aws>=0.2.0",
+    "langgraph>=0.2.0",
     "pydantic>=2.8",
     "PyYAML>=6.0",
     "python-dotenv>=1.0",
@@ -21,7 +22,7 @@ dependencies = [
 ]
 
 [project.scripts]
-cfd-scientist = "cfd_langchain.workflow.main:main"
+cfd-scientist = "cfd_langgraph.workflow.main:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

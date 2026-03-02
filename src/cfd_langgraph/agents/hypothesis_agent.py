@@ -4,9 +4,9 @@ import json
 from typing import Any, Dict, List
 from langchain_core.prompts import ChatPromptTemplate
 
-from cfd_langchain.llm.factory import create_langchain_llm
-from cfd_langchain.prompts.loader import PromptLoader
-from cfd_langchain.utils import strip_json_fences
+from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.prompts.loader import PromptLoader
+from cfd_langgraph.utils import strip_json_fences
 
 
 class HypothesisAgent:
@@ -14,7 +14,8 @@ class HypothesisAgent:
         self.model = model
         self.prompts = prompt_loader.section("HypothesisAgent")
         self.llm = create_langchain_llm(model=model, temperature=0.3)
-        self.validator_llm = create_langchain_llm(model=model, temperature=0.1)
+        # Keep validator non-deterministic (LLM semantic QA), but lower-temp than generator.
+        self.validator_llm = create_langchain_llm(model=model, temperature=0.2)
 
     def generate_user_requirement(
         self, idea: Dict[str, Any], simulation: Dict[str, Any]
@@ -62,7 +63,12 @@ class HypothesisAgent:
             "You are a strict CFD QA checker for Foam-Agent prompts. "
             "Decide whether this requirement is logically consistent and executable by Foam-Agent. "
             "Validate things like solver presence, time-control consistency, boundary-condition completeness, "
-            "mesh details, physics coherence, units. Also ensure NO visualization instructions are present "
+            "mesh details, physics coherence, units. "
+            "Explicitly sanity-check time controls: endTime > 0, deltaT > 0, deltaT <= endTime, "
+            "writeInterval is consistent with deltaT/endTime, and any 'run from t0 to tf' matches the chosen controls. "
+            "Also ensure the prompt includes enough detail for Foam-Agent to pick a tutorial/solver and write all required files "
+            "(e.g., solver, viscosity/nu or transport properties, initial/boundary conditions, and mesh description). "
+            "Also ensure NO visualization instructions are present "
             "(no 'Visualize', no plotting requests, no figure-generation instructions)."
         )
         user = (
@@ -127,8 +133,25 @@ class HypothesisAgent:
             "plot",
             "contour",
             "streamline",
+            "stream line",
             "save as png",
+            "screenshot",
+            "render",
+            "paraview",
+            "para view",
+            "pyvista",
+            "vtk",
+            "glyph",
+            "quiver",
+            "vector",
+            "post-process",
+            "postprocess",
+            "post processing",
             "figure",
+            "image",
+            "png",
+            "jpg",
+            "jpeg",
         ]
         sentences = [s.strip() for s in req.replace("\n", " ").split(".")]
         kept = []

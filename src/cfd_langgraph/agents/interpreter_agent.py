@@ -4,9 +4,9 @@ import json
 from typing import Any, Dict
 from langchain_core.prompts import ChatPromptTemplate
 
-from cfd_langchain.llm.factory import create_langchain_llm
-from cfd_langchain.prompts.loader import PromptLoader
-from cfd_langchain.utils import strip_json_fences
+from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.prompts.loader import PromptLoader
+from cfd_langgraph.utils import strip_json_fences
 
 
 class ResultsInterpreterAgent:

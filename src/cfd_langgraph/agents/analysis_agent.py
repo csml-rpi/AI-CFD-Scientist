@@ -5,8 +5,8 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from langchain_core.prompts import ChatPromptTemplate
 
-from cfd_langchain.llm.factory import create_langchain_llm
-from cfd_langchain.utils import strip_json_fences
+from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.utils import strip_json_fences
 
 
 class AnalysisAgent:
