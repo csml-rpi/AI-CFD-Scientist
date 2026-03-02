@@ -1,0 +1,28 @@
+# Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pycache/
+*.pyc
+
+# Virtual env
+.venv/
+venv/
+env/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Build / install
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Local data / runs (optional – uncomment if you don’t want to track)
+# data/
+# runs/
