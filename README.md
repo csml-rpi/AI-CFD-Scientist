@@ -1,141 +1,97 @@
-## Prerequisites
+# cfd-scientist-langchain
 
-1. **OpenFOAM**: Install OpenFOAM v10 or later
-2. **Python**: Python 3.8+ with conda/pip
-3. **Foam-Agent**: Clone and set up the Foam-Agent repository (required for simulation execution)
+LangChain modular re-architecture of `~/Documents/cfd-scientist` with the **same agent roles**, prompt source, and Foam-Agent integration points.
 
-## Installation
+## Goals
+- Preserve existing behavior/prompting from `cfd-scientist/prompts/prompts.yaml`
+- Modularize into composable agents and workflow orchestration
+- Add literature-aware ideation (Semantic Scholar + optional Brave web search)
+- Keep execution optional (no auto-run in this scaffold)
 
-1. **Clone the repository:**
+## Agent parity
+- IdeationAgent
+- HypothesisAgent
+- AnalysisAgent
+- WriterAgent
+- LiteratureSurveyAgent (Semantic Scholar + web search)
+
+## Prompt parity
+By default, this project reads prompts from:
+- `/home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain/prompts/prompts.yaml`
+
+You can override with env var:
+- `CFD_PROMPTS_PATH=/path/to/prompts.yaml`
+
+## Foam-Agent parity
+Runner points to:
+- `~/Documents/cfd-scientist/Foam-Agent/foambench_main.py`
+(or override via `FOAM_AGENT_MAIN` env var)
+
+## Install
 ```bash
-git clone https://github.com/blitzionic/cfd-scientist.git
-cd cfd-scientist
+cd /home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-2. **Set up Python environment:**
+## Configure
 ```bash
-conda create -n cfd-scientist python=3.9
-conda activate cfd-scientist
-pip install -r requirements.txt  
+export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-20250514-v1:0"
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
 ```
 
-3. **Set up Foam-Agent dependency:**
+### Codex provider (API only)
+Use OpenAI API-key auth for codex models.
+
 ```bash
-# Clone Foam-Agent in the same parent directory
-cd ..
-git clone https://github.com/csml-rpi/Foam-Agent.git
-cd cfd-scientist
+export CFD_SCIENTIST_MODEL="codex/gpt-5-codex"
+export OPENAI_API_KEY="..."
 ```
 
-4. **Configure environment variables:**
+You can also set the model directly without the `codex/` prefix:
+
 ```bash
-# Copy example environment file
-cp .env.example .env
-
-# Edit .env with your API keys
-export OPENAI_API_KEY=your_openai_api_key_here
-export ANTHROPIC_API_KEY=your_anthropic_key_here 
-export AWS_ACCESS_KEY_ID=your_aws_key           
-export AWS_SECRET_ACCESS_KEY=your_aws_secret       
+export CFD_SCIENTIST_MODEL="gpt-5-codex"
+export OPENAI_API_KEY="..."
 ```
 
-## Quick Start
-
-### 1. Basic Experiment Run
+Optional:
 ```bash
-# Run with default settings (manual rerun prompts)
-python src/main.py
-
-# Run with automatic reruns for failed experiments
-python src/main.py --auto-rerun
-
-# Skip analysis phase
-python src/main.py --skip-analysis
+export CFD_PROMPTS_PATH="/home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain/prompts/prompts.yaml"
+export FOAM_AGENT_MAIN="/home/somasn/Documents/openclaw/2026-02-26/cfd-scientist-langchain/Foam-Agent/foambench_main.py"
+export S2_API_KEY="your_semantic_scholar_api_key"      # literature agent
+export BRAVE_SEARCH_API_KEY="your_brave_search_api_key" # optional web supplement
 ```
 
-### 2. Advanced Usage
+## CLI examples
 ```bash
-# Rerun specific batch
-python src/main.py --rerun-batch batch_20251216_140000_abc123
+python -m cfd_langchain.workflow.main ideate \
+  --topic "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire." \
+  --out ideation_with_lit.json
 
-# Auto-execute study recommendations
-python src/main.py --auto-execute-recommendations
-
-# Custom rerun threshold and max iterations
-python src/main.py --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3
+python -m cfd_langchain.workflow.main run-topic \
+  --topic "Your CFD research topic" \
+  --out-dir ./runs/topic_run_001
+# add --execute to actually run Foam-Agent
+# add --allow-non-executed-artifacts to generate analysis/paper without --execute
 ```
 
-### 3. Analysis and Paper Generation
+Current implemented workflow commands:
+- `ideate` (literature-aware): retrieves prior studies first, then generates idea JSON.
+- `run-topic`: end-to-end flow (topic -> ideation -> hypothesis+LLM validation/repair -> Foam-Agent run/plan -> interpreter rerun loop -> analysis -> writer).
+
+Env knobs for ideation:
 ```bash
-# Generate research paper from experiment batch
-python src/latexpaper.py --batch batch_20251216_140000_abc123
-
-# Run only analysis agent on existing results
-python agents/analysis_ag.py --batch batch_20251216_140000_abc123
+export CFD_IDEATION_ENABLE_LITERATURE=1
+export CFD_IDEATION_MAX_PAPERS=12
+export CFD_IDEATION_MAX_WEB_RESULTS=5
+export CFD_IDEATION_MAX_EXPERIMENTS=50
+export CFD_IDEATION_NOVELTY_THRESHOLD=0.62
+export CFD_IDEATION_NOVELTY_MAX_RETRIES=3
+export CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL=50
+export CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT=2
+export S2_API_KEY="..."              # Semantic Scholar
+export BRAVE_SEARCH_API_KEY="..."    # Optional web supplement
 ```
-
-## Configuration
-
-### Model Selection
-Set your preferred LLM model via environment variable or command line:
-```bash
-export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
-# or
-python src/main.py --model "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
-```
-
-Supported models:
-- AWS Bedrock: `bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`, or use ARN format
-- Anthropic: `claude-3-5-sonnet-20241022`, `claude-3-5-sonnet-20240620`
-- OpenAI: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`
-- Google: `gemini-2.0-flash`
-
-### Experiment Parameters
-Edit `prompts/prompts.yaml` to customize:
-- Agent behavior and prompting strategies
-- Validation criteria for physics parameters
-- Analysis evaluation metrics
-
-## Workflow Overview
-
-1. **Ideation Phase**: Generate research ideas from literature or user input
-2. **Hypothesis Generation**: Convert ideas to OpenFOAM-compatible requirements
-3. **Parameter Validation**: Automatically validate and correct simulation parameters
-4. **Simulation Execution**: Run OpenFOAM via Foam-Agent integration
-5. **Results Analysis**: LLM vision evaluation of simulation mesh convergence, physics, and quality
-6. **Iterative Improvement**: Automatic rerun of failed experiments with corrections
-
-## Output Structure
-
-```
-data/experiments/
-├── batch_YYYYMMDD_HHMMSS_id/
-│   ├── sim_001/
-│   │   ├── run_001/
-│   │   │   ├── user_requirement.txt
-│   │   │   └── output/
-│   │   └── analysis.txt
-│   ├── sim_002/
-│   └── analysis_summary.txt
-└── ideas/
-    └── generated_ideas.json
-```
-
-## Example User Requirements
-
-### Basic Lid-Driven Cavity
-```
-Do an incompressible lid driven cavity flow.
-The cavity is a square with dimensions normalized to 1 unit.
-Use a 20x20 grid with the top wall moving at 1 m/s.
-Run from time 0 to 10 with timestep 0.005.
-```
-
-### Advanced Turbulent Flow
-```
-Perform turbulent flow over a 2D diamond obstacle using pimpleFoam.
-Domain: x=[0,15], y=[0,5], z=[-0.5,0.5] (2D with 1 cell in z).
-Diamond obstacle centered at (2.5,2.5) with diagonal = 1 unit.
-Inlet velocity: 1 m/s, kinematic viscosity: 2×10⁻⁶ m²/s.
-```
-

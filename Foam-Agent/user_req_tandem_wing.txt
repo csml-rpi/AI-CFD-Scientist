@@ -1,0 +1,6 @@
+do an incompressible 3D incompressible flow over a tandem wing configuration. The mesh is provided as a .msh file. The msh file contains 4 boundaries named "inlet",
+"outlet", "walls", "airfoil" and "frontAndBack". The "inlet" and "outlet" are of type freestream with the freestream velocity being 9 m/s. 
+ The "walls" and "airfoil" have a no-slip boundary condition (velocity equal to zero at the wall). The "frontAndBack"  faces are also of type wall. 
+ The simulation runs from time 0 to 10 with a time step of 1.0 units,
+  and results are output every 1 time steps. The viscosity (`nu`) is set as constant
+  with a value of 1.5e-05 m^2/s. Use simpleFoam solver. Use SpalartAllmaras turbulence model. Further visualize the magnitude of velocity along the mid Z section at the final time.
