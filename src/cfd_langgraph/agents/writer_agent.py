@@ -7,40 +7,64 @@ failure/negative results section, and mandatory AI-disclosure sentence.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.agents.literature_agent import LiteratureSurveyAgent
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.agents.paper_reviewer_agent import PaperReviewerAgent
+from cfd_langgraph.paper_utils import compile_tex_to_pdf, extract_pdflatex_errors
+from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
 
 
-# Writer features aligned with Sakana AI Scientist v2: standard sections, claim–evidence,
-# VLM-style figure–text alignment, multi-round citations, reproducibility, and mandatory disclosure.
+def _get_figure_paths_for_review(
+    visualization_bundle: Optional[List[Dict[str, Any]]],
+    work_dir: Optional[Path],
+) -> List[str]:
+    """Extract valid figure paths (relative to work_dir) for reviewer."""
+    if not visualization_bundle or not work_dir:
+        return []
+    paths: List[str] = []
+    for v in visualization_bundle:
+        vis = v.get("visualization", {}) if isinstance(v, dict) else {}
+        for p in vis.get("images", []) or []:
+            if isinstance(p, str) and p.strip():
+                try:
+                    rel = str(Path(p).relative_to(Path(work_dir)))
+                    if rel not in paths:
+                        paths.append(rel)
+                except ValueError:
+                    paths.append(p)
+    return paths
+
+
+# Writer features: experiment-only, no hallucination, grounded to visualizations, 8–15 pages.
 AI_SCIENTIST_V2_STYLE_CHECKLIST = """
-Sakana AI Scientist v2–style manuscript requirements (peer-review oriented):
+Manuscript requirements (experiment-grounded, no hallucination):
+
+Length:
+0) Main body (Abstract–Conclusion): at least 8 pages, at most 15 pages, excluding References and Appendix.
+
+Scope and truthfulness:
+1) The paper must reflect ONLY the provided experiments. No hallucinations. Do not mention standard literature or theory that was not actually performed or validated in these experiments.
+2) Analysis, Discussion, and Conclusion must be grounded strictly in the given visualizations and experiment data. Every claim must map to a specific figure, table, or number from the provided analysis.
+
+Figures:
+3) Include only good-quality figures. If an image is poor (blurry, wrong, uninformative), omit it. If an image doesn't make sense or doesn't provide any information, exclude it.
+4) Include at least one important figure from each experiment so all experiments are represented. Not every image from every experiment is required, but each experiment must appear in at least one figure.
+5) Every figure must be referenced in the main text; captions must accurately describe what is shown. No hallucinated numbers or mismatched descriptions. Use LaTeX \\ref{fig:...} for all figures.
 
 Structure:
-1) Standard sections in order: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion, plus appendices as needed.
-2) Explicit novelty positioning vs closest prior work in Related Work / Introduction.
-3) Claim–evidence mapping: include an explicit Claim–Evidence table (LaTeX tabular) tying each major claim to specific experiments, figures, and quantitative results. No unsupported claims.
-4) Transparent negative results and failure analysis: dedicate a subsection (e.g. Failure Cases / Negative Results) to failed or inconclusive runs, syntax/execution issues, and what was learned.
-5) Ablation/sensitivity discussion and robustness caveats where applicable.
-6) Limitations and concrete next-experiment proposals (what would you run next and why).
+6) Standard sections: Abstract, Introduction, Related Work (only if relevant to what was done), Methods, Results, Discussion, Conclusion; Reproducibility appendix and Claim–Evidence table.
+7) Claim–evidence table: tie each major claim to specific experiments, figures, and numbers. No unsupported claims.
+8) Failure Cases / Negative Results subsection if any run failed or was inconclusive.
+9) Reproducibility appendix: solver, OpenFOAM/case setup, mesh, BCs, time step and end time, how to run—only what was actually used.
 
-Reproducibility (reproducibility-first reporting):
-7) Reproducibility appendix or section: exact solver name and version, OpenFOAM/case setup, mesh/resolution, boundary conditions, time step and end time, and how to run the case (e.g. Foam-Agent or allRun script). No vague “as in code” without specifics.
-8) Environment and config: mention WM_PROJECT_DIR / OpenFOAM version if relevant, and any env vars or paths a reader would need.
-
-Figures and consistency (VLM-style alignment):
-9) Every figure must be referenced in the main text; figure captions must accurately describe what is shown (field, slice/contour type, time step, case). Text interpretation must match the actual analysis and visualization evidence—no hallucinated numbers or mismatched descriptions.
-10) Use LaTeX \\ref{fig:...} for all figures; ensure numbering and captions are complete.
-
-Ethics and calibration:
-11) Avoid overclaiming; calibrate conclusions to evidence strength. Do not state implications not supported by the experiments.
-12) Mandatory disclosure: in the Abstract or Methods section, include a single clear sentence that this draft was generated with an automated CFD Scientist pipeline (or “AI-assisted workflow”) and that results and figures come from the provided experiments and analysis.
+Disclosure:
+10) Mandatory: one sentence in Abstract or Methods that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results and figures come from the provided experiments and analysis.
 """.strip()
 
 
@@ -50,6 +74,7 @@ class WriterAgent:
         self.prompts = prompt_loader.section("WriterAgent")
         self.llm = create_langchain_llm(model=model, temperature=0.2)
         self.lit_agent = LiteratureSurveyAgent(model=model)
+        self.reviewer = PaperReviewerAgent(model=model, prompt_loader=prompt_loader)
 
     def write_section(self, section_context: str) -> str:
         system = self.prompts.get(
@@ -121,13 +146,19 @@ class WriterAgent:
         section_context: str,
         ideation_literature_bundle: Optional[List[Dict[str, Any]]] = None,
         visualization_bundle: Optional[List[Dict[str, Any]]] = None,
+        max_literature_papers: int = 40,
+        verbose: bool = False,
     ) -> str:
         # Prefer workflow ideation literature to keep end-to-end context aligned.
         lit_bundle: Any = ideation_literature_bundle or []
         if not lit_bundle:
+            if verbose:
+                print("[Writer] Literature survey (Semantic Scholar, max %d papers)..." % max_literature_papers)
             try:
-                lit_bundle = self.lit_agent.survey(idea_text=topic, max_papers=20)
+                lit_bundle = self.lit_agent.survey(idea_text=topic, max_papers=max_literature_papers)
             except Exception as e:
+                if verbose:
+                    print("[Writer] Literature survey failed: %s" % e)
                 lit_bundle = {
                     "idea": topic,
                     "semantic_scholar": [],
@@ -151,15 +182,15 @@ class WriterAgent:
             "Topic:\n{topic}\n\n"
             "Context (including analysis summaries):\n{section_context}\n\n"
             "Literature survey bundle:\n{lit_bundle}\n\n"
-            "Candidate citations (use these; add \\cite{} where appropriate):\n{citations}\n\n"
-            "Visualization bundle (figures and plot descriptions—every figure listed here must appear in the paper with a caption and be referenced in the text):\n{viz_bundle}\n\n"
+            "Candidate citations (use these; add \\cite{{}} where appropriate):\n{citations}\n\n"
+            "Visualization bundle (figures and paths): Include only good-quality images. You must include at least one figure from each experiment; omit poor or uninformative images. Every figure included must have a caption and be referenced in the text. Do not include figures that do not clearly support the narrative.\n{viz_bundle}\n\n"
             "Mandatory style checklist (Sakana AI Scientist v2–aligned):\n{checklist}\n\n"
             "Requirements:\n"
             "- Structure: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion; add Reproducibility appendix and Claim–Evidence table.\n"
             "- Use evidence-grounded claims only; every claim must map to an experiment, figure, or number in the analysis.\n"
             "- Include a Failure Cases / Negative Results subsection.\n"
             "- Include mandatory disclosure in Abstract or Methods: one sentence that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results/figures come from the provided experiments and analysis.\n"
-            "- Reference every figure with \\ref{fig:...}; ensure captions and in-text descriptions match the actual visualization data (no hallucinated values).\n"
+            "- Reference every figure with \\ref{{fig:...}}; ensure captions and in-text descriptions match the actual visualization data (no hallucinated values).\n"
             "Return ONLY LaTeX (no markdown, no explanation outside comments)."
         )
 
@@ -170,7 +201,7 @@ class WriterAgent:
             ]
         )
         chain = prompt | self.llm
-        return chain.invoke(
+        out = chain.invoke(
             {
                 "topic": topic,
                 "section_context": section_context,
@@ -179,4 +210,202 @@ class WriterAgent:
                 "checklist": AI_SCIENTIST_V2_STYLE_CHECKLIST,
                 "viz_bundle": json.dumps(visualization_bundle or []),
             }
-        ).content
+        )
+        result = getattr(out, "content", str(out))
+        if verbose:
+            print("[Writer] Paper draft generated.")
+        return result
+
+    def revise_paper(
+        self,
+        tex_content: str,
+        recommendations: List[str],
+        visualization_bundle: Optional[List[Dict[str, Any]]] = None,
+        work_dir: Optional[Path] = None,
+        analysis_context: Optional[str] = None,
+        verbose: bool = False,
+    ) -> str:
+        """Revise the LaTeX paper based on reviewer recommendations. analysis_context (topic, idea, analysis report) is provided so the writer knows what experiments exist and what figures are available per experiment."""
+        system = self.prompts.get(
+            "system_prompt",
+            "You are a LaTeX paper writer for CFD.",
+        )
+        fig_paths_block = ""
+        if visualization_bundle and work_dir:
+            by_exp: Dict[str, List[str]] = {}
+            for v in visualization_bundle:
+                sim_id = (v.get("simulation_id") or v.get("case_name") or "unknown") if isinstance(v, dict) else "unknown"
+                vis = v.get("visualization", {}) if isinstance(v, dict) else {}
+                imgs = vis.get("images", [])
+                paths_for_exp: List[str] = []
+                for p in imgs:
+                    if isinstance(p, str) and p.strip():
+                        try:
+                            rel = str(Path(p).relative_to(Path(work_dir)))
+                            if rel not in paths_for_exp:
+                                paths_for_exp.append(rel)
+                        except ValueError:
+                            paths_for_exp.append(p)
+                if paths_for_exp:
+                    by_exp.setdefault(sim_id, []).extend(paths_for_exp[:15])
+            if by_exp:
+                lines = []
+                for sid, plist in sorted(by_exp.items()):
+                    lines.append(f"{sid}:")
+                    for p in plist:
+                        lines.append(f"  - {p}")
+                fig_paths_block = (
+                    "\n\nFIGURE PATHS BY EXPERIMENT (use in \\includegraphics; relative to project root):\n"
+                    + "\n".join(lines)
+                )
+        analysis_block = ""
+        if analysis_context:
+            analysis_block = (
+                "\n\nANALYSIS CONTEXT (topic, experiments, available figures—use this to add missing experiment figures or correct descriptions):\n"
+                "---\n"
+                f"{analysis_context[:30000]}\n"
+                "---\n"
+            )
+        user = (
+            "Revise this LaTeX paper according to the reviewer recommendations. "
+            "Apply ALL recommended fixes. When the reviewer says an experiment (e.g. exp_004) has no figures: use the FIGURE PATHS BY EXPERIMENT and ANALYSIS CONTEXT below to add the correct \\includegraphics from that experiment. Use ONLY paths from the list; do NOT invent paths. "
+            "LENGTH: Main body 8–15 pages. FIGURES: At least one from each experiment; only good-quality images. Exclude any image that doesn't make sense or doesn't provide useful information. SCOPE: No hallucinations; grounded in the given analysis and visualizations.\n\n"
+            "Return ONLY the complete revised LaTeX document (no markdown, no explanation).\n\n"
+            "CURRENT LaTeX:\n{tex_content}\n\n"
+            "REVIEWER RECOMMENDATIONS:\n{recommendations}"
+            "{fig_paths}"
+            "{analysis_context}"
+        )
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", system),
+            ("human", user),
+        ])
+        chain = prompt | self.llm
+        if verbose:
+            print("[Writer] Revising paper (%d recommendations)..." % len(recommendations))
+        out = chain.invoke({
+            "tex_content": tex_content[:80000],
+            "recommendations": "\n".join(f"- {r}" for r in recommendations),
+            "fig_paths": fig_paths_block,
+            "analysis_context": analysis_block,
+        })
+        if verbose:
+            print("[Writer] Revision done.")
+        return getattr(out, "content", str(out))
+
+    def write_paper_with_literature_and_review(
+        self,
+        topic: str,
+        section_context: str,
+        out_dir: Path,
+        work_dir: Path | None = None,
+        ideation_literature_bundle: Optional[List[Dict[str, Any]]] = None,
+        visualization_bundle: Optional[List[Dict[str, Any]]] = None,
+        max_literature_papers: int = 40,
+        max_review_tries: int = 10,
+        verbose: bool = False,
+    ) -> Tuple[str, Path | None, Dict[str, Any]]:
+        """
+        Write paper, compile to PDF, and run reviewer loop until pass or max tries.
+
+        Returns:
+            (final_tex, pdf_path, review_info)
+            pdf_path is None if compilation never succeeded.
+        """
+        if verbose:
+            print("[Writer] === Paper writing (with literature and review loop, max %d tries) ===" % max_review_tries)
+
+        paper_tex = self.write_paper_with_literature(
+            topic=topic,
+            section_context=section_context,
+            ideation_literature_bundle=ideation_literature_bundle,
+            visualization_bundle=visualization_bundle,
+            max_literature_papers=max_literature_papers,
+            verbose=verbose,
+        )
+        paper_tex = strip_latex_fences(paper_tex)
+
+        tex_path = out_dir / "paper_draft.tex"
+        work_dir = work_dir or out_dir
+        review_info: Dict[str, Any] = {"tries": 0, "reviews": []}
+
+        for attempt in range(max_review_tries):
+            review_info["tries"] = attempt + 1
+            n = attempt + 1
+            if verbose:
+                print("[Writer] --- Attempt %d / %d ---" % (n, max_review_tries))
+
+            tex_path.write_text(paper_tex, encoding="utf-8")
+
+            if verbose:
+                print("[Writer] Compiling LaTeX (pdflatex)...")
+            compile_ok, pdf_path, compile_err = compile_tex_to_pdf(
+                tex_path, work_dir=work_dir
+            )
+
+            if compile_ok:
+                if verbose:
+                    print("[Writer] Compilation: SUCCESS -> %s" % pdf_path)
+            else:
+                if verbose:
+                    print("[Writer] Compilation: FAILED")
+                    err_summary = extract_pdflatex_errors(compile_err or "")
+                    print("[Writer] Compilation errors:\n%s" % err_summary)
+
+            if verbose:
+                print("[Writer] Reviewing paper...")
+            # Pass extracted key errors (not raw log) so reviewer sees the actual problem
+            err_for_review = extract_pdflatex_errors(compile_err) if not compile_ok and compile_err else compile_err
+            review = self.reviewer.review(
+                tex_content=paper_tex,
+                compile_ok=compile_ok,
+                compile_error=err_for_review,
+                valid_figure_paths=_get_figure_paths_for_review(visualization_bundle, work_dir),
+            )
+            review_info["reviews"].append(review)
+
+            passed = bool(review.get("pass", False))
+            score = review.get("score", 0)
+            recs = review.get("recommendations", [])
+            summary = review.get("summary", "")
+
+            if verbose:
+                print("[Writer] Review: %s (score=%.2f) %s" % (
+                    "PASS" if passed else "FAIL",
+                    score,
+                    ("- %s" % summary) if summary else "",
+                ))
+                if recs:
+                    print("[Writer] Recommendations (%d):" % len(recs))
+                    for i, r in enumerate(recs[:10], 1):
+                        print("[Writer]   %d. %s" % (i, (r[:120] + "..." if len(r) > 120 else r)))
+                    if len(recs) > 10:
+                        print("[Writer]   ... and %d more" % (len(recs) - 10))
+
+            if compile_ok and passed:
+                if verbose:
+                    print("[Writer] === Done: paper accepted after %d attempt(s) ===" % n)
+                return paper_tex, pdf_path, review_info
+
+            recommendations = recs
+            if not recommendations:
+                recommendations = [summary or "Improve overall quality."]
+
+            if attempt < max_review_tries - 1:
+                if verbose:
+                    print("[Writer] Revising paper and retrying...")
+                paper_tex = self.revise_paper(
+                    paper_tex,
+                    recommendations,
+                    visualization_bundle=visualization_bundle,
+                    work_dir=work_dir,
+                    analysis_context=section_context,
+                    verbose=verbose,
+                )
+                paper_tex = strip_latex_fences(paper_tex)
+            else:
+                if verbose:
+                    print("[Writer] Max tries (%d) reached; returning last version." % max_review_tries)
+
+        pdf_path = out_dir / "paper_draft.pdf" if (out_dir / "paper_draft.pdf").exists() else None
+        return paper_tex, pdf_path, review_info

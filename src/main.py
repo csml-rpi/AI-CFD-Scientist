@@ -19,7 +19,7 @@ import uuid
 # For Bedrock, always use the Claude Sonnet 4 application profile.
 DEFAULT_BEDROCK_MODEL = os.environ.get(
     "CFD_SCIENTIST_MODEL",
-    "us.anthropic.claude-sonnet-4-20250514-v1:0",
+    "us.anthropic.claude-sonnet-4-6",
 )
 
 # Allow override via command-line argument

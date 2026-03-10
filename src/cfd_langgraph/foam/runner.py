@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import os
+import sys
 import subprocess
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Dict, Any
 
 
 DEFAULT_SUBPROCESS_TIMEOUT = 1800  # 30 minutes
+DEFAULT_STD_TAIL_CHARS = 1000  # keep only tail for JSON payload
 
 
 class FoamAgentRunner:
@@ -35,27 +39,69 @@ class FoamAgentRunner:
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{project_root}:{env.get('PYTHONPATH', '')}"
         output_dir.mkdir(parents=True, exist_ok=True)
+
+        stdout_tail = deque(maxlen=DEFAULT_STD_TAIL_CHARS)
+        stderr_tail = deque(maxlen=DEFAULT_STD_TAIL_CHARS)
+
+        def _pump(pipe, sink, tail_buf):
+            try:
+                for line in iter(pipe.readline, ""):
+                    sink.write(line)
+                    sink.flush()
+                    tail_buf.extend(line)
+            finally:
+                pipe.close()
+
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
                 cwd=str(project_root),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.timeout,
+                bufsize=1,
             )
-        except subprocess.TimeoutExpired as exc:
+
+            t_out = threading.Thread(target=_pump, args=(proc.stdout, sys.stdout, stdout_tail), daemon=True)
+            t_err = threading.Thread(target=_pump, args=(proc.stderr, sys.stderr, stderr_tail), daemon=True)
+            t_out.start()
+            t_err.start()
+
+            try:
+                returncode = proc.wait(timeout=self.timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                t_out.join(timeout=1)
+                t_err.join(timeout=1)
+                return {
+                    "planned": False,
+                    "cmd": cmd,
+                    "returncode": -1,
+                    "stdout": "".join(stdout_tail),
+                    "stderr": f"Process timed out after {self.timeout}s\n" + "".join(stderr_tail),
+                    "stdout_truncated": True,
+                    "stderr_truncated": True,
+                }
+
+            t_out.join(timeout=1)
+            t_err.join(timeout=1)
+            return {
+                "planned": False,
+                "cmd": cmd,
+                "returncode": returncode,
+                "stdout": "".join(stdout_tail),
+                "stderr": "".join(stderr_tail),
+                "stdout_truncated": True,
+                "stderr_truncated": True,
+            }
+        except Exception as e:
             return {
                 "planned": False,
                 "cmd": cmd,
                 "returncode": -1,
-                "stdout": (exc.stdout or b"").decode(errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
-                "stderr": f"Process timed out after {self.timeout}s",
+                "stdout": "".join(stdout_tail),
+                "stderr": f"Runner exception: {e}\n" + "".join(stderr_tail),
+                "stdout_truncated": True,
+                "stderr_truncated": True,
             }
-        return {
-            "planned": False,
-            "cmd": cmd,
-            "returncode": result.returncode,
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-        }

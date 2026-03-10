@@ -48,7 +48,7 @@ pip install -r requirements.txt
 ### Required for pipeline (Bedrock default)
 
 ```bash
-export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-20250514-v1:0"
+export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-6"
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 # AWS region for Bedrock (e.g. us-west-2)
@@ -63,7 +63,7 @@ export AWS_DEFAULT_REGION="us-west-2"
 
 ### Optional: literature and ideation
 
-- `S2_API_KEY` – Semantic Scholar API key (recommended for ideation)
+- `S2_API_KEY` – Semantic Scholar API key (optional; public API works without it, rate-limited)
 - `BRAVE_SEARCH_API_KEY` – optional web search for literature
 - `CFD_IDEATION_ENABLE_LITERATURE=1`
 - `CFD_IDEATION_MAX_PAPERS=12`
@@ -140,6 +140,7 @@ After `run-topic` with `--execute` (and optionally `--allow-non-executed-artifac
 - `pipeline_log.json` – full log (ideation, sims, run history, interpreter, analysis path, paper path).
 - `analysis_report.md` – cross-case analysis.
 - `paper_draft.tex` – LaTeX draft (Sakana AI Scientist v2–style).
+- `paper_draft.pdf` – compiled PDF (via pdflatex; reviewer loop runs up to 10 times until pass).
 - Per simulation (e.g. `sim_001/`):
   - `user_requirement.txt` – Foam-Agent prompt used.
   - `foam_output/` – OpenFOAM case output.
@@ -158,9 +159,10 @@ After `run-topic` with `--execute` (and optionally `--allow-non-executed-artifac
 ## Troubleshooting
 
 - **“No module named 'cfd_langgraph'”** – run from repo root and `pip install -e .`, or set `PYTHONPATH` to the repo root.
-- **Bedrock errors** – check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` and model id `us.anthropic.claude-sonnet-4-20250514-v1:0`.
+- **Bedrock errors** – check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` and model id `us.anthropic.claude-sonnet-4-6`.
 - **Foam-Agent not found** – ensure `Foam-Agent/foambench_main.py` exists or set `FOAM_AGENT_MAIN`.
 - **No figures / PyVista errors** – ensure Foam-Agent wrote results (e.g. VTK) under `foam_output/` and that `pyvista` and `matplotlib` are installed.
+- **PDF compilation fails** – ensure `pdflatex` is installed (e.g. `texlive-latex-base` or full TeX Live). The paper agent compiles LaTeX to PDF and runs a reviewer loop (max 10 tries).
 
 ---
 

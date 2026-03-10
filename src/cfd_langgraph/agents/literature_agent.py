@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Dict, List
 
 import requests
@@ -8,12 +9,17 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 
+# Retry on 429 (rate limit) or timeout; max 4 attempts, exponential backoff
+S2_RETRY_ATTEMPTS = 4
+S2_RETRY_BASE_DELAY = 10
+S2_REQUEST_TIMEOUT = 45
+
 
 class LiteratureSurveyAgent:
     """Finds close/relevant literature for a CFD idea using Semantic Scholar + web search snippets.
 
     Env vars:
-    - S2_API_KEY (optional, but recommended)
+    - S2_API_KEY (optional; Semantic Scholar works without it, public rate limit applies)
     - BRAVE_SEARCH_API_KEY (optional, for web supplement)
     """
 
@@ -38,9 +44,43 @@ class LiteratureSurveyAgent:
             "limit": max(1, min(limit, 100)),
             "fields": "title,abstract,year,venue,url,citationCount,authors,externalIds",
         }
-        r = requests.get(url, params=params, headers=self._s2_headers(), timeout=30)
-        r.raise_for_status()
-        return (r.json() or {}).get("data", [])
+        last_error = None
+        for attempt in range(S2_RETRY_ATTEMPTS):
+            try:
+                r = requests.get(
+                    url,
+                    params=params,
+                    headers=self._s2_headers(),
+                    timeout=S2_REQUEST_TIMEOUT,
+                )
+                if r.status_code == 429:
+                    last_error = requests.exceptions.HTTPError("429 Rate limit (Semantic Scholar)", response=r)
+                    if attempt < S2_RETRY_ATTEMPTS - 1:
+                        delay = S2_RETRY_BASE_DELAY * (2 ** attempt)
+                        time.sleep(delay)
+                    continue
+                r.raise_for_status()
+                return (r.json() or {}).get("data", [])
+            except requests.exceptions.Timeout as e:
+                last_error = e
+                if attempt < S2_RETRY_ATTEMPTS - 1:
+                    delay = S2_RETRY_BASE_DELAY * (2 ** attempt)
+                    print("[Literature] Semantic Scholar timeout, retrying in %ds (attempt %d/%d)..." % (delay, attempt + 1, S2_RETRY_ATTEMPTS))
+                    time.sleep(delay)
+                continue
+            except requests.exceptions.HTTPError as e:
+                last_error = e
+                if e.response is not None and e.response.status_code == 429 and attempt < S2_RETRY_ATTEMPTS - 1:
+                    delay = S2_RETRY_BASE_DELAY * (2 ** attempt)
+                    time.sleep(delay)
+                    continue
+                raise
+            except requests.exceptions.RequestException as e:
+                last_error = e
+                raise
+        if last_error:
+            raise last_error
+        return []
 
     def search_web(self, query: str, count: int = 10) -> List[Dict[str, Any]]:
         if not self.brave_api_key:

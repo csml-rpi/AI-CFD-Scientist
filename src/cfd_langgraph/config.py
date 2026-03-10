@@ -11,7 +11,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 class Settings(BaseModel):
     model: str = os.environ.get(
         "CFD_SCIENTIST_MODEL",
-        "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        "us.anthropic.claude-sonnet-4-6",
     )
     prompts_path: Path = Path(
         os.environ.get(
@@ -31,9 +31,9 @@ class Settings(BaseModel):
     s2_api_key: str | None = os.environ.get("S2_API_KEY")
     brave_api_key: str | None = os.environ.get("BRAVE_SEARCH_API_KEY")
     ideation_enable_literature: bool = os.environ.get("CFD_IDEATION_ENABLE_LITERATURE", "1") == "1"
-    ideation_max_papers: int = int(os.environ.get("CFD_IDEATION_MAX_PAPERS", "12"))
+    ideation_max_papers: int = int(os.environ.get("CFD_IDEATION_MAX_PAPERS", "20"))
     ideation_max_web_results: int = int(os.environ.get("CFD_IDEATION_MAX_WEB_RESULTS", "5"))
-    ideation_max_experiments: int = int(os.environ.get("CFD_IDEATION_MAX_EXPERIMENTS", "50"))
+    ideation_max_experiments: int = int(os.environ.get("CFD_IDEATION_MAX_EXPERIMENTS", "4"))
 
     # Strict novelty gate for ideation output vs retrieved prior studies
     ideation_novelty_threshold: float = float(os.environ.get("CFD_IDEATION_NOVELTY_THRESHOLD", "0.62"))

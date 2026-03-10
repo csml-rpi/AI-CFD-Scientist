@@ -19,7 +19,7 @@ def main():
     p_ideate = sub.add_parser("ideate", help="Run literature-aware ideation only")
     p_ideate.add_argument(
         "--topic",
-        default="Study the effect of fuel velocity and inlet box sizes in 2D small pool fire.",
+        default="Parametric CFD study in a 2D domain.",
         help="Research topic for ideation",
     )
     p_ideate.add_argument(
@@ -39,12 +39,26 @@ def main():
         action="store_true",
         help="Allow analysis/paper generation when --execute is not set",
     )
+    p_topic.add_argument(
+        "--verbose",
+        action="store_true",
+        default=True,
+        help="Print progress from each agent (default: True)",
+    )
+    p_topic.add_argument(
+        "--no-verbose",
+        action="store_true",
+        dest="no_verbose",
+        help="Disable verbose agent output",
+    )
 
     args = parser.parse_args()
     settings = get_settings()
+    print(f"[CFD-WORKFLOW] Using LLM model: {settings.model}")
 
     if args.cmd == "ideate":
-        result = run_ideation(settings=settings, research_topic=args.topic)
+        verbose = not getattr(args, "no_verbose", False)
+        result = run_ideation(settings=settings, research_topic=args.topic, verbose=verbose)
         text = json.dumps(result, indent=2)
         if args.out == "-":
             print(text)
@@ -55,6 +69,7 @@ def main():
         return
 
     if args.cmd == "run-topic":
+        verbose = getattr(args, "no_verbose", False) is False and getattr(args, "verbose", True)
         wf = CFDWorkflow(
             settings=settings, prompt_loader=PromptLoader(settings.prompts_path)
         )
@@ -63,6 +78,7 @@ def main():
             out_dir=Path(args.out_dir),
             execute=args.execute,
             allow_non_executed_artifacts=args.allow_non_executed_artifacts,
+            verbose=verbose,
         )
         print(
             json.dumps(

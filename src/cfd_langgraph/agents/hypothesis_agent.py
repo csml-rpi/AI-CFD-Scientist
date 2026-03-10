@@ -18,8 +18,14 @@ class HypothesisAgent:
         self.validator_llm = create_langchain_llm(model=model, temperature=0.2)
 
     def generate_user_requirement(
-        self, idea: Dict[str, Any], simulation: Dict[str, Any]
+        self,
+        idea: Dict[str, Any],
+        simulation: Dict[str, Any],
+        run_topic: str = "",
+        verbose: bool = False,
     ) -> str:
+        if verbose:
+            print("[Hypothesis] Generating requirement for %s..." % simulation.get("simulation_id", "?"), flush=True)
         sys_t = self.prompts.get("hypothesis_system_prompt", "")
         usr_t = self.prompts.get("hypothesis_user_prompt", "")
         if not sys_t or not usr_t:
@@ -29,14 +35,19 @@ class HypothesisAgent:
         param_val = simulation.get("parameter_value", {})
         if not isinstance(param_val, dict):
             param_val = {}
+        # Generic parameter representation: pass full param dict so prompts work for any case type (jet, cavity, etc.)
+        param_str = json.dumps(param_val, indent=2) if param_val else ""
+        topic_val = run_topic or ""
         payload = {
             "study_id": idea.get("study_id", ""),
             "description": idea.get("description", ""),
             "case_name": simulation.get("case_name", ""),
             "simulation_id": simulation.get("simulation_id", ""),
-            "fuel_velocity": param_val.get("fuel_speed", ""),
-            "box_dimension": param_val.get("box_size", ""),
+            "fuel_velocity": param_str,
+            "box_dimension": "(see parameter values above)" if param_str else "",
             "simulation_description": simulation.get("description", ""),
+            "run_topic": topic_val,
+            "topic": topic_val,
             "experiment_concept": {
                 "case_data": case_data,
                 "solver": idea.get("solver", "icoFoam"),
@@ -52,9 +63,12 @@ class HypothesisAgent:
             ]
         )
         chain = prompt | self.llm
-        return chain.invoke(payload).content.strip()
+        out = chain.invoke(payload).content.strip()
+        if verbose:
+            print("[Hypothesis] Requirement generated (%d chars)" % len(out), flush=True)
+        return out
 
-    def llm_validate_requirement(self, req: str) -> Dict[str, Any]:
+    def llm_validate_requirement(self, req: str, verbose: bool = False) -> Dict[str, Any]:
         """
         LLM semantic validator for Foam-Agent prompt quality and consistency.
         Non-deterministic by design (requested).
@@ -74,11 +88,11 @@ class HypothesisAgent:
         user = (
             "Requirement:\n{req}\n\n"
             "Return ONLY valid JSON with schema:\n"
-            "{\n"
+            "{{\n"
             '  "valid": true/false,\n'
             '  "issues": ["..."],\n'
             '  "repair_guidance": ["..."]\n'
-            "}"
+            "}}"
         )
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", user)])
         chain = prompt | self.validator_llm
@@ -91,8 +105,12 @@ class HypothesisAgent:
             parsed.setdefault("valid", False)
             parsed.setdefault("issues", [])
             parsed.setdefault("repair_guidance", [])
+            if verbose:
+                print("[Hypothesis] Validation: valid=%s" % parsed.get("valid", False), flush=True)
             return parsed
-        except Exception:
+        except Exception as e:
+            if verbose:
+                print("[Hypothesis] Validation parse error: %s" % e, flush=True)
             return {
                 "valid": False,
                 "issues": ["Validator response was not parseable JSON."],
@@ -168,15 +186,19 @@ class HypothesisAgent:
         self,
         idea: Dict[str, Any],
         simulation: Dict[str, Any],
+        run_topic: str = "",
         max_retries: int = 3,
+        verbose: bool = False,
     ) -> Dict[str, Any]:
         req = self._strip_visualization_mentions(
-            self.generate_user_requirement(idea, simulation)
+            self.generate_user_requirement(idea, simulation, run_topic=run_topic, verbose=verbose)
         )
         history: List[Dict[str, Any]] = []
 
-        for _ in range(max(1, max_retries + 1)):
-            verdict = self.llm_validate_requirement(req)
+        for attempt in range(max(1, max_retries + 1)):
+            if verbose and attempt > 0:
+                print("[Hypothesis] Retry %d/%d (validation failed)" % (attempt, max_retries), flush=True)
+            verdict = self.llm_validate_requirement(req, verbose=verbose)
             history.append({"requirement": req, "verdict": verdict})
             if verdict.get("valid", False):
                 return {
@@ -184,6 +206,8 @@ class HypothesisAgent:
                     "valid": True,
                     "history": history,
                 }
+            if verbose:
+                print("[Hypothesis] Repairing requirement...", flush=True)
             req = self.repair_requirement(
                 req,
                 issues=verdict.get("issues", []),
@@ -191,7 +215,9 @@ class HypothesisAgent:
             )
             req = self._strip_visualization_mentions(req)
 
-        final_verdict = self.llm_validate_requirement(req)
+        if verbose:
+            print("[Hypothesis] Final validation...", flush=True)
+        final_verdict = self.llm_validate_requirement(req, verbose=verbose)
         return {
             "requirement": self._strip_visualization_mentions(req),
             "valid": bool(final_verdict.get("valid", False)),

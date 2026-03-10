@@ -7,6 +7,9 @@ import re
 _JSON_FENCE_RE = re.compile(
     r"```(?:json)?\s*\n?(.*?)\n?\s*```", re.DOTALL
 )
+_LATEX_FENCE_RE = re.compile(
+    r"```(?:latex|tex)?\s*\n?(.*?)\n?\s*```", re.DOTALL
+)
 
 
 def strip_json_fences(text: str) -> str:
@@ -17,6 +20,15 @@ def strip_json_fences(text: str) -> str:
     """
     text = text.strip()
     m = _JSON_FENCE_RE.search(text)
+    if m:
+        return m.group(1).strip()
+    return text
+
+
+def strip_latex_fences(text: str) -> str:
+    """Remove markdown ```latex ... ``` or ```tex ... ``` fences, returning the inner content."""
+    text = text.strip()
+    m = _LATEX_FENCE_RE.search(text)
     if m:
         return m.group(1).strip()
     return text
