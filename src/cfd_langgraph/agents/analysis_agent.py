@@ -173,7 +173,8 @@ class AnalysisAgent:
             "and user requirements below, decide exactly what visualizations are needed for the analysis. "
             "List specific types: e.g. velocity magnitude contour at selected times, pressure contour, "
             "centreline velocity profile (line plot), cross-stream profiles, streamlines, etc. "
-            f"Suggest at most {max_viz} distinct visualization types per experiment. "
+            f"CRITICAL: suggest at most {max_viz} distinct visualization types per experiment; "
+            "this is a strict upper bound and you must NOT exceed it. "
             "Be concise but precise so a script writer can implement them. Output only the visualization "
             "specification (no code, no markdown)."
         )

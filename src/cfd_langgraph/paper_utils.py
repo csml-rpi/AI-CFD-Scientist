@@ -90,7 +90,7 @@ def compile_tex_to_pdf(
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=600,
         )
         if proc.returncode != 0:
             # pdflatex usually puts error details in stdout (log); include both for reviewer

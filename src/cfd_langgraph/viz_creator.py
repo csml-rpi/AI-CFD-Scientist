@@ -109,18 +109,30 @@ def viz_creator(
 
     _log(f"case_dir={foam_output_dir} viz_dir={viz_dir}")
 
+    # On each new viz_creator call (including interpreter reruns / analysis reruns),
+    # clear out any existing PNGs in viz_dir so that only images from the current
+    # attempt set are considered. This avoids mixing old images from previous runs.
+    for old_png in viz_dir.glob("*.png"):
+        try:
+            old_png.unlink()
+        except Exception:
+            pass
+
     marker_foam = _ensure_marker_foam(foam_output_dir)
 
     llm = create_langchain_llm(model=model, temperature=0.1)
 
     script_system = (
         "You write PyVista+matplotlib Python scripts to visualize OpenFOAM cases.\n"
-        "Requirements:\n"
+        "Requirements (CFD paper-quality figures only):\n"
         "- Load the case using PyVista from the given foam_output_dir.\n"
         "- The marker .foam file to load is always the given marker_name.\n"
         "- Use off_screen=True plotters only (no interactive windows).\n"
         "- Save all figures as PNG files into viz_dir.\n"
-        "- You may create multiple figures (contours, slices, line plots, mesh outline, etc.).\n"
+        "- Use PyVista for all field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.); do NOT use matplotlib to draw 2D contour/filled-field plots.\n"
+        "- Matplotlib may be used only for 1D line plots (e.g. profiles, time histories) where data are first sampled/extracted from PyVista.\n"
+        "- All figures must be readable in a CFD paper: avoid sparse dot-only plots; use filled contours, meaningful colorbars, clear legends, and informative layouts so readers can extract physical insight.\n"
+        "- Use a minimum font size of 18 for all titles, axis labels, tick labels, legends, and colorbar labels so they are legible when embedded in a paper.\n"
         "- Output ONLY raw Python code. Do NOT wrap in markdown code fences (no ``` or ```python).\n"
         "- Do NOT start with the word 'python' or any language tag. The first line must be an import statement.\n"
     )
@@ -145,7 +157,8 @@ def viz_creator(
         "The first line must be 'import ...' or similar, never the word 'python'. The script should:\n"
         "- import pyvista as pv (and matplotlib if needed for line plots)\n"
         "- read the case from foam_output_dir/marker_name\n"
-        "- generate the requested visualizations\n"
+        "- generate high-quality CFD paper-style visualizations: PyVista filled contour/colormap plots and streamlines for field data, plus line plots (via matplotlib) for extracted profiles or time histories as needed\n"
+        "- avoid sparse dot-only plots; ensure every figure is informative and readable with font sizes >= 18 for titles, labels, ticks, legends, and colorbars\n"
         "- save PNG files into viz_dir\n"
         "- exit with code 0 on success and non-zero on fatal error.\n"
     )

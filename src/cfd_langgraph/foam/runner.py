@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, Any
 
 
-DEFAULT_SUBPROCESS_TIMEOUT = 1800  # 30 minutes
+DEFAULT_SUBPROCESS_TIMEOUT = 7200  # 2 hours
 DEFAULT_STD_TAIL_CHARS = 1000  # keep only tail for JSON payload
 
 

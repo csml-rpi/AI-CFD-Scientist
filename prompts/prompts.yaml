@@ -163,8 +163,7 @@ HypothesisAgent:
 
     Selected Simulation:
     - Simulation ID: {simulation_id}
-    - Parameter values (use keys from the case, e.g. velocity, dimension, Re): {fuel_velocity}
-    - Other case parameters: {box_dimension}
+    - Parameter values (use keys from the case, e.g. velocity, dimensions, Re): {parameter_values}
     - Description: {simulation_description}
 
     Important: Do NOT include any visualization request in the generated requirement.
@@ -242,7 +241,7 @@ ResultsInterpreterAgent:
     The following images are from the simulation (mesh and field visualizations). Are they acceptable to judge the run? Return JSON only: {"viz_acceptable": bool, "reason": "string"}.
 
   interpretation_system_prompt: |
-    You are a CFD results interpreter. You receive the user requirement and visualization images from an OpenFOAM run. Your tasks: (1) Did the simulation run successfully (no crashes, completed)? (2) Did the results satisfy the user requirement? (3) What issues exist, if any (e.g. divergence, unphysical fields, wrong setup)? (4) Should the run be redone (rerun_required)? Be concise. Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), issues (string or list), rerun_required (bool), summary (string), reasons (string). If results are good and requirement is met, set rerun_required false and explain why. If not, set rerun_required true and give reasons.
+    You are a CFD results interpreter. You receive the user requirement and visualization images from an OpenFOAM run. Your tasks: (1) Did the simulation run successfully (no crashes, completed)? (2) Did the results satisfy the user requirement? (3) VERY IMPORTANT: check that the geometry and flow scenario described in the user requirement (e.g. jet, cavity, channel, bluff-body, etc.) actually matches what is shown in the images (domain shape, inlet/outlet locations, obstacles, etc.). If the geometry/scenario in the images does not match the requested scenario, treat this as "requirement NOT met". (4) What issues exist, if any (e.g. divergence, unphysical fields, wrong setup)? (5) Should the run be redone (rerun_required)? Be concise. Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), issues (string or list), rerun_required (bool), summary (string), reasons (string). If results are good and requirement is met, set rerun_required false and explain why. If not, set rerun_required true and give reasons, explicitly mentioning any geometry/scenario mismatch.
 
   interpretation_user_prompt: |
     User requirement:
@@ -416,6 +415,8 @@ WriterAgent:
     - Proper figure placement and referencing
     - Mathematical equations only for relations actually used or verified in the experiments
     - Bibliography in standard format (BibTeX or manual)
+    - Do NOT include a table of contents (no \\tableofcontents or “Contents” section); typical CFD journal papers do not use a TOC in the main manuscript.
+    - References section must contain at least 20 distinct, non-duplicate references, drawn from the provided Semantic Scholar / web literature bundles and candidate citations.
 
     OUTPUT FORMAT:
     - Complete LaTeX document (.tex file)
@@ -510,7 +511,7 @@ PaperReviewerAgent:
 
     **When compilation FAILED:** Your job is to fix the LaTeX so it compiles. The error summary below contains the PRIMARY errors from pdflatex — focus on the FIRST error listed; it is usually the root cause. Common causes: (1) "File X not found" — the \\includegraphics path is wrong; use ONLY paths from the VALID figure paths list if provided; (2) missing \\end{{document}}; (3) undefined control sequence; (4) unclosed environment. Do NOT assume the file is truncated unless the error explicitly says so. Give 1–3 concrete recommendations that fix the PRIMARY error. Set pass=false.
 
-    **When compilation SUCCEEDED:** Your job is to evaluate the paper for publication readiness. Check: (1) Formatting — structure, \\ref/\\cite, typography; (2) Figures — paths valid, only good-quality images included, at least one figure from each experiment, captions and labels correct, referenced in text; (3) Content — reflects only the experiments, no hallucinations, analysis/discussion/conclusion grounded in the given visualizations; (4) Coherence — flow, conclusions supported by evidence; (5) Length — main body 8–15 pages (excluding References and Appendix); flag if too short or too long; (6) Publishability. Set pass=true only if all are acceptable; otherwise give specific recommendations.
+    **When compilation SUCCEEDED:** Your job is to evaluate the paper for publication readiness. Check: (1) Formatting — structure, \\ref/\\cite, typography; ensure there is NO table of contents (no \\tableofcontents or “Contents” section), as typical CFD journal manuscripts do not include one; (2) Figures — paths valid, only good-quality images included, at least one figure from each experiment, captions and labels correct, referenced in text; (3) Content — reflects only the experiments, no hallucinations, analysis/discussion/conclusion grounded in the given visualizations; (4) Coherence — flow, conclusions supported by evidence; (5) Length — main body 8–15 pages (excluding References and Appendix); flag if too short or too long; (6) References — at least 20 distinct, non-duplicate references in the References/bibliography section, primarily drawn from the provided literature bundles and candidate citations; (7) Publishability. Set pass=true only if all are acceptable; otherwise give specific recommendations (e.g., remove TOC, increase references to ≥ 20, improve figure quality).
 
     Be strict but fair. Recommendations must be specific and actionable.
 

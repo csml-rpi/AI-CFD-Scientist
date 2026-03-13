@@ -291,7 +291,8 @@ class ResultsInterpreterAgent:
                 "Focus on scientifically useful plots that help assess whether the simulation "
                 "meets the requirement (e.g., mesh outline, key scalar/vector fields at important times, "
                 "pressure or velocity contours, centerline/line profiles, etc.). "
-                f"Suggest at most {max_viz} distinct visualization types per experiment. "
+                f"CRITICAL: suggest at most {max_viz} distinct visualization types per experiment; "
+                "this is a hard upper limit and you must NOT exceed it. "
                 "Do NOT write code. Return only a short paragraph or a few sentences describing "
                 "what to visualize; this text will be given to a separate viz generator."
             )
@@ -385,6 +386,39 @@ class ResultsInterpreterAgent:
             return self._text_only_interpret(user_req, solver_log_tail, experiment_results)
 
         case_structure = self._get_case_structure(output_dir, foam_path)
+        times = [str(t) for t in (case_structure.get("times", []) or [])]
+        # If there are no time folders beyond 0, treat this as "case did not run"
+        nonzero_times: List[str] = []
+        for t in times:
+            try:
+                if float(t) != 0.0:
+                    nonzero_times.append(t)
+            except Exception:
+                # If folder name is non-numeric (e.g. processor dirs), ignore for this check
+                continue
+        if not nonzero_times:
+            # Augment solver log with discovered time folders and force an immediate rerun decision.
+            times_str = ", ".join(times) if times else "(no time folders discovered)"
+            augmented_tail = (
+                f"Detected time folders in foam_output_dir: {times_str}. "
+                "Only '0' (or none) usually means the solver did not advance beyond the initial state.\n\n"
+                f"{solver_log_tail}"
+            )
+            base = self._text_only_interpret(user_req, augmented_tail, experiment_results)
+            base["rerun_required"] = True
+            base["simulation_success"] = False
+            base["requirement_met"] = False
+            base["viz_ok"] = False
+            base.setdefault("viz_attempts", [])
+            base["viz_attempts"].append(
+                {
+                    "attempt": 0,
+                    "viz_ok": False,
+                    "reason": "Case did not advance beyond time 0; skipping visualization and requesting rerun.",
+                }
+            )
+            return base
+
         viz_base = output_dir / "interpreter_viz"
         viz_base.mkdir(parents=True, exist_ok=True)
 

@@ -12,7 +12,7 @@ from cfd_langgraph.llm.factory import create_langchain_llm
 # Retry on 429 (rate limit) or timeout; max 4 attempts, exponential backoff
 S2_RETRY_ATTEMPTS = 4
 S2_RETRY_BASE_DELAY = 10
-S2_REQUEST_TIMEOUT = 45
+S2_REQUEST_TIMEOUT = 600  # seconds (10 minutes)
 
 
 class LiteratureSurveyAgent:
@@ -37,7 +37,7 @@ class LiteratureSurveyAgent:
             h["x-api-key"] = self.s2_api_key
         return h
 
-    def search_semantic_scholar(self, query: str, limit: int = 20) -> List[Dict[str, Any]]:
+    def search_semantic_scholar(self, query: str, limit: int = 40) -> List[Dict[str, Any]]:
         url = f"{self.S2_BASE}/paper/search"
         params = {
             "query": query,
@@ -95,7 +95,7 @@ class LiteratureSurveyAgent:
         r.raise_for_status()
         return (((r.json() or {}).get("web") or {}).get("results") or [])
 
-    def survey(self, idea_text: str, max_papers: int = 20) -> Dict[str, Any]:
+    def survey(self, idea_text: str, max_papers: int = 40) -> Dict[str, Any]:
         s2 = self.search_semantic_scholar(idea_text, limit=max_papers)
         web = self.search_web(f"{idea_text} CFD OpenFOAM", count=8)
 

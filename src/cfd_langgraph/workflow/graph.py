@@ -92,37 +92,25 @@ class CFDWorkflow:
                 )
             return sims[:max_total]
 
-        # Backward-compatible path: cases + sweep lists
+        # Generic fallback path: cases[] without explicit experiments[]
         cases = idea.get("cases", []) if isinstance(idea, dict) else []
         sim_id = 0
         for c in cases:
-            case_name = c.get("name", f"case_{sim_id}")
-            fuel_list = (
-                c.get("fuel_speed_list")
-                if isinstance(c.get("fuel_speed_list"), list)
-                else [c.get("fuel speed")]
+            if not isinstance(c, dict):
+                continue
+            sim_id += 1
+            sims.append(
+                {
+                    "simulation_id": f"sim_{sim_id:03d}",
+                    "case_name": c.get("name", f"case_{sim_id}"),
+                    "parameter_value": c.get("parameters", {}),
+                    "description": c.get("description", ""),
+                    "visualization": "",
+                    "case_data": c,
+                }
             )
-            box_list = (
-                c.get("box_size_list")
-                if isinstance(c.get("box_size_list"), list)
-                else [c.get("box size")]
-            )
-
-            for fs in fuel_list:
-                for bs in box_list:
-                    sim_id += 1
-                    sims.append(
-                        {
-                            "simulation_id": f"sim_{sim_id:03d}",
-                            "case_name": case_name,
-                            "parameter_value": {"fuel_speed": fs, "box_size": bs},
-                            "description": f"Sweep fuel_speed={fs}, box_size={bs}",
-                            "visualization": "",
-                            "case_data": c,
-                        }
-                    )
-                    if len(sims) >= max_total:
-                        return sims
+            if len(sims) >= max_total:
+                return sims
 
         return sims[:max_total]
 

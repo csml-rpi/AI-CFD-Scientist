@@ -35,7 +35,7 @@ class HypothesisAgent:
         param_val = simulation.get("parameter_value", {})
         if not isinstance(param_val, dict):
             param_val = {}
-        # Generic parameter representation: pass full param dict so prompts work for any case type (jet, cavity, etc.)
+        # Generic parameter representation: pass full param dict so prompts work for any case type.
         param_str = json.dumps(param_val, indent=2) if param_val else ""
         topic_val = run_topic or ""
         payload = {
@@ -43,8 +43,7 @@ class HypothesisAgent:
             "description": idea.get("description", ""),
             "case_name": simulation.get("case_name", ""),
             "simulation_id": simulation.get("simulation_id", ""),
-            "fuel_velocity": param_str,
-            "box_dimension": "(see parameter values above)" if param_str else "",
+            "parameter_values": param_str,
             "simulation_description": simulation.get("description", ""),
             "run_topic": topic_val,
             "topic": topic_val,
@@ -125,7 +124,10 @@ class HypothesisAgent:
     ) -> str:
         system = (
             "You repair CFD prompts for Foam-Agent. "
-            "Output exactly one corrected plain-English paragraph, executable and logically coherent."
+            "The repaired requirement must remain a single, executable paragraph that is logically coherent: "
+            "include solver, geometry/domain, mesh, boundary conditions, and time controls consistent with the study and topic constraints, in SI units, "
+            "and do NOT add any visualization or plotting instructions. "
+            "Output exactly one corrected plain-English requirement paragraph."
         )
         user = (
             "Requirement:\n{req}\n\n"

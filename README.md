@@ -161,7 +161,7 @@ After `run-topic` with `--execute` (and optionally `--allow-non-executed-artifac
 - **“No module named 'cfd_langgraph'”** – run from repo root and `pip install -e .`, or set `PYTHONPATH` to the repo root.
 - **Bedrock errors** – check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` and model id `us.anthropic.claude-sonnet-4-6`.
 - **Foam-Agent not found** – ensure `Foam-Agent/foambench_main.py` exists or set `FOAM_AGENT_MAIN`.
-- **No figures / PyVista errors** – ensure Foam-Agent wrote results (e.g. VTK) under `foam_output/` and that `pyvista` and `matplotlib` are installed.
+- **No figures / PyVista errors** – ensure Foam-Agent wrote results (e.g. VTK) under `foam_output/` and that `pyvista` and `matplotlib` are installed. On headless servers (no physical display or GPU), PyVista/VTK also require an off-screen OpenGL backend such as OSMesa/EGL or a software Mesa stack; make sure the container or system has these libraries so `pyvista.Plotter(off_screen=True)` can render without X/GUI.
 - **PDF compilation fails** – ensure `pdflatex` is installed (e.g. `texlive-latex-base` or full TeX Live). The paper agent compiles LaTeX to PDF and runs a reviewer loop (max 10 tries).
 
 ---

@@ -90,6 +90,11 @@ def _dedupe_and_cap_experiments(experiments: List[Dict[str, Any]], max_experimen
 
 
 def _normalize_to_experiments_schema(idea_json: Dict[str, Any], max_experiments: int) -> Dict[str, Any]:
+    """
+    Normalize older or partial idea JSONs to the canonical experiments[] schema.
+    New code should populate experiments[] directly; this helper keeps a minimal,
+    generic path for legacy ideas without embedding fuel-specific concepts.
+    """
     if not isinstance(idea_json, dict):
         return idea_json
 
@@ -98,43 +103,26 @@ def _normalize_to_experiments_schema(idea_json: Dict[str, Any], max_experiments:
         idea_json["experiments"] = _dedupe_and_cap_experiments(idea_json.get("experiments", []), max_experiments)
         return idea_json
 
-    # Backward compatibility path: convert cases/fuel_speed_list/box_size_list -> experiments
+    # Generic legacy path: convert cases[*].parameters -> experiments without fuel-specific fields
     cases = idea_json.get("cases", [])
     experiments: List[Dict[str, Any]] = []
     if isinstance(cases, list):
         for c in cases:
             if not isinstance(c, dict):
                 continue
-            fs = c.get("fuel_speed_list") if isinstance(c.get("fuel_speed_list"), list) else []
-            bs = c.get("box_size_list") if isinstance(c.get("box_size_list"), list) else []
-            if fs and bs:
-                for f in fs:
-                    for b in bs:
-                        experiments.append(
-                            {
-                                "name": c.get("name", "experiment"),
-                                "topology": c.get("topology", "2d"),
-                                "dimensions": c.get("dimensions", [1.0, 1.0, 0.1]),
-                                "parameters": {"fuel_velocity": f, "inlet_box_size": b},
-                                "controls": {"target_CFL": idea_json.get("target_CFL", 0.5)},
-                                "notes": c.get("description", ""),
-                            }
-                        )
-            else:
-                params = c.get("parameters") if isinstance(c.get("parameters"), dict) else {}
-                experiments.append(
-                    {
-                        "name": c.get("name", "experiment"),
-                        "topology": c.get("topology", "2d"),
-                        "dimensions": c.get("dimensions", [1.0, 1.0, 0.1]),
-                        "parameters": params,
-                        "controls": {"target_CFL": idea_json.get("target_CFL", 0.5)},
-                        "notes": c.get("description", ""),
-                    }
-                )
+            params = c.get("parameters") if isinstance(c.get("parameters"), dict) else {}
+            experiments.append(
+                {
+                    "name": c.get("name", "experiment"),
+                    "topology": c.get("topology", "2d"),
+                    "dimensions": c.get("dimensions", [1.0, 1.0, 0.1]),
+                    "parameters": params,
+                    "controls": {"target_CFL": idea_json.get("target_CFL", 0.5)},
+                    "notes": c.get("description", ""),
+                }
+            )
 
     idea_json["experiments"] = _dedupe_and_cap_experiments(experiments, max_experiments)
-    # keep backward fields for compatibility, but canonical experiments[] is primary
     return idea_json
 def _extract_experiment_count(idea_json: Dict[str, Any]) -> int | None:
     """
@@ -152,24 +140,10 @@ def _extract_experiment_count(idea_json: Dict[str, Any]) -> int | None:
         return len(experiments)
 
     cases = idea_json.get("cases")
-    if not isinstance(cases, list):
-        return None
-
-    total = 0
-    for c in cases:
-        if not isinstance(c, dict):
-            continue
-        fs = c.get("fuel_speed_list")
-        bs = c.get("box_size_list")
-        if isinstance(fs, list) and isinstance(bs, list):
-            total += max(1, len(fs) * len(bs))
-        elif isinstance(fs, list):
-            total += max(1, len(fs))
-        elif isinstance(bs, list):
-            total += max(1, len(bs))
-        else:
-            total += 1
-    return total
+    if isinstance(cases, list):
+        # Fallback: treat each case as at least one experiment
+        return sum(1 for c in cases if isinstance(c, dict))
+    return None
 
 
 def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) -> Dict[str, Any]:

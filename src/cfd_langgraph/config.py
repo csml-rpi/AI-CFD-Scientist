@@ -31,9 +31,9 @@ class Settings(BaseModel):
     s2_api_key: str | None = os.environ.get("S2_API_KEY")
     brave_api_key: str | None = os.environ.get("BRAVE_SEARCH_API_KEY")
     ideation_enable_literature: bool = os.environ.get("CFD_IDEATION_ENABLE_LITERATURE", "1") == "1"
-    ideation_max_papers: int = int(os.environ.get("CFD_IDEATION_MAX_PAPERS", "20"))
+    ideation_max_papers: int = int(os.environ.get("CFD_IDEATION_MAX_PAPERS", "40"))
     ideation_max_web_results: int = int(os.environ.get("CFD_IDEATION_MAX_WEB_RESULTS", "5"))
-    ideation_max_experiments: int = int(os.environ.get("CFD_IDEATION_MAX_EXPERIMENTS", "4"))
+    ideation_max_experiments: int = int(os.environ.get("CFD_IDEATION_MAX_EXPERIMENTS", "10"))
 
     # Strict novelty gate for ideation output vs retrieved prior studies
     ideation_novelty_threshold: float = float(os.environ.get("CFD_IDEATION_NOVELTY_THRESHOLD", "0.62"))
@@ -41,7 +41,7 @@ class Settings(BaseModel):
 
     # Orchestration controls
     workflow_max_experiments_total: int = int(os.environ.get("CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL", "50"))
-    workflow_max_reruns_per_experiment: int = int(os.environ.get("CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT", "2"))
+    workflow_max_reruns_per_experiment: int = int(os.environ.get("CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT", "10"))
 
 
 

@@ -34,7 +34,7 @@ class LiteratureClient:
             headers["x-api-key"] = self.s2_api_key
 
         try:
-            resp = requests.get(url, params=params, headers=headers, timeout=20)
+            resp = requests.get(url, params=params, headers=headers, timeout=600)
             resp.raise_for_status()
             data = resp.json().get("data", [])
         except Exception:
@@ -62,7 +62,7 @@ class LiteratureClient:
             "sort": "relevance_score:desc",
         }
         try:
-            resp = requests.get(url, params=params, timeout=20)
+            resp = requests.get(url, params=params, timeout=600)
             resp.raise_for_status()
             results = resp.json().get("results", [])
         except Exception:
@@ -106,7 +106,7 @@ class LiteratureClient:
             + f"&start=0&max_results={max(1, min(limit, 30))}"
         )
         try:
-            resp = requests.get(url, timeout=20)
+            resp = requests.get(url, timeout=600)
             resp.raise_for_status()
             text = resp.text
         except Exception:
@@ -157,7 +157,7 @@ class LiteratureClient:
         params = {"q": query, "count": max(1, min(limit, 20))}
 
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=20)
+            resp = requests.get(url, headers=headers, params=params, timeout=600)
             resp.raise_for_status()
             results = resp.json().get("web", {}).get("results", [])
         except Exception:
