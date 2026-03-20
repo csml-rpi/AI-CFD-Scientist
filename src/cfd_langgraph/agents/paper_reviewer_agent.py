@@ -72,7 +72,11 @@ class PaperReviewerAgent:
             "compile_error": compile_error or "",
             # Optional extra input used by the prompt template (see prompts.yaml).
             "reference_report": reference_report or "",
-            "tex_content": tex_content[:50000],  # truncate for context limit
+            # IMPORTANT: Avoid truncating too aggressively.
+            # In your current run, `paper_draft.tex` is ~54k+ chars; truncation here
+            # makes the reviewer believe the bibliography / \\end{document} are missing
+            # even when pdflatex succeeds.
+            "tex_content": tex_content[:200000],
         })
         raw = getattr(out, "content", str(out))
 

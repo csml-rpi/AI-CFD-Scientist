@@ -1,6 +1,6 @@
 """
 ResultsInterpreterAgent: for each experiment, (1) takes user requirement and case
-structure (time folders, variables), (2) writes and runs a PyVista script to create
+structure (time folders, variables), (2) uses the central `viz_creator` to generate
 multiple visualizations (angles, variables at different times, mesh), (3) with
 user requirement + images, decides if viz are good enough (retry up to 25 times),
 then (4) decides if the simulation satisfied the user requirement, identifies issues,
@@ -424,7 +424,7 @@ class ResultsInterpreterAgent:
 
         # Use central viz_creator to generate and refine visualizations (no reference yet).
         if verbose:
-            print("[Interpreter] Running viz_creator (PyVista)...", flush=True)
+            print("[Interpreter] Running viz_creator (ParaView)...", flush=True)
         viz_result = viz_creator(
             model=self.model,
             foam_output_dir=output_dir,
@@ -483,6 +483,34 @@ class ResultsInterpreterAgent:
         parsed.setdefault("viz_ok", bool(viz_attempts and viz_attempts[-1].get("viz_ok")))
         parsed.setdefault("viz_attempts", viz_attempts)
         parsed.setdefault("case_structure", case_structure)
+
+        # If we decided to rerun, print a concise reason in the terminal
+        # so you can quickly judge whether to proceed.
+        if bool(parsed.get("rerun_required", False)):
+            def _short_str(v: Any, limit: int = 1200) -> str:
+                try:
+                    if isinstance(v, (dict, list)):
+                        s = json.dumps(v, ensure_ascii=False)
+                    else:
+                        s = str(v)
+                except Exception:
+                    s = str(v)
+                s = s.strip().replace("\n", " ")
+                if len(s) > limit:
+                    s = s[:limit] + "..."
+                return s
+
+            reason = (
+                parsed.get("rerun_reason")
+                or parsed.get("reasons")
+                or parsed.get("issues")
+                or parsed.get("summary")
+                or parsed.get("failure_reason")
+            )
+            print(
+                f"[Interpreter] RERUN_REQUIRED sim_id={sim_id} requirement_met={parsed.get('requirement_met')} reason={_short_str(reason)}",
+                flush=True,
+            )
         if verbose:
             print("[Interpreter] Done: rerun_required=%s requirement_met=%s" % (
                 parsed.get("rerun_required"), parsed.get("requirement_met")), flush=True)

@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import subprocess
-import sys
+import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -32,8 +33,9 @@ def _ensure_marker_foam(case_dir: Path) -> Path:
 
 def _run_script(script_path: Path, cwd: Path) -> tuple[int, str, str]:
     try:
+        pvpython = os.environ.get("CFD_PVPYTHON") or shutil.which("pvpython") or "pvpython"
         proc = subprocess.run(
-            [sys.executable, str(script_path)],
+            [pvpython, str(script_path)],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -80,7 +82,7 @@ def viz_creator(
 
     - Touches <foam_output_dir.name>.foam inside foam_output_dir and uses it as the .foam marker.
     - For up to max_retries:
-        * Asks LLM to write a PyVista script that loads the marker .foam, creates the requested
+        * Asks LLM to write a ParaView (pvpython) script that loads the marker .foam, creates the requested
           visualizations, and saves PNGs into viz_dir.
         * Runs the script.
         * If script fails or produces no PNGs, feeds the error trace back into the next LLM call.
@@ -123,14 +125,18 @@ def viz_creator(
     llm = create_langchain_llm(model=model, temperature=0.1)
 
     script_system = (
-        "You write PyVista+matplotlib Python scripts to visualize OpenFOAM cases.\n"
+        "You write ParaView (pvpython) + matplotlib Python scripts to visualize OpenFOAM cases.\n"
         "Requirements (CFD paper-quality figures only):\n"
-        "- Load the case using PyVista from the given foam_output_dir.\n"
+        "- Use `from paraview.simple import *` (ParaView pipeline objects).\n"
+        "- Load the case using ParaView's `OpenFOAMReader` from the given foam_output_dir.\n"
         "- The marker .foam file to load is always the given marker_name.\n"
-        "- Use off_screen=True plotters only (no interactive windows).\n"
+        "- Ensure offscreen/headless rendering works (do not open interactive GUI windows).\n"
+        "- Use `renderView = GetActiveViewOrCreate('RenderView')` and set `renderView.OffscreenRendering = 1` if available.\n"
         "- Save all figures as PNG files into viz_dir.\n"
-        "- Use PyVista for all field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.); do NOT use matplotlib to draw 2D contour/filled-field plots.\n"
-        "- Matplotlib may be used only for 1D line plots (e.g. profiles, time histories) where data are first sampled/extracted from PyVista.\n"
+        "- IMPORTANT: keep the number of PNG files small for paper use. Create at most about 10 PNG files TOTAL in `viz_dir` for this run/attempt. "
+        "If you need multiple views (full-domain + zoomed feature), combine them into multi-panel figures when possible instead of writing many separate PNGs.\n"
+        "- Use ParaView filters/representations for all field visualizations (contours, slices, filled scalar maps, streamlines, mesh outlines, etc.).\n"
+        "- Matplotlib may be used only for 1D line plots (e.g. profiles, time histories) where data are extracted from ParaView.\n"
         "- All figures must be readable in a CFD paper: avoid sparse dot-only plots; use filled contours, meaningful colorbars, clear legends, and informative layouts so readers can extract physical insight.\n"
         "- Camera/zoom rules: if the requested visualization targets a localized flow feature "
         "(recirculation bubble, reattachment point/length, shear layer, step lip/corner, inlet jet, "
@@ -163,9 +169,14 @@ def viz_creator(
         "{previous_script}\n\n"
         "Write ONLY a complete Python script. Output raw code only—no markdown fences, no ```python, no explanations. "
         "The first line must be 'import ...' or similar, never the word 'python'. The script should:\n"
-        "- import pyvista as pv (and matplotlib if needed for line plots)\n"
-        "- read the case from foam_output_dir/marker_name\n"
-        "- generate high-quality CFD paper-style visualizations: PyVista filled contour/colormap plots and streamlines for field data, plus line plots (via matplotlib) for extracted profiles or time histories as needed\n"
+        "- import os and pathlib for paths\n"
+        "- define: foam_output_dir, viz_dir, marker_path = foam_output_dir / marker_name\n"
+        "- create viz_dir if missing\n"
+        "- define a helper save_png(name) that calls SaveScreenshot with a unique filename in viz_dir\n"
+        "- read the case using: reader = OpenFOAMReader(FileName=str(marker_path))\n"
+        "- create renderView = GetActiveViewOrCreate('RenderView') and enable offscreen rendering\n"
+        "- generate high-quality CFD paper-style visualizations using ParaView filters/representations: contours/slices/filled scalar maps and streamlines for field data; plus line plots (via matplotlib) for extracted profiles/time histories as needed\n"
+        "- IMPORTANT: keep PNG count small. Save at most about 10 PNG files TOTAL into viz_dir for this run/attempt. Prefer multi-panel / consolidated figures over many single-view PNGs.\n"
         "- avoid sparse dot-only plots; ensure every figure is informative and readable with font sizes >= 18 for titles, labels, ticks, legends, and colorbars\n"
         "- choose camera positions and zoom/cropping so that the requested feature(s) are resolved and readable; "
         "include zoomed-in frames for localized features (recirculation/reattachment/shear layer/step lip/walls) "
@@ -226,6 +237,11 @@ def viz_creator(
             except Exception:
                 reference_viz_script = None
 
+    # Only reuse reference scripts if they look ParaView-based.
+    if reference_viz_script:
+        if "paraview.simple" not in reference_viz_script.lower():
+            reference_viz_script = None
+
     if reference_viz_script:
         reference_block = (
             "Reference: a previous visualization run used the following Python script "
@@ -271,18 +287,43 @@ def viz_creator(
         rc, out, err = _run_script(script_path, cwd=foam_output_dir)
         pngs = sorted(p for p in viz_dir.glob("*.png") if p.is_file())
 
-        if rc != 0 or not pngs:
+        # Some ParaView/Pvpython crashes (notably GPU/renderer teardown issues) can
+        # produce a non-zero return code *and* still leave behind valid PNGs.
+        # In that case we want to keep the images and still run the vision gate.
+        out_err = (out or "") + "\n" + (err or "")
+        has_segfault = "segmentation fault" in out_err.lower() or "segfault" in out_err.lower()
+
+        if not pngs:
             # Script failed or produced no images; feed back error and script for next attempt
             snippet = (err or out or "Unknown error")[-4000:]
             last_error = f"Return code: {rc}\nSTDOUT:\n{out[-1000:]}\nSTDERR:\n{snippet}\n"
             last_script = script_text
-            # Clean up any partial images
+            # Clean up any partial images (if any were produced before failure)
             for p in pngs:
                 try:
                     p.unlink()
                 except Exception:
                     pass
             continue
+
+        if rc != 0 and not has_segfault:
+            # Non-segfault failures: delete images and retry with feedback.
+            snippet = (err or out or "Unknown error")[-4000:]
+            last_error = f"Return code: {rc}\nSTDOUT:\n{out[-1000:]}\nSTDERR:\n{snippet}\n"
+            last_script = script_text
+            # Clean up images so we don't feed wrong/partial figures to the vision gate.
+            for p in pngs:
+                try:
+                    p.unlink()
+                except Exception:
+                    pass
+            continue
+
+        if rc != 0 and has_segfault:
+            # Segfault but PNGs exist: keep images and proceed to the vision check.
+            # (We still pass the snippet as last_error feedback, but do not delete PNGs.)
+            snippet = (err or out or "Unknown error")[-4000:]
+            last_error = f"ParaView exited with rc={rc} due to segmentation fault; PNGs exist, ignoring rc and continuing to vision gate.\nSTDERR snippet:\n{snippet}\n"
 
         # Script produced images; run viz-quality check (limit images to avoid huge payload + Bedrock read timeout)
         img_blocks = _images_to_blocks(pngs)
