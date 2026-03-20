@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict, cast
 
+from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import END, START, StateGraph
 
 from cfd_langgraph.agents.analysis_agent import AnalysisAgent
@@ -15,7 +17,9 @@ from cfd_langgraph.agents.writer_agent import WriterAgent
 from cfd_langgraph.config import Settings
 from cfd_langgraph.foam.runner import FoamAgentRunner
 from cfd_langgraph.ideation import run_ideation
+from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
+from cfd_langgraph.utils import strip_json_fences
 
 
 class WorkflowState(TypedDict, total=False):
@@ -67,6 +71,718 @@ class CFDWorkflow:
         self.foam = FoamAgentRunner(
             self.settings.foam_agent_main, self.settings.openfoam_path
         )
+
+    # ------------------------------------------------------------------
+    # Helper: build reference summary for rerun from a working case
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_rerun_reference_summary(sim_entry: Dict[str, Any], out_dir: Path) -> str:
+        """
+        Build a compact text summary of a working case to guide rerun requirement repair.
+
+        Only includes files from:
+          - system/* (except anything under constant/polyMesh)
+          - constant/* (excluding polyMesh)
+          - 0/* (time-zero fields)
+          - Allrun (if present)
+        Never reads or mentions constant/polyMesh or time directories > 0.
+        """
+        sim_meta = sim_entry.get("simulation", {}) if isinstance(sim_entry.get("simulation", {}), dict) else {}
+        sim_id = str(sim_meta.get("simulation_id", "") or "")
+        case_name = str(sim_meta.get("case_name", sim_id) or "")
+        sim_dir = out_dir / sim_id
+        foam_dir = sim_dir / "foam_output"
+
+        lines: List[str] = []
+        lines.append(f"REFERENCE CASE ID: {sim_id}")
+        if case_name:
+            lines.append(f"REFERENCE CASE NAME: {case_name}")
+        lines.append(f"REFERENCE ROOT DIR: {foam_dir}")
+
+        # List candidate input files
+        system_files: List[Path] = []
+        constant_files: List[Path] = []
+        zero_files: List[Path] = []
+        allrun_path: Path | None = None
+
+        if foam_dir.is_dir():
+            sys_dir = foam_dir / "system"
+            if sys_dir.is_dir():
+                for p in sorted(sys_dir.iterdir()):
+                    if p.is_file():
+                        system_files.append(p)
+            const_dir = foam_dir / "constant"
+            if const_dir.is_dir():
+                for p in sorted(const_dir.iterdir()):
+                    # skip polyMesh entirely
+                    if p.name == "polyMesh":
+                        continue
+                    if p.is_file():
+                        constant_files.append(p)
+            zero_dir = foam_dir / "0"
+            if zero_dir.is_dir():
+                for p in sorted(zero_dir.iterdir()):
+                    if p.is_file():
+                        zero_files.append(p)
+            candidate_allrun = foam_dir / "Allrun"
+            if candidate_allrun.is_file():
+                allrun_path = candidate_allrun
+
+        def _rel(p: Path) -> str:
+            try:
+                return str(p.relative_to(foam_dir))
+            except ValueError:
+                return str(p)
+
+        if system_files:
+            lines.append("SYSTEM FILES:")
+            for p in system_files:
+                lines.append(f"  - { _rel(p) }")
+        if constant_files:
+            lines.append("CONSTANT FILES (excluding polyMesh):")
+            for p in constant_files:
+                lines.append(f"  - { _rel(p) }")
+        if zero_files:
+            lines.append("TIME 0 FILES (initial fields):")
+            for p in zero_files:
+                lines.append(f"  - { _rel(p) }")
+        if allrun_path:
+            lines.append(f"ALLRUN SCRIPT: { _rel(allrun_path) }")
+
+        # Optionally embed a few high-signal file contents to help the LLM.
+        def _read_if_exists(p: Path) -> str:
+            try:
+                return p.read_text(encoding="utf-8")
+            except Exception:
+                return ""
+
+        # Mesh / numerics / BC snippets
+        key_files = [
+            foam_dir / "system" / "blockMeshDict",
+            foam_dir / "system" / "fvSolution",
+            foam_dir / "system" / "fvSchemes",
+            foam_dir / "constant" / "turbulenceProperties",
+            foam_dir / "0" / "U",
+            foam_dir / "0" / "p",
+            foam_dir / "0" / "k",
+            foam_dir / "0" / "epsilon",
+            foam_dir / "0" / "omega",
+            foam_dir / "0" / "nuTilda",
+            foam_dir / "0" / "nut",
+        ]
+
+        for p in key_files:
+            if not p.is_file():
+                continue
+            content = _read_if_exists(p)
+            if not content.strip():
+                continue
+            rel = _rel(p)
+            # Keep each snippet bounded in size to avoid huge prompts.
+            snippet = content.strip()
+            if len(snippet) > 4000:
+                snippet = snippet[:4000] + "\n... [truncated]"
+            lines.append(f"\n--- BEGIN REFERENCE FILE {rel} ---\n{snippet}\n--- END REFERENCE FILE {rel} ---")
+
+        return "\n".join(lines)
+
+
+    @staticmethod
+    def _image_path_to_block(image_path: str) -> Optional[Dict[str, Any]]:
+        p = Path(image_path)
+        if not p.is_file():
+            return None
+        try:
+            b = p.read_bytes()
+            b64 = base64.b64encode(b).decode("utf-8")
+            ext = p.suffix.lower()
+            mime = "image/jpeg" if ext in (".jpg", ".jpeg") else "image/png"
+            return {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}}
+        except Exception:
+            return None
+
+    def _vision_filter_viz_bundle(
+        self,
+        viz_bundle: List[Dict[str, Any]],
+        experiments: List[Dict[str, Any]],
+        verbose: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """
+        Vision-LLM figure quality gate.
+        Keeps figures that are readable and show requested features clearly.
+        Falls back to deterministic selection if any step fails.
+        """
+        ex_by_id: Dict[str, Dict[str, Any]] = {}
+        for ex in experiments:
+            sid = ex.get("simulation_id")
+            if sid is not None:
+                ex_by_id[str(sid)] = ex
+
+        llm = create_langchain_llm(model=self.settings.model, temperature=0.0)
+        out: List[Dict[str, Any]] = []
+
+        system = (
+            "You are a CFD figure quality selector for journal papers.\n"
+            "Given a user requirement and candidate images from one experiment, choose images that are:\n"
+            "1) readable for human readers (not tiny/illegible),\n"
+            "2) framed appropriately (zoomed/cropped enough for requested local features when relevant),\n"
+            "3) informative (show requested flow features or metrics).\n"
+            "Reject images that are too zoomed-out, cluttered, blurry, or not useful.\n"
+            "Return ONLY JSON with keys: keep_indices (list[int]), rejected_indices (list[int]), reason (string)."
+        )
+
+        for item in viz_bundle:
+            if not isinstance(item, dict):
+                out.append(item)
+                continue
+
+            sid = str(item.get("simulation_id", "") or "")
+            ex = ex_by_id.get(sid, {})
+            user_req = str(ex.get("user_requirement", "") or "")
+
+            vis = item.get("visualization", {}) if isinstance(item.get("visualization"), dict) else {}
+            images_raw = vis.get("images", []) if isinstance(vis.get("images"), list) else []
+            images = [str(p) for p in images_raw if isinstance(p, str) and p.strip()]
+
+            # Pure vision-based selection (no deterministic pre-filtering by filename).
+            candidates = images
+            # Keep payload bounded.
+            candidates = candidates[:8]
+            if not candidates:
+                out.append(item)
+                continue
+
+            content: List[Any] = [{
+                "type": "text",
+                "text": (
+                    f"Experiment: {sid}\n"
+                    f"User requirement:\n{user_req}\n\n"
+                    "Candidate images are provided in order. "
+                    "Select the best subset for paper use."
+                ),
+            }]
+            valid_candidates: List[str] = []
+            for p in candidates:
+                block = self._image_path_to_block(p)
+                if block:
+                    valid_candidates.append(p)
+                    content.append({"type": "text", "text": f"IMAGE_INDEX={len(valid_candidates)-1} PATH={p}"})
+                    content.append(block)
+
+            if not valid_candidates:
+                out.append(item)
+                continue
+
+            try:
+                resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=content)])
+                raw = getattr(resp, "content", str(resp))
+                parsed = json.loads(strip_json_fences(raw))
+                keep_idx = parsed.get("keep_indices", [])
+                if not isinstance(keep_idx, list):
+                    keep_idx = []
+                keep_paths = []
+                for i in keep_idx:
+                    if isinstance(i, int) and 0 <= i < len(valid_candidates):
+                        keep_paths.append(valid_candidates[i])
+                # Fallback: if model rejects all, keep top 1 candidate.
+                if not keep_paths:
+                    keep_paths = valid_candidates[:1]
+            except Exception as e:
+                if verbose:
+                    print(f"[CFD-WORKFLOW] vision filter failed for {sid}: {e}", flush=True)
+                # Fallback behavior
+                keep_paths = candidates[:1]
+
+            item2 = {**item, "visualization": {**vis, "images": keep_paths}}
+            out.append(item2)
+
+        return out
+
+    # ======================================================================
+    # Restart helper: reuse completed Foam-Agent runs and re-run only
+    # interpreter + analysis + writer stages for an existing out_dir.
+    # This deliberately bypasses the LangGraph app and operates directly on
+    # disk artifacts (pipeline_log.json, ideation_output.json, etc.).
+    # ======================================================================
+
+    def restart_from_foam(self, out_dir: Path, verbose: bool = True) -> Dict[str, Any]:
+        """
+        Restart pipeline AFTER Foam-Agent runs have completed.
+
+        This:
+        - Loads idea and simulations from existing ideation_output.json /
+          hypothesis_output.json / pipeline_log.json.
+        - For each simulation, loads the latest Foam-Agent run_result from
+          pipeline_log and re-runs the interpreter agent.
+        - Runs the analysis agent with images for all experiments.
+        - Runs the writer agent (paper with literature + review loop).
+        - Updates pipeline_log.json with new interpreter, analysis, and paper entries.
+
+        Foam-Agent (Allrun) is NOT re-executed.
+        """
+        out_dir = out_dir.expanduser().resolve()
+        if verbose:
+            print(f"[CFD-WORKFLOW] RESTART from foam runs in {out_dir}", flush=True)
+
+        # Load existing pipeline_log if present
+        pipeline_path = out_dir / "pipeline_log.json"
+        pipeline_log: Dict[str, Any] = {}
+        if pipeline_path.is_file():
+            try:
+                pipeline_log = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            except Exception:
+                pipeline_log = {}
+
+        topic = str(pipeline_log.get("topic") or "")
+
+        # Load idea from ideation_output.json if available
+        idea: Dict[str, Any] = {}
+        ideation_path = out_dir / "ideation_output.json"
+        if ideation_path.is_file():
+            try:
+                ideation_payload = json.loads(ideation_path.read_text(encoding="utf-8"))
+                ideation_bundle = ideation_payload.get("ideation", {}) or {}
+                idea = ideation_bundle.get("idea", {}) if isinstance(ideation_bundle, dict) else {}
+                if not topic:
+                    topic = str(ideation_payload.get("topic") or "")
+            except Exception:
+                idea = {}
+
+        if not topic:
+            topic = str(pipeline_log.get("topic") or "")
+
+        if verbose:
+            print(f"[CFD-WORKFLOW] Restart topic: {topic!r}", flush=True)
+
+        sims_entries: List[Dict[str, Any]] = []
+        # Prefer simulations list from pipeline_log if present
+        if isinstance(pipeline_log.get("simulations"), list):
+            sims_entries = [s for s in pipeline_log.get("simulations", []) if isinstance(s, dict)]
+
+        # Back-compat restart: rebuild simulations from hypothesis_output / foamagent_output / interpreter_output
+        # when pipeline_log.json is missing or does not contain simulations.
+        if not sims_entries:
+            hyp_path = out_dir / "hypothesis_output.json"
+            foam_path = out_dir / "foamagent_output.json"
+            interp_path = out_dir / "interpreter_output.json"
+            try:
+                hyp_payload = json.loads(hyp_path.read_text(encoding="utf-8")) if hyp_path.is_file() else {}
+            except Exception:
+                hyp_payload = {}
+            try:
+                foam_payload = json.loads(foam_path.read_text(encoding="utf-8")) if foam_path.is_file() else {}
+            except Exception:
+                foam_payload = {}
+            try:
+                interp_payload = json.loads(interp_path.read_text(encoding="utf-8")) if interp_path.is_file() else {}
+            except Exception:
+                interp_payload = {}
+
+            hyp_items = hyp_payload.get("items", []) if isinstance(hyp_payload, dict) else []
+            foam_cases = foam_payload.get("cases", []) if isinstance(foam_payload, dict) else []
+            interp_cases = interp_payload.get("cases", []) if isinstance(interp_payload, dict) else []
+
+            foam_by_id = {}
+            for c in foam_cases if isinstance(foam_cases, list) else []:
+                if isinstance(c, dict) and c.get("simulation_id"):
+                    foam_by_id[str(c.get("simulation_id"))] = c
+
+            interp_by_id = {}
+            for c in interp_cases if isinstance(interp_cases, list) else []:
+                if isinstance(c, dict) and c.get("simulation_id"):
+                    interp_by_id[str(c.get("simulation_id"))] = c
+
+            rebuilt: List[Dict[str, Any]] = []
+            for it in hyp_items if isinstance(hyp_items, list) else []:
+                if not isinstance(it, dict):
+                    continue
+                sim_id = str(it.get("simulation_id", "") or "")
+                if not sim_id:
+                    continue
+                exp = it.get("experiment", {}) if isinstance(it.get("experiment", {}), dict) else {}
+                prompt_for_foam = str(it.get("prompt_for_foamagent", "") or "")
+                attempts_used = int((interp_by_id.get(sim_id, {}) or {}).get("attempts_used", 0) or 0)
+                latest_run = (foam_by_id.get(sim_id, {}) or {}).get("latest_run", {}) if isinstance(foam_by_id.get(sim_id, {}), dict) else {}
+
+                rebuilt.append(
+                    {
+                        "simulation": exp or {"simulation_id": sim_id, "case_name": it.get("case_name", sim_id)},
+                        "hypothesis": {"requirement": prompt_for_foam, "valid": bool(it.get("valid", True))},
+                        "run_history": [latest_run] if isinstance(latest_run, dict) and latest_run else [],
+                        "interpreter": (interp_by_id.get(sim_id, {}) or {}).get("interpreter", {}) if isinstance(interp_by_id.get(sim_id, {}), dict) else {},
+                        "attempt": attempts_used,
+                    }
+                )
+
+            sims_entries = rebuilt
+            if sims_entries:
+                pipeline_log["simulations"] = sims_entries
+                pipeline_log["topic"] = topic or str(hyp_payload.get("topic") or "")
+                # Persist a pipeline_log so future restarts/resumes are robust.
+                self._write_json(pipeline_path, pipeline_log)
+
+        if not sims_entries:
+            if verbose:
+                print("[CFD-WORKFLOW] No simulations found in existing artifacts; nothing to restart.", flush=True)
+            return {"pipeline_log": pipeline_log}
+
+        # Build experiments list for interpreter + analysis stages
+        experiments: List[Dict[str, Any]] = []
+        for entry in sims_entries:
+            sim_meta = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+            sim_id = str(sim_meta.get("simulation_id", "") or "")
+            if not sim_id:
+                continue
+            sim_dir = out_dir / sim_id
+            foam_output_dir = sim_dir / "foam_output"
+
+            run_history = entry.get("run_history", []) if isinstance(entry.get("run_history", []), list) else []
+            latest_run = run_history[-1] if run_history else {}
+
+            hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
+            user_req = str(hyp.get("requirement", "") or "")
+
+            experiments.append(
+                {
+                    "simulation_id": sim_id,
+                    "case_name": sim_meta.get("case_name", sim_id),
+                    "description": sim_meta.get("description", ""),
+                    "user_requirement": user_req,
+                    "sim_dir": sim_dir,
+                    "foam_output_dir": foam_output_dir,
+                    "latest_run_result": latest_run,
+                    "simulation_meta": sim_meta,
+                }
+            )
+
+        if verbose:
+            print(f"[CFD-WORKFLOW] Restart: {len(experiments)} experiment(s) for interpreter/analysis/writer.", flush=True)
+
+        # Re-run interpreter for each experiment using latest Foam-Agent run_result.
+        new_sims_entries: List[Dict[str, Any]] = []
+        for entry, ex in zip(sims_entries, experiments):
+            sim_meta = ex["simulation_meta"]
+            sim_id = ex["simulation_id"]
+            if verbose:
+                print(f"[CFD-WORKFLOW] RESTART interpreter :: {sim_id}", flush=True)
+            interp = self.interpreter.interpret(
+                idea_json=idea,
+                experiment_spec=sim_meta,
+                experiment_results=ex["latest_run_result"],
+                verbose=verbose,
+            )
+
+            # Update entry with new interpreter results
+            entry = dict(entry)
+            entry["interpreter"] = interp
+            new_sims_entries.append(entry)
+
+        pipeline_log["simulations"] = new_sims_entries
+
+        # If some cases need rerun, perform rerun rounds here (restart should be resilient to workflow stops).
+        max_reruns = int(self.settings.workflow_max_reruns_per_experiment)
+        while True:
+            queue: List[str] = []
+            for entry in new_sims_entries:
+                sim = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+                sim_id = str(sim.get("simulation_id", "") or "")
+                if not sim_id:
+                    continue
+                interp = entry.get("interpreter", {}) if isinstance(entry.get("interpreter", {}), dict) else {}
+                rerun_required = bool(interp.get("rerun_required", False)) if isinstance(interp, dict) else False
+                attempt_used = int(entry.get("attempt", 0) or 0)
+                if rerun_required and attempt_used < max_reruns:
+                    queue.append(sim_id)
+
+            if not queue:
+                break
+
+            if verbose:
+                print(f"[CFD-WORKFLOW] RESTART rerun-round queue={queue}", flush=True)
+
+            for sim_id in queue:
+                # Find entry
+                entry = None
+                for e in new_sims_entries:
+                    sim = e.get("simulation", {}) if isinstance(e.get("simulation", {}), dict) else {}
+                    if str(sim.get("simulation_id", "")) == str(sim_id):
+                        entry = e
+                        break
+                if entry is None:
+                    continue
+
+                sim_dir = out_dir / str(sim_id)
+                req_path = sim_dir / "user_requirement.txt"
+                if req_path.exists():
+                    try:
+                        current_req = req_path.read_text(encoding="utf-8")
+                    except Exception:
+                        current_req = ""
+                else:
+                    hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
+                    current_req = str(hyp.get("requirement", "") or hyp.get("prompt_for_foamagent", "") or "")
+
+                interp = entry.get("interpreter", {}) if isinstance(entry.get("interpreter", {}), dict) else {}
+                if verbose:
+                    print(f"[CFD-WORKFLOW] RESTART rerun :: {sim_id}", flush=True)
+
+                revision = self.rerun_analysis.revise_requirement(
+                    current_req,
+                    cast(Dict[str, Any], interp or {}),
+                    verbose=verbose,
+                )
+                next_req = str(revision.get("requirement", "") or "")
+                req_valid = bool(revision.get("valid", False))
+
+                # Track requirement updates + attempts
+                requirement_updates = entry.get("requirement_updates", []) if isinstance(entry.get("requirement_updates", []), list) else []
+                attempt_used = int(entry.get("attempt", 0) or 0)
+                requirement_updates.append(
+                    {
+                        "attempt": attempt_used,
+                        "feedback": revision.get("feedback", []),
+                        "valid": req_valid,
+                        "requirement": next_req,
+                    }
+                )
+                entry["requirement_updates"] = requirement_updates
+                entry["attempt"] = attempt_used + 1
+
+                if not req_valid or not next_req.strip():
+                    entry["interpreter"] = {
+                        **(cast(Dict[str, Any], interp or {})),
+                        "rerun_required": True,
+                        "rerun_reason": "rerun_analysis produced invalid/empty requirement; skipping rerun.",
+                    }
+                    continue
+
+                self._write_requirement(req_path, next_req)
+                run_result = self.foam.run(
+                    user_requirement_path=req_path,
+                    output_dir=sim_dir / "foam_output",
+                    project_root=Path.cwd(),
+                    execute=True,
+                )
+
+                run_history = entry.get("run_history", []) if isinstance(entry.get("run_history", []), list) else []
+                run_history.append(run_result)
+                entry["run_history"] = run_history
+
+                # Re-interpret
+                interp2 = self.interpreter.interpret(
+                    idea_json=idea,
+                    experiment_spec=cast(Dict[str, Any], entry.get("simulation", {}) or {}),
+                    experiment_results=cast(Dict[str, Any], run_result if isinstance(run_result, dict) else {}),
+                    verbose=verbose,
+                )
+                entry["interpreter"] = interp2
+
+            pipeline_log["simulations"] = new_sims_entries
+            self._write_json(pipeline_path, pipeline_log)
+
+        # Run full analysis pipeline (viz + analysis text)
+        if verbose:
+            print("[CFD-WORKFLOW] RESTART analysis...", flush=True)
+        # Strip helper-only keys before passing to analysis agent
+        analysis_experiments: List[Dict[str, Any]] = []
+        for ex in experiments:
+            analysis_experiments.append(
+                {
+                    "simulation_id": ex["simulation_id"],
+                    "case_name": ex["case_name"],
+                    "description": ex["description"],
+                    "user_requirement": ex["user_requirement"],
+                    "sim_dir": ex["sim_dir"],
+                    "foam_output_dir": ex["foam_output_dir"],
+                }
+            )
+        analysis_result = self.analysis.run_full_analysis_pipeline(analysis_experiments, topic, verbose=verbose)
+        analysis_text = analysis_result.get("analysis_text", "")
+        viz_bundle = analysis_result.get("visualizations", [])
+        viz_bundle = self._vision_filter_viz_bundle(viz_bundle, analysis_experiments, verbose=verbose)
+
+        analysis_path = out_dir / "analysis_report.md"
+        self.analysis.save_analysis(analysis_path, analysis_text, topic=topic)
+        pipeline_log["analysis"] = str(analysis_path)
+
+        # Map analysis visualizations back into pipeline_log simulations
+        viz_by_id = {v["simulation_id"]: v.get("visualization") for v in viz_bundle if isinstance(v, dict)}
+        for entry in new_sims_entries:
+            sim_meta = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+            sid = sim_meta.get("simulation_id")
+            if sid and sid in viz_by_id:
+                entry["analysis_visualization"] = viz_by_id[sid]
+
+        # Run writer (paper + review loop)
+        if verbose:
+            print("[CFD-WORKFLOW] RESTART writer...", flush=True)
+        # Build section_context from idea + analysis text
+        section_context = json.dumps(idea, indent=2) + "\n\n" + analysis_text
+        paper_text, pdf_path, review_info = self.writer.write_paper_with_literature_and_review(
+            topic=topic,
+            section_context=section_context,
+            out_dir=out_dir,
+            work_dir=out_dir,
+            ideation_literature_bundle=pipeline_log.get("ideation", {}),
+            visualization_bundle=viz_bundle,
+            verbose=verbose,
+        )
+        tex_path = out_dir / "paper_draft.tex"
+        tex_path.write_text(paper_text, encoding="utf-8")
+        pipeline_log["paper"] = {
+            "tex": str(tex_path),
+            "pdf": str(pdf_path) if pdf_path else None,
+            "review": review_info,
+        }
+
+        # Persist updated pipeline_log
+        pipeline_log["topic"] = topic
+        self._write_json(pipeline_path, pipeline_log)
+
+        if verbose:
+            print("[CFD-WORKFLOW] RESTART completed.", flush=True)
+
+        return {
+            "pipeline_log": pipeline_log,
+            "analysis": str(analysis_path),
+            "paper": str(pdf_path) if pdf_path else None,
+        }
+
+    # ======================================================================
+    # Resume helper: finish Foam-Agent runs that were not completed, then
+    # reuse restart_from_foam to (re)run interpreter + analysis + writer.
+    # ======================================================================
+
+    def resume_after_runs(self, out_dir: Path, verbose: bool = True) -> Dict[str, Any]:
+        """
+        Resume pipeline in the Foam-Agent run stage and beyond.
+
+        For each simulation in pipeline_log.json:
+        - If run_history is empty OR latest run_result has no returncode,
+          re-run Foam-Agent for that simulation using the last known
+          validated requirement from the hypothesis stage.
+        - Otherwise, leave its runs untouched.
+
+        After ensuring all simulations have completed Foam-Agent runs,
+        delegate to restart_from_foam to re-run interpreter + analysis + writer.
+        """
+        out_dir = out_dir.expanduser().resolve()
+        if verbose:
+            print(f"[CFD-WORKFLOW] RESUME after Foam-Agent runs in {out_dir}", flush=True)
+
+        pipeline_path = out_dir / "pipeline_log.json"
+        if not pipeline_path.is_file():
+            # Back-compat: build pipeline_log.json from existing outputs if possible.
+            if verbose:
+                print("[CFD-WORKFLOW] No pipeline_log.json found; attempting to rebuild from outputs...", flush=True)
+            rebuilt = self.restart_from_foam(out_dir=out_dir, verbose=verbose)
+            # restart_from_foam will persist a pipeline_log.json if it can rebuild.
+            if not pipeline_path.is_file():
+                if verbose:
+                    print("[CFD-WORKFLOW] Could not rebuild pipeline_log.json; nothing to resume.", flush=True)
+                return rebuilt or {}
+
+        try:
+            pipeline_log = json.loads(pipeline_path.read_text(encoding="utf-8"))
+        except Exception:
+            if verbose:
+                print("[CFD-WORKFLOW] Could not parse pipeline_log.json; aborting resume.", flush=True)
+            return {}
+
+        sims_entries: List[Dict[str, Any]] = []
+        if isinstance(pipeline_log.get("simulations"), list):
+            sims_entries = [s for s in pipeline_log.get("simulations", []) if isinstance(s, dict)]
+
+        if not sims_entries:
+            if verbose:
+                print("[CFD-WORKFLOW] No simulations in pipeline_log.json; nothing to resume.", flush=True)
+            return {"pipeline_log": pipeline_log}
+
+        # Ensure Foam-Agent runs exist for each simulation.
+        for entry in sims_entries:
+            sim_meta = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+            sim_id = str(sim_meta.get("simulation_id", "") or "")
+            if not sim_id:
+                continue
+            sim_dir = out_dir / sim_id
+            sim_dir.mkdir(parents=True, exist_ok=True)
+
+            run_history = entry.get("run_history", []) if isinstance(entry.get("run_history", []), list) else []
+            latest_run = run_history[-1] if run_history else {}
+            has_returncode = isinstance(latest_run, dict) and (latest_run.get("returncode") is not None)
+
+            # If we already have a completed Foam-Agent run (success or failure), do not re-run here.
+            if has_returncode:
+                if verbose:
+                    print(f"[CFD-WORKFLOW] RESUME: Foam run already completed for {sim_id} (returncode={latest_run.get('returncode')}); skipping.", flush=True)
+                continue
+
+            # Need to run Foam-Agent at least once for this simulation.
+            hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
+            req_text = str(hyp.get("requirement", "") or "")
+            if not req_text.strip():
+                if verbose:
+                    print(f"[CFD-WORKFLOW] RESUME: No requirement text for {sim_id}; skipping Foam-Agent run.", flush=True)
+                continue
+
+            if verbose:
+                print(f"[CFD-WORKFLOW] RESUME Foam-Agent :: {sim_id}", flush=True)
+            req_path = sim_dir / "user_requirement.txt"
+            self._write_requirement(req_path, req_text)
+
+            run_result = self.foam.run(
+                user_requirement_path=req_path,
+                output_dir=sim_dir / "foam_output",
+                project_root=Path.cwd(),
+                execute=True,
+            )
+            run_history.append(run_result)
+            entry["run_history"] = run_history
+
+        # Update foamagent_output.json from updated run_history
+        foam_cases: List[Dict[str, Any]] = []
+        for entry in sims_entries:
+            sim = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+            run_history = entry.get("run_history", []) if isinstance(entry.get("run_history", []), list) else []
+            latest_run = run_history[-1] if run_history else {}
+            status = "unknown"
+            if isinstance(latest_run, dict):
+                if latest_run.get("skipped"):
+                    status = "skipped"
+                elif latest_run.get("planned"):
+                    status = "planned"
+                elif latest_run.get("returncode") == 0:
+                    status = "success"
+                elif latest_run.get("returncode") is not None:
+                    status = "failed"
+            foam_cases.append(
+                {
+                    "simulation_id": sim.get("simulation_id"),
+                    "case_name": sim.get("case_name"),
+                    "status": status,
+                    "latest_run": latest_run,
+                }
+            )
+
+        foam_output_path = out_dir / "foamagent_output.json"
+        self._write_json(
+            foam_output_path,
+            {
+                "total_cases": len(foam_cases),
+                "success_count": sum(1 for c in foam_cases if c.get("status") == "success"),
+                "failed_count": sum(1 for c in foam_cases if c.get("status") == "failed"),
+                "skipped_count": sum(1 for c in foam_cases if c.get("status") == "skipped"),
+                "planned_count": sum(1 for c in foam_cases if c.get("status") == "planned"),
+                "cases": foam_cases,
+            },
+        )
+
+        pipeline_log["simulations"] = sims_entries
+        self._write_json(pipeline_path, pipeline_log)
+
+        # Now delegate to restart_from_foam to (re)run interpreter + analysis + writer.
+        return self.restart_from_foam(out_dir=out_dir, verbose=verbose)
 
     @staticmethod
     def _expand_simulations(
@@ -794,10 +1510,59 @@ class CFDWorkflow:
                 hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
                 current_req = str(hyp.get("requirement", "") or hyp.get("prompt_for_foamagent", "") or "")
 
+            # Build reference summary from the closest working case, if any.
+            reference_summary = ""
+            try:
+                working_candidates: List[Dict[str, Any]] = []
+                for e in sims_list:
+                    if not isinstance(e, dict):
+                        continue
+                    sim_e = e.get("simulation", {}) if isinstance(e.get("simulation", {}), dict) else {}
+                    interp_e = e.get("interpreter", {}) if isinstance(e.get("interpreter", {}), dict) else {}
+                    latest_runs = e.get("run_history", []) if isinstance(e.get("run_history", []), list) else []
+                    latest_run = latest_runs[-1] if latest_runs else {}
+                    if not isinstance(latest_run, dict):
+                        continue
+                    rc = latest_run.get("returncode")
+                    if rc != 0:
+                        continue
+                    if not isinstance(interp_e, dict):
+                        continue
+                    if not bool(interp_e.get("simulation_success", False)):
+                        continue
+                    if not bool(interp_e.get("requirement_met", False)):
+                        continue
+                    if not bool(interp_e.get("viz_ok", False)):
+                        continue
+                    # Don't use the current failing case as its own reference.
+                    if str(sim_e.get("simulation_id", "")) == str(sim_id):
+                        continue
+                    working_candidates.append(e)
+
+                # Simple heuristic: prefer same base case_name prefix (before first '_').
+                base_name = str(sim.get("case_name", "") or "").split("_")[0]
+                chosen: Dict[str, Any] | None = None
+                if working_candidates:
+                    if base_name:
+                        for e in working_candidates:
+                            sim_e = e.get("simulation", {}) if isinstance(e.get("simulation", {}), dict) else {}
+                            cname = str(sim_e.get("case_name", "") or "")
+                            if cname.split("_")[0] == base_name:
+                                chosen = e
+                                break
+                    if chosen is None:
+                        chosen = working_candidates[0]
+
+                if chosen is not None:
+                    reference_summary = self._build_rerun_reference_summary(chosen, out_dir=out_dir)
+            except Exception:
+                reference_summary = ""
+
             log_stage(f"START rerun_analysis :: {sim_id}")
             revision = self.rerun_analysis.revise_requirement(
                 current_req,
                 cast(Dict[str, Any], interp or {}),
+                reference_summary=reference_summary or None,
                 verbose=bool(state.get("verbose", True)),
             )
             next_req = str(revision.get("requirement", "") or "")
@@ -986,6 +1751,11 @@ class CFDWorkflow:
                 result = self.analysis.run_full_analysis_pipeline(experiments, topic, verbose=verbose)
                 analysis_text = result["analysis_text"]
                 viz_bundle = result["visualizations"]
+                viz_bundle = self._vision_filter_viz_bundle(
+                    viz_bundle,
+                    experiments,
+                    verbose=bool(state.get("verbose", True)),
+                )
                 viz_by_id = {v["simulation_id"]: v.get("visualization") for v in viz_bundle}
                 for entry in pipeline_log.get("simulations", []) or []:
                     sim_meta = entry.get("simulation", {}) if isinstance(entry, dict) else {}

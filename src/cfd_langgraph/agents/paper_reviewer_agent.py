@@ -25,6 +25,7 @@ class PaperReviewerAgent:
         tex_content: str,
         compile_ok: bool = True,
         compile_error: str = "",
+        reference_report: str = "",
         valid_figure_paths: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
@@ -66,6 +67,11 @@ class PaperReviewerAgent:
         chain = prompt | self.llm
         out = chain.invoke({
             "compile_status": compile_status,
+            # Required by the prompt template (see prompts.yaml).
+            # Always provide the variable to avoid LangChain KeyError.
+            "compile_error": compile_error or "",
+            # Optional extra input used by the prompt template (see prompts.yaml).
+            "reference_report": reference_report or "",
             "tex_content": tex_content[:50000],  # truncate for context limit
         })
         raw = getattr(out, "content", str(out))

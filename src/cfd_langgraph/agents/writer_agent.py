@@ -18,6 +18,7 @@ from cfd_langgraph.agents.literature_agent import LiteratureSurveyAgent
 from cfd_langgraph.agents.paper_reviewer_agent import PaperReviewerAgent
 from cfd_langgraph.paper_utils import compile_tex_to_pdf, extract_pdflatex_errors
 from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
+from cfd_langgraph.refchecker_integration import run_refchecker_on_tex
 
 
 def _get_figure_paths_for_review(
@@ -65,6 +66,8 @@ Structure:
 
 Disclosure:
 10) Mandatory: one sentence in Abstract or Methods that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results and figures come from the provided experiments and analysis.
+11) Introduce the set of experiments (exp_001, exp_002, etc.) with a clear table early in the Methods/Results section before referring to experiments by these IDs in the narrative; the table should summarise for each experiment the key varying parameter(s) (e.g. turbulence model, wall treatment), mesh size, and any other essential configuration.
+12) Avoid repeating the same explanatory paragraph or caveat (e.g. geometry mismatch, post-processing artefact, expansion-ratio difference) in multiple sections. Provide a single, well-placed, detailed explanation and refer back to it briefly elsewhere instead of duplicating text.
 """.strip()
 
 
@@ -337,6 +340,21 @@ class WriterAgent:
 
             tex_path.write_text(paper_tex, encoding="utf-8")
 
+            reference_report_summary = ""
+            try:
+                # Validate generated citations/references before pdflatex.
+                # This helps the reviewer catch missing/incorrect BibTeX entries.
+                _, reference_report_summary = run_refchecker_on_tex(
+                    tex_path=tex_path,
+                    out_dir=out_dir / "refchecker_reports",
+                    attempt=n,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"[Writer] refchecker integration failed: {e}")
+                reference_report_summary = ""
+
             if verbose:
                 print("[Writer] Compiling LaTeX (pdflatex)...")
             compile_ok, pdf_path, compile_err = compile_tex_to_pdf(
@@ -349,17 +367,18 @@ class WriterAgent:
             else:
                 if verbose:
                     print("[Writer] Compilation: FAILED")
-                    err_summary = extract_pdflatex_errors(compile_err or "")
-                    print("[Writer] Compilation errors:\n%s" % err_summary)
+                    # Print full pdflatex log when available so users can inspect all errors.
+                    print("[Writer] Compilation errors (full log):\n%s" % (compile_err or ""))
 
             if verbose:
                 print("[Writer] Reviewing paper...")
-            # Pass extracted key errors (not raw log) so reviewer sees the actual problem
-            err_for_review = extract_pdflatex_errors(compile_err) if not compile_ok and compile_err else compile_err
+            # Pass the full pdflatex log (if any) to the reviewer so it can see all errors.
+            err_for_review = compile_err
             review = self.reviewer.review(
                 tex_content=paper_tex,
                 compile_ok=compile_ok,
                 compile_error=err_for_review,
+                reference_report=reference_report_summary,
                 valid_figure_paths=_get_figure_paths_for_review(visualization_bundle, work_dir),
             )
             review_info["reviews"].append(review)

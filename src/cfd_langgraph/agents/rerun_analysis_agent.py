@@ -46,6 +46,7 @@ class RerunAnalysisAgent:
         self,
         current_requirement: str,
         interpreter_report: Dict[str, Any],
+        reference_summary: str | None = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         if verbose:
@@ -60,14 +61,28 @@ class RerunAnalysisAgent:
                 "validator": verdict,
             }
 
+        guidance_lines: List[str] = [
+            "Update the requirement to address interpreter-detected execution or physics issues.",
+            "Keep the requirement executable by Foam-Agent (solver, time controls, BCs, mesh).",
+            "Do not include visualization instructions.",
+        ]
+        if reference_summary:
+            guidance_lines.append(
+                "You also have a summary of a closely related WORKING case. "
+                "Where helpful, borrow only the minimal necessary details from that reference "
+                "(e.g., mesh layout, boundary-condition pattern, turbulence model settings, "
+                "or solver/relaxation parameters) to fix the failing case, while preserving "
+                "the intended sweep dimension (what the study topic says should vary). "
+                "The reference summary is:\n"
+                f"{reference_summary}\n"
+                "Never copy or mention any contents from constant/polyMesh or any time directories "
+                "other than time 0; those are generated outputs, not inputs."
+            )
+
         revised = self.hypothesis.repair_requirement(
             current_requirement,
             issues=[f"Interpreter feedback: {x}" for x in feedback],
-            guidance=[
-                "Update the requirement to address interpreter-detected execution or physics issues.",
-                "Keep the requirement executable by Foam-Agent (solver, time controls, BCs, mesh).",
-                "Do not include visualization instructions.",
-            ],
+            guidance=guidance_lines,
         )
         revised = self.hypothesis._strip_visualization_mentions(revised)
 

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from cfd_langgraph.config import get_settings
 from cfd_langgraph.ideation import run_ideation
+from cfd_langgraph.llm.token_stats import get_token_stats, estimate_sonnet_46_cost_usd
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.workflow.graph import CFDWorkflow
 
@@ -52,6 +53,46 @@ def main():
         help="Disable verbose agent output",
     )
 
+    p_restart = sub.add_parser(
+        "restart-topic",
+        help="Restart pipeline AFTER Foam-Agent runs (reuse existing foam_output and re-run interpreter+analysis+writer).",
+    )
+    p_restart.add_argument(
+        "--out-dir", required=True, help="Existing output directory for the previous run"
+    )
+    p_restart.add_argument(
+        "--verbose",
+        action="store_true",
+        default=True,
+        help="Print progress from each agent (default: True)",
+    )
+    p_restart.add_argument(
+        "--no-verbose",
+        action="store_true",
+        dest="no_verbose",
+        help="Disable verbose agent output",
+    )
+
+    p_resume = sub.add_parser(
+        "resume-topic",
+        help="Resume pipeline after partial Foam-Agent runs (finish remaining runs, then interpreter+analysis+writer).",
+    )
+    p_resume.add_argument(
+        "--out-dir", required=True, help="Existing output directory for the previous run"
+    )
+    p_resume.add_argument(
+        "--verbose",
+        action="store_true",
+        default=True,
+        help="Print progress from each agent (default: True)",
+    )
+    p_resume.add_argument(
+        "--no-verbose",
+        action="store_true",
+        dest="no_verbose",
+        help="Disable verbose agent output",
+    )
+
     args = parser.parse_args()
     settings = get_settings()
     print(f"[CFD-WORKFLOW] Using LLM model: {settings.model}")
@@ -80,6 +121,63 @@ def main():
             allow_non_executed_artifacts=args.allow_non_executed_artifacts,
             verbose=verbose,
         )
+        stats = get_token_stats()
+        cost = estimate_sonnet_46_cost_usd(
+            prompt_tokens=stats.prompt_tokens,
+            completion_tokens=stats.completion_tokens,
+        )
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "out_dir": args.out_dir,
+                    "analysis": result.get("analysis"),
+                    "paper": result.get("paper"),
+                    "llm_usage": {
+                        "model": settings.model,
+                        "prompt_tokens": stats.prompt_tokens,
+                        "completion_tokens": stats.completion_tokens,
+                        "pricing": {
+                            "prompt_usd_per_1M_tokens": 3.0,
+                            "completion_usd_per_1M_tokens": 15.0,
+                        },
+                        "cost_estimate_usd": cost,
+                    },
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if args.cmd == "restart-topic":
+        verbose = getattr(args, "no_verbose", False) is False and getattr(
+            args, "verbose", True
+        )
+        wf = CFDWorkflow(
+            settings=settings, prompt_loader=PromptLoader(settings.prompts_path)
+        )
+        result = wf.restart_from_foam(out_dir=Path(args.out_dir), verbose=verbose)
+        print(
+            json.dumps(
+                {
+                    "ok": True,
+                    "out_dir": args.out_dir,
+                    "analysis": result.get("analysis"),
+                    "paper": result.get("paper"),
+                },
+                indent=2,
+            )
+        )
+        return
+
+    if args.cmd == "resume-topic":
+        verbose = getattr(args, "no_verbose", False) is False and getattr(
+            args, "verbose", True
+        )
+        wf = CFDWorkflow(
+            settings=settings, prompt_loader=PromptLoader(settings.prompts_path)
+        )
+        result = wf.resume_after_runs(out_dir=Path(args.out_dir), verbose=verbose)
         print(
             json.dumps(
                 {

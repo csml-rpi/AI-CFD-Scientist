@@ -256,7 +256,7 @@ class ResultsInterpreterAgent:
                 time.sleep(delay)
         if last_error is not None:
             raise last_error
-        return ""
+            return ""
 
     @staticmethod
     def _user_requirement_text(idea_json: Dict[str, Any], experiment_spec: Dict[str, Any]) -> str:

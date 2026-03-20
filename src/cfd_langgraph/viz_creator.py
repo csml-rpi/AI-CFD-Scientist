@@ -132,6 +132,14 @@ def viz_creator(
         "- Use PyVista for all field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.); do NOT use matplotlib to draw 2D contour/filled-field plots.\n"
         "- Matplotlib may be used only for 1D line plots (e.g. profiles, time histories) where data are first sampled/extracted from PyVista.\n"
         "- All figures must be readable in a CFD paper: avoid sparse dot-only plots; use filled contours, meaningful colorbars, clear legends, and informative layouts so readers can extract physical insight.\n"
+        "- Camera/zoom rules: if the requested visualization targets a localized flow feature "
+        "(recirculation bubble, reattachment point/length, shear layer, step lip/corner, inlet jet, "
+        "or wall quantities like Cp/Cf/y+), you MUST create at least one view that zooms/crops "
+        "around that feature so it occupies a substantial part of the frame and is legible when printed. "
+        "Do NOT rely only on far-out views where the feature becomes tiny/unreadable. "
+        "If full-domain context helps, include a second full/wider view as well.\n"
+        "- Place colorbars/legends so they do NOT overlap the main plotted contour/streamline/feature region. "
+        "Use layout/position controls and adequate margins to keep plotted data clearly visible.\n"
         "- Use a minimum font size of 18 for all titles, axis labels, tick labels, legends, and colorbar labels so they are legible when embedded in a paper.\n"
         "- Output ONLY raw Python code. Do NOT wrap in markdown code fences (no ``` or ```python).\n"
         "- Do NOT start with the word 'python' or any language tag. The first line must be an import statement.\n"
@@ -159,6 +167,10 @@ def viz_creator(
         "- read the case from foam_output_dir/marker_name\n"
         "- generate high-quality CFD paper-style visualizations: PyVista filled contour/colormap plots and streamlines for field data, plus line plots (via matplotlib) for extracted profiles or time histories as needed\n"
         "- avoid sparse dot-only plots; ensure every figure is informative and readable with font sizes >= 18 for titles, labels, ticks, legends, and colorbars\n"
+        "- choose camera positions and zoom/cropping so that the requested feature(s) are resolved and readable; "
+        "include zoomed-in frames for localized features (recirculation/reattachment/shear layer/step lip/walls) "
+        "and optionally include a wider full-domain context view if it helps interpretation\n"
+        "- make sure colorbars/legends do not overlap important contour/streamline regions; reposition them when needed\n"
         "- save PNG files into viz_dir\n"
         "- exit with code 0 on success and non-zero on fatal error.\n"
     )
@@ -167,9 +179,14 @@ def viz_creator(
         "You are a visualization output checker (NOT a physics/simulation judge). Your ONLY job is to decide "
         "whether the generated images show the REQUESTED types of data (contours, profiles, plots, etc.) "
         "and are non-empty and readable.\n"
-        "REJECT only when: (1) images are blank/empty or show no data, (2) images are broken or unreadable, "
+        "Check that contour/field figures are framed and zoomed appropriately for a CFD paper: "
+        "the requested feature(s) must be readable when printed. "
+        "If the request is about localized features (recirculation/reattachment/shear layer/step lip/walls/Cp/Cf/y+), "
+        "accept zoomed-in feature framing even if the full computational domain is not visible. "
+        "Reject if the only views are extremely zoomed-out such that the feature is too small to inspect.\n"
+        "REJECT when: (1) images are blank/empty or show no data, (2) images are broken or unreadable, "
         "(3) the requested visualization types are completely missing (e.g. contours requested but no contour "
-        "figures at all).\n"
+        "figures at all), or (4) the camera/zoom makes the domain or key features too small to inspect in a paper figure.\n"
         "Do NOT reject based on: whether the simulation physics looks wrong, whether the flow field is "
         "physically plausible, axis orientation, numerical noise, failed simulation, or plug flow. Judging "
         "simulation correctness is the interpreter's job later. If the figures show the requested data "
@@ -184,8 +201,10 @@ def viz_creator(
         "{what_to_visualize}\n\n"
         "Previous feedback / error (if any):\n"
         "{previous_error}\n\n"
-        "You will see the generated images below. Check ONLY: (1) Are the images non-empty and readable? "
+        "You will see the generated images below. Check ONLY: "
+        "(1) Are the images non-empty and readable? "
         "(2) Do they contain the requested types of plots (e.g. contours, profiles) with actual data drawn? "
+        "(3) If the request targets localized features, is there at least one zoomed-in framing where that feature is inspectable in a paper figure? "
         "If yes, set viz_acceptable=true. Do NOT reject because the physics or simulation results look wrong "
         "or unphysical—that is for the interpreter to judge. Reject only if figures are blank, empty, "
         "missing the requested plot types entirely, or broken.\n"
@@ -197,10 +216,21 @@ def viz_creator(
     images: List[Path] = []
     attempt = 0
 
+    # If no reference script explicitly provided, try to reuse an existing viz_script.py
+    # in this viz_dir (from a previous interpreter/analysis loop) as a starting point.
+    if not reference_viz_script:
+        existing_script = viz_dir / "viz_script.py"
+        if existing_script.is_file():
+            try:
+                reference_viz_script = existing_script.read_text(encoding="utf-8")
+            except Exception:
+                reference_viz_script = None
+
     if reference_viz_script:
         reference_block = (
-            "Reference: the interpreter agent used the following code to create viz. "
-            "You can use this as reference (adapt and extend for the requested visualizations):\n"
+            "Reference: a previous visualization run used the following Python script "
+            "to generate figures in this directory. You can treat this as a starting "
+            "point and adapt or extend it to satisfy the current visualization request:\n"
             f"{reference_viz_script}\n\n"
         )
     else:

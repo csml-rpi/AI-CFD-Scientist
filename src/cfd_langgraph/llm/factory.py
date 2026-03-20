@@ -7,6 +7,8 @@ from langchain_openai import ChatOpenAI
 from langchain_anthropic import ChatAnthropic
 from langchain_aws import ChatBedrockConverse
 
+from cfd_langgraph.llm.token_stats import TOKEN_STATS_HANDLER
+
 
 # Longer read timeout for Bedrock (vision/large payloads can take 60s+). Env: BEDROCK_READ_TIMEOUT (default 300).
 def _bedrock_read_timeout() -> int:
@@ -27,11 +29,20 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
             from boto3 import client as boto_client
             config = Config(read_timeout=_bedrock_read_timeout(), connect_timeout=30)
             bedrock_client = boto_client("bedrock-runtime", config=config)
-            return ChatBedrockConverse(client=bedrock_client, model=model_id, temperature=temperature)
+            return ChatBedrockConverse(
+                client=bedrock_client,
+                model=model_id,
+                temperature=temperature,
+                callbacks=[TOKEN_STATS_HANDLER],
+            )
         except Exception:
-            return ChatBedrockConverse(model=model_id, temperature=temperature)
+            return ChatBedrockConverse(
+                model=model_id,
+                temperature=temperature,
+                callbacks=[TOKEN_STATS_HANDLER],
+            )
     if m.startswith("claude-"):
-        return ChatAnthropic(model=m, temperature=temperature)
+        return ChatAnthropic(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
 
     # Codex/OpenAI models use API-key auth via OPENAI_API_KEY.
     # Examples:
@@ -39,14 +50,14 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
     #   CFD_SCIENTIST_MODEL=gpt-5-codex
     if m.startswith("codex/"):
         openai_model = m.split("codex/", 1)[1].strip() or "gpt-5-codex"
-        return ChatOpenAI(model=openai_model, temperature=temperature)
+        return ChatOpenAI(model=openai_model, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
 
     if m == "codex":
-        return ChatOpenAI(model="gpt-5-codex", temperature=temperature)
+        return ChatOpenAI(model="gpt-5-codex", temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
 
     if "gpt" in m or m.startswith("o1") or m.startswith("o3"):
-        return ChatOpenAI(model=m, temperature=temperature)
+        return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
     if "gemini" in m:
         # assuming OpenAI-compatible endpoint if user configured env externally
-        return ChatOpenAI(model=m, temperature=temperature)
+        return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
     raise ValueError(f"Unsupported model: {model}")
