@@ -16,7 +16,60 @@ def _bedrock_read_timeout() -> int:
 
 
 def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
-    m = model.strip()
+    m = (model or "").strip()
+
+    # Optional explicit provider override.
+    # Supported providers:
+    # - bedrock, openai, openai-codex, anthropic, gemini
+    # If unset/empty: infer provider from model string (existing behavior).
+    provider = (
+        os.environ.get("CFD_SCIENTIST_LLM_PROVIDER")
+        or os.environ.get("CFD_SCIEINTIST_LLM_PROVIDER")
+        or ""
+    ).strip().lower()
+
+    def _bedrock_model_id(mm: str) -> str:
+        return mm.split("bedrock/", 1)[1].strip() if mm.startswith("bedrock/") else mm
+
+    if provider:
+        if provider == "bedrock":
+            model_id = _bedrock_model_id(m)
+            try:
+                from botocore.config import Config
+                from boto3 import client as boto_client
+
+                config = Config(read_timeout=_bedrock_read_timeout(), connect_timeout=30)
+                bedrock_client = boto_client("bedrock-runtime", config=config)
+                return ChatBedrockConverse(
+                    client=bedrock_client,
+                    model=model_id,
+                    temperature=temperature,
+                    callbacks=[TOKEN_STATS_HANDLER],
+                )
+            except Exception:
+                return ChatBedrockConverse(
+                    model=model_id,
+                    temperature=temperature,
+                    callbacks=[TOKEN_STATS_HANDLER],
+                )
+
+        if provider in {"openai", "openai-codex"}:
+            if provider == "openai-codex":
+                if m.startswith("codex/"):
+                    m = m.split("codex/", 1)[1].strip() or "gpt-5-codex"
+                elif m == "codex":
+                    m = "gpt-5-codex"
+            return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+
+        if provider == "anthropic":
+            return ChatAnthropic(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+
+        if provider == "gemini":
+            # We use OpenAI-compatible interface here. Users can set OPENAI_BASE_URL
+            # to point to a Gemini endpoint; this keeps vision plumbing consistent.
+            return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+
+    # Back-compat inference from model string.
     if (
         m.startswith("arn:aws:bedrock")
         or m.startswith("bedrock/")

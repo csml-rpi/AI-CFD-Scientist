@@ -95,7 +95,9 @@ def main():
 
     args = parser.parse_args()
     settings = get_settings()
-    print(f"[CFD-WORKFLOW] Using LLM model: {settings.model}")
+    print(
+        f"[CFD-WORKFLOW] Using LLM provider/model: provider={settings.llm_provider} model={settings.model}"
+    )
 
     if args.cmd == "ideate":
         verbose = not getattr(args, "no_verbose", False)

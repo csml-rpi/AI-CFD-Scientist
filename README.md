@@ -45,9 +45,23 @@ pip install -r requirements.txt
 
 ## Configure
 
-### Required for pipeline (Bedrock default)
+### LLM Provider Selection (used by cfd-scientist + Foam-Agent)
+
+The pipeline uses these environment variables to pick both the provider and the model:
+
+- `CFD_SCIENTIST_LLM_PROVIDER` (explicit override; otherwise inferred from `CFD_SCIENTIST_MODEL`)
+  - Supported values: `bedrock`, `openai`, `openai-codex`, `anthropic`, `gemini`
+- `CFD_SCIENTIST_MODEL` (model identifier)
+
+For convenience/backward-compatibility, the code also accepts misspelled variants:
+`CFD_SCIEINTIST_LLM_PROVIDER` and `CFD_SCIENITST_MODEL`.
+
+When you use `--execute`, the same provider/model selection is passed into Foam-Agent by the runner (mapped to Foam-Agent’s `FOAMAGENT_MODEL_PROVIDER` and `FOAMAGENT_MODEL_VERSION`).
+
+#### Bedrock (default behavior)
 
 ```bash
+export CFD_SCIENTIST_LLM_PROVIDER="bedrock"
 export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-6"
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
@@ -73,8 +87,35 @@ export AWS_DEFAULT_REGION="us-west-2"
 
 ### Other model providers
 
-- **OpenAI:** `export CFD_SCIENTIST_MODEL="gpt-4o"` and `OPENAI_API_KEY="..."`
-- **Anthropic (direct):** `export CFD_SCIENTIST_MODEL="claude-3-5-sonnet-20241022"` and `ANTHROPIC_API_KEY="..."`
+- **OpenAI (text + vision):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="openai"
+  export CFD_SCIENTIST_MODEL="gpt-4o"   # choose a vision-capable model for VLM steps
+  export OPENAI_API_KEY="..."
+  ```
+  Note: the interpreter/analysis VLM steps must use a **vision-capable** model (to interpret PNGs/images). If you set a text-only model, those steps will fail.
+
+- **OpenAI Codex (subscription / Codex auth):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="openai-codex"
+  export CFD_SCIENTIST_MODEL="codex/gpt-5-codex"
+  ```
+
+- **Anthropic (direct API):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="anthropic"
+  export CFD_SCIENTIST_MODEL="claude-3-5-sonnet-20241022"
+  export ANTHROPIC_API_KEY="..."
+  ```
+
+- **Gemini (OpenAI-compatible endpoint):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="gemini"
+  export CFD_SCIENTIST_MODEL="gemini-1.5-pro"  # must be accepted by your Gemini proxy
+  export OPENAI_API_KEY="..."
+  export OPENAI_BASE_URL="..."  # Gemini OpenAI-compatible endpoint
+  ```
+  Note: use a **vision-capable** Gemini model/proxy so the VLM steps can interpret PNGs/images.
 
 ---
 

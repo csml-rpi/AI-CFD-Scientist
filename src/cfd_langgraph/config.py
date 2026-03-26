@@ -11,8 +11,15 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 class Settings(BaseModel):
     model: str = os.environ.get(
         "CFD_SCIENTIST_MODEL",
-        "us.anthropic.claude-sonnet-4-6",
+        os.environ.get("CFD_SCIENITST_MODEL", "us.anthropic.claude-sonnet-4-6"),
     )
+    # Explicit provider override. If unset, provider is inferred from `model` string.
+    # Foam-Agent also supports its own provider env vars; our runner maps CFD_* values into FOAMAGENT_*.
+    llm_provider: str = (
+        os.environ.get("CFD_SCIENTIST_LLM_PROVIDER")
+        or os.environ.get("CFD_SCIEINTIST_LLM_PROVIDER")
+        or "auto"
+    ).lower()
     prompts_path: Path = Path(
         os.environ.get(
             "CFD_PROMPTS_PATH",

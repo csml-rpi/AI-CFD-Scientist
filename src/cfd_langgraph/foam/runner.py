@@ -37,6 +37,31 @@ class FoamAgentRunner:
             return {"planned": True, "cmd": cmd, "cwd": str(project_root)}
 
         env = os.environ.copy()
+        # Pass CFD_SCIENTIST_* provider/model selections through to Foam-Agent,
+        # so the whole pipeline uses the same LLM backend.
+        cfd_provider = (
+            env.get("CFD_SCIENTIST_LLM_PROVIDER")
+            or env.get("CFD_SCIEINTIST_LLM_PROVIDER")
+            or ""
+        ).strip().lower()
+        cfd_model = (
+            env.get("CFD_SCIENTIST_MODEL")
+            or env.get("CFD_SCIENITST_MODEL")
+            or ""
+        ).strip()
+
+        if cfd_provider:
+            # Foam-Agent allowed values include: openai, openai-codex, ollama, bedrock, anthropic.
+            foam_provider = cfd_provider
+            if foam_provider == "gemini":
+                foam_provider = "openai"
+            if foam_provider in {"openai", "openai-codex", "ollama", "bedrock", "anthropic"}:
+                env["FOAMAGENT_MODEL_PROVIDER"] = foam_provider
+            # else: leave Foam-Agent default as-is.
+
+        if cfd_model:
+            env["FOAMAGENT_MODEL_VERSION"] = cfd_model
+
         env["PYTHONPATH"] = f"{project_root}:{env.get('PYTHONPATH', '')}"
         output_dir.mkdir(parents=True, exist_ok=True)
 

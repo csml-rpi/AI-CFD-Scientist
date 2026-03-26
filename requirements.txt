@@ -22,3 +22,6 @@ requests>=2.32
 pyvista>=0.44
 matplotlib>=3.8
 Pillow>=10.0  # Image downscaling for Bedrock many-image requests
+
+# Bedrock runtime client (used by langchain-aws / ChatBedrockConverse)
+boto3>=1.34.0
