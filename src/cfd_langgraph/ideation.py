@@ -60,6 +60,44 @@ def novelty_score(idea_json: Dict[str, Any], lit_items: List[Dict[str, Any]]) ->
     return max(SequenceMatcher(None, itext, r).ratio() for r in refs)
 
 
+def novelty_score_llm(
+    llm: Any,
+    idea_json: Dict[str, Any],
+    lit_items: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    LLM-based novelty evaluator.
+    Returns JSON-like dict:
+      {
+        "max_similarity_to_prior": float in [0,1],
+        "judgement": "novel"|"too_similar",
+        "reason": str
+      }
+    """
+    literature_context = build_literature_context(lit_items)
+    system = (
+        "You are a strict CFD novelty evaluator.\n"
+        "Compare ONE proposed study idea against prior studies.\n"
+        "Decide if the idea is too similar to existing work.\n"
+        "Output ONLY JSON with keys:\n"
+        '- "max_similarity_to_prior": number in [0,1] (higher means more similar)\n'
+        '- "judgement": "novel" or "too_similar"\n'
+        '- "reason": short string\n'
+        "Do not output markdown or extra text."
+    )
+    user = (
+        "Prior studies:\n"
+        f"{literature_context}\n\n"
+        "Proposed idea JSON:\n"
+        f"{json.dumps(idea_json, ensure_ascii=False)}\n\n"
+        "Evaluate novelty now."
+    )
+    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    parsed = json.loads(strip_json_fences(content))
+    return parsed if isinstance(parsed, dict) else {}
+
+
 
 
 def _dedupe_and_cap_experiments(experiments: List[Dict[str, Any]], max_experiments: int) -> List[Dict[str, Any]]:
@@ -192,6 +230,8 @@ def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) 
     threshold = settings.ideation_novelty_threshold
 
     novelty_val = None
+    novelty_reason = ""
+    novelty_method = "llm"
     count_val = None
     last_raw = ""
     idea_json: Dict[str, Any] = {}
@@ -211,7 +251,19 @@ def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) 
             count_val = None
         else:
             idea_json = _normalize_to_experiments_schema(idea_json, settings.ideation_max_experiments)
-            novelty_val = novelty_score(idea_json, lit_items)
+            try:
+                novelty_eval = novelty_score_llm(llm, idea_json, lit_items)
+                novelty_val = float(novelty_eval.get("max_similarity_to_prior", 1.0))
+                novelty_reason = str(novelty_eval.get("reason", "") or "")
+                if novelty_val < 0.0:
+                    novelty_val = 0.0
+                elif novelty_val > 1.0:
+                    novelty_val = 1.0
+            except Exception:
+                # Safety fallback: keep pipeline running if novelty LLM output is malformed.
+                novelty_method = "llm_fallback_heuristic"
+                novelty_val = novelty_score(idea_json, lit_items)
+                novelty_reason = "LLM novelty parse/eval failed; used heuristic fallback."
             count_val = _extract_experiment_count(idea_json)
 
         too_similar = novelty_val is not None and novelty_val >= threshold
@@ -253,6 +305,8 @@ def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) 
             "threshold": threshold,
             "passed": (novelty_val is None or novelty_val < threshold),
             "max_retries": retries,
+            "method": novelty_method,
+            "reason": novelty_reason,
         },
         "experiment_count": {
             "estimated_total": count_val,

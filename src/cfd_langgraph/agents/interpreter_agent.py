@@ -8,8 +8,8 @@ and sets rerun_required with reasons.
 
 Prompt context (no huge payloads): All LLM calls use only (a) short user_requirement
 text, (b) last 20 lines of solver log in text-only fallback, or (c) user_requirement
-+ base64 images in vision path. idea_json, experiment_spec, and experiment_results
-are never sent to the model.
++ base64 images in vision path. Large objects like idea_json/experiment_spec are not
+sent directly; only a short synthesized text snippet is included.
 """
 
 from __future__ import annotations
@@ -32,6 +32,33 @@ from cfd_langgraph.utils import strip_json_fences
 from cfd_langgraph.viz_creator import viz_creator
 
 VIZ_MAX_RETRIES = 10
+
+
+def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
+    """Short text for terminal logging (mirrors workflow graph helper; kept local to avoid import cycles)."""
+    if not isinstance(interp, dict):
+        return ""
+    r = interp.get("rerun_reason")
+    if r is not None and str(r).strip():
+        return str(r).strip()
+    r2 = interp.get("reasons")
+    if r2 is not None:
+        if isinstance(r2, list):
+            return "; ".join(str(x).strip() for x in r2 if str(x).strip())
+        s = str(r2).strip()
+        if s:
+            return s
+    summ = interp.get("summary")
+    if summ is not None and str(summ).strip():
+        return str(summ).strip()
+    issues = interp.get("issues")
+    if issues is not None:
+        if isinstance(issues, list):
+            return "; ".join(str(x).strip() for x in issues if str(x).strip())
+        s = str(issues).strip()
+        if s:
+            return s
+    return ""
 
 
 class ResultsInterpreterAgent:
@@ -263,9 +290,34 @@ class ResultsInterpreterAgent:
         parts: List[str] = []
         if isinstance(idea_json, dict) and idea_json.get("description"):
             parts.append(str(idea_json["description"]).strip())
+
         if isinstance(experiment_spec, dict):
+            case_data = experiment_spec.get("case_data", None)
+            if isinstance(case_data, dict):
+                exp_name = case_data.get("name") or case_data.get("experiment_id")
+                if exp_name:
+                    parts.append(f"Experiment: {exp_name}".strip())
+
+                notes = case_data.get("notes") or case_data.get("description")
+                if isinstance(notes, str) and notes.strip():
+                    parts.append(notes.strip())
+
+                params = case_data.get("parameters", None)
+                if isinstance(params, dict) and params:
+                    scalar_items: List[Tuple[str, Any]] = []
+                    for k, v in params.items():
+                        if isinstance(v, (str, int, float, bool)):
+                            scalar_items.append((str(k), v))
+                    scalar_items.sort(key=lambda x: x[0])
+                    scalar_items = scalar_items[:6]
+                    if scalar_items:
+                        params_subset = {k: v for k, v in scalar_items}
+                        parts.append("Key parameters: " + json.dumps(params_subset, ensure_ascii=False, sort_keys=True))
+
+            # Fallbacks for older/alternate schemas.
             if experiment_spec.get("description"):
-                parts.append(str(experiment_spec["description"]).strip())
+                if not any("Experiment:" in p for p in parts):
+                    parts.append(str(experiment_spec["description"]).strip())
             if experiment_spec.get("case_name") and not parts:
                 parts.append(str(experiment_spec["case_name"]).strip())
         return "\n".join(p for p in parts if p) or "No user requirement provided."
@@ -288,6 +340,8 @@ class ResultsInterpreterAgent:
                 "You are a CFD visualization planner for general CFD simulations. "
                 "Given the user requirement, the available solution times, and field variables, "
                 "you must describe in plain language what visualizations to generate. "
+                "Scope is strictly the current experiment/case only. Do not request cross-experiment "
+                "comparisons, multi-case correlations, or data from sibling case directories. "
                 "Focus on scientifically useful plots that help assess whether the simulation "
                 "meets the requirement (e.g., mesh outline, key scalar/vector fields at important times, "
                 "pressure or velocity contours, centerline/line profiles, etc.). "
@@ -307,6 +361,7 @@ class ResultsInterpreterAgent:
                 "to best evaluate whether the simulation satisfies the requirement. "
                 "Mention which fields (e.g., U, p), which times (early/mid/late or specific values), "
                 "and what types of plots (contours, slices, centerline profiles, etc.). "
+                "Only request plots derivable from this single case's data. "
                 "Plain text only, no bullet lists, no JSON, no code."
             )
             prompt = ChatPromptTemplate.from_messages(
@@ -463,11 +518,11 @@ class ResultsInterpreterAgent:
 
         system_interp = self.prompts.get(
             "interpretation_system_prompt",
-            "You are a CFD results interpreter. Given the user requirement and visualization images from a simulation, decide: (1) Did the simulation run successfully and satisfy the user requirement? (2) What issues exist, if any? (3) Should the run be redone (rerun_required)? Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), issues (string or list), rerun_required (bool), summary (string), reasons (string).",
+            "You are a CFD results interpreter. Given the user requirement and visualization images from a simulation, decide: (1) Did the simulation run successfully and satisfy the user requirement? (2) What issues exist, if any? (3) Should the run be redone (rerun_required)? Scope is strictly this single experiment; do not infer results about other experiments unless explicitly visible in the provided images, and do not assume fabricated data unless explicitly shown. Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), issues (string or list), rerun_required (bool), summary (string), reasons (string).",
         )
         user_interp = self.prompts.get(
             "interpretation_user_prompt",
-            "User requirement:\n{user_requirement}\n\nBelow are visualizations from the run. Did the simulation satisfy the requirement? Any issues? check if flow field develops accuratley, expected flow features are well visible. Set rerun_required true if results are not acceptable. Return JSON only.",
+            "User requirement:\n{user_requirement}\n\nBelow are visualizations from the run. Evaluate only this current experiment from the provided images. Do not use or assume other experiment outputs unless they are explicitly present in these images. Did the simulation satisfy the requirement? Any issues? check if flow field develops accuratley, expected flow features are well visible. Set rerun_required true if results are not acceptable. Return JSON only.",
         )
         if verbose:
             print("[Interpreter] Invoking vision LLM for interpretation...", flush=True)
@@ -477,15 +532,41 @@ class ResultsInterpreterAgent:
         except Exception:
             parsed = {"raw": content, "parse_error": True}
 
-        parsed.setdefault("rerun_required", False)
+        # Normalize rerun_required/requirement_met to avoid contradictory states.
+        # Rules:
+        # 1) If rerun_required is provided, requirement_met is its inverse.
+        # 2) Else if requirement_met is provided, rerun_required is its inverse.
+        # 3) If neither is provided, default to rerun_required=False and requirement_met=True.
+        rr_raw = parsed.get("rerun_required", None)
+        rm_raw = parsed.get("requirement_met", None)
+        rr_provided = rr_raw is not None
+        rm_provided = rm_raw is not None
+
+        if rr_provided:
+            rerun_required = bool(rr_raw)
+            requirement_met = not rerun_required
+        elif rm_provided:
+            requirement_met = bool(rm_raw)
+            rerun_required = not requirement_met
+        else:
+            rerun_required = False
+            requirement_met = True
+
+        parsed["rerun_required"] = rerun_required
+        parsed["requirement_met"] = requirement_met
         parsed.setdefault("simulation_success", True)
-        parsed.setdefault("requirement_met", False)
         parsed.setdefault("viz_ok", bool(viz_attempts and viz_attempts[-1].get("viz_ok")))
         parsed.setdefault("viz_attempts", viz_attempts)
         parsed.setdefault("case_structure", case_structure)
         if verbose:
-            print("[Interpreter] Done: rerun_required=%s requirement_met=%s" % (
-                parsed.get("rerun_required"), parsed.get("requirement_met")), flush=True)
+            rr = bool(parsed.get("rerun_required"))
+            rm = parsed.get("requirement_met")
+            line = "[Interpreter] Done: rerun_required=%s requirement_met=%s" % (rr, rm)
+            if rr:
+                reason = _interp_rerun_reason_for_log(parsed)
+                if reason:
+                    line += " — %s" % (reason[:800] + ("..." if len(reason) > 800 else ""),)
+            print(line, flush=True)
         return parsed
 
     def _collect_solver_log_tails(

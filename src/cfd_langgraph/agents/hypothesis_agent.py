@@ -22,6 +22,9 @@ class HypothesisAgent:
         idea: Dict[str, Any],
         simulation: Dict[str, Any],
         run_topic: str = "",
+        all_experiment_ideas: str = "",
+        current_experiment_idea: str = "",
+        previous_requirement: str = "",
         verbose: bool = False,
     ) -> str:
         if verbose:
@@ -47,6 +50,9 @@ class HypothesisAgent:
             "simulation_description": simulation.get("description", ""),
             "run_topic": topic_val,
             "topic": topic_val,
+            "all_experiment_ideas": all_experiment_ideas or "",
+            "current_experiment_idea": current_experiment_idea or "",
+            "previous_requirement": previous_requirement or "",
             "experiment_concept": {
                 "case_data": case_data,
                 "solver": idea.get("solver", "icoFoam"),
@@ -120,7 +126,14 @@ class HypothesisAgent:
             }
 
     def repair_requirement(
-        self, req: str, issues: List[str], guidance: List[str]
+        self,
+        req: str,
+        issues: List[str],
+        guidance: List[str],
+        run_topic: str = "",
+        all_experiment_ideas: str = "",
+        current_experiment_idea: str = "",
+        previous_requirement: str = "",
     ) -> str:
         system = (
             "You repair CFD prompts for Foam-Agent. "
@@ -131,6 +144,10 @@ class HypothesisAgent:
         )
         user = (
             "Requirement:\n{req}\n\n"
+            "Run topic:\n{run_topic}\n\n"
+            "All experiment ideas/context summary:\n{all_experiment_ideas}\n\n"
+            "Current experiment idea:\n{current_experiment_idea}\n\n"
+            "Previous experiment requirement (for consistency):\n{previous_requirement}\n\n"
             "Issues detected:\n{issues}\n\n"
             "Repair guidance:\n{guidance}\n\n"
             "Return only the corrected requirement paragraph."
@@ -140,6 +157,10 @@ class HypothesisAgent:
         return chain.invoke(
             {
                 "req": req,
+                "run_topic": run_topic or "",
+                "all_experiment_ideas": all_experiment_ideas or "",
+                "current_experiment_idea": current_experiment_idea or "",
+                "previous_requirement": previous_requirement or "",
                 "issues": "\n".join(f"- {i}" for i in issues),
                 "guidance": "\n".join(f"- {g}" for g in guidance),
             }
@@ -189,11 +210,22 @@ class HypothesisAgent:
         idea: Dict[str, Any],
         simulation: Dict[str, Any],
         run_topic: str = "",
+        all_experiment_ideas: str = "",
+        current_experiment_idea: str = "",
+        previous_requirement: str = "",
         max_retries: int = 3,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         req = self._strip_visualization_mentions(
-            self.generate_user_requirement(idea, simulation, run_topic=run_topic, verbose=verbose)
+            self.generate_user_requirement(
+                idea,
+                simulation,
+                run_topic=run_topic,
+                all_experiment_ideas=all_experiment_ideas,
+                current_experiment_idea=current_experiment_idea,
+                previous_requirement=previous_requirement,
+                verbose=verbose,
+            )
         )
         history: List[Dict[str, Any]] = []
 
@@ -214,6 +246,10 @@ class HypothesisAgent:
                 req,
                 issues=verdict.get("issues", []),
                 guidance=verdict.get("repair_guidance", []),
+                run_topic=run_topic,
+                all_experiment_ideas=all_experiment_ideas,
+                current_experiment_idea=current_experiment_idea,
+                previous_requirement=previous_requirement,
             )
             req = self._strip_visualization_mentions(req)
 

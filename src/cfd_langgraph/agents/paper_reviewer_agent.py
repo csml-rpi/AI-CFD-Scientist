@@ -51,6 +51,7 @@ class PaperReviewerAgent:
         user = self.prompts.get(
             "user_prompt",
             "Review this LaTeX paper.\n\nCompilation: {compile_status}\n\nLaTeX content:\n{tex_content}\n\n"
+            "Conclusion must be a single paragraph; if Conclusion is formatted as bullets/numbered list, mark fail and recommend rewriting as one paragraph.\n\n"
             "Return JSON with: pass (bool), score (0-1), formatting_ok, figures_ok, content_ok, coherent, publishable (all bool), "
             "recommendations (list of specific fixes), summary (brief).",
         )
@@ -65,6 +66,8 @@ class PaperReviewerAgent:
             ("human", user),
         ])
         chain = prompt | self.llm
+        tex_for_review = tex_content or ""
+
         out = chain.invoke({
             "compile_status": compile_status,
             # Required by the prompt template (see prompts.yaml).
@@ -72,7 +75,7 @@ class PaperReviewerAgent:
             "compile_error": compile_error or "",
             # Optional extra input used by the prompt template (see prompts.yaml).
             "reference_report": reference_report or "",
-            "tex_content": tex_content[:50000],  # truncate for context limit
+            "tex_content": tex_for_review,
         })
         raw = getattr(out, "content", str(out))
 

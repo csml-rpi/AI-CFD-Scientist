@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List
 
 from cfd_langgraph.agents.hypothesis_agent import HypothesisAgent
@@ -14,6 +15,59 @@ class RerunAnalysisAgent:
 
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.hypothesis = HypothesisAgent(model=model, prompt_loader=prompt_loader)
+
+    @staticmethod
+    def _format_experiment_idea(experiment_idea: Dict[str, Any] | None) -> str:
+        """
+        Produce a short, stable text snippet for prompt guidance.
+
+        experiment_idea is expected to come from ideation_output.json / simulation.case_data,
+        and may include experiment_id/name/notes/parameters/controls.
+        """
+        if not isinstance(experiment_idea, dict) or not experiment_idea:
+            return ""
+
+        exp_id = experiment_idea.get("experiment_id")
+        name = experiment_idea.get("name")
+        notes = experiment_idea.get("notes") or experiment_idea.get("description")
+        topology = experiment_idea.get("topology")
+
+        params = experiment_idea.get("parameters")
+        params_txt = ""
+        if isinstance(params, dict) and params:
+            # Only include simple scalar-ish values to keep prompts small.
+            scalar_items: List[tuple[str, Any]] = []
+            for k, v in params.items():
+                if isinstance(v, (str, int, float, bool)):
+                    scalar_items.append((str(k), v))
+            scalar_items.sort(key=lambda x: x[0])
+            scalar_items = scalar_items[:8]
+            if scalar_items:
+                params_txt = json.dumps({k: v for k, v in scalar_items}, ensure_ascii=False, sort_keys=True)
+
+        controls = experiment_idea.get("controls")
+        controls_txt = ""
+        if isinstance(controls, dict) and controls:
+            controls_txt = json.dumps(controls, ensure_ascii=False, sort_keys=True)
+            # Hard truncate to avoid very large controls blocks.
+            if len(controls_txt) > 600:
+                controls_txt = controls_txt[:600] + "..."
+
+        lines: List[str] = []
+        if exp_id:
+            lines.append(f"experiment_id: {exp_id}")
+        if name:
+            lines.append(f"name: {name}")
+        if topology:
+            lines.append(f"topology: {topology}")
+        if isinstance(notes, str) and notes.strip():
+            lines.append(f"notes: {notes.strip()}")
+        if params_txt:
+            lines.append(f"key_parameters: {params_txt}")
+        if controls_txt:
+            lines.append(f"controls: {controls_txt}")
+
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _extract_feedback(interp: Dict[str, Any]) -> List[str]:
@@ -46,7 +100,9 @@ class RerunAnalysisAgent:
         self,
         current_requirement: str,
         interpreter_report: Dict[str, Any],
+        experiment_idea: Dict[str, Any] | None = None,
         reference_summary: str | None = None,
+        reference_diff_report: str | None = None,
         verbose: bool = False,
     ) -> Dict[str, Any]:
         if verbose:
@@ -66,6 +122,12 @@ class RerunAnalysisAgent:
             "Keep the requirement executable by Foam-Agent (solver, time controls, BCs, mesh).",
             "Do not include visualization instructions.",
         ]
+        experiment_idea_txt = self._format_experiment_idea(experiment_idea)
+        if experiment_idea_txt:
+            guidance_lines.append(
+                "Experiment concept you must preserve while repairing the requirement:\n"
+                f"{experiment_idea_txt}"
+            )
         if reference_summary:
             guidance_lines.append(
                 "You also have a summary of a closely related WORKING case. "
@@ -77,6 +139,15 @@ class RerunAnalysisAgent:
                 f"{reference_summary}\n"
                 "Never copy or mention any contents from constant/polyMesh or any time directories "
                 "other than time 0; those are generated outputs, not inputs."
+            )
+
+        if reference_diff_report:
+            guidance_lines.append(
+                "Diff report between a closely related WORKING case and the failing case. "
+                "Use this diff report as the primary source of what to change in the failing-case "
+                "Foam-Agent requirement. Do not summarize the diff report; only incorporate the concrete "
+                "file-level changes into the revised requirement:\n"
+                f"{reference_diff_report}"
             )
 
         revised = self.hypothesis.repair_requirement(

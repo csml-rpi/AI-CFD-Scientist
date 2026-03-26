@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, TypedDict, cast
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph import END, START, StateGraph
 
 from cfd_langgraph.agents.analysis_agent import AnalysisAgent
@@ -186,6 +187,287 @@ class CFDWorkflow:
             lines.append(f"\n--- BEGIN REFERENCE FILE {rel} ---\n{snippet}\n--- END REFERENCE FILE {rel} ---")
 
         return "\n".join(lines)
+
+    @staticmethod
+    def _read_text_file(path: Path, *, max_chars: int = 6000) -> str:
+        try:
+            if not path.exists() or not path.is_file():
+                return ""
+            txt = path.read_text(encoding="utf-8", errors="ignore")
+            txt = txt.strip("\ufeff")
+            if len(txt) <= max_chars:
+                return txt
+            # Keep head + tail so diffs still catch key changes.
+            head = txt[: max_chars // 2]
+            tail = txt[-(max_chars // 2) :]
+            return head + "\n... [truncated] ...\n" + tail
+        except Exception:
+            return ""
+
+    def _get_latest_requirement_text(
+        self, sim_id: str, entry: Dict[str, Any], out_dir: Path
+    ) -> str:
+        """
+        For rerun reference selection:
+        Prefer the persisted `user_requirement.txt` for that case; otherwise fall back
+        to pipeline-log stored hypothesis/requirement_updates.
+        """
+        sim_dir = out_dir / str(sim_id)
+        req_path = sim_dir / "user_requirement.txt"
+        if req_path.exists():
+            txt = self._read_text_file(req_path, max_chars=12000)
+            if txt.strip():
+                return txt.strip()
+
+        # Fallbacks (no persisted file)
+        req = ""
+        hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
+        if isinstance(hyp.get("requirement"), str):
+            req = hyp.get("requirement", "") or ""
+
+        # If requirement_updates exists, take the last attempt requirement.
+        updates = entry.get("requirement_updates", []) if isinstance(entry.get("requirement_updates", []), list) else []
+        if updates:
+            last = updates[-1]
+            if isinstance(last, dict) and isinstance(last.get("requirement"), str):
+                req = last["requirement"] or req
+
+        return str(req or "").strip()
+
+    def _collect_openfoam_inputs_bundle(
+        self,
+        sim_id: str,
+        out_dir: Path,
+        *,
+        max_files: int = 18,
+        max_chars_total: int = 12000,
+        max_file_chars: int = 2500,
+        skip_poly_mesh: bool = True,
+    ) -> str:
+        """
+        Collect relevant OpenFOAM *inputs* from foam_output/system/, constant/, 0/
+        (ignoring constant/polyMesh by default).
+        """
+        sim_dir = out_dir / str(sim_id)
+        foam_dir = sim_dir / "foam_output"
+        if not foam_dir.is_dir():
+            return f"(no foam_output dir found at {foam_dir})"
+
+        def _list_files(root: Path) -> List[Path]:
+            if not root.is_dir():
+                return []
+            paths: List[Path] = []
+            for p in sorted(root.iterdir()):
+                if p.is_file():
+                    paths.append(p)
+                elif p.is_dir():
+                    # Only include top-level dirs if they contain files; but we'll mostly avoid
+                    # large generated mesh subtrees.
+                    if p.name == "polyMesh" and skip_poly_mesh:
+                        continue
+                    for fp in sorted(p.rglob("*")):
+                        if fp.is_file():
+                            paths.append(fp)
+            return paths
+
+        system_dir = foam_dir / "system"
+        constant_dir = foam_dir / "constant"
+        zero_dir = foam_dir / "0"
+
+        system_files = _list_files(system_dir)
+        constant_files = _list_files(constant_dir)
+        zero_files = _list_files(zero_dir)
+
+        # Prioritize a small set of “high signal” known input files.
+        priority_hints = {
+            "system/controlDict",
+            "system/fvSchemes",
+            "system/fvSolution",
+            "system/blockMeshDict",
+            "constant/transportProperties",
+            "constant/turbulenceProperties",
+            "constant/thermophysicalProperties",
+            "constant/RASProperties",
+            "0/U",
+            "0/p",
+            "0/k",
+            "0/epsilon",
+            "0/omega",
+            "0/nuTilda",
+            "0/nut",
+        }
+
+        def _rel(fp: Path) -> str:
+            try:
+                return str(fp.relative_to(foam_dir))
+            except ValueError:
+                return str(fp)
+
+        all_files = system_files + constant_files + zero_files
+        all_files = [p for p in all_files if p.is_file()]
+
+        # Sort: priority first, then shortest relpath, then lexicographic.
+        def _sort_key(p: Path):
+            rel = _rel(p)
+            pri = 0 if rel in priority_hints else 1
+            return (pri, len(rel), rel)
+
+        all_files.sort(key=_sort_key)
+
+        total_chars = 0
+        included: List[str] = []
+        file_count = 0
+        for p in all_files:
+            if file_count >= max_files:
+                break
+            rel = _rel(p)
+            if skip_poly_mesh and rel.startswith("constant/polyMesh/"):
+                continue
+            txt = self._read_text_file(p, max_chars=max_file_chars)
+            if not txt.strip():
+                continue
+            if total_chars + len(txt) > max_chars_total:
+                # Truncate to remaining budget.
+                remaining = max_chars_total - total_chars
+                if remaining <= 0:
+                    break
+                txt = txt[:remaining] + "\n...[truncated budget]..."
+            included.append(f"--- BEGIN FILE {rel} ---\n{txt}\n--- END FILE {rel} ---")
+            total_chars += len(txt)
+            file_count += 1
+
+        return "\n".join(
+            [f"CASE_INPUT_BUNDLE sim_id={sim_id}", f"foam_output_dir={foam_dir}"] + included
+        )
+
+    def _select_closest_successful_case_llm(
+        self,
+        *,
+        target_user_requirement: str,
+        successful_entries: List[Dict[str, Any]],
+        out_dir: Path,
+        max_candidates: int = 6,
+        verbose: bool = False,
+    ) -> str:
+        """
+        LLM selects the closest-successful case based on user requirement similarity.
+        Returns selected simulation_id.
+        """
+        # Build candidate list with their latest requirement text.
+        candidates: List[Dict[str, Any]] = []
+        for e in successful_entries:
+            if not isinstance(e, dict):
+                continue
+            sim = e.get("simulation", {}) if isinstance(e.get("simulation", {}), dict) else {}
+            sim_id = sim.get("simulation_id")
+            if sim_id is None:
+                continue
+            sim_id_s = str(sim_id)
+            req_txt = self._get_latest_requirement_text(sim_id_s, e, out_dir=out_dir)
+            if not req_txt:
+                continue
+            candidates.append(
+                {
+                    "simulation_id": sim_id_s,
+                    "case_name": sim.get("case_name", ""),
+                    "requirement": req_txt[:4000],  # hard cap for selection prompt
+                }
+            )
+
+        if not candidates:
+            return ""
+
+        # Cap candidates to keep prompt small: choose by closeness heuristic to reduce cost.
+        target_base = str(target_user_requirement).split(".")[0][:120].strip()
+        candidates.sort(
+            key=lambda c: (0 if c.get("case_name", "").split("_")[0] in target_user_requirement else 1, c["simulation_id"])
+        )
+        candidates = candidates[:max_candidates]
+
+        llm = create_langchain_llm(model=self.settings.model, temperature=0.0)
+        system = (
+            "You are a CFD workflow planner. You are given a target (non-working) Foam-Agent user requirement "
+            "and several successful candidate cases from the same study. "
+            "Choose which candidate is closest to the target in terms of intended setup, geometry, sweep parameter, "
+            "solver usage, mesh/numerics, and boundary-condition pattern. "
+            "Do not guess about missing files; use only the provided requirement texts. "
+            "Return ONLY valid JSON."
+        )
+        user = {
+            "target_user_requirement": target_user_requirement[:8000],
+            "successful_candidates": candidates,
+        }
+        prompt = ChatPromptTemplate.from_messages([("system", system), ("human", "{payload}")])
+        resp = llm.invoke(prompt.format_messages(payload=json.dumps(user, ensure_ascii=False)) )
+        raw = getattr(resp, "content", str(resp))
+        try:
+            parsed = json.loads(strip_json_fences(raw))
+        except Exception:
+            if verbose:
+                print(f"[rerun] LLM selection parse failed; raw={raw[:2000]}", flush=True)
+            return candidates[0]["simulation_id"]
+        sid = parsed.get("selected_simulation_id") if isinstance(parsed, dict) else None
+        if sid is None:
+            sid = parsed.get("simulation_id") if isinstance(parsed, dict) else None
+        return str(sid or "") or candidates[0]["simulation_id"]
+
+    def _diff_inputs_llm(
+        self,
+        *,
+        working_sim_id: str,
+        failing_sim_id: str,
+        out_dir: Path,
+        verbose: bool = False,
+    ) -> str:
+        """
+        LLM creates a diff report (not a summary) between working vs failing OpenFOAM inputs,
+        comparing only system/, constant/ (excluding polyMesh/), and 0/.
+        """
+        llm = create_langchain_llm(model=self.settings.model, temperature=0.0)
+
+        working_bundle = self._collect_openfoam_inputs_bundle(working_sim_id, out_dir)
+        failing_bundle = self._collect_openfoam_inputs_bundle(failing_sim_id, out_dir)
+
+        system = (
+            "You are an expert OpenFOAM case diff assistant. "
+            "You will be given two case input bundles: a WORKING case and a failing (NON-WORKING) case. "
+            "Both bundles include file contents from system/, constant/ (excluding constant/polyMesh), and 0/. "
+            "Your job is to create a DIFF REPORT that explicitly describes what differs between the cases "
+            "at the file level and the line/section level as much as possible. "
+            "You must NOT produce a generic summary; the report should be diffs and actionable edits. "
+            "Output ONLY valid JSON."
+        )
+        human = (
+            "Return JSON with schema {"
+            "\"diff_report\": string"
+            "}. "
+            "The diff_report must include: "
+            "1) FILE PATHS that differ; "
+            "2) For each differing file, show a unified-diff-like block (use '+'/'-' lines when possible); "
+            "3) 'SUGGESTED USER-REQUIREMENT CHANGES': concrete guidance describing what parts of the Foam-Agent "
+            "user requirement should be updated in the failing case to match the working case's inputs, "
+            "while preserving the intended sweep concept. "
+            "If the prompt truncates file contents, mention '<<TRUNCATED>>' inside the diff report for that file. \n\n"
+            "WORKING_CASE:\n{working}\n\nFAILING_CASE:\n{failing}\n"
+        )
+        # Use ChatPromptTemplate for consistent formatting with other calls.
+        prompt = ChatPromptTemplate.from_messages([("system", system), ("human", human)])
+        resp = llm.invoke(prompt.format_messages(working=working_bundle, failing=failing_bundle))
+        raw = getattr(resp, "content", str(resp))
+        try:
+            parsed = json.loads(strip_json_fences(raw))
+            diff_report = parsed.get("diff_report")
+            if isinstance(diff_report, str) and diff_report.strip():
+                return diff_report.strip()
+        except Exception:
+            if verbose:
+                print(f"[rerun] LLM diff parse failed; raw={raw[:2000]}", flush=True)
+        # Fallback: minimal report.
+        return (
+            f"<<DIFF REPORT UNAVAILABLE>>\n"
+            f"working_sim_id={working_sim_id}\n"
+            f"failing_sim_id={failing_sim_id}\n"
+        )
 
 
     @staticmethod
@@ -402,7 +684,12 @@ class CFDWorkflow:
                     continue
                 exp = it.get("experiment", {}) if isinstance(it.get("experiment", {}), dict) else {}
                 prompt_for_foam = str(it.get("prompt_for_foamagent", "") or "")
-                attempts_used = int((interp_by_id.get(sim_id, {}) or {}).get("attempts_used", 0) or 0)
+                ic = interp_by_id.get(sim_id, {}) or {}
+                attempts_used = int(
+                    (ic.get("foam_rerun_count") if isinstance(ic, dict) else None)
+                    or (ic.get("attempts_used", 0) if isinstance(ic, dict) else 0)
+                    or 0
+                )
                 latest_run = (foam_by_id.get(sim_id, {}) or {}).get("latest_run", {}) if isinstance(foam_by_id.get(sim_id, {}), dict) else {}
 
                 rebuilt.append(
@@ -448,6 +735,7 @@ class CFDWorkflow:
                     "simulation_id": sim_id,
                     "case_name": sim_meta.get("case_name", sim_id),
                     "description": sim_meta.get("description", ""),
+                    "experiment_idea": sim_meta.get("case_data", None),
                     "user_requirement": user_req,
                     "sim_dir": sim_dir,
                     "foam_output_dir": foam_output_dir,
@@ -459,13 +747,51 @@ class CFDWorkflow:
         if verbose:
             print(f"[CFD-WORKFLOW] Restart: {len(experiments)} experiment(s) for interpreter/analysis/writer.", flush=True)
 
+        max_reruns = int(self.settings.workflow_max_reruns_per_experiment)
+
+        # Optional optimization: if interpreter_output.json exists, only
+        # re-interpret cases that previously requested a rerun.
+        interp_snapshot_path = out_dir / "interpreter_output.json"
+        snapshot_by_sim_id: Dict[str, Dict[str, Any]] = {}
+        if interp_snapshot_path.is_file():
+            snap = self._read_json(interp_snapshot_path)
+            snap_cases = snap.get("cases", []) if isinstance(snap, dict) else []
+            if isinstance(snap_cases, list):
+                for c in snap_cases:
+                    if isinstance(c, dict) and c.get("simulation_id") is not None:
+                        snapshot_by_sim_id[str(c.get("simulation_id"))] = c
+
         # Re-run interpreter for each experiment using latest Foam-Agent run_result.
+        # For cases marked rerun_required=false in the snapshot, keep the existing
+        # interpreter payload untouched to avoid unnecessary LLM calls.
         new_sims_entries: List[Dict[str, Any]] = []
         for entry, ex in zip(sims_entries, experiments):
             sim_meta = ex["simulation_meta"]
             sim_id = ex["simulation_id"]
+            sim_id_s = str(sim_id)
+
+            snap_case = snapshot_by_sim_id.get(sim_id_s)
+            snap_rr = bool(snap_case.get("rerun_required", False)) if isinstance(snap_case, dict) else False
+            snap_interp = snap_case.get("interpreter") if isinstance(snap_case, dict) else None
+            snap_attempts_used = None
+            if isinstance(snap_case, dict):
+                snap_attempts_used = snap_case.get("attempts_used", snap_case.get("foam_rerun_count"))
+
+            if snap_case and not snap_rr and isinstance(snap_interp, dict):
+                entry2 = dict(entry)
+                entry2["interpreter"] = snap_interp
+                if snap_attempts_used is not None:
+                    try:
+                        entry2["attempt"] = int(snap_attempts_used)
+                    except Exception:
+                        pass
+                if verbose:
+                    print(f"[CFD-WORKFLOW] RESTART interpreter skip :: {sim_id_s} (snapshot rerun_required=false)", flush=True)
+                new_sims_entries.append(entry2)
+                continue
+
             if verbose:
-                print(f"[CFD-WORKFLOW] RESTART interpreter :: {sim_id}", flush=True)
+                print(f"[CFD-WORKFLOW] RESTART interpreter :: {sim_id_s}", flush=True)
             interp = self.interpreter.interpret(
                 idea_json=idea,
                 experiment_spec=sim_meta,
@@ -474,14 +800,18 @@ class CFDWorkflow:
             )
 
             # Update entry with new interpreter results
-            entry = dict(entry)
-            entry["interpreter"] = interp
-            new_sims_entries.append(entry)
+            entry2 = dict(entry)
+            entry2["interpreter"] = interp
+            new_sims_entries.append(entry2)
+            self._log_interpreter_rerun_required(sim_id_s, interp, verbose=verbose)
+            self._log_rerun_skipped_at_cap(
+                sim_id_s, interp, int(entry2.get("attempt", 0) or 0), max_reruns, verbose=verbose
+            )
 
         pipeline_log["simulations"] = new_sims_entries
+        self._write_interpreter_output_json(out_dir, new_sims_entries)
 
         # If some cases need rerun, perform rerun rounds here (restart should be resilient to workflow stops).
-        max_reruns = int(self.settings.workflow_max_reruns_per_experiment)
         while True:
             queue: List[str] = []
             for entry in new_sims_entries:
@@ -494,6 +824,8 @@ class CFDWorkflow:
                 attempt_used = int(entry.get("attempt", 0) or 0)
                 if rerun_required and attempt_used < max_reruns:
                     queue.append(sim_id)
+                elif rerun_required:
+                    self._log_rerun_skipped_at_cap(sim_id, interp, attempt_used, max_reruns, verbose=verbose)
 
             if not queue:
                 break
@@ -527,11 +859,84 @@ class CFDWorkflow:
                 if verbose:
                     print(f"[CFD-WORKFLOW] RESTART rerun :: {sim_id}", flush=True)
 
+                sim_meta2 = cast(Dict[str, Any], entry.get("simulation", {}) or {})
+                exp_idea = sim_meta2.get("case_data", None)
+
+                # Choose closest successful case (by user requirement text),
+                # then diff their OpenFOAM inputs (system/, constant/, 0/) ignoring polyMesh/.
+                chosen_ref_sim_id = ""
+                diff_report = ""
+                try:
+                    working_candidates: List[Dict[str, Any]] = []
+                    for e2 in new_sims_entries:
+                        if not isinstance(e2, dict):
+                            continue
+                        sim_e = e2.get("simulation", {}) if isinstance(e2.get("simulation", {}), dict) else {}
+                        sim_id_e = sim_e.get("simulation_id", "")
+                        if str(sim_id_e) == str(sim_id):
+                            continue
+                        interp_e = e2.get("interpreter", {}) if isinstance(e2.get("interpreter", {}), dict) else {}
+                        if not interp_e:
+                            continue
+                        if not bool(interp_e.get("simulation_success", False)):
+                            continue
+                        if not bool(interp_e.get("requirement_met", False)):
+                            continue
+                        if not bool(interp_e.get("viz_ok", False)):
+                            continue
+
+                        latest_runs = e2.get("run_history", []) if isinstance(e2.get("run_history", []), list) else []
+                        latest_run = latest_runs[-1] if latest_runs else {}
+                        if isinstance(latest_run, dict) and latest_run.get("returncode") not in (0, None):
+                            continue
+                        working_candidates.append(e2)
+
+                    if verbose:
+                        print(
+                            f"[CFD-WORKFLOW] RESTART rerun reference candidates :: target={sim_id} count={len(working_candidates)}",
+                            flush=True,
+                        )
+
+                    chosen_ref_sim_id = self._select_closest_successful_case_llm(
+                        target_user_requirement=current_req,
+                        successful_entries=working_candidates,
+                        out_dir=out_dir,
+                        verbose=verbose,
+                    )
+                    if verbose and chosen_ref_sim_id:
+                        print(
+                            f"[CFD-WORKFLOW] RESTART rerun reference selected (LLM) :: target={sim_id} selected={chosen_ref_sim_id}",
+                            flush=True,
+                        )
+                    if chosen_ref_sim_id:
+                        diff_report = self._diff_inputs_llm(
+                            working_sim_id=chosen_ref_sim_id,
+                            failing_sim_id=str(sim_id),
+                            out_dir=out_dir,
+                            verbose=verbose,
+                        )
+                        if verbose:
+                            print(
+                                f"[CFD-WORKFLOW] RESTART rerun diff report :: target={sim_id} selected={chosen_ref_sim_id} chars={len(diff_report)}",
+                                flush=True,
+                            )
+                except Exception:
+                    chosen_ref_sim_id = ""
+                    diff_report = ""
+
                 revision = self.rerun_analysis.revise_requirement(
                     current_req,
                     cast(Dict[str, Any], interp or {}),
+                    experiment_idea=exp_idea if isinstance(exp_idea, dict) else None,
+                    reference_summary=None,
+                    reference_diff_report=diff_report or None,
                     verbose=verbose,
                 )
+                if verbose:
+                    print(
+                        f"[CFD-WORKFLOW] RESTART rerun revise used_diff={bool(diff_report)} used_ref={bool(chosen_ref_sim_id)}",
+                        flush=True,
+                    )
                 next_req = str(revision.get("requirement", "") or "")
                 req_valid = bool(revision.get("valid", False))
 
@@ -577,9 +982,18 @@ class CFDWorkflow:
                     verbose=verbose,
                 )
                 entry["interpreter"] = interp2
+                self._log_interpreter_rerun_required(sim_id, interp2, verbose=verbose)
+                self._log_rerun_skipped_at_cap(
+                    sim_id,
+                    interp2,
+                    int(entry.get("attempt", 0) or 0),
+                    max_reruns,
+                    verbose=verbose,
+                )
 
             pipeline_log["simulations"] = new_sims_entries
             self._write_json(pipeline_path, pipeline_log)
+            self._write_interpreter_output_json(out_dir, new_sims_entries)
 
         # Run full analysis pipeline (viz + analysis text)
         if verbose:
@@ -592,6 +1006,7 @@ class CFDWorkflow:
                     "simulation_id": ex["simulation_id"],
                     "case_name": ex["case_name"],
                     "description": ex["description"],
+                    "experiment_idea": ex.get("experiment_idea", None),
                     "user_requirement": ex["user_requirement"],
                     "sim_dir": ex["sim_dir"],
                     "foam_output_dir": ex["foam_output_dir"],
@@ -601,10 +1016,46 @@ class CFDWorkflow:
         analysis_text = analysis_result.get("analysis_text", "")
         viz_bundle = analysis_result.get("visualizations", [])
         viz_bundle = self._vision_filter_viz_bundle(viz_bundle, analysis_experiments, verbose=verbose)
+        data_proc = self.analysis.run_cross_experiment_data_processing(
+            topic=topic,
+            experiments=analysis_experiments,
+            out_dir=out_dir,
+            verbose=True,
+        )
+        data_proc_report_text = ""
+        data_proc_report_path = str(data_proc.get("report_path", "") or "")
+        if data_proc_report_path:
+            rp = Path(data_proc_report_path)
+            if rp.is_file():
+                try:
+                    data_proc_report_text = rp.read_text(encoding="utf-8")
+                except Exception:
+                    data_proc_report_text = ""
+        data_proc_interp_text = str(data_proc.get("interpretation_text", "") or "")
+        if not data_proc_interp_text:
+            ip = Path(str(data_proc.get("interpretation_path", "") or ""))
+            if ip.is_file():
+                try:
+                    data_proc_interp_text = ip.read_text(encoding="utf-8")
+                except Exception:
+                    data_proc_interp_text = ""
+        # Make cross-experiment images visible to writer/reviewer path resolution.
+        data_proc_images = [
+            str(p) for p in (data_proc.get("images", []) or []) if isinstance(p, str) and p.strip()
+        ]
+        if data_proc_images:
+            viz_bundle.append(
+                {
+                    "simulation_id": "cross_experiment",
+                    "case_name": "cross_experiment_analysis",
+                    "visualization": {"ok": True, "images": data_proc_images},
+                }
+            )
 
         analysis_path = out_dir / "analysis_report.md"
         self.analysis.save_analysis(analysis_path, analysis_text, topic=topic)
         pipeline_log["analysis"] = str(analysis_path)
+        pipeline_log["cross_experiment_data_processing"] = data_proc
 
         # Map analysis visualizations back into pipeline_log simulations
         viz_by_id = {v["simulation_id"]: v.get("visualization") for v in viz_bundle if isinstance(v, dict)}
@@ -617,8 +1068,35 @@ class CFDWorkflow:
         # Run writer (paper + review loop)
         if verbose:
             print("[CFD-WORKFLOW] RESTART writer...", flush=True)
+        exp_ideas_for_writer: List[Dict[str, Any]] = []
+        for ex in analysis_experiments:
+            exp_ideas_for_writer.append(
+                {
+                    "simulation_id": ex.get("simulation_id"),
+                    "case_name": ex.get("case_name"),
+                    "experiment_idea": ex.get("experiment_idea"),
+                }
+            )
         # Build section_context from idea + analysis text
-        section_context = json.dumps(idea, indent=2) + "\n\n" + analysis_text
+        section_context = (
+            json.dumps(idea, indent=2)
+            + "\n\nPER-EXPERIMENT IDEAS/CONTEXT:\n"
+            + json.dumps(exp_ideas_for_writer, indent=2, ensure_ascii=False)
+            + "\n\n"
+            + analysis_text
+            + (
+                "\n\nCROSS-EXPERIMENT DATA PROCESSING REPORT:\n"
+                + data_proc_report_text
+                if data_proc_report_text
+                else ""
+            )
+            + (
+                "\n\nCROSS-EXPERIMENT INTERPRETATION (LLM):\n"
+                + data_proc_interp_text
+                if data_proc_interp_text
+                else ""
+            )
+        )
         paper_text, pdf_path, review_info = self.writer.write_paper_with_literature_and_review(
             topic=topic,
             section_context=section_context,
@@ -863,6 +1341,137 @@ class CFDWorkflow:
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     @staticmethod
+    def _interp_rerun_reason_for_display(interp: Dict[str, Any]) -> str:
+        """Human-readable rerun motivation from interpreter output (several possible keys)."""
+        if not isinstance(interp, dict):
+            return ""
+        r = interp.get("rerun_reason")
+        if r is not None and str(r).strip():
+            return str(r).strip()
+        r2 = interp.get("reasons")
+        if r2 is not None:
+            if isinstance(r2, list):
+                joined = "; ".join(str(x).strip() for x in r2 if str(x).strip())
+                return joined
+            s = str(r2).strip()
+            if s:
+                return s
+        summ = interp.get("summary")
+        if summ is not None and str(summ).strip():
+            return str(summ).strip()
+        issues = interp.get("issues")
+        if issues is not None:
+            if isinstance(issues, list):
+                return "; ".join(str(x).strip() for x in issues if str(x).strip())
+            s = str(issues).strip()
+            if s:
+                return s
+        return ""
+
+    @staticmethod
+    def _log_interpreter_rerun_required(
+        sim_id: str,
+        interp: Dict[str, Any],
+        *,
+        verbose: bool,
+        prefix: str = "[CFD-WORKFLOW]",
+    ) -> None:
+        if not verbose or not isinstance(interp, dict) or not bool(interp.get("rerun_required", False)):
+            return
+        reason = CFDWorkflow._interp_rerun_reason_for_display(interp)
+        if reason:
+            print(f"{prefix} Interpreter rerun_required :: {sim_id} — {reason}", flush=True)
+        else:
+            print(f"{prefix} Interpreter rerun_required :: {sim_id}", flush=True)
+
+    @staticmethod
+    def _log_rerun_skipped_at_cap(
+        sim_id: str,
+        interp: Dict[str, Any],
+        attempt_used: int,
+        max_reruns: int,
+        *,
+        verbose: bool,
+    ) -> None:
+        if (
+            not verbose
+            or not isinstance(interp, dict)
+            or not bool(interp.get("rerun_required", False))
+            or attempt_used < max_reruns
+        ):
+            return
+        reason = CFDWorkflow._interp_rerun_reason_for_display(interp)
+        base = (
+            f"[CFD-WORKFLOW] Rerun not queued (foam_rerun_count={attempt_used} >= "
+            f"workflow_max_reruns={max_reruns}) :: {sim_id}"
+        )
+        if reason:
+            print(f"{base} — interpreter would rerun because: {reason}", flush=True)
+        else:
+            print(base, flush=True)
+
+    @staticmethod
+    def _build_interpreter_output_payload(
+        sims_list: List[Dict[str, Any]],
+        *,
+        rerun_round: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Snapshot of per-case interpreter state for interpreter_output.json.
+        foam_rerun_count / attempts_used mirror pipeline_log simulations[].attempt (lifetime corrective runs).
+        """
+        interp_cases: List[Dict[str, Any]] = []
+        for entry in sims_list:
+            if not isinstance(entry, dict):
+                continue
+            sim = entry.get("simulation", {}) if isinstance(entry.get("simulation", {}), dict) else {}
+            interp = entry.get("interpreter", {}) if isinstance(entry.get("interpreter", {}), dict) else {}
+            sim_id = sim.get("simulation_id", "unknown")
+            rerun_required = bool(interp.get("rerun_required", False)) if isinstance(interp, dict) else False
+            run_history = entry.get("run_history", []) if isinstance(entry.get("run_history", []), list) else []
+            latest_run = run_history[-1] if run_history else {}
+            latest_run = cast(Dict[str, Any], latest_run if isinstance(latest_run, dict) else {})
+            attempt_val = int(entry.get("attempt", 0) or 0)
+            rerun_reason_out = interp.get("rerun_reason") if isinstance(interp, dict) else None
+            if rerun_reason_out is None or (isinstance(rerun_reason_out, str) and not str(rerun_reason_out).strip()):
+                rerun_reason_out = (
+                    CFDWorkflow._interp_rerun_reason_for_display(interp) if rerun_required else None
+                )
+            interp_cases.append(
+                {
+                    "simulation_id": sim.get("simulation_id"),
+                    "case_name": sim.get("case_name"),
+                    "rerun_required": rerun_required,
+                    "rerun_reason": rerun_reason_out,
+                    "status": ("rerun" if rerun_required else "ok"),
+                    "attempts_used": attempt_val,
+                    "foam_rerun_count": attempt_val,
+                    "final_returncode": latest_run.get("returncode"),
+                    "viz_final_ok": latest_run.get("viz_final_ok"),
+                    "interpreter": interp,
+                }
+            )
+        payload: Dict[str, Any] = {
+            "total_cases": len(interp_cases),
+            "rerun_required_count": sum(1 for c in interp_cases if c.get("rerun_required") is True),
+            "ok_count": sum(1 for c in interp_cases if c.get("status") == "ok"),
+            "cases": interp_cases,
+        }
+        if rerun_round is not None:
+            payload["rerun_round"] = int(rerun_round)
+        return payload
+
+    def _write_interpreter_output_json(
+        self,
+        out_dir: Path,
+        sims_list: List[Dict[str, Any]],
+        *,
+        rerun_round: Optional[int] = None,
+    ) -> None:
+        payload = self._build_interpreter_output_payload(sims_list, rerun_round=rerun_round)
+        self._write_json(out_dir.expanduser().resolve() / "interpreter_output.json", payload)
+
+    @staticmethod
     def _read_json(path: Path) -> Dict[str, Any]:
         if not path.exists():
             return {}
@@ -870,6 +1479,28 @@ class CFDWorkflow:
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {}
+
+    @staticmethod
+    def _compact_experiment_idea_text(exp: Dict[str, Any]) -> str:
+        idea = exp.get("case_data", None) or exp.get("experiment_idea", None)
+        if isinstance(idea, dict):
+            try:
+                return json.dumps(idea, ensure_ascii=False)[:1200]
+            except Exception:
+                return str(idea)[:1200]
+        if isinstance(idea, str):
+            return idea[:1200]
+        return str(exp.get("description", "") or "")[:800]
+
+    def _all_experiment_ideas_summary(self, simulations: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for s in simulations or []:
+            sid = str(s.get("simulation_id", "") or "")
+            if not sid:
+                continue
+            cname = str(s.get("case_name", "") or "")
+            lines.append(f"{sid} ({cname}): {self._compact_experiment_idea_text(s)}")
+        return "\n".join(lines)[:8000]
 
     @staticmethod
     def _normalize_feedback_lines(interp: Dict[str, Any]) -> List[str]:
@@ -958,7 +1589,13 @@ class CFDWorkflow:
         return "Visualization diagnostics were not acceptable; regenerating plots."
 
     def _revise_requirement_from_feedback(
-        self, req: str, interp: Dict[str, Any]
+        self,
+        req: str,
+        interp: Dict[str, Any],
+        experiment_idea: Dict[str, Any] | None = None,
+        run_topic: str = "",
+        all_experiment_ideas: str = "",
+        previous_requirement: str = "",
     ) -> Dict[str, Any]:
         feedback = self._normalize_feedback_lines(interp)
         if not feedback:
@@ -969,13 +1606,20 @@ class CFDWorkflow:
                 "feedback": [],
             }
 
+        guidance_lines: List[str] = [
+            "Update the requirement to address interpreter-detected execution issues.",
+            "Keep the requirement executable by Foam-Agent and do not include visualization instructions.",
+        ]
+        guidance_lines = self._append_experiment_idea_to_guidance(guidance_lines, experiment_idea)
+
         revised = self.hypothesis.repair_requirement(
             req,
             issues=[f"Interpreter feedback: {x}" for x in feedback],
-            guidance=[
-                "Update the requirement to address interpreter-detected execution issues.",
-                "Keep the requirement executable by Foam-Agent and do not include visualization instructions.",
-            ],
+            guidance=guidance_lines,
+            run_topic=run_topic,
+            all_experiment_ideas=all_experiment_ideas,
+            current_experiment_idea=json.dumps(experiment_idea, ensure_ascii=False) if isinstance(experiment_idea, dict) else "",
+            previous_requirement=previous_requirement,
         )
         revised = self.hypothesis._strip_visualization_mentions(revised)
 
@@ -983,10 +1627,18 @@ class CFDWorkflow:
         if verdict.get("valid", False):
             return {"requirement": revised, "valid": True, "feedback": feedback}
 
+        repair_guidance = verdict.get("repair_guidance", [])
+        if isinstance(repair_guidance, list):
+            repair_guidance = self._append_experiment_idea_to_guidance(repair_guidance, experiment_idea)
+
         repaired = self.hypothesis.repair_requirement(
             revised,
             issues=verdict.get("issues", []),
-            guidance=verdict.get("repair_guidance", []),
+            guidance=repair_guidance,
+            run_topic=run_topic,
+            all_experiment_ideas=all_experiment_ideas,
+            current_experiment_idea=json.dumps(experiment_idea, ensure_ascii=False) if isinstance(experiment_idea, dict) else "",
+            previous_requirement=previous_requirement,
         )
         repaired = self.hypothesis._strip_visualization_mentions(repaired)
         repaired_verdict = self.hypothesis.llm_validate_requirement(repaired)
@@ -996,6 +1648,20 @@ class CFDWorkflow:
             "feedback": feedback,
             "validator": repaired_verdict,
         }
+
+    def _append_experiment_idea_to_guidance(
+        self, guidance: List[str], experiment_idea: Dict[str, Any] | None
+    ) -> List[str]:
+        if not isinstance(experiment_idea, dict) or not experiment_idea:
+            return guidance
+        idea_txt = json.dumps(experiment_idea, ensure_ascii=False, sort_keys=True)
+        if len(idea_txt) > 1200:
+            idea_txt = idea_txt[:1200] + "..."
+        guidance.append(
+            "Experiment concept you must preserve while repairing the requirement:\n"
+            f"{idea_txt}"
+        )
+        return guidance
 
     def _build_langgraph_app(self):
         def log_stage(msg: str) -> None:
@@ -1039,6 +1705,8 @@ class CFDWorkflow:
             log_stage(f"START hypothesis-batch :: total={len(simulations)}")
             hyp_items: List[Dict[str, Any]] = []
             updated_sims: List[Dict[str, Any]] = []
+            all_ideas_summary = self._all_experiment_ideas_summary(simulations)
+            prev_req_for_consistency = ""
             for sim in simulations:
                 sim_id = str(sim.get("simulation_id", ""))
                 log_stage(f"START hypothesis :: {sim_id}")
@@ -1046,11 +1714,15 @@ class CFDWorkflow:
                     idea=idea,
                     simulation=sim,
                     run_topic=str(state.get("topic", "") or ""),
+                    all_experiment_ideas=all_ideas_summary,
+                    current_experiment_idea=self._compact_experiment_idea_text(sim),
+                    previous_requirement=prev_req_for_consistency,
                     max_retries=3,
                 )
                 req_text = str(hyp.get("requirement", "") or "")
                 req_valid = bool(hyp.get("valid", False))
                 log_stage(f"END hypothesis :: {sim_id} (valid={req_valid})")
+                prev_req_for_consistency = req_text or prev_req_for_consistency
 
                 sim_enriched = dict(sim)
                 sim_enriched["_hyp"] = hyp
@@ -1125,10 +1797,18 @@ class CFDWorkflow:
         def generate_requirement(state: WorkflowState) -> WorkflowState:
             current_sim = cast(Dict[str, Any], state.get("current_sim", {}) or {})
             log_stage(f"START hypothesis :: {current_sim.get('simulation_id', 'unknown')}")
+            sims = cast(List[Dict[str, Any]], state.get("simulations", []) or [])
+            idx = int(state.get("sim_index", 0) or 0)
+            prev_req_for_consistency = ""
+            if idx > 0 and idx - 1 < len(sims):
+                prev_req_for_consistency = str((sims[idx - 1] or {}).get("_req_text", "") or "")
             hyp = self.hypothesis.generate_validated_requirement(
                 idea=cast(Dict[str, Any], state.get("idea", {}) or {}),
                 simulation=cast(Dict[str, Any], state.get("current_sim", {}) or {}),
                 run_topic=str(state.get("topic", "") or ""),
+                all_experiment_ideas=self._all_experiment_ideas_summary(sims),
+                current_experiment_idea=self._compact_experiment_idea_text(current_sim),
+                previous_requirement=prev_req_for_consistency,
                 max_retries=3,
                 verbose=bool(state.get("verbose", True)),
             )
@@ -1284,7 +1964,21 @@ class CFDWorkflow:
         def revise_requirement(state: WorkflowState) -> WorkflowState:
             req_text = str(state.get("req_text", "") or "")
             interp = cast(Dict[str, Any], state.get("interp", {}) or {})
-            revision = self._revise_requirement_from_feedback(req_text, interp)
+            current_sim = cast(Dict[str, Any], state.get("current_sim", {}) or {})
+            exp_idea = current_sim.get("case_data", None)
+            sims = cast(List[Dict[str, Any]], state.get("simulations", []) or [])
+            idx = int(state.get("sim_index", 0) or 0)
+            prev_req_for_consistency = ""
+            if idx > 0 and idx - 1 < len(sims):
+                prev_req_for_consistency = str((sims[idx - 1] or {}).get("_req_text", "") or "")
+            revision = self._revise_requirement_from_feedback(
+                req_text,
+                interp,
+                experiment_idea=exp_idea if isinstance(exp_idea, dict) else None,
+                run_topic=str(state.get("topic", "") or ""),
+                all_experiment_ideas=self._all_experiment_ideas_summary(sims),
+                previous_requirement=prev_req_for_consistency,
+            )
             next_req = str(revision.get("requirement", "") or "")
             req_valid = bool(revision.get("valid", False))
 
@@ -1377,12 +2071,47 @@ class CFDWorkflow:
             idea = cast(Dict[str, Any], state.get("idea", {}) or {})
             pipeline_log = cast(Dict[str, Any], state.get("pipeline_log", {}) or {})
             sims_list = cast(List[Dict[str, Any]], pipeline_log.get("simulations", []) or [])
+            verbose_ib = bool(state.get("verbose", True))
+            max_reruns_ib = int(self.settings.workflow_max_reruns_per_experiment)
 
-            interp_cases: List[Dict[str, Any]] = []
+            # Optimization: if interpreter_output.json exists, only (re)interpret
+            # cases that are currently marked rerun_required=true in that snapshot.
+            snapshot_by_sim_id: Dict[str, Dict[str, Any]] = {}
+            snap_path = out_dir / "interpreter_output.json"
+            if snap_path.is_file():
+                snap = self._read_json(snap_path)
+                snap_cases = snap.get("cases", []) if isinstance(snap, dict) else []
+                if isinstance(snap_cases, list):
+                    for c in snap_cases:
+                        if isinstance(c, dict) and c.get("simulation_id") is not None:
+                            snapshot_by_sim_id[str(c.get("simulation_id"))] = c
+
             for entry in sims_list:
                 sim = entry.get("simulation", {}) if isinstance(entry, dict) else {}
                 sim_id = sim.get("simulation_id", "unknown")
                 log_stage(f"START interpreter :: {sim_id}")
+
+                snap_case = snapshot_by_sim_id.get(str(sim_id))
+                snap_rr = bool(snap_case.get("rerun_required", False)) if isinstance(snap_case, dict) else False
+                snap_interp = snap_case.get("interpreter") if isinstance(snap_case, dict) else None
+                snap_attempts_used = None
+                if isinstance(snap_case, dict):
+                    snap_attempts_used = snap_case.get("attempts_used", snap_case.get("foam_rerun_count"))
+
+                if snap_case and not snap_rr and isinstance(snap_interp, dict):
+                    entry["interpreter"] = snap_interp
+                    if snap_attempts_used is not None:
+                        try:
+                            entry["attempt"] = max(int(entry.get("attempt", 0) or 0), int(snap_attempts_used))
+                        except Exception:
+                            pass
+                    if verbose_ib:
+                        print(
+                            f"[CFD-WORKFLOW] interpreter-batch skip :: {sim_id} (snapshot rerun_required=false)",
+                            flush=True,
+                        )
+                    log_stage(f"END interpreter :: {sim_id} (rerun_required=False; snapshot-skip)")
+                    continue
 
                 run_history = entry.get("run_history", []) if isinstance(entry, dict) else []
                 run_result = run_history[-1] if isinstance(run_history, list) and run_history else {}
@@ -1396,6 +2125,7 @@ class CFDWorkflow:
                     idea_json=idea,
                     experiment_spec=cast(Dict[str, Any], sim or {}),
                     experiment_results=run_result,
+                    verbose=verbose_ib,
                 )
                 run_result["viz_attempts"] = interp.get("viz_attempts", []) if isinstance(interp, dict) else []
                 run_result["viz_final_ok"] = bool(interp.get("viz_ok", False)) if isinstance(interp, dict) else False
@@ -1410,31 +2140,18 @@ class CFDWorkflow:
                     entry["run_history"] = run_history
 
                 rerun_required = bool(interp.get("rerun_required", False)) if isinstance(interp, dict) else False
-                interp_cases.append(
-                    {
-                        "simulation_id": sim.get("simulation_id"),
-                        "case_name": sim.get("case_name"),
-                        "rerun_required": rerun_required,
-                        "rerun_reason": interp.get("rerun_reason") if isinstance(interp, dict) else None,
-                        "status": ("rerun" if rerun_required else "ok"),
-                        "attempts_used": int(entry.get("attempt", 0) if isinstance(entry, dict) else 0),
-                        "final_returncode": run_result.get("returncode"),
-                        "viz_final_ok": run_result.get("viz_final_ok"),
-                        "interpreter": interp,
-                    }
+                self._log_interpreter_rerun_required(str(sim_id), interp, verbose=verbose_ib)
+                self._log_rerun_skipped_at_cap(
+                    str(sim_id),
+                    interp,
+                    int(entry.get("attempt", 0) or 0),
+                    max_reruns_ib,
+                    verbose=verbose_ib,
                 )
                 log_stage(f"END interpreter :: {sim_id} (rerun_required={rerun_required})")
 
             pipeline_log["simulations"] = sims_list
-            self._write_json(
-                out_dir / "interpreter_output.json",
-                {
-                    "total_cases": len(interp_cases),
-                    "rerun_required_count": sum(1 for c in interp_cases if c.get("rerun_required") is True),
-                    "ok_count": sum(1 for c in interp_cases if c.get("status") == "ok"),
-                    "cases": interp_cases,
-                },
-            )
+            self._write_interpreter_output_json(out_dir, sims_list)
             log_stage("END interpreter-batch")
             return {"pipeline_log": pipeline_log}
 
@@ -1456,6 +2173,14 @@ class CFDWorkflow:
                 attempt_used = int(entry.get("attempt", 0) or 0)
                 if rerun_required and attempt_used < max_reruns:
                     queue.append(sim_id)
+                elif rerun_required:
+                    self._log_rerun_skipped_at_cap(
+                        sim_id,
+                        interp,
+                        attempt_used,
+                        max_reruns,
+                        verbose=bool(state.get("verbose", True)),
+                    )
 
             round_idx = int(state.get("rerun_round", 0) or 0) + 1
             log_stage(f"RERUN-ROUND-START round={round_idx} queue={queue}")
@@ -1510,8 +2235,11 @@ class CFDWorkflow:
                 hyp = entry.get("hypothesis", {}) if isinstance(entry.get("hypothesis", {}), dict) else {}
                 current_req = str(hyp.get("requirement", "") or hyp.get("prompt_for_foamagent", "") or "")
 
-            # Build reference summary from the closest working case, if any.
-            reference_summary = ""
+            # LLM chooses the closest successful case (based on user requirement text),
+            # then LLM diffs system/constant/0 inputs (excluding polyMesh) to produce
+            # an actionable diff report for repairing the failing requirement.
+            chosen_ref_sim_id = ""
+            diff_report = ""
             try:
                 working_candidates: List[Dict[str, Any]] = []
                 for e in sims_list:
@@ -1539,32 +2267,71 @@ class CFDWorkflow:
                         continue
                     working_candidates.append(e)
 
-                # Simple heuristic: prefer same base case_name prefix (before first '_').
-                base_name = str(sim.get("case_name", "") or "").split("_")[0]
-                chosen: Dict[str, Any] | None = None
-                if working_candidates:
-                    if base_name:
-                        for e in working_candidates:
-                            sim_e = e.get("simulation", {}) if isinstance(e.get("simulation", {}), dict) else {}
-                            cname = str(sim_e.get("case_name", "") or "")
-                            if cname.split("_")[0] == base_name:
-                                chosen = e
-                                break
-                    if chosen is None:
-                        chosen = working_candidates[0]
+                if bool(state.get("verbose", True)):
+                    print(
+                        f"[CFD-WORKFLOW] RERUN-REFERENCE candidates :: target={sim_id} count={len(working_candidates)}",
+                        flush=True,
+                    )
 
-                if chosen is not None:
-                    reference_summary = self._build_rerun_reference_summary(chosen, out_dir=out_dir)
+                chosen_ref_sim_id = self._select_closest_successful_case_llm(
+                    target_user_requirement=current_req,
+                    successful_entries=working_candidates,
+                    out_dir=out_dir,
+                    verbose=bool(state.get("verbose", True)),
+                )
+                if chosen_ref_sim_id:
+                    if bool(state.get("verbose", True)):
+                        print(
+                            f"[CFD-WORKFLOW] RERUN-REFERENCE (LLM) target={sim_id} selected={chosen_ref_sim_id}",
+                            flush=True,
+                        )
+                    diff_report = self._diff_inputs_llm(
+                        working_sim_id=chosen_ref_sim_id,
+                        failing_sim_id=str(sim_id),
+                        out_dir=out_dir,
+                        verbose=bool(state.get("verbose", True)),
+                    )
+                    if bool(state.get("verbose", True)):
+                        print(
+                            f"[CFD-WORKFLOW] RERUN-REFERENCE diff report :: target={sim_id} selected={chosen_ref_sim_id} chars={len(diff_report)}",
+                            flush=True,
+                        )
             except Exception:
-                reference_summary = ""
+                chosen_ref_sim_id = ""
+                diff_report = ""
+
+            if bool(state.get("verbose", True)):
+                if chosen_ref_sim_id and diff_report:
+                    print(
+                        f"[CFD-WORKFLOW] RERUN-REFERENCE diff report generated for target={sim_id} selected={chosen_ref_sim_id}",
+                        flush=True,
+                    )
+                elif chosen_ref_sim_id:
+                    print(
+                        f"[CFD-WORKFLOW] RERUN-REFERENCE diff report empty for target={sim_id} selected={chosen_ref_sim_id}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[CFD-WORKFLOW] RERUN-REFERENCE target={sim_id} selected=NONE (no suitable working case)",
+                        flush=True,
+                    )
 
             log_stage(f"START rerun_analysis :: {sim_id}")
+            exp_idea = sim.get("case_data", None) if isinstance(sim, dict) else None
             revision = self.rerun_analysis.revise_requirement(
                 current_req,
                 cast(Dict[str, Any], interp or {}),
-                reference_summary=reference_summary or None,
+                experiment_idea=exp_idea if isinstance(exp_idea, dict) else None,
+                reference_summary=None,
+                reference_diff_report=diff_report or None,
                 verbose=bool(state.get("verbose", True)),
             )
+            if bool(state.get("verbose", True)):
+                print(
+                    f"[CFD-WORKFLOW] RERUN-REFERENCE revise used_diff={bool(diff_report)} used_ref={bool(chosen_ref_sim_id)}",
+                    flush=True,
+                )
             next_req = str(revision.get("requirement", "") or "")
             req_valid = bool(revision.get("valid", False))
             log_stage(f"END rerun_analysis :: {sim_id} (valid={req_valid})")
@@ -1625,6 +2392,12 @@ class CFDWorkflow:
                 f"END interpreter (rerun) :: {sim_id} (rerun_required={bool(interp2.get('rerun_required', False)) if isinstance(interp2, dict) else False})"
             )
             entry["interpreter"] = interp2
+            v = bool(state.get("verbose", True))
+            max_rr = int(self.settings.workflow_max_reruns_per_experiment)
+            self._log_interpreter_rerun_required(sim_id, interp2, verbose=v)
+            self._log_rerun_skipped_at_cap(
+                sim_id, interp2, int(entry.get("attempt", 0) or 0), max_rr, verbose=v
+            )
 
             pipeline_log["simulations"] = sims_list
             return {"pipeline_log": pipeline_log, "rerun_idx": idx + 1}
@@ -1641,36 +2414,16 @@ class CFDWorkflow:
             pipeline_log = cast(Dict[str, Any], state.get("pipeline_log", {}) or {})
             sims_list = cast(List[Dict[str, Any]], pipeline_log.get("simulations", []) or [])
             out_dir = state["out_dir"]
+            rr = int(state.get("rerun_round", 0) or 0)
 
-            interp_cases: List[Dict[str, Any]] = []
             for entry in sims_list:
                 sim = entry.get("simulation", {}) if isinstance(entry, dict) else {}
                 interp = entry.get("interpreter", {}) if isinstance(entry, dict) else {}
                 sim_id = sim.get("simulation_id", "unknown")
                 rerun_required = bool(interp.get("rerun_required", False)) if isinstance(interp, dict) else False
-                interp_cases.append(
-                    {
-                        "simulation_id": sim.get("simulation_id"),
-                        "case_name": sim.get("case_name"),
-                        "rerun_required": rerun_required,
-                        "rerun_reason": interp.get("rerun_reason") if isinstance(interp, dict) else None,
-                        "status": ("rerun" if rerun_required else "ok"),
-                        "attempts_used": int(entry.get("attempt", 0) if isinstance(entry, dict) else 0),
-                        "interpreter": interp,
-                    }
-                )
                 log_stage(f"RERUN-STATUS :: {sim_id} rerun_required={rerun_required}")
 
-            self._write_json(
-                out_dir / "interpreter_output.json",
-                {
-                    "total_cases": len(interp_cases),
-                    "rerun_required_count": sum(1 for c in interp_cases if c.get("rerun_required") is True),
-                    "ok_count": sum(1 for c in interp_cases if c.get("status") == "ok"),
-                    "cases": interp_cases,
-                    "rerun_round": int(state.get("rerun_round", 0) or 0),
-                },
-            )
+            self._write_interpreter_output_json(out_dir, sims_list, rerun_round=rr)
             pipeline_log["simulations"] = sims_list
             return {"pipeline_log": pipeline_log}
 
@@ -1741,6 +2494,7 @@ class CFDWorkflow:
                     "simulation_id": sim_id,
                     "case_name": sim_meta.get("case_name", sim_id),
                     "description": sim_meta.get("description", ""),
+                    "experiment_idea": sim_meta.get("case_data", None),
                     "user_requirement": user_req,
                     "sim_dir": sim_dir,
                     "foam_output_dir": foam_output_dir,
@@ -1756,6 +2510,41 @@ class CFDWorkflow:
                     experiments,
                     verbose=bool(state.get("verbose", True)),
                 )
+                data_proc = self.analysis.run_cross_experiment_data_processing(
+                    topic=topic,
+                    experiments=experiments,
+                    out_dir=out_dir,
+                    verbose=True,
+                )
+                data_proc_report_text = ""
+                data_proc_report_path = str(data_proc.get("report_path", "") or "")
+                if data_proc_report_path:
+                    rp = Path(data_proc_report_path)
+                    if rp.is_file():
+                        try:
+                            data_proc_report_text = rp.read_text(encoding="utf-8")
+                        except Exception:
+                            data_proc_report_text = ""
+                data_proc_interp_text = str(data_proc.get("interpretation_text", "") or "")
+                if not data_proc_interp_text:
+                    ip = Path(str(data_proc.get("interpretation_path", "") or ""))
+                    if ip.is_file():
+                        try:
+                            data_proc_interp_text = ip.read_text(encoding="utf-8")
+                        except Exception:
+                            data_proc_interp_text = ""
+                # Include cross-experiment PNG outputs so writer can cite/add them.
+                data_proc_images = [
+                    str(p) for p in (data_proc.get("images", []) or []) if isinstance(p, str) and p.strip()
+                ]
+                if data_proc_images:
+                    viz_bundle.append(
+                        {
+                            "simulation_id": "cross_experiment",
+                            "case_name": "cross_experiment_analysis",
+                            "visualization": {"ok": True, "images": data_proc_images},
+                        }
+                    )
                 viz_by_id = {v["simulation_id"]: v.get("visualization") for v in viz_bundle}
                 for entry in pipeline_log.get("simulations", []) or []:
                     sim_meta = entry.get("simulation", {}) if isinstance(entry, dict) else {}
@@ -1765,17 +2554,48 @@ class CFDWorkflow:
             else:
                 analysis_text = ""
                 viz_bundle = []
+                data_proc = {
+                    "ok": True,
+                    "needs_processing": False,
+                    "report_path": None,
+                    "images": [],
+                    "attempts": 0,
+                    "error": "",
+                }
+                data_proc_report_text = ""
 
             analysis_path = out_dir / "analysis_report.md"
             self.analysis.save_analysis(analysis_path, analysis_text, topic=topic)
             pipeline_log["analysis"] = str(analysis_path)
+            pipeline_log["cross_experiment_data_processing"] = data_proc
             log_stage("END analysis")
 
             log_stage("START writer")
+            exp_ideas_for_writer: List[Dict[str, Any]] = []
+            for ex in experiments:
+                exp_ideas_for_writer.append(
+                    {
+                        "simulation_id": ex.get("simulation_id"),
+                        "case_name": ex.get("case_name"),
+                        "experiment_idea": ex.get("experiment_idea"),
+                    }
+                )
             paper_context = (
                 f"TOPIC:\n{topic}\n\n"
                 f"IDEA:\n{json.dumps(state.get('idea', {}), indent=2)}\n\n"
+                f"PER-EXPERIMENT IDEAS/CONTEXT:\n{json.dumps(exp_ideas_for_writer, indent=2, ensure_ascii=False)}\n\n"
                 f"ANALYSIS:\n{analysis_text}\n\n"
+                + (
+                    f"CROSS-EXPERIMENT DATA PROCESSING REPORT:\n{data_proc_report_text}\n\n"
+                    if data_proc_report_text
+                    else ""
+                )
+                + (
+                    f"CROSS-EXPERIMENT INTERPRETATION (LLM):\n{data_proc_interp_text}\n\n"
+                    if data_proc_interp_text
+                    else ""
+                )
+                +
                 "Write paper draft using available artifacts."
             )
             work_dir = out_dir.parent.parent if out_dir.parent.name == "runs" else out_dir
@@ -1806,6 +2626,7 @@ class CFDWorkflow:
                     "paper_pdf": str(pdf_path) if pdf_path else None,
                     "analysis_text": analysis_text,
                     "visualizations": viz_bundle,
+                    "cross_experiment_data_processing": data_proc,
                 },
             )
             log_stage("END writer")

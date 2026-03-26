@@ -3,6 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -66,6 +69,28 @@ def _is_image_dimension_error(exc: BaseException) -> bool:
     msg = str(exc).lower()
     return "2000" in str(exc) and ("dimension" in msg or "pixels" in msg)
 
+def _strip_json_fences(text: str) -> str:
+    """
+    Strip common markdown code fences around JSON, e.g.:
+    ```json
+    {...}
+    ```
+    Returns best-effort raw JSON string.
+    """
+    s = (text or "").strip()
+    if not s.startswith("```"):
+        return s
+    # Drop the opening fence line
+    first_nl = s.find("\n")
+    if first_nl == -1:
+        return s.strip("`").strip()
+    s2 = s[first_nl + 1 :]
+    # Drop a trailing fence if present
+    end = s2.rfind("```")
+    if end != -1:
+        s2 = s2[:end]
+    return s2.strip()
+
 
 class AnalysisAgent:
     """Max distinct visualization types to suggest per experiment (tweak as needed)."""
@@ -74,6 +99,30 @@ class AnalysisAgent:
     def __init__(self, model: str):
         self.model = model
         self.llm = create_langchain_llm(model=model, temperature=0.0)
+
+    @staticmethod
+    def _experiment_idea_text(ex: Dict[str, Any]) -> str:
+        """Best-effort compact idea text from experiment_idea/case_data/description."""
+        idea = ex.get("experiment_idea", None) or ex.get("case_data", None)
+        if isinstance(idea, dict):
+            parts: List[str] = []
+            name = str(idea.get("name", "") or "").strip()
+            notes = str(idea.get("notes", "") or "").strip()
+            params = idea.get("parameters", {}) if isinstance(idea.get("parameters", {}), dict) else {}
+            if name:
+                parts.append(f"name={name}")
+            if notes:
+                parts.append(f"notes={notes[:600]}")
+            if params:
+                try:
+                    parts.append("parameters=" + json.dumps(params, ensure_ascii=False)[:1200])
+                except Exception:
+                    parts.append(f"parameters={str(params)[:1200]}")
+            if parts:
+                return "; ".join(parts)
+        if isinstance(idea, str) and idea.strip():
+            return idea.strip()[:1800]
+        return str(ex.get("description", "") or "")[:1000]
 
     def analyze_text_bundle(self, batch_name: str, bundle_text: str, extra_context: Optional[str] = None) -> str:
         system = "You are a CFD expert specializing in simulation diagnostics and scientific analysis."
@@ -185,8 +234,10 @@ class AnalysisAgent:
         )
         parts = [f"Study topic: {topic}\n"]
         for ex in experiments:
+            idea_text = self._experiment_idea_text(ex)
             parts.append(
                 f"Experiment {ex.get('simulation_id', '?')} ({ex.get('case_name', '')}):\n"
+                f"Idea/context: {idea_text}\n"
                 f"{ex.get('user_requirement', '')[:2000]}\n"
             )
         parts.append(f"\nWhat visualizations are needed for the paper? List at most {max_viz} distinct types per experiment.")
@@ -287,10 +338,15 @@ class AnalysisAgent:
                 sim_id = ex.get("simulation_id", "?")
                 case_name = ex.get("case_name", "")
                 user_req = (ex.get("user_requirement") or "")[:1500]
+                idea_text = (ex.get("experiment_idea_text") or "")[:1800]
                 paths = ex.get("image_paths") or []
                 content_parts.append({
                     "type": "text",
-                    "text": f"--- Experiment: {sim_id} ({case_name}) ---\nUser requirement: {user_req}\n\n",
+                    "text": (
+                        f"--- Experiment: {sim_id} ({case_name}) ---\n"
+                        f"Experiment idea/context: {idea_text}\n"
+                        f"User requirement: {user_req}\n\n"
+                    ),
                 })
                 blocks = _image_paths_to_blocks(
                     [Path(p) for p in paths],
@@ -317,6 +373,426 @@ class AnalysisAgent:
                     continue
                 raise
 
+    def _build_experiment_inventory(self, experiments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Compact manifest of available artifacts per experiment for cross-experiment data processing."""
+        manifest: List[Dict[str, Any]] = []
+        for ex in experiments:
+            sim_id = str(ex.get("simulation_id", ""))
+            if not sim_id:
+                continue
+            sim_dir = Path(ex.get("sim_dir")) if ex.get("sim_dir") else None
+            foam_dir = Path(ex.get("foam_output_dir")) if ex.get("foam_output_dir") else None
+            item: Dict[str, Any] = {
+                "simulation_id": sim_id,
+                "case_name": ex.get("case_name", sim_id),
+                "description": ex.get("description", ""),
+                "experiment_idea": self._experiment_idea_text(ex),
+                "user_requirement": ex.get("user_requirement", ""),
+                "sim_dir": str(sim_dir) if sim_dir else "",
+                "foam_output_dir": str(foam_dir) if foam_dir else "",
+                "time_dirs": [],
+                "files_0": [],
+                "files_system": [],
+                "files_constant": [],
+            }
+            if foam_dir and foam_dir.is_dir():
+                # Numeric time folders
+                times: List[str] = []
+                for d in foam_dir.iterdir():
+                    if not d.is_dir():
+                        continue
+                    try:
+                        float(d.name)
+                        times.append(d.name)
+                    except Exception:
+                        continue
+                item["time_dirs"] = sorted(times, key=lambda x: float(x))[:50]
+                # Key config/input files
+                for sub, key in [("0", "files_0"), ("system", "files_system"), ("constant", "files_constant")]:
+                    p = foam_dir / sub
+                    if p.is_dir():
+                        names = []
+                        for f in sorted(p.iterdir()):
+                            if sub == "constant" and f.name == "polyMesh":
+                                continue
+                            if f.is_file():
+                                names.append(f.name)
+                        item[key] = names[:80]
+            manifest.append(item)
+        return manifest
+
+    def _interpret_cross_experiment_outputs(
+        self,
+        topic: str,
+        proc_dir: Path,
+        objectives: List[str],
+        script_text: str,
+        report_text: str,
+        image_paths: List[str],
+        verbose: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Vision+text interpretation for cross-experiment processing artifacts.
+        Reads the generated script/report and inspects cross-experiment plots.
+        """
+        system = (
+            "You are a CFD research analyst focused on cross-experiment synthesis.\n"
+            "Given the study topic, cross-experiment objectives, generated processing script, report text, "
+            "and plot images, write a concise but rigorous interpretation suitable for Results/Discussion.\n"
+            "Include: (1) what quantitative results were actually obtained, (2) fitted relations/equations "
+            "and their credibility limits, (3) image-backed observations, (4) cautions or missing evidence, "
+            "(5) what the writer should include verbatim vs qualify.\n"
+            "Return plain markdown prose (no JSON)."
+        )
+        content_parts: List[Any] = [
+            {"type": "text", "text": f"Study topic:\n{topic}\n\n"},
+            {"type": "text", "text": "Cross-experiment objectives:\n" + ("\n".join(f"- {o}" for o in objectives) if objectives else "- (none)") + "\n\n"},
+            {"type": "text", "text": "Generated cross-experiment script (truncated):\n```python\n" + (script_text or "")[:25000] + "\n```\n\n"},
+            {"type": "text", "text": "Cross-experiment report (truncated):\n" + (report_text or "")[:25000] + "\n\n"},
+            {"type": "text", "text": "Now inspect attached cross-experiment plots and provide interpretation.\n"},
+        ]
+        blocks = _image_paths_to_blocks([Path(p) for p in image_paths], max_images=12, max_dimension=1999)
+        content_parts.extend(blocks)
+        content_parts.append({"type": "text", "text": "\nEnd of artifacts. Write cross-experiment interpretation now."})
+
+        try:
+            out = self.llm.invoke([SystemMessage(content=system), HumanMessage(content=content_parts)])
+            text = str(getattr(out, "content", str(out))).strip()
+        except Exception as e:
+            text = (
+                "Cross-experiment interpretation generation failed.\n\n"
+                f"Error: {e}\n\n"
+                "Fallback summary: use data_processing_report.md directly in writer context."
+            )
+        interp_path = proc_dir / "cross_experiment_interpretation.md"
+        try:
+            interp_path.write_text(text, encoding="utf-8")
+        except Exception:
+            pass
+        if verbose:
+            print(f"[Analysis] cross_experiment: interpretation saved -> {interp_path}", flush=True)
+        return {"interpretation_text": text, "interpretation_path": str(interp_path)}
+
+    def run_cross_experiment_data_processing(
+        self,
+        topic: str,
+        experiments: List[Dict[str, Any]],
+        out_dir: Path,
+        verbose: bool = False,
+        max_retries: int = 10,
+    ) -> Dict[str, Any]:
+        """
+        Decide if additional cross-experiment quantitative post-processing is needed.
+        If needed, generate and execute a Python script with a repair loop.
+        """
+        proc_dir = out_dir / "cross_experiment_analysis"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        manifest = self._build_experiment_inventory(experiments)
+
+        print(
+            f"[Analysis] cross_experiment: starting (experiments={len(experiments)}, dir={proc_dir})",
+            flush=True,
+        )
+
+        planner_system = (
+            "You are a CFD cross-experiment data-processing planner.\n"
+            "Given topic + experiment requirements + available artifacts, decide whether additional quantitative "
+            "post-processing is needed beyond image-based interpretation.\n"
+            "Examples: trend/correlation plots, regression fits, summary tables, derived metrics.\n"
+            "Return ONLY JSON with keys: needs_processing (bool), objectives (list[str]), rationale (str)."
+        )
+        planner_user = (
+            f"Study topic:\n{topic}\n\n"
+            f"Experiment manifest:\n{json.dumps(manifest, ensure_ascii=False)}\n\n"
+            "Decide if cross-experiment processing is needed for stronger analysis/paper evidence."
+        )
+        needs_processing = False
+        objectives: List[str] = []
+        rationale = ""
+        plan_raw = ""
+        planner_raw_path = proc_dir / "planner_raw.txt"
+        planner_json_path = proc_dir / "planner_parsed.json"
+        try:
+            plan_raw = (self.llm.invoke([
+                SystemMessage(content=planner_system),
+                HumanMessage(content=planner_user),
+            ])).content
+            plan_raw = str(plan_raw)
+            try:
+                planner_raw_path.write_text(plan_raw, encoding="utf-8")
+            except Exception:
+                pass
+            plan = json.loads(_strip_json_fences(plan_raw))
+            needs_processing = bool(plan.get("needs_processing", False))
+            objectives = [str(x) for x in (plan.get("objectives", []) or []) if str(x).strip()]
+            rationale = str(plan.get("rationale", "") or "")
+            try:
+                planner_json_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        except Exception as e:
+            needs_processing = False
+            objectives = []
+            rationale = "Planner output parse failed; skipped extra processing."
+            try:
+                if plan_raw:
+                    planner_raw_path.write_text(str(plan_raw), encoding="utf-8")
+            except Exception:
+                pass
+            raw_s = str(plan_raw or "")
+            if raw_s:
+                head = raw_s[:500].replace("\n", "\\n")
+                tail = raw_s[-800:].replace("\n", "\\n")
+                print(
+                    "[Analysis] cross_experiment: planner parse failed; saved planner_raw.txt; "
+                    f"error={type(e).__name__}: {e}; head={head!r}; tail={tail!r}",
+                    flush=True,
+                )
+            else:
+                print(
+                    "[Analysis] cross_experiment: planner parse failed; no raw output captured; "
+                    f"error={type(e).__name__}: {e}",
+                    flush=True,
+                )
+
+        rationale_short = (rationale or "")[:200] + ("..." if len(rationale or "") > 200 else "")
+        print(
+            f"[Analysis] cross_experiment: planner -> needs_processing={needs_processing}"
+            + (f"; objectives={len(objectives)}" if objectives else "")
+            + (f" | {rationale_short!r}" if rationale_short else ""),
+            flush=True,
+        )
+        if verbose and objectives:
+            for i, obj in enumerate(objectives[:8], 1):
+                print(f"[Analysis] cross_experiment:   objective {i}: {obj[:160]}", flush=True)
+            if len(objectives) > 8:
+                print(f"[Analysis] cross_experiment:   ... and {len(objectives) - 8} more", flush=True)
+
+        if not needs_processing:
+            report_path = proc_dir / "data_processing_report.md"
+            report_text = (
+                "# Cross-Experiment Data Processing\n\n"
+                "No additional script-based cross-experiment processing was required.\n\n"
+                f"Reason: {rationale or 'not needed by planner'}\n"
+            )
+            report_path.write_text(report_text, encoding="utf-8")
+            interp = self._interpret_cross_experiment_outputs(
+                topic=topic,
+                proc_dir=proc_dir,
+                objectives=objectives,
+                script_text="",
+                report_text=report_text,
+                image_paths=[],
+                verbose=verbose,
+            )
+            print(
+                f"[Analysis] cross_experiment: no Python script generated; report={report_path}",
+                flush=True,
+            )
+            return {
+                "ok": True,
+                "needs_processing": False,
+                "objectives": objectives,
+                "rationale": rationale,
+                "script_path": None,
+                "report_path": str(report_path),
+                "images": [],
+                "attempts": 0,
+                "error": "",
+                "interpretation_text": interp.get("interpretation_text", ""),
+                "interpretation_path": interp.get("interpretation_path"),
+            }
+
+        script_system = (
+            "You write robust Python post-processing scripts for CFD cross-experiment analysis.\n"
+            "Return ONLY raw Python code (no markdown).\n"
+            "Script requirements:\n"
+            "- Read available experiment artifacts from the manifest.\n"
+            "- Compute requested cross-experiment metrics/trends only when data is available.\n"
+            "- Save outputs under output_dir: (1) data_processing_report.md, (2) optional plots PNG.\n"
+            "- Be defensive: if some files are missing, continue with available data and explain limitations in report.\n"
+            "- Prefer PyVista for reading OpenFOAM case data/fields when needed (do NOT depend on ParaView GUI).\n"
+            "- Exit 0 on success.\n\n"
+            "PyVista OpenFOAM loading snippet (use as a starting point):\n"
+            "```python\n"
+            "import pyvista as pv\n"
+            "from pathlib import Path\n"
+            "foam_output_dir = Path('/path/to/foam_output')\n"
+            "# If no .foam exists, create one; PyVista uses it as a marker\n"
+            "marker = foam_output_dir / f\"{foam_output_dir.name}.foam\"\n"
+            "marker.touch(exist_ok=True)\n"
+            "mesh = pv.read(str(marker))\n"
+            "available_arrays = getattr(mesh, 'array_names', []) or []\n"
+            "```\n"
+        )
+        user_tpl = (
+            "Topic:\n{topic}\n\n"
+            "Objectives:\n{objectives}\n\n"
+            "Experiment manifest:\n{manifest}\n\n"
+            "output_dir:\n{output_dir}\n\n"
+            "Previous error:\n{previous_error}\n\n"
+            "Previous script:\n{previous_script}\n\n"
+            "Write a complete Python script."
+        )
+
+        last_error = ""
+        last_script = ""
+        script_path = proc_dir / "data_processing_script.py"
+        print(
+            f"[Analysis] cross_experiment: generating & running Python script (max {max_retries} attempts) -> {script_path}",
+            flush=True,
+        )
+        for attempt in range(1, max_retries + 1):
+            if verbose:
+                print(f"[Analysis] cross_experiment: attempt {attempt}/{max_retries} (LLM script + execute)", flush=True)
+            user = user_tpl.format(
+                topic=topic,
+                objectives=json.dumps(objectives, ensure_ascii=False),
+                manifest=json.dumps(manifest, ensure_ascii=False),
+                output_dir=str(proc_dir),
+                previous_error=last_error or "(none)",
+                previous_script=last_script or "(none)",
+            )
+            try:
+                resp = self.llm.invoke([SystemMessage(content=script_system), HumanMessage(content=user)])
+                script_text = getattr(resp, "content", str(resp))
+            except Exception as e:
+                last_error = f"LLM script generation failed: {e}"
+                continue
+
+            script_text = str(script_text).strip()
+            if script_text.startswith("```"):
+                script_text = script_text.strip("`")
+                if script_text.lower().startswith("python"):
+                    script_text = script_text[6:]
+            script_path.write_text(script_text, encoding="utf-8")
+            last_script = script_text
+            if verbose:
+                print(f"[Analysis] cross_experiment: wrote script ({len(script_text)} chars) -> {script_path}", flush=True)
+
+            try:
+                if verbose:
+                    print(f"[Analysis] cross_experiment: running {sys.executable} {script_path} (cwd={out_dir})", flush=True)
+                proc = subprocess.run(
+                    [sys.executable, str(script_path)],
+                    cwd=str(out_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=600,
+                )
+                rc = int(proc.returncode)
+                if rc != 0:
+                    stdout_tail = (proc.stdout or "")[-2000:]
+                    stderr_tail = (proc.stderr or "")[-4000:]
+                    last_error = (
+                        f"Return code: {rc}\n"
+                        f"STDOUT (tail):\n{stdout_tail}\n\n"
+                        f"STDERR (tail):\n{stderr_tail}"
+                    )
+
+                    # Persist per-attempt artifacts for debugging + deterministic repair prompts.
+                    try:
+                        (proc_dir / f"attempt_{attempt:02d}_script.py").write_text(last_script or "", encoding="utf-8")
+                    except Exception:
+                        pass
+                    try:
+                        (proc_dir / f"attempt_{attempt:02d}_error.txt").write_text(last_error, encoding="utf-8")
+                    except Exception:
+                        pass
+
+                    print(f"[Analysis] cross_experiment: attempt {attempt} script failed rc={rc}", flush=True)
+                    # Always show the error tail in terminal so user can see it immediately.
+                    print(f"[Analysis] cross_experiment: attempt {attempt} error (tail):\n{last_error[-2000:]}", flush=True)
+                    continue
+            except Exception as e:
+                last_error = f"Script runner exception: {e}"
+                print(f"[Analysis] cross_experiment: attempt {attempt} runner exception: {e}", flush=True)
+                continue
+
+            report_path = proc_dir / "data_processing_report.md"
+            if not report_path.exists():
+                last_error = "Script succeeded but did not create data_processing_report.md"
+                print(f"[Analysis] cross_experiment: attempt {attempt} missing data_processing_report.md after exit 0", flush=True)
+                continue
+
+            pngs = sorted(str(p) for p in proc_dir.glob("*.png") if p.is_file())
+            print(
+                f"[Analysis] cross_experiment: success after {attempt} attempt(s); report={report_path} pngs={len(pngs)}",
+                flush=True,
+            )
+            if verbose and pngs:
+                for p in pngs[:10]:
+                    print(f"[Analysis] cross_experiment:   plot {p}", flush=True)
+                if len(pngs) > 10:
+                    print(f"[Analysis] cross_experiment:   ... and {len(pngs) - 10} more", flush=True)
+            try:
+                report_text = report_path.read_text(encoding="utf-8")
+            except Exception:
+                report_text = ""
+            interp = self._interpret_cross_experiment_outputs(
+                topic=topic,
+                proc_dir=proc_dir,
+                objectives=objectives,
+                script_text=last_script,
+                report_text=report_text,
+                image_paths=pngs,
+                verbose=verbose,
+            )
+            return {
+                "ok": True,
+                "needs_processing": True,
+                "objectives": objectives,
+                "rationale": rationale,
+                "script_path": str(script_path),
+                "report_path": str(report_path),
+                "images": pngs,
+                "attempts": attempt,
+                "error": "",
+                "interpretation_text": interp.get("interpretation_text", ""),
+                "interpretation_path": interp.get("interpretation_path"),
+            }
+
+        # Failure fallback report
+        fallback_report = proc_dir / "data_processing_report.md"
+        fallback_report.write_text(
+            "# Cross-Experiment Data Processing\n\n"
+            "Script-based post-processing could not be completed.\n\n"
+            f"Last error:\n\n{last_error}\n",
+            encoding="utf-8",
+        )
+        print(
+            f"[Analysis] cross_experiment: FAILED after {max_retries} attempts; report={fallback_report}",
+            flush=True,
+        )
+        if verbose and last_error:
+            print(f"[Analysis] cross_experiment: last_error (tail):\n{last_error[-1500:]}", flush=True)
+        try:
+            fallback_text = fallback_report.read_text(encoding="utf-8")
+        except Exception:
+            fallback_text = ""
+        interp = self._interpret_cross_experiment_outputs(
+            topic=topic,
+            proc_dir=proc_dir,
+            objectives=objectives,
+            script_text=last_script,
+            report_text=fallback_text,
+            image_paths=[],
+            verbose=verbose,
+        )
+        return {
+            "ok": False,
+            "needs_processing": True,
+            "objectives": objectives,
+            "rationale": rationale,
+            "script_path": str(script_path) if script_path.exists() else None,
+            "report_path": str(fallback_report),
+            "images": [],
+            "attempts": max_retries,
+            "error": last_error,
+            "interpretation_text": interp.get("interpretation_text", ""),
+            "interpretation_path": interp.get("interpretation_path"),
+        }
+
     def run_full_analysis_pipeline(
         self,
         experiments: List[Dict[str, Any]],
@@ -342,6 +818,7 @@ class AnalysisAgent:
                 "simulation_id": r["simulation_id"],
                 "case_name": r["case_name"],
                 "user_requirement": ex.get("user_requirement", ""),
+                "experiment_idea_text": self._experiment_idea_text(ex),
                 "image_paths": [Path(p) for p in r.get("images", [])],
             })
         analysis_text = self.run_analysis_with_images(

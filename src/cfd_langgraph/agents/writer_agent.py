@@ -68,6 +68,7 @@ Disclosure:
 10) Mandatory: one sentence in Abstract or Methods that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results and figures come from the provided experiments and analysis.
 11) Introduce the set of experiments (exp_001, exp_002, etc.) with a clear table early in the Methods/Results section before referring to experiments by these IDs in the narrative; the table should summarise for each experiment the key varying parameter(s) (e.g. turbulence model, wall treatment), mesh size, and any other essential configuration.
 12) Avoid repeating the same explanatory paragraph or caveat (e.g. geometry mismatch, post-processing artefact, expansion-ratio difference) in multiple sections. Provide a single, well-placed, detailed explanation and refer back to it briefly elsewhere instead of duplicating text.
+13) The Conclusion section must be written as one cohesive paragraph (continuous prose). Do NOT use bullet points, numbered lists, or itemized/enumerated formatting in Conclusion.
 """.strip()
 
 
@@ -191,9 +192,11 @@ class WriterAgent:
             "Requirements:\n"
             "- Structure: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion; add Reproducibility appendix and Claim–Evidence table.\n"
             "- Use evidence-grounded claims only; every claim must map to an experiment, figure, or number in the analysis.\n"
+            "- When cross-experiment artifacts are present in context (e.g., fitted formulas/correlations, regression outputs, cross-case tables, or cross_experiment_analysis plots), include and discuss them explicitly in Results/Discussion with matching equations/figure references.\n"
             "- Include a Failure Cases / Negative Results subsection.\n"
             "- Include mandatory disclosure in Abstract or Methods: one sentence that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results/figures come from the provided experiments and analysis.\n"
             "- Reference every figure with \\ref{{fig:...}}; ensure captions and in-text descriptions match the actual visualization data (no hallucinated values).\n"
+            "- Conclusion format: write Conclusion as a single paragraph only; never as bullet points or numbered lists.\n"
             "Return ONLY LaTeX (no markdown, no explanation outside comments)."
         )
 
