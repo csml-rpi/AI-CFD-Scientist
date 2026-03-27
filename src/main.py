@@ -15,8 +15,12 @@ import subprocess
 from datetime import datetime
 import uuid
 
-# Set default model for all LLM/agent calls (Bedrock by default)
-DEFAULT_BEDROCK_MODEL = os.environ.get("CFD_SCIENTIST_MODEL","arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2")
+# Set default model for all LLM/agent calls (Bedrock by default).
+# For Bedrock, always use the Claude Sonnet 4 application profile.
+DEFAULT_BEDROCK_MODEL = os.environ.get(
+    "CFD_SCIENTIST_MODEL",
+    "us.anthropic.claude-sonnet-4-6",
+)
 
 # Allow override via command-line argument
 def parse_args():

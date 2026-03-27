@@ -1,141 +1,214 @@
-## Prerequisites
+# CFD Scientist
 
-1. **OpenFOAM**: Install OpenFOAM v10 or later
-2. **Python**: Python 3.8+ with conda/pip
-3. **Foam-Agent**: Clone and set up the Foam-Agent repository (required for simulation execution)
+End-to-end **agentic CFD research pipeline** orchestrated by **LangGraph**: from a research topic to literature-aware ideation, Foam-Agent runs, interpreter checks with diagnostics, analysis, and a LaTeX paper draft (Sakana AI Scientist v2–style).
 
-## Installation
+---
 
-1. **Clone the repository:**
+## Pipeline overview
+
+1. **User topic** → research question in CFD.
+2. **Ideation agent** → literature (Semantic Scholar ± Brave), novelty check, list of experiments.
+3. **Hypothesis agent** → turns experiment ideas into **Foam-Agent prompts** (no viz text); LLM checks logic (solver, dt/endTime, BCs, etc.) and repairs until valid.
+4. **Foam-Agent** → runs OpenFOAM cases (planner, input writer, runner, reviewer, etc.).
+5. **Interpreter agent** → after each run: load data with PyVista, generate diagnostic plots (contours, slices, streamlines, etc.), check syntax/viz health; if needed, revise requirement and **rerun via Foam-Agent**.
+6. **Analysis agent** → after all experiments: PyVista-based viz, cross-case analysis, conclusions; saves figures and `analysis_report.md`.
+7. **Writer agent** → LaTeX paper: claim–evidence table, reproducibility appendix, failure/negative results, mandatory AI-disclosure sentence.
+
+---
+
+## Requirements
+
+- **Python ≥ 3.10**
+- **OpenFOAM** (for real runs; only needed when using `--execute`)
+- **AWS credentials** (for default Bedrock model) or **OpenAI/Anthropic API key** if using another model
+
+---
+
+## Install
+
 ```bash
-git clone https://github.com/blitzionic/cfd-scientist.git
-cd cfd-scientist
+cd /path/to/cfd-scientist
+python3 -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+pip install -e .           # install cfd-scientist CLI
 ```
 
-2. **Set up Python environment:**
+Or with pip only (no editable install):
+
 ```bash
-conda create -n cfd-scientist python=3.9
-conda activate cfd-scientist
-pip install -r requirements.txt  
+pip install -r requirements.txt
+# then run via: python -m cfd_langgraph.workflow.main <cmd> ...
 ```
 
-3. **Set up Foam-Agent dependency:**
+---
+
+## Configure
+
+### LLM Provider Selection (used by cfd-scientist + Foam-Agent)
+
+The pipeline uses these environment variables to pick both the provider and the model:
+
+- `CFD_SCIENTIST_LLM_PROVIDER` (explicit override; otherwise inferred from `CFD_SCIENTIST_MODEL`)
+  - Supported values: `bedrock`, `openai`, `openai-codex`, `anthropic`, `gemini`
+- `CFD_SCIENTIST_MODEL` (model identifier)
+
+For convenience/backward-compatibility, the code also accepts misspelled variants:
+`CFD_SCIEINTIST_LLM_PROVIDER` and `CFD_SCIENITST_MODEL`.
+
+When you use `--execute`, the same provider/model selection is passed into Foam-Agent by the runner (mapped to Foam-Agent’s `FOAMAGENT_MODEL_PROVIDER` and `FOAMAGENT_MODEL_VERSION`).
+
+#### Bedrock (default behavior)
+
 ```bash
-# Clone Foam-Agent in the same parent directory
-cd ..
-git clone https://github.com/csml-rpi/Foam-Agent.git
-cd cfd-scientist
+export CFD_SCIENTIST_LLM_PROVIDER="bedrock"
+export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-6"
+export AWS_ACCESS_KEY_ID="..."
+export AWS_SECRET_ACCESS_KEY="..."
+# AWS region for Bedrock (e.g. us-west-2)
+export AWS_DEFAULT_REGION="us-west-2"
 ```
 
-4. **Configure environment variables:**
+### Optional paths
+
+- `CFD_PROMPTS_PATH` – path to `prompts.yaml` (default: `./prompts/prompts.yaml`)
+- `FOAM_AGENT_MAIN` – path to Foam-Agent entrypoint (default: `./Foam-Agent/foambench_main.py`)
+- `WM_PROJECT_DIR` – OpenFOAM install path (for Foam-Agent when using `--execute`)
+
+### Optional: literature and ideation
+
+- `S2_API_KEY` – Semantic Scholar API key (optional; public API works without it, rate-limited)
+- `BRAVE_SEARCH_API_KEY` – optional web search for literature
+- `CFD_IDEATION_ENABLE_LITERATURE=1`
+- `CFD_IDEATION_MAX_PAPERS=12`
+- `CFD_IDEATION_MAX_EXPERIMENTS=50`
+- `CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL=50`
+- `CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT=2`
+
+### Other model providers
+
+- **OpenAI (text + vision):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="openai"
+  export CFD_SCIENTIST_MODEL="gpt-4o"   # choose a vision-capable model for VLM steps
+  export OPENAI_API_KEY="..."
+  ```
+  Note: the interpreter/analysis VLM steps must use a **vision-capable** model (to interpret PNGs/images). If you set a text-only model, those steps will fail.
+
+- **OpenAI Codex (subscription / Codex auth):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="openai-codex"
+  export CFD_SCIENTIST_MODEL="codex/gpt-5-codex"
+  ```
+
+- **Anthropic (direct API):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="anthropic"
+  export CFD_SCIENTIST_MODEL="claude-3-5-sonnet-20241022"
+  export ANTHROPIC_API_KEY="..."
+  ```
+
+- **Gemini (OpenAI-compatible endpoint):**
+  ```bash
+  export CFD_SCIENTIST_LLM_PROVIDER="gemini"
+  export CFD_SCIENTIST_MODEL="gemini-1.5-pro"  # must be accepted by your Gemini proxy
+  export OPENAI_API_KEY="..."
+  export OPENAI_BASE_URL="..."  # Gemini OpenAI-compatible endpoint
+  ```
+  Note: use a **vision-capable** Gemini model/proxy so the VLM steps can interpret PNGs/images.
+
+---
+
+## How to run the pipeline
+
+### 1. Ideation only (no runs)
+
+Generate an idea JSON from a topic (with literature if keys are set):
+
 ```bash
-# Copy example environment file
-cp .env.example .env
-
-# Edit .env with your API keys
-export OPENAI_API_KEY=your_openai_api_key_here
-export ANTHROPIC_API_KEY=your_anthropic_key_here 
-export AWS_ACCESS_KEY_ID=your_aws_key           
-export AWS_SECRET_ACCESS_KEY=your_aws_secret       
+cfd-scientist ideate \
+  --topic "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire." \
+  --out ideation.json
 ```
 
-## Quick Start
+- `--out -` prints JSON to stdout.
+- Output includes `idea`, `literature_used`, novelty and experiment-count info.
 
-### 1. Basic Experiment Run
+### 2. Full pipeline (recommended)
+
+Single command from topic to analysis + paper:
+
 ```bash
-# Run with default settings (manual rerun prompts)
-python src/main.py
-
-# Run with automatic reruns for failed experiments
-python src/main.py --auto-rerun
-
-# Skip analysis phase
-python src/main.py --skip-analysis
+cfd-scientist run-topic \
+  --topic "Your CFD research topic" \
+  --out-dir /absolute/path/to/runs/my_topic
 ```
 
-### 2. Advanced Usage
+Note: Use an **absolute path** for `--out-dir`. Later stages (including Foam-Agent subprocess calls) may run with a different working directory; absolute `--out-dir` avoids “file not found” issues for `user_requirement.txt` and other artifacts.
+
+- **Without `--execute`:** ideation → hypothesis (Foam-Agent prompts) → **plan-only** Foam-Agent (no OpenFOAM run) → no interpreter viz/rerun → no analysis/paper unless you add `--allow-non-executed-artifacts`.
+- **With `--execute`:** real Foam-Agent runs → interpreter (PyVista diagnostics + rerun loop) → analysis (figures + report) → writer (LaTeX draft).
+
+**Execute Foam-Agent and produce analysis + paper:**
+
 ```bash
-# Rerun specific batch
-python src/main.py --rerun-batch batch_20251216_140000_abc123
-
-# Auto-execute study recommendations
-python src/main.py --auto-execute-recommendations
-
-# Custom rerun threshold and max iterations
-python src/main.py --auto-rerun --auto-rerun-threshold 5.0 --max-rerun-iterations 3
+cfd-scientist run-topic \
+  --topic "Lid-driven cavity at Re=100 and Re=400" \
+  --out-dir ./runs/cavity \
+  --execute
 ```
 
-### 3. Analysis and Paper Generation
+**Generate analysis and paper even when not executing** (e.g. using existing run data):
+
 ```bash
-# Generate research paper from experiment batch
-python src/latexpaper.py --batch batch_20251216_140000_abc123
-
-# Run only analysis agent on existing results
-python agents/analysis_ag.py --batch batch_20251216_140000_abc123
+cfd-scientist run-topic \
+  --topic "Same topic" \
+  --out-dir ./runs/cavity \
+  --allow-non-executed-artifacts
 ```
 
-## Configuration
+### 3. Run as Python module (no CLI install)
 
-### Model Selection
-Set your preferred LLM model via environment variable or command line:
 ```bash
-export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
-# or
-python src/main.py --model "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
+python -m cfd_langgraph.workflow.main ideate --topic "Your topic" --out -
+python -m cfd_langgraph.workflow.main run-topic --topic "Your topic" --out-dir ./runs/out --execute
 ```
 
-Supported models:
-- AWS Bedrock: `bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0`, or use ARN format
-- Anthropic: `claude-3-5-sonnet-20241022`, `claude-3-5-sonnet-20240620`
-- OpenAI: `gpt-4o`, `gpt-4o-mini`, `o1`, `o1-mini`
-- Google: `gemini-2.0-flash`
+---
 
-### Experiment Parameters
-Edit `prompts/prompts.yaml` to customize:
-- Agent behavior and prompting strategies
-- Validation criteria for physics parameters
-- Analysis evaluation metrics
+## Output layout (`--out-dir`)
 
-## Workflow Overview
+After `run-topic` with `--execute` (and optionally `--allow-non-executed-artifacts`):
 
-1. **Ideation Phase**: Generate research ideas from literature or user input
-2. **Hypothesis Generation**: Convert ideas to OpenFOAM-compatible requirements
-3. **Parameter Validation**: Automatically validate and correct simulation parameters
-4. **Simulation Execution**: Run OpenFOAM via Foam-Agent integration
-5. **Results Analysis**: LLM vision evaluation of simulation mesh convergence, physics, and quality
-6. **Iterative Improvement**: Automatic rerun of failed experiments with corrections
+- `pipeline_log.json` – full log (ideation, sims, run history, interpreter, analysis path, paper path).
+- `analysis_report.md` – cross-case analysis.
+- `paper_draft.tex` – LaTeX draft (Sakana AI Scientist v2–style).
+- `paper_draft.pdf` – compiled PDF (via pdflatex; reviewer loop runs up to 10 times until pass).
+- Per simulation (e.g. `sim_001/`):
+  - `user_requirement.txt` – Foam-Agent prompt used.
+  - `foam_output/` – OpenFOAM case output.
+  - `viz_interpreter/` – diagnostic plots (interpreter).
+  - `viz_analysis/` – publication-style figures (analysis agent).
 
-## Output Structure
+---
 
-```
-data/experiments/
-├── batch_YYYYMMDD_HHMMSS_id/
-│   ├── sim_001/
-│   │   ├── run_001/
-│   │   │   ├── user_requirement.txt
-│   │   │   └── output/
-│   │   └── analysis.txt
-│   ├── sim_002/
-│   └── analysis_summary.txt
-└── ideas/
-    └── generated_ideas.json
-```
+## Prompts and Foam-Agent
 
-## Example User Requirements
+- **Prompts:** default path `./prompts/prompts.yaml`. Override with `CFD_PROMPTS_PATH`.
+- **Foam-Agent:** default `./Foam-Agent/foambench_main.py`. Override with `FOAM_AGENT_MAIN`. When you use `--execute`, the pipeline calls this script with `--prompt_path` and `--output`; OpenFOAM must be available (e.g. `WM_PROJECT_DIR` set) for real runs.
 
-### Basic Lid-Driven Cavity
-```
-Do an incompressible lid driven cavity flow.
-The cavity is a square with dimensions normalized to 1 unit.
-Use a 20x20 grid with the top wall moving at 1 m/s.
-Run from time 0 to 10 with timestep 0.005.
-```
+---
 
-### Advanced Turbulent Flow
-```
-Perform turbulent flow over a 2D diamond obstacle using pimpleFoam.
-Domain: x=[0,15], y=[0,5], z=[-0.5,0.5] (2D with 1 cell in z).
-Diamond obstacle centered at (2.5,2.5) with diagonal = 1 unit.
-Inlet velocity: 1 m/s, kinematic viscosity: 2×10⁻⁶ m²/s.
-```
+## Troubleshooting
 
+- **“No module named 'cfd_langgraph'”** – run from repo root and `pip install -e .`, or set `PYTHONPATH` to the repo root.
+- **Bedrock errors** – check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` and model id `us.anthropic.claude-sonnet-4-6`.
+- **Foam-Agent not found** – ensure `Foam-Agent/foambench_main.py` exists or set `FOAM_AGENT_MAIN`.
+- **No figures / PyVista errors** – ensure Foam-Agent wrote results (e.g. VTK) under `foam_output/` and that `pyvista` and `matplotlib` are installed. On headless servers (no physical display or GPU), PyVista/VTK also require an off-screen OpenGL backend such as OSMesa/EGL or a software Mesa stack; make sure the container or system has these libraries so `pyvista.Plotter(off_screen=True)` can render without X/GUI.
+- **PDF compilation fails** – ensure `pdflatex` is installed (e.g. `texlive-latex-base` or full TeX Live). The paper agent compiles LaTeX to PDF and runs a reviewer loop (max 10 tries).
+
+---
+
+## License and citation
+
+See repository license. If you use this pipeline in research, cite the repo and any Foam-Agent / OpenFOAM references as appropriate. The writer agent adds a mandatory sentence that the draft was generated with an automated CFD Scientist (AI-assisted) pipeline.

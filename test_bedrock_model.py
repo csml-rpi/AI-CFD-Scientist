@@ -69,14 +69,14 @@ def test_bedrock_simple():
 
 
 def test_bedrock_specific_model():
-    """Test with a specific Bedrock ARN."""
+    """Test with a specific Bedrock model id."""
     
     print("\n" + "=" * 60)
     print("Testing Specific Bedrock ARN")
     print("=" * 60)
     
-    # model = "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
-    model = "arn:aws:bedrock:us-west-2:991404956194:application-inference-profile/f6tueltt82a2"
+    # Use the standard Claude Sonnet 4 Bedrock model id used across this codebase.
+    model = "us.anthropic.claude-sonnet-4-20250514-v1:0"
     
     print(f"\n1. Creating client with ARN...")
     print(f"   ARN: {model}")

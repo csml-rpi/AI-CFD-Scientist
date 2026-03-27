@@ -1,0 +1,27 @@
+# CFD Scientist pipeline – Python dependencies
+# Install: pip install -r requirements.txt
+# Python >= 3.10
+
+# LangChain & LangGraph (orchestration and agents)
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-openai>=0.2.0
+langchain-anthropic>=0.3.0
+langchain-aws>=0.2.0
+langgraph>=0.2.0
+
+# Config and data
+pydantic>=2.8
+PyYAML>=6.0
+python-dotenv>=1.0
+
+# HTTP and literature/APIs
+requests>=2.32
+
+# Visualization (Analysis/Interpreter agents – PyVista for Foam/VTK data)
+pyvista>=0.44
+matplotlib>=3.8
+Pillow>=10.0  # Image downscaling for Bedrock many-image requests
+
+# Bedrock runtime client (used by langchain-aws / ChatBedrockConverse)
+boto3>=1.34.0
