@@ -118,7 +118,7 @@ def main():
         )
         result = wf.run_topic(
             topic=args.topic,
-            out_dir=Path(args.out_dir),
+            out_dir=Path(args.out_dir).expanduser().resolve(),
             execute=args.execute,
             allow_non_executed_artifacts=args.allow_non_executed_artifacts,
             verbose=verbose,
@@ -158,7 +158,7 @@ def main():
         wf = CFDWorkflow(
             settings=settings, prompt_loader=PromptLoader(settings.prompts_path)
         )
-        result = wf.restart_from_foam(out_dir=Path(args.out_dir), verbose=verbose)
+        result = wf.restart_from_foam(out_dir=Path(args.out_dir).expanduser().resolve(), verbose=verbose)
         print(
             json.dumps(
                 {
@@ -179,7 +179,7 @@ def main():
         wf = CFDWorkflow(
             settings=settings, prompt_loader=PromptLoader(settings.prompts_path)
         )
-        result = wf.resume_after_runs(out_dir=Path(args.out_dir), verbose=verbose)
+        result = wf.resume_after_runs(out_dir=Path(args.out_dir).expanduser().resolve(), verbose=verbose)
         print(
             json.dumps(
                 {

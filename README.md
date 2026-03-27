@@ -141,8 +141,10 @@ Single command from topic to analysis + paper:
 ```bash
 cfd-scientist run-topic \
   --topic "Your CFD research topic" \
-  --out-dir ./runs/my_topic
+  --out-dir /absolute/path/to/runs/my_topic
 ```
+
+Note: Use an **absolute path** for `--out-dir`. Later stages (including Foam-Agent subprocess calls) may run with a different working directory; absolute `--out-dir` avoids “file not found” issues for `user_requirement.txt` and other artifacts.
 
 - **Without `--execute`:** ideation → hypothesis (Foam-Agent prompts) → **plan-only** Foam-Agent (no OpenFOAM run) → no interpreter viz/rerun → no analysis/paper unless you add `--allow-non-executed-artifacts`.
 - **With `--execute`:** real Foam-Agent runs → interpreter (PyVista diagnostics + rerun loop) → analysis (figures + report) → writer (LaTeX draft).

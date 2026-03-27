@@ -20,6 +20,9 @@ class FoamAgentRunner:
         self.timeout = timeout
 
     def plan_command(self, user_requirement_path: Path, output_dir: Path) -> list[str]:
+        # Always use absolute paths so Foam-Agent works regardless of cwd.
+        user_requirement_path = user_requirement_path.expanduser().resolve()
+        output_dir = output_dir.expanduser().resolve()
         return [
             "python",
             str(self.foam_main),
