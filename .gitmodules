@@ -1,0 +1,3 @@
+[submodule "Foam-Agent"]
+	path = Foam-Agent
+	url = git@github.com:csml-rpi/Foam-Agent.git

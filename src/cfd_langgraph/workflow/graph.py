@@ -1190,10 +1190,14 @@ class CFDWorkflow:
             latest_run = run_history[-1] if run_history else {}
             has_returncode = isinstance(latest_run, dict) and (latest_run.get("returncode") is not None)
 
-            # If we already have a completed Foam-Agent run (success or failure), do not re-run here.
-            if has_returncode:
+            # Check if foam_output already has Allrun.err and Allrun.out (completed run).
+            foam_out = sim_dir / "foam_output"
+            has_allrun_files = (foam_out / "Allrun.err").is_file() and (foam_out / "Allrun.out").is_file()
+
+            if has_returncode and has_allrun_files:
                 if verbose:
-                    print(f"[CFD-WORKFLOW] RESUME: Foam run already completed for {sim_id} (returncode={latest_run.get('returncode')}); skipping.", flush=True)
+                    reason = f"returncode={latest_run.get('returncode')}" if has_returncode else "Allrun.err and Allrun.out found"
+                    print(f"[CFD-WORKFLOW] RESUME: Foam run already completed for {sim_id} ({reason}); skipping.", flush=True)
                 continue
 
             # Need to run Foam-Agent at least once for this simulation.
