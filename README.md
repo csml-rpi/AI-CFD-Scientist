@@ -62,7 +62,7 @@ When you use `--execute`, the same provider/model selection is passed into Foam-
 
 ```bash
 export CFD_SCIENTIST_LLM_PROVIDER="bedrock"
-export CFD_SCIENTIST_MODEL="us.anthropic.claude-sonnet-4-6"
+export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-opus-4-6-v1"
 export AWS_ACCESS_KEY_ID="..."
 export AWS_SECRET_ACCESS_KEY="..."
 # AWS region for Bedrock (e.g. us-west-2)

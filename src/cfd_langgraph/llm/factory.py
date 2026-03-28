@@ -31,9 +31,23 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
     def _bedrock_model_id(mm: str) -> str:
         return mm.split("bedrock/", 1)[1].strip() if mm.startswith("bedrock/") else mm
 
+    def _bedrock_provider(model_id: str) -> str | None:
+        """Extract model provider from ARN for ChatBedrockConverse (required for ARN model IDs)."""
+        if not model_id.startswith("arn:"):
+            return None
+        # ARN format: arn:aws:bedrock:region:account:inference-profile/us.anthropic.claude-...
+        # Extract the part after the last '/' and take the second segment (e.g. 'anthropic')
+        tail = model_id.rsplit("/", 1)[-1]  # e.g. "us.anthropic.claude-opus-4-6-v1"
+        parts = tail.split(".")
+        if len(parts) >= 2:
+            return parts[1]  # e.g. "anthropic"
+        return None
+
     if provider:
         if provider == "bedrock":
             model_id = _bedrock_model_id(m)
+            bedrock_provider = _bedrock_provider(model_id)
+            extra = {"provider": bedrock_provider} if bedrock_provider else {}
             try:
                 from botocore.config import Config
                 from boto3 import client as boto_client
@@ -42,15 +56,17 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
                 bedrock_client = boto_client("bedrock-runtime", config=config)
                 return ChatBedrockConverse(
                     client=bedrock_client,
-                    model=model_id,
+                    model_id=model_id,
                     temperature=temperature,
                     callbacks=[TOKEN_STATS_HANDLER],
+                    **extra,
                 )
             except Exception:
                 return ChatBedrockConverse(
-                    model=model_id,
+                    model_id=model_id,
                     temperature=temperature,
                     callbacks=[TOKEN_STATS_HANDLER],
+                    **extra,
                 )
 
         if provider in {"openai", "openai-codex"}:
@@ -77,6 +93,8 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
         or m.startswith("anthropic.")
     ):
         model_id = m.split("bedrock/")[-1] if m.startswith("bedrock/") else m
+        bedrock_provider = _bedrock_provider(model_id)
+        extra = {"provider": bedrock_provider} if bedrock_provider else {}
         try:
             from botocore.config import Config
             from boto3 import client as boto_client
@@ -84,15 +102,17 @@ def create_langchain_llm(model: str, temperature: float = 0.2) -> Any:
             bedrock_client = boto_client("bedrock-runtime", config=config)
             return ChatBedrockConverse(
                 client=bedrock_client,
-                model=model_id,
+                model_id=model_id,
                 temperature=temperature,
                 callbacks=[TOKEN_STATS_HANDLER],
+                **extra,
             )
         except Exception:
             return ChatBedrockConverse(
-                model=model_id,
+                model_id=model_id,
                 temperature=temperature,
                 callbacks=[TOKEN_STATS_HANDLER],
+                **extra,
             )
     if m.startswith("claude-"):
         return ChatAnthropic(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])

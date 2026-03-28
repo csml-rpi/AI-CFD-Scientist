@@ -27,3 +27,4 @@ dist/
 # data/
 # runs/
 Foam-Agent/
+output/
