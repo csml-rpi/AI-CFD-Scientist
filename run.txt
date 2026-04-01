@@ -2,6 +2,7 @@ source .venv/bin/activate
 
 cfd-scientist run-topic \
   --topic "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire." \
-  --out-dir ./output
+  --out-dir ./output \
+  --execute
 
 cfd-scientist resume-topic --out-dir ./output   
