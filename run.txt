@@ -1,7 +1,9 @@
+source env.sh
+
 source .venv/bin/activate
 
 cfd-scientist run-topic \
-  --topic "Study the effect of fuel velocity and inlet box sizes in 2D small pool fire." \
+  --topic "Study the effect of fully turbulent flow using steady state rans with sa model compared to simple laminar model keeping other state same, you can use reynolds number 395." \
   --out-dir ./output \
   --execute
 
