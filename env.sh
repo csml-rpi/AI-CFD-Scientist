@@ -3,8 +3,8 @@
 
 # LLM provider + model
 export CFD_SCIENTIST_LLM_PROVIDER="bedrock"
-export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-sonnet-4-6"
-export CFD_SCIENTIST_VALIDATOR_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-haiku-4-5-20251001"
+export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-sonnet-4-6" # sonnet 4.6
+export CFD_SCIENTIST_VALIDATOR_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0" # haiku 4.5
 
 # AWS credentials (Bedrock)
 # export AWS_ACCESS_KEY_ID="..."
