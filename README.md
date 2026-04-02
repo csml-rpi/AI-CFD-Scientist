@@ -45,6 +45,12 @@ pip install -r requirements.txt
 
 ## Configure
 
+### Set up Foam-Agent
+```bash
+git submodule sync --recursive
+git submodule update --init --recursive
+```
+
 ### LLM Provider Selection (used by cfd-scientist + Foam-Agent)
 
 The pipeline uses these environment variables to pick both the provider and the model:
