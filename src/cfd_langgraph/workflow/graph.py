@@ -62,7 +62,11 @@ class CFDWorkflow:
     _app: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self):
-        self.hypothesis = HypothesisAgent(self.settings.model, self.prompt_loader)
+        self.hypothesis = HypothesisAgent(
+            self.settings.model,
+            self.prompt_loader,
+            validator_model=self.settings.validator_model,
+        )
         self.interpreter = ResultsInterpreterAgent(
             self.settings.model, self.prompt_loader
         )

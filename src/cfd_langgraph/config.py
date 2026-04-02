@@ -46,6 +46,11 @@ class Settings(BaseModel):
     ideation_novelty_threshold: float = float(os.environ.get("CFD_IDEATION_NOVELTY_THRESHOLD", "0.62"))
     ideation_novelty_max_retries: int = int(os.environ.get("CFD_IDEATION_NOVELTY_MAX_RETRIES", "3"))
 
+    # Lighter model for hypothesis validation/repair loop (defaults to main model if unset).
+    # Set CFD_SCIENTIST_VALIDATOR_MODEL to a fast model (e.g. Haiku) to speed up the
+    # validate+repair loop without affecting requirement generation quality.
+    validator_model: str = os.environ.get("CFD_SCIENTIST_VALIDATOR_MODEL", "")
+
     # Orchestration controls
     workflow_max_experiments_total: int = int(os.environ.get("CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL", "50"))
     workflow_max_reruns_per_experiment: int = int(os.environ.get("CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT", "10"))

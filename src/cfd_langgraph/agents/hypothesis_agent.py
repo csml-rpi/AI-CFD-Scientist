@@ -10,12 +10,14 @@ from cfd_langgraph.utils import strip_json_fences
 
 
 class HypothesisAgent:
-    def __init__(self, model: str, prompt_loader: PromptLoader):
+    def __init__(self, model: str, prompt_loader: PromptLoader, validator_model: str = ""):
         self.model = model
         self.prompts = prompt_loader.section("HypothesisAgent")
         self.llm = create_langchain_llm(model=model, temperature=0.3)
-        # Keep validator non-deterministic (LLM semantic QA), but lower-temp than generator.
-        self.validator_llm = create_langchain_llm(model=model, temperature=0.2)
+        # validator_model can be a lighter/faster model (e.g. Haiku) to speed up the
+        # validate+repair loop. Falls back to the main model if unset.
+        _vmodel = validator_model or model
+        self.validator_llm = create_langchain_llm(model=_vmodel, temperature=0.2)
 
     def generate_user_requirement(
         self,
