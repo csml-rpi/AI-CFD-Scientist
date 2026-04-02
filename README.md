@@ -51,77 +51,15 @@ git submodule sync --recursive
 git submodule update --init --recursive
 ```
 
-### LLM Provider Selection (used by cfd-scientist + Foam-Agent)
+### Environment variables
 
-The pipeline uses these environment variables to pick both the provider and the model:
-
-- `CFD_SCIENTIST_LLM_PROVIDER` (explicit override; otherwise inferred from `CFD_SCIENTIST_MODEL`)
-  - Supported values: `bedrock`, `openai`, `openai-codex`, `anthropic`, `gemini`
-- `CFD_SCIENTIST_MODEL` (model identifier)
-
-For convenience/backward-compatibility, the code also accepts misspelled variants:
-`CFD_SCIEINTIST_LLM_PROVIDER` and `CFD_SCIENITST_MODEL`.
-
-When you use `--execute`, the same provider/model selection is passed into Foam-Agent by the runner (mapped to Foam-Agent’s `FOAMAGENT_MODEL_PROVIDER` and `FOAMAGENT_MODEL_VERSION`).
-
-#### Bedrock (default behavior)
+Copy `env.sh`, fill in your values, and source it before running:
 
 ```bash
-export CFD_SCIENTIST_LLM_PROVIDER="bedrock"
-export CFD_SCIENTIST_MODEL="arn:aws:bedrock:us-west-2:567316078106:inference-profile/us.anthropic.claude-opus-4-6-v1"
-export AWS_ACCESS_KEY_ID="..."
-export AWS_SECRET_ACCESS_KEY="..."
-# AWS region for Bedrock (e.g. us-west-2)
-export AWS_DEFAULT_REGION="us-west-2"
+source env.sh
 ```
 
-### Optional paths
-
-- `CFD_PROMPTS_PATH` – path to `prompts.yaml` (default: `./prompts/prompts.yaml`)
-- `FOAM_AGENT_MAIN` – path to Foam-Agent entrypoint (default: `./Foam-Agent/foambench_main.py`)
-- `WM_PROJECT_DIR` – OpenFOAM install path (for Foam-Agent when using `--execute`)
-
-### Optional: literature and ideation
-
-- `S2_API_KEY` – Semantic Scholar API key (optional; public API works without it, rate-limited)
-- `BRAVE_SEARCH_API_KEY` – optional web search for literature
-- `CFD_IDEATION_ENABLE_LITERATURE=1`
-- `CFD_IDEATION_MAX_PAPERS=12`
-- `CFD_IDEATION_MAX_EXPERIMENTS=50`
-- `CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL=50`
-- `CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT=2`
-
-### Other model providers
-
-- **OpenAI (text + vision):**
-  ```bash
-  export CFD_SCIENTIST_LLM_PROVIDER="openai"
-  export CFD_SCIENTIST_MODEL="gpt-4o"   # choose a vision-capable model for VLM steps
-  export OPENAI_API_KEY="..."
-  ```
-  Note: the interpreter/analysis VLM steps must use a **vision-capable** model (to interpret PNGs/images). If you set a text-only model, those steps will fail.
-
-- **OpenAI Codex (subscription / Codex auth):**
-  ```bash
-  export CFD_SCIENTIST_LLM_PROVIDER="openai-codex"
-  export CFD_SCIENTIST_MODEL="codex/gpt-5-codex"
-  ```
-
-- **Anthropic (direct API):**
-  ```bash
-  export CFD_SCIENTIST_LLM_PROVIDER="anthropic"
-  export CFD_SCIENTIST_MODEL="claude-3-5-sonnet-20241022"
-  export ANTHROPIC_API_KEY="..."
-  ```
-
-- **Gemini (OpenAI-compatible endpoint):**
-  ```bash
-  export CFD_SCIENTIST_LLM_PROVIDER="gemini"
-  export CFD_SCIENTIST_MODEL="gemini-1.5-pro"  # must be accepted by your Gemini proxy
-  export OPENAI_API_KEY="..."
-  export OPENAI_BASE_URL="..."  # Gemini OpenAI-compatible endpoint
-  ```
-  Note: use a **vision-capable** Gemini model/proxy so the VLM steps can interpret PNGs/images.
+Supported providers: `bedrock` (default), `openai`, `openai-codex`, `anthropic`, `gemini`. The interpreter and analysis stages require a vision-capable model. When using `--execute`, the same provider/model is passed through to Foam-Agent automatically.
 
 ---
 
@@ -173,7 +111,19 @@ cfd-scientist run-topic \
   --allow-non-executed-artifacts
 ```
 
-### 3. Run as Python module (no CLI install)
+### 3. Resume or restart a partial run
+
+If a run was interrupted after Foam-Agent finished (e.g. Ctrl-C during interpreter):
+
+```bash
+# Resume from where it left off (re-enters the interpreter/rerun loop)
+cfd-scientist resume-topic --out-dir ./runs/my_topic
+
+# Restart from the interpreter stage, skipping ideation/hypothesis/foam entirely
+cfd-scientist restart-topic --out-dir ./runs/my_topic
+```
+
+### 4. Run as Python module (no CLI install)
 
 ```bash
 python -m cfd_langgraph.workflow.main ideate --topic "Your topic" --out -
@@ -209,6 +159,7 @@ After `run-topic` with `--execute` (and optionally `--allow-non-executed-artifac
 
 - **“No module named 'cfd_langgraph'”** – run from repo root and `pip install -e .`, or set `PYTHONPATH` to the repo root.
 - **Bedrock errors** – check `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION` and model id `us.anthropic.claude-sonnet-4-6`.
+- **Hypothesis stage is very slow** – the validate+repair loop uses the main model by default (up to ~9 calls per experiment). Set `CFD_SCIENTIST_VALIDATOR_MODEL` to a fast model (e.g. Haiku) to reduce this significantly. Also consider lowering `BEDROCK_READ_TIMEOUT` from 300s to 90s for text-only stages.
 - **Foam-Agent not found** – ensure `Foam-Agent/foambench_main.py` exists or set `FOAM_AGENT_MAIN`.
 - **No figures / PyVista errors** – ensure Foam-Agent wrote results (e.g. VTK) under `foam_output/` and that `pyvista` and `matplotlib` are installed. On headless servers (no physical display or GPU), PyVista/VTK also require an off-screen OpenGL backend such as OSMesa/EGL or a software Mesa stack; make sure the container or system has these libraries so `pyvista.Plotter(off_screen=True)` can render without X/GUI.
 - **PDF compilation fails** – ensure `pdflatex` is installed (e.g. `texlive-latex-base` or full TeX Live). The paper agent compiles LaTeX to PDF and runs a reviewer loop (max 10 tries).
