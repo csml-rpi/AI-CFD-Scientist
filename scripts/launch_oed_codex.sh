@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+cd /home/somasn/Desktop/cfd-scientist-arch-change
+mkdir -p runs
+nohup python scripts/orchestrator_run.py \
+  --topic "Open-ended discovery: find a novel SA model modification for periodic hill flow at Re=5600 that beats baseline SA and available literature on Cf prediction. Base case and DNS reference data are in the starter folder. Propose, implement, and test new model terms not in the literature." \
+  --starter-dir /home/somasn/Desktop/cfd-scientist-arch-change/starter \
+  --out-dir /home/somasn/Desktop/cfd-scientist-arch-change/runs/open_ended_turbulence_model_codex \
+  --open-ended-budget 20 \
+  --provider openai-codex --model gpt-5.5 \
+  --no-ask-clarifications \
+  > runs/oed_codex.log 2>&1 &
+echo "OED Codex PID: $!"

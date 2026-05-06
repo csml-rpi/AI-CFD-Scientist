@@ -1,0 +1,30 @@
+Code-mod validation (custom viscosity in a channel case) — reference layout
+============================================================================
+
+Golden template directory:
+  starter/channel_custom_code_mod_validation/
+
+What it contains (all case-local; OpenFOAM install is not modified):
+  - Same mesh / 0 / system numerics as starter/channel_newtonian
+  - customModels/<ClassName>/ with .H, .C, Make/files, Make/options
+  - constant/momentumTransport: laminar { generalisedNewtonian; viscosityModel <ClassName>;
+      <ClassName>Coeffs { ... } }  ← Coeffs MUST be inside laminar { } (OpenFOAM 10)
+  - system/controlDict: libs ("customModels/<Class>/platforms/$(WM_OPTIONS)/lib/lib<Class>.so");
+  - Allrun: optional wmake libso if .so missing, then simpleFoam
+
+Make/files (wmake):
+  <ClassName>.C
+
+  LIB = ./platforms/$(WM_OPTIONS)/lib/lib<ClassName>
+  (Do not use LIB_SRCS — it produces an empty .so.)
+
+Orchestrator validation copy:
+  scripts/orchestrator_run.py runs foam_run with
+    --base-case-dir <canonical_base_case>
+    --output-dir runs/<run>/code_mod_validation/modified
+  That copy must keep the same dictionary layout as this template.
+
+Quick manual check:
+  source $WM_PROJECT_DIR/etc/bashrc
+  cd starter/channel_custom_code_mod_validation
+  ./Allrun

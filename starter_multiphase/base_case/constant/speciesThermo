@@ -1,0 +1,49 @@
+species
+(
+    air
+    C7H16
+);
+
+air
+{
+    specie
+    {
+        nMoles          1;
+        molWeight       28.9596;
+    }
+    thermodynamics
+    {
+        Tlow            200;
+        Thigh           3500;
+        Tcommon         1000;
+        highCpCoeffs    ( 3.57304 -7.24383e-04 1.67022e-06 -1.26501e-10 -4.20580e-13 -1047.41 3.12431 );
+        lowCpCoeffs     ( 3.09589 1.22835e-03 -4.14267e-07 6.56910e-11 -3.87021e-15 -983.191 5.34161 );
+    }
+    transport
+    {
+        As              1.67212e-06;
+        Ts              170.672;
+    }
+}
+
+C7H16
+{
+    specie
+    {
+        nMoles          1;
+        molWeight       100.204;
+    }
+    thermodynamics
+    {
+        Tlow            200;
+        Thigh           3500;
+        Tcommon         1000;
+        highCpCoeffs    ( 20.4669 0.03427 -1.114e-05 1.68e-09 -9.71e-14 -3.635e+04 -80.0 );
+        lowCpCoeffs     ( -1.2688 0.08568 -5.37e-05 1.708e-08 -2.234e-12 -2.566e+04 35.43 );
+    }
+    transport
+    {
+        As              1.12e-06;
+        Ts              320.0;
+    }
+}

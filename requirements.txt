@@ -17,6 +17,7 @@ python-dotenv>=1.0
 
 # HTTP and literature/APIs
 requests>=2.32
+semanticscholar>=0.7.0
 
 # Visualization (Analysis/Interpreter agents – PyVista for Foam/VTK data)
 pyvista>=0.44
