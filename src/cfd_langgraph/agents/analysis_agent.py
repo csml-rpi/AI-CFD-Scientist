@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -382,12 +383,25 @@ class AnalysisAgent:
                 continue
             sim_dir = Path(ex.get("sim_dir")) if ex.get("sim_dir") else None
             foam_dir = Path(ex.get("foam_output_dir")) if ex.get("foam_output_dir") else None
+            user_requirement = str(ex.get("user_requirement", "") or "").strip()
+            if not user_requirement and sim_dir and sim_dir.is_dir():
+                for cand in (
+                    sim_dir / "_verify_requirement.txt",
+                    sim_dir / "user_requirement.txt",
+                    sim_dir / "requirement.txt",
+                ):
+                    if cand.is_file():
+                        try:
+                            user_requirement = cand.read_text(encoding="utf-8", errors="ignore").strip()
+                            break
+                        except Exception:
+                            pass
             item: Dict[str, Any] = {
                 "simulation_id": sim_id,
                 "case_name": ex.get("case_name", sim_id),
                 "description": ex.get("description", ""),
                 "experiment_idea": self._experiment_idea_text(ex),
-                "user_requirement": ex.get("user_requirement", ""),
+                "user_requirement": user_requirement,
                 "sim_dir": str(sim_dir) if sim_dir else "",
                 "foam_output_dir": str(foam_dir) if foam_dir else "",
                 "time_dirs": [],
@@ -420,6 +434,181 @@ class AnalysisAgent:
                         item[key] = names[:80]
             manifest.append(item)
         return manifest
+
+    @staticmethod
+    def _read_text_safe(path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _extract_dim_scalar(text: str, key: str) -> Optional[float]:
+        # OpenFOAM style: key [dims] value;
+        m = re.search(rf"\b{re.escape(key)}\b\s+\[[^\]]+\]\s+([-+0-9.eE]+)\s*;", text)
+        if not m:
+            return None
+        try:
+            return float(m.group(1))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_model_name(momentum_text: str) -> str:
+        m = re.search(r"\bmodel\s+([A-Za-z0-9_]+)\s*;", momentum_text)
+        return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _extract_ubar(fv_constraints_text: str) -> Optional[List[float]]:
+        m = re.search(r"\bUbar\s*\(\s*([-+0-9.eE]+)\s+([-+0-9.eE]+)\s+([-+0-9.eE]+)\s*\)\s*;", fv_constraints_text)
+        if not m:
+            return None
+        try:
+            return [float(m.group(1)), float(m.group(2)), float(m.group(3))]
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_libs(control_text: str) -> List[str]:
+        m = re.search(r"\blibs\s*\(([\s\S]*?)\)\s*;", control_text)
+        if not m:
+            return []
+        body = m.group(1)
+        return [s for s in re.findall(r"\"([^\"]+)\"", body) if s]
+
+    def _extract_case_context(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        foam_dir_raw = str(item.get("foam_output_dir", "") or "")
+        foam_dir = Path(foam_dir_raw) if foam_dir_raw else None
+        if not foam_dir or not foam_dir.is_dir():
+            return {"ok": False, "error": "missing foam_output_dir", "authoritative": {}, "files": {}}
+
+        tp = foam_dir / "constant" / "transportProperties"
+        mt = foam_dir / "constant" / "momentumTransport"
+        fv = foam_dir / "system" / "fvConstraints"
+        cd = foam_dir / "system" / "controlDict"
+        rr = foam_dir / "run_result.json"
+        dj = foam_dir / "decision.json"
+
+        tp_txt = self._read_text_safe(tp)
+        mt_txt = self._read_text_safe(mt)
+        fv_txt = self._read_text_safe(fv)
+        cd_txt = self._read_text_safe(cd)
+
+        authoritative: Dict[str, Any] = {}
+        sources: Dict[str, str] = {}
+        for key in ("Ub", "nu", "h"):
+            v = self._extract_dim_scalar(tp_txt, key)
+            if v is not None:
+                authoritative[key] = v
+                sources[key] = str(tp)
+
+        ubar = self._extract_ubar(fv_txt)
+        if ubar is not None:
+            authoritative["Ubar"] = ubar
+            sources["Ubar"] = str(fv)
+
+        model = self._extract_model_name(mt_txt)
+        if model:
+            authoritative["turbulence_model"] = model
+            sources["turbulence_model"] = str(mt)
+
+        libs = self._extract_libs(cd_txt)
+        if libs:
+            authoritative["control_libs"] = libs
+            sources["control_libs"] = str(cd)
+
+        # pull optional coefficients from momentumTransport as scalar entries
+        coeffs: Dict[str, float] = {}
+        for m in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([-+0-9.eE]+)\s*;\s*$", mt_txt, re.MULTILINE):
+            k, raw = m.group(1), m.group(2)
+            if k in {"model", "simulationType", "turbulence", "printCoeffs"}:
+                continue
+            try:
+                coeffs[k] = float(raw)
+            except Exception:
+                continue
+        if coeffs:
+            authoritative["model_coefficients"] = coeffs
+            sources["model_coefficients"] = str(mt)
+
+        run_result = {}
+        decision = {}
+        try:
+            if rr.is_file():
+                run_result = json.loads(rr.read_text(encoding="utf-8"))
+        except Exception:
+            run_result = {}
+        try:
+            if dj.is_file():
+                decision = json.loads(dj.read_text(encoding="utf-8"))
+        except Exception:
+            decision = {}
+
+        return {
+            "ok": True,
+            "authoritative": authoritative,
+            "sources": sources,
+            "files": {
+                "transportProperties": str(tp),
+                "momentumTransport": str(mt),
+                "fvConstraints": str(fv),
+                "controlDict": str(cd),
+                "run_result": str(rr),
+                "decision": str(dj),
+            },
+            "run_status": run_result.get("status", ""),
+            "decision_status": decision.get("status", ""),
+            "available_time_dirs": item.get("time_dirs", []),
+            "reference_quantities_hint": self._infer_reference_quantities_hint(str(item.get("user_requirement", ""))),
+        }
+
+    @staticmethod
+    def _infer_reference_quantities_hint(user_requirement: str) -> List[str]:
+        t = (user_requirement or "").lower()
+        out: List[str] = []
+        for q in ("cf", "cp", "drag", "lift", "pressure", "velocity", "y+", "heat flux", "nusselt"):
+            if q in t:
+                out.append(q)
+        return out
+
+    def _llm_summarize_case_contexts(self, contexts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Normalize case contexts with an LLM, but keep deterministic extraction as source of truth.
+        """
+        if not contexts:
+            return []
+        system = (
+            "You normalize CFD case contexts for downstream script generation.\n"
+            "Use only provided extracted data. Do not invent values.\n"
+            "For each case, return JSON with keys:\n"
+            "simulation_id, summary, authoritative_values, missing_values, consistency_notes.\n"
+            "authoritative_values must be copied from input values only.\n"
+            "Return STRICT JSON array only."
+        )
+        user = "Case contexts:\n" + json.dumps(contexts, ensure_ascii=False)[:120000]
+        try:
+            raw = self.llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+            txt = _strip_json_fences(str(getattr(raw, "content", raw)).strip())
+            arr = json.loads(txt)
+            if isinstance(arr, list):
+                out = [x for x in arr if isinstance(x, dict)]
+                return out
+        except Exception:
+            pass
+        # Fallback deterministic summary
+        out: List[Dict[str, Any]] = []
+        for c in contexts:
+            auth = c.get("case_context", {}).get("authoritative", {}) if isinstance(c.get("case_context"), dict) else {}
+            out.append(
+                {
+                    "simulation_id": c.get("simulation_id", ""),
+                    "summary": f"model={auth.get('turbulence_model', 'unknown')}, keys={sorted(list(auth.keys()))}",
+                    "authoritative_values": auth,
+                    "missing_values": [],
+                    "consistency_notes": [],
+                }
+            )
+        return out
 
     def _interpret_cross_experiment_outputs(
         self,
@@ -488,6 +677,21 @@ class AnalysisAgent:
         proc_dir = out_dir / "cross_experiment_analysis"
         proc_dir.mkdir(parents=True, exist_ok=True)
         manifest = self._build_experiment_inventory(experiments)
+        # Phase 1: deterministic context extraction from each case.
+        for item in manifest:
+            item["case_context"] = self._extract_case_context(item)
+        case_context_path = proc_dir / "case_context.json"
+        try:
+            case_context_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        # Phase 2: LLM normalization/synthesis (non-authoritative; deterministic values remain source-of-truth).
+        normalized_contexts = self._llm_summarize_case_contexts(manifest)
+        normalized_context_path = proc_dir / "case_context_normalized.json"
+        try:
+            normalized_context_path.write_text(json.dumps(normalized_contexts, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
         print(
             f"[Analysis] cross_experiment: starting (experiments={len(experiments)}, dir={proc_dir})",
@@ -499,11 +703,15 @@ class AnalysisAgent:
             "Given topic + experiment requirements + available artifacts, decide whether additional quantitative "
             "post-processing is needed beyond image-based interpretation.\n"
             "Examples: trend/correlation plots, regression fits, summary tables, derived metrics.\n"
+            "For **mesh independence / baseline-vs-refined** style comparisons, plan work that uses the **final "
+            "written timestep** in each case (same nominal endTime); do not require QoIs aggregated over all "
+            "intermediate times unless the study is explicitly transient.\n"
             "Return ONLY JSON with keys: needs_processing (bool), objectives (list[str]), rationale (str)."
         )
         planner_user = (
             f"Study topic:\n{topic}\n\n"
             f"Experiment manifest:\n{json.dumps(manifest, ensure_ascii=False)}\n\n"
+            f"Normalized case context:\n{json.dumps(normalized_contexts, ensure_ascii=False)}\n\n"
             "Decide if cross-experiment processing is needed for stronger analysis/paper evidence."
         )
         needs_processing = False
@@ -608,10 +816,29 @@ class AnalysisAgent:
             "Return ONLY raw Python code (no markdown).\n"
             "Script requirements:\n"
             "- Read available experiment artifacts from the manifest.\n"
+            "- Use case_context.json / normalized context as authoritative metadata inputs.\n"
+            "- Do not invent physical constants or defaults (e.g., U_bulk, nu, rho, Re).\n"
+            "- For every quantity used in computation, resolve from case_context first and cite source path in report.\n"
+            "- If required values are missing/inconsistent, mark that metric as UNRESOLVED and explain why.\n"
+            "- Parse configuration with a model-aware source-of-truth policy instead of assuming one fixed dictionary.\n"
+            "- Automatically discover and read all relevant case configuration artifacts for physics, numerics, mesh,\n"
+            "  forcing/boundary driving, model selection, and experiment metadata/verification context.\n"
+            "- Determine the authoritative location of model parameters from the active model family and study mode,\n"
+            "  and cross-check against supporting dictionaries and metadata before extracting coefficients.\n"
+            "- Validate consistency of key controls that can be duplicated across files (e.g., driving conditions,\n"
+            "  target parameters, model activation) and report any mismatch explicitly before computing comparisons.\n"
+            "- For OpenFOAM field-based comparisons (e.g. mesh refinement, two cases same physics), load each case "
+            "at its **latest/final write time** only for scalar QoIs and difference maps used in convergence checks; "
+            "assume both runs share the same **endTime** unless manifest shows otherwise — do not integrate metrics "
+            "across all saved timesteps unless an objective explicitly asks for transient analysis.\n"
             "- Compute requested cross-experiment metrics/trends only when data is available.\n"
             "- Save outputs under output_dir: (1) data_processing_report.md, (2) optional plots PNG.\n"
             "- Be defensive: if some files are missing, continue with available data and explain limitations in report.\n"
             "- Prefer PyVista for reading OpenFOAM case data/fields when needed (do NOT depend on ParaView GUI).\n"
+            "- Any matplotlib or PyVista PNGs intended for the paper: large fonts (ticks >= 14–18 pt, titles/labels >= 18–22 pt), "
+            "no colorbar or legend overlapping data (use tight_layout with padding, horizontal colorbar, bbox_to_anchor for legends, or PyVista scalar_bar_args position/size).\n"
+            "- NumPy integration: use `np.trapezoid(y, x)` (NumPy 2+) or `getattr(np, \"trapezoid\", np.trapz)(y, x)` — **do not** call `np.trapz` alone (removed in NumPy 2.0).\n"
+            "- For 2D contour plots of elongated domains (e.g. channel flow), match figure or window aspect to domain extents so the channel is not a thin line.\n"
             "- Exit 0 on success.\n\n"
             "PyVista OpenFOAM loading snippet (use as a starting point):\n"
             "```python\n"
@@ -629,6 +856,8 @@ class AnalysisAgent:
             "Topic:\n{topic}\n\n"
             "Objectives:\n{objectives}\n\n"
             "Experiment manifest:\n{manifest}\n\n"
+            "Deterministic case context path:\n{case_context_path}\n\n"
+            "Normalized case context path:\n{normalized_context_path}\n\n"
             "output_dir:\n{output_dir}\n\n"
             "Previous error:\n{previous_error}\n\n"
             "Previous script:\n{previous_script}\n\n"
@@ -649,6 +878,8 @@ class AnalysisAgent:
                 topic=topic,
                 objectives=json.dumps(objectives, ensure_ascii=False),
                 manifest=json.dumps(manifest, ensure_ascii=False),
+                case_context_path=str(case_context_path),
+                normalized_context_path=str(normalized_context_path),
                 output_dir=str(proc_dir),
                 previous_error=last_error or "(none)",
                 previous_script=last_script or "(none)",

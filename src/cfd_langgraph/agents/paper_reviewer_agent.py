@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from langchain_core.prompts import ChatPromptTemplate
 
@@ -92,7 +92,14 @@ class PaperReviewerAgent:
                 "publishable": False,
                 "recommendations": ["Reviewer output parse failed; re-run review."],
                 "summary": "Could not parse reviewer response.",
+                "needs_additional_visualization": False,
+                "additional_viz_specs": [],
+                "regenerate_batch_figures": True,
             }
+
+        rb = parsed.get("regenerate_batch_figures")
+        if rb is None and compile_ok and not bool(parsed.get("figures_ok", True)):
+            rb = True
 
         return {
             "pass": bool(parsed.get("pass", False)),
@@ -104,4 +111,7 @@ class PaperReviewerAgent:
             "publishable": bool(parsed.get("publishable", False)),
             "recommendations": list(parsed.get("recommendations", [])) or [],
             "summary": str(parsed.get("summary", "")),
+            "needs_additional_visualization": bool(parsed.get("needs_additional_visualization", False)),
+            "additional_viz_specs": list(parsed.get("additional_viz_specs", [])) or [],
+            "regenerate_batch_figures": rb,
         }

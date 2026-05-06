@@ -1,0 +1,154 @@
+/*--------------------------------*- C++ -*----------------------------------*\
+| =========                 |                                                 |
+| \\      /  F ield         | OpenFOAM v10                                    |
+|  \\    /   O peration     |                                                 |
+|   \\  /    A nd           |                                                 |
+|    \\/     M anipulation  |                                                 |
+\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    format      ascii;
+    class       dictionary;
+    location    "constant";
+    object      cloudProperties;
+}
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+
+type        reactingCloud;
+
+solution
+{
+    coupled         true;
+    transient       yes;
+    cellValueSourceCorrection off;
+    maxCo           0.3;
+
+    sourceTerms
+    {
+        schemes
+        {
+            rho             explicit 1;
+            U               explicit 1;
+            Yi              explicit 1;
+            h               explicit 1;
+            radiation       explicit 1;
+        }
+    }
+
+    interpolationSchemes
+    {
+        rho             cell;
+        U               cellPoint;
+        thermo:mu       cell;
+        T               cell;
+        Cp              cell;
+        thermo:kappa    cell;
+        p               cell;
+    }
+
+    integrationSchemes
+    {
+        U               Euler;
+        T               Euler;
+    }
+}
+
+
+constantProperties
+{
+    rho0            684;        // n-heptane liquid density at 300 K [kg/m3]
+    T0              300;        // initial droplet temperature [K]
+    Cp0             2240;       // n-heptane liquid Cp at 300 K [J/kg/K]
+
+    constantVolume  false;
+}
+
+
+subModels
+{
+    particleForces
+    {
+        // no forces - suspended droplet
+    }
+
+    injectionModels
+    {
+        model1
+        {
+            type            manualInjection;
+            // mass of 1 droplet: rho * pi/6 * d^3 = 684 * pi/6 * (1.052e-3)^3
+            massTotal       4.484e-08;
+            parcelBasisType mass;
+            SOI             0;
+            positionsFile   "cloudPositions";
+            U0              (0 0 0);       // suspended (zero initial velocity)
+            sizeDistribution
+            {
+                type uniform;
+                uniformDistribution
+                {
+                    minValue        5.0e-04;   // Daif e1: d0 = 1.052 mm
+                    maxValue        5.0e-04;
+                }
+            }
+        }
+    }
+
+    dispersionModel none;
+
+    patchInteractionModel standardWallInteraction;
+
+    heatTransferModel RanzMarshall;
+
+    compositionModel singlePhaseMixture;
+
+    phaseChangeModel liquidEvaporation;
+
+    stochasticCollisionModel none;
+
+    surfaceFilmModel none;
+
+    radiation       off;
+
+    standardWallInteractionCoeffs
+    {
+        type            rebound;
+    }
+
+    RanzMarshallCoeffs
+    {
+        BirdCorrection  off;
+    }
+
+    singlePhaseMixtureCoeffs
+    {
+        phases
+        (
+            liquid
+            {
+                C7H16 1;          // pure n-heptane
+            }
+        );
+    }
+
+    liquidEvaporationCoeffs
+    {
+        enthalpyTransfer enthalpyDifference;
+        activeLiquids   ( C7H16 );
+    }
+}
+
+
+cloudFunctions
+{
+    particleTracks1
+    {
+        type            particleTracks;
+        trackInterval   1;
+        maxSamples      100000;
+        resetOnWrite    no;
+    }
+}
+
+
+// ************************************************************************* //

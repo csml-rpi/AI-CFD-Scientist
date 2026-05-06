@@ -17,6 +17,8 @@ from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.agents.literature_agent import LiteratureSurveyAgent
 from cfd_langgraph.agents.paper_reviewer_agent import PaperReviewerAgent
 from cfd_langgraph.paper_utils import compile_tex_to_pdf, extract_pdflatex_errors
+
+_COMPILE_ERR_TAIL_CHARS = 14_000
 from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
 from cfd_langgraph.refchecker_integration import run_refchecker_on_tex
 
@@ -55,18 +57,26 @@ Scope and truthfulness:
 
 Figures:
 3) Include only good-quality figures. If an image is poor (blurry, wrong, uninformative), omit it. If an image doesn't make sense or doesn't provide any information, exclude it.
+3b) Prefer figures suitable for journal print: colorbars and legends must not cover the flow field or data; text must be large enough to read at column width. Omit figures that fail this (common with default PyVista exports).
 4) Include at least one important figure from each experiment so all experiments are represented. Not every image from every experiment is required, but each experiment must appear in at least one figure.
 5) Every figure must be referenced in the main text; captions must accurately describe what is shown. No hallucinated numbers or mismatched descriptions. Use LaTeX \\ref{fig:...} for all figures.
 
 Structure:
 6) Standard sections: Abstract, Introduction, Related Work (only if relevant to what was done), Methods, Results, Discussion, Conclusion; Reproducibility appendix and Claim–Evidence table.
+6b) If the section context JSON includes a non-empty `mesh_independence` object from the workflow, include an explicit **mesh refinement / mesh independence** subsection with a table of QoIs per mesh level and state which mesh was selected for production runs; use only provided numbers.
 7) Claim–evidence table: tie each major claim to specific experiments, figures, and numbers. No unsupported claims.
 8) Failure Cases / Negative Results subsection if any run failed or was inconclusive.
 9) Reproducibility appendix: solver, OpenFOAM/case setup, mesh, BCs, time step and end time, how to run—only what was actually used.
 
+Abstract (strict):
+10a) Abstract must NOT name case numbers (no “case 1”, “case_003”, exp_ IDs) and must NOT reference section numbers (“Section 3”, etc.).
+
+Case naming (body):
+10b) In prose use “case 1”, “case 2” (space, not underscore) only after introducing what each case is; never use case_001-style tokens in narrative. If context lists omitted duplicate experiments, say nothing about them.
+
 Disclosure:
 10) Mandatory: one sentence in Abstract or Methods that this draft was generated with an automated CFD Scientist (AI-assisted) pipeline and that results and figures come from the provided experiments and analysis.
-11) Introduce the set of experiments (exp_001, exp_002, etc.) with a clear table early in the Methods/Results section before referring to experiments by these IDs in the narrative; the table should summarise for each experiment the key varying parameter(s) (e.g. turbulence model, wall treatment), mesh size, and any other essential configuration.
+11) Introduce the set of experiments with a clear table early in Methods/Results before referring to them by number; the table should summarise for each experiment the key varying parameter(s) (e.g. turbulence model, wall treatment), mesh size, and any other essential configuration.
 12) Avoid repeating the same explanatory paragraph or caveat (e.g. geometry mismatch, post-processing artefact, expansion-ratio difference) in multiple sections. Provide a single, well-placed, detailed explanation and refer back to it briefly elsewhere instead of duplicating text.
 13) The Conclusion section must be written as one cohesive paragraph (continuous prose). Do NOT use bullet points, numbered lists, or itemized/enumerated formatting in Conclusion.
 """.strip()
@@ -299,6 +309,56 @@ class WriterAgent:
             print("[Writer] Revision done.")
         return getattr(out, "content", str(out))
 
+    def revise_paper_for_compilation_only(
+        self,
+        tex_content: str,
+        compile_error: str,
+        visualization_bundle: Optional[List[Dict[str, Any]]] = None,
+        work_dir: Optional[Path] = None,
+        verbose: bool = False,
+    ) -> str:
+        """Minimal LaTeX edits so pdflatex succeeds (no publishability review)."""
+        system = self.prompts.get("compile_fix_system_prompt", "").strip()
+        if not system:
+            system = (
+                "You are a LaTeX build engineer. The document failed pdflatex. "
+                "Output a complete LaTeX document that compiles. "
+                "Only fix build errors (paths, packages, environments, escapes, undefined commands). "
+                "Do not rewrite for style or length. Return ONLY full LaTeX."
+            )
+        user_t = self.prompts.get("compile_fix_user_prompt", "").strip()
+        if not user_t:
+            user_t = (
+                "Fix compilation.\n\nERRORS:\n{error_summary}\n\nLOG TAIL:\n{compile_error_tail}\n\n"
+                "VALID FIGURE PATHS:\n{valid_figure_paths}\n\nLaTeX:\n{tex_content}\n\n"
+                "Return ONLY complete LaTeX."
+            )
+        paths = _get_figure_paths_for_review(visualization_bundle, work_dir)
+        paths_block = "\n".join(f"- {p}" for p in paths[:80]) if paths else "(none listed — keep existing paths that match the project layout)"
+        err = compile_error or ""
+        summary = extract_pdflatex_errors(err, max_errors=8)
+        tail = err[-_COMPILE_ERR_TAIL_CHARS:] if len(err) > _COMPILE_ERR_TAIL_CHARS else err
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", system),
+                ("human", user_t),
+            ]
+        )
+        chain = prompt | self.llm
+        if verbose:
+            print("[Writer] Compile-only revision (minimize edits, no reviewer pass)...")
+        out = chain.invoke(
+            {
+                "tex_content": tex_content[:80000],
+                "error_summary": summary,
+                "compile_error_tail": tail,
+                "valid_figure_paths": paths_block,
+            }
+        )
+        if verbose:
+            print("[Writer] Compile-only revision done.")
+        return getattr(out, "content", str(out))
+
     def write_paper_with_literature_and_review(
         self,
         topic: str,
@@ -309,10 +369,14 @@ class WriterAgent:
         visualization_bundle: Optional[List[Dict[str, Any]]] = None,
         max_literature_papers: int = 40,
         max_review_tries: int = 10,
+        max_compile_recovery_tries: int = 10,
         verbose: bool = False,
     ) -> Tuple[str, Path | None, Dict[str, Any]]:
         """
         Write paper, compile to PDF, and run reviewer loop until pass or max tries.
+
+        If the review budget is exhausted and pdflatex still fails, runs an extra
+        compile-only fix loop (no publishability review) to try to produce a PDF.
 
         Returns:
             (final_tex, pdf_path, review_info)
@@ -334,6 +398,9 @@ class WriterAgent:
         tex_path = out_dir / "paper_draft.tex"
         work_dir = work_dir or out_dir
         review_info: Dict[str, Any] = {"tries": 0, "reviews": []}
+        last_compile_ok = False
+        last_pdf_path: Path | None = None
+        last_compile_err = ""
 
         for attempt in range(max_review_tries):
             review_info["tries"] = attempt + 1
@@ -363,6 +430,9 @@ class WriterAgent:
             compile_ok, pdf_path, compile_err = compile_tex_to_pdf(
                 tex_path, work_dir=work_dir
             )
+            last_compile_ok = compile_ok
+            last_pdf_path = pdf_path
+            last_compile_err = compile_err or ""
 
             if compile_ok:
                 if verbose:
@@ -429,5 +499,52 @@ class WriterAgent:
                 if verbose:
                     print("[Writer] Max tries (%d) reached; returning last version." % max_review_tries)
 
-        pdf_path = out_dir / "paper_draft.pdf" if (out_dir / "paper_draft.pdf").exists() else None
+        # Review budget exhausted: if the last build failed, try compile-only fixes (no reviewer pass).
+        recovery_cap = max(0, int(max_compile_recovery_tries))
+        if not last_compile_ok and recovery_cap > 0:
+            review_info["compile_recovery"] = {
+                "attempts": 0,
+                "succeeded": False,
+                "max_tries": recovery_cap,
+            }
+            if verbose:
+                print(
+                    "[Writer] Review loop ended with compilation failure; "
+                    "starting compile-only recovery (max %d tries, no publishability review)."
+                    % recovery_cap
+                )
+            for cr in range(recovery_cap):
+                review_info["compile_recovery"]["attempts"] = cr + 1
+                if verbose:
+                    print("[Writer] --- Compile recovery %d / %d ---" % (cr + 1, recovery_cap))
+                paper_tex = self.revise_paper_for_compilation_only(
+                    paper_tex,
+                    last_compile_err,
+                    visualization_bundle=visualization_bundle,
+                    work_dir=work_dir,
+                    verbose=verbose,
+                )
+                paper_tex = strip_latex_fences(paper_tex)
+                tex_path.write_text(paper_tex, encoding="utf-8")
+                compile_ok, pdf_path, compile_err = compile_tex_to_pdf(
+                    tex_path, work_dir=work_dir
+                )
+                last_compile_ok = compile_ok
+                last_pdf_path = pdf_path
+                last_compile_err = compile_err or ""
+                if compile_ok:
+                    review_info["compile_recovery"]["succeeded"] = True
+                    if verbose:
+                        print(
+                            "[Writer] Compile recovery succeeded -> %s" % (pdf_path or "")
+                        )
+                    return paper_tex, pdf_path, review_info
+            review_info["compile_recovery"]["succeeded"] = False
+            if verbose:
+                print("[Writer] Compile recovery exhausted; PDF may be missing.")
+
+        pdf_path = last_pdf_path
+        if pdf_path is None or not Path(pdf_path).exists():
+            fallback = out_dir / "paper_draft.pdf"
+            pdf_path = fallback if fallback.is_file() else None
         return paper_tex, pdf_path, review_info

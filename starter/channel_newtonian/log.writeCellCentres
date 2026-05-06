@@ -1,0 +1,37 @@
+/*---------------------------------------------------------------------------*\
+  =========                 |
+  \\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox
+   \\    /   O peration     | Website:  https://openfoam.org
+    \\  /    A nd           | Version:  10
+     \\/     M anipulation  |
+\*---------------------------------------------------------------------------*/
+Build  : 10-c4cf895ad8fa
+Exec   : postProcess -case /data/runs/siskoPipeBenchmark/cases/channel_newtonian -func writeCellCentres -latestTime
+Date   : Apr 07 2026
+Time   : 13:45:41
+Host   : "rabi-Z590-AORUS-ELITE-AX"
+PID    : 4129385
+I/O    : uncollated
+Case   : /data/runs/siskoPipeBenchmark/cases/channel_newtonian
+nProcs : 1
+sigFpe : Enabling floating point exception trapping (FOAM_SIGFPE).
+fileModificationChecking : Monitoring run-time modified files using timeStampMaster (fileModificationSkew 10)
+allowSystemOperations : Allowing user-supplied system call operations
+
+// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
+Create time
+
+Create mesh for time = 50000
+
+Time = 50000s
+
+Reading fields:
+
+Executing functionObjects
+    Writing cell-centre field C to 50000
+    Writing the x component field of the cell-centres Cx to 50000
+    Writing the y component field of the cell-centres Cy to 50000
+    Writing the z component field of the cell-centres Cz to 50000
+
+End
+

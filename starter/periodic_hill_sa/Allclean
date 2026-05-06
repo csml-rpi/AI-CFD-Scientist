@@ -1,0 +1,17 @@
+#!/bin/bash
+cd "${0%/*}" || exit 1
+
+shopt -s nullglob
+
+rm -rf processor*
+rm -rf constant/polyMesh
+rm -rf postProcessing
+rm -f log.*
+rm -f slurm-*.out slurm-*.err
+rm -f ./*.foam ./*.OpenFOAM
+
+for d in [1-9]* 0.[0-9]*; do
+    [ -d "$d" ] && rm -rf "$d"
+done
+
+exit 0

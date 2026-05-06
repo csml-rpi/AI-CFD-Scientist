@@ -66,6 +66,41 @@ def _images_to_blocks(image_paths: List[Path], max_images: int = 16) -> List[Dic
     return blocks
 
 
+_PAPER_PYVISTA_ONLY_SYSTEM = (
+    "You write Python scripts for CFD **paper figures** using **PyVista only** for all raster (PNG) output.\n"
+    "Requirements:\n"
+    "- Load OpenFOAM data with PyVista from foam_output_dir using the given marker .foam file.\n"
+    "- Use off_screen=True plotters only. Save PNGs **only** via PyVista (e.g. plotter.screenshot, plotter.export_gltf is NOT for PNG—use screenshot).\n"
+    "- **Do NOT use matplotlib.pyplot.savefig** or any matplotlib-based figure export. Matplotlib may be imported only for numpy-style helpers if needed, but every PNG must come from a PyVista Plotter screenshot.\n"
+    "- For 1D profiles (e.g. U vs y/H), use PyVista Chart2D, or plot polylines in a 2D Plotter view, then screenshot.\n"
+    "- **Slim/long channels (high aspect ratio):** prefer **horizontal** layout: set window_size so the **longer** domain direction is the **wider** pixel dimension (e.g. streamwise horizontal). Use parallel_projection, zoom, and bounds so the channel is not a thin line.\n"
+    "- **nuEff / effective viscosity:** only plot if the field exists in cell_data or point_data (e.g. nuEff, strainRateViscosityModel:nu). If absent, **do not** fabricate a figure—skip that output or plot another requested quantity.\n"
+    "- Colorbars and legends must not overlap streamlines, contours, or velocity data; use scalar_bar_args (horizontal bar if needed), margins, larger window.\n"
+    "- Typography: large fonts (tick labels ≥18 pt, titles ≥20 pt) via PyVista theme or text properties.\n"
+    "- Output ONLY raw Python. No markdown fences. First line must be import.\n"
+)
+
+_PAPER_PYVISTA_ONLY_USER_EXTRA = (
+    "PAPER MODE: PyVista-only PNG output (no matplotlib savefig). Horizontal layout for long thin channels. "
+    "Do not save nuEff/viscosity figures unless that array exists on the mesh.\n\n"
+)
+
+_REFERENCE_DATA_RULE = (
+    "MANDATORY REFERENCE DATA RULE:\n"
+    "Any plot that shows a simulation quantity (wall coefficient, force, profile, scalar field sample, "
+    "error metric, or any QoI) MUST include the corresponding reference/DNS/experimental data on the "
+    "same axes if reference data is available in the context. A comparison plot without the ground-truth "
+    "curve is incomplete. Label reference curves clearly (e.g. 'DNS', 'Experiment', 'Reference'). "
+    "If reference data is provided as a CSV or table, load and overlay it on the same plot.\n"
+    "SIGN AND NORMALIZATION CHECK:\n"
+    "Before plotting any wall quantity extracted from OpenFOAM (e.g. wallShearStress, heatFlux), "
+    "check the sign convention. OpenFOAM reports quantities acting ON THE FLUID; if the reference "
+    "uses the opposite convention, negate the simulation values. "
+    "Normalization must use the authoritative reference scale from the case parameters "
+    "(bulk velocity, free-stream velocity, diameter, etc.) — never use 1.0 as a default.\n"
+)
+
+
 def viz_creator(
     model: str,
     foam_output_dir: Path,
@@ -74,6 +109,8 @@ def viz_creator(
     user_requirement: str,
     reference_viz_script: Optional[str] = None,
     max_retries: int = VIZ_MAX_RETRIES,
+    paper_pyvista_only: bool = False,
+    strict_quality: bool = True,
 ) -> Dict[str, Any]:
     """
     Central visualization creator.
@@ -122,15 +159,21 @@ def viz_creator(
 
     llm = create_langchain_llm(model=model, temperature=0.1)
 
-    script_system = (
+    script_system = (_PAPER_PYVISTA_ONLY_SYSTEM + "\n\n" + _REFERENCE_DATA_RULE) if paper_pyvista_only else (
         "You write PyVista+matplotlib Python scripts to visualize OpenFOAM cases.\n"
+        + _REFERENCE_DATA_RULE + "\n"
         "Requirements (CFD paper-quality figures only):\n"
         "- Load the case using PyVista from the given foam_output_dir.\n"
         "- The marker .foam file to load is always the given marker_name.\n"
         "- Use off_screen=True plotters only (no interactive windows).\n"
         "- Save all figures as PNG files into viz_dir.\n"
-        "- Use PyVista for all field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.); do NOT use matplotlib to draw 2D contour/filled-field plots.\n"
-        "- Matplotlib may be used only for 1D line plots (e.g. profiles, time histories) where data are first sampled/extracted from PyVista.\n"
+        "- Use PyVista for field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.).\n"
+        "- **Elongated 2D domains (channels, long ducts, periodic boxes with Lx >> Ly or Ly >> Lx):** a naive PyVista top/side view in a wide window makes the domain look like a **thin line**—unacceptable for papers. "
+        "You MUST fix this by at least one of: (1) set `window_size=(w,h)` so **w:h is proportional to the in-plane extents** (e.g. dx:dy) so both dimensions occupy a substantial fraction of the frame; "
+        "(2) use `parallel_projection=True` and adjust camera / `reset_camera` / zoom so bounds fill the view without crushing the short direction; "
+        "(3) add a **second** figure that zooms a short streamwise window so wall-to-wall structure is obvious; "
+        "(4) if PyVista still cannot show both extents clearly, use **matplotlib** `tricontourf` / `pcolormesh` on the 2D slice with `extent=[xmin,xmax,ymin,ymax]` and a **figure size whose aspect ratio matches the domain** (or `ax.set_box_aspect` / constrained layout) so the channel looks like a channel, not a line.\n"
+        "- Matplotlib is required for 1D line plots (profiles, time histories). It is **also allowed** for 2D filled contours when needed to fix extreme aspect ratio as above.\n"
         "- All figures must be readable in a CFD paper: avoid sparse dot-only plots; use filled contours, meaningful colorbars, clear legends, and informative layouts so readers can extract physical insight.\n"
         "- Camera/zoom rules: if the requested visualization targets a localized flow feature "
         "(recirculation bubble, reattachment point/length, shear layer, step lip/corner, inlet jet, "
@@ -138,9 +181,14 @@ def viz_creator(
         "around that feature so it occupies a substantial part of the frame and is legible when printed. "
         "Do NOT rely only on far-out views where the feature becomes tiny/unreadable. "
         "If full-domain context helps, include a second full/wider view as well.\n"
-        "- Place colorbars/legends so they do NOT overlap the main plotted contour/streamline/feature region. "
-        "Use layout/position controls and adequate margins to keep plotted data clearly visible.\n"
-        "- Use a minimum font size of 18 for all titles, axis labels, tick labels, legends, and colorbar labels so they are legible when embedded in a paper.\n"
+        "- Colorbars and legends (publication layout): they must NEVER overlap contours, streamlines, mesh, or other plotted data. "
+        "Reserve margin space (e.g. adjust camera/viewport, use plotter.subplot, or shrink the rendered domain area). "
+        "For PyVista, use scalar_bar_args to position/size the bar (e.g. position_x, position_y, width, height) or place it in empty space; "
+        "if a vertical bar would cover data, use a horizontal colorbar (vertical=False in scalar_bar_args where supported) or move it below/above the scene. "
+        "For matplotlib line plots, use tight_layout with rect=[0,0,0.85,1] or make room for colorbar(orientation='horizontal', pad=...), and keep legend outside axes (bbox_to_anchor) when needed.\n"
+        "- Typography: use large, paper-ready fonts — at least 18 pt for tick labels and colorbar tick labels, "
+        "and at least 20–22 pt for titles, axis labels, and colorbar titles (PyVista: title_font_size / label_font_size in scalar_bar_args; matplotlib: rcParams['font.size'] and axis label sizes). "
+        "Figures are often scaled down in PDFs; err on the side of larger text.\n"
         "- Output ONLY raw Python code. Do NOT wrap in markdown code fences (no ``` or ```python).\n"
         "- Do NOT start with the word 'python' or any language tag. The first line must be an import statement.\n"
     )
@@ -165,34 +213,89 @@ def viz_creator(
         "The first line must be 'import ...' or similar, never the word 'python'. The script should:\n"
         "- import pyvista as pv (and matplotlib if needed for line plots)\n"
         "- read the case from foam_output_dir/marker_name\n"
-        "- generate high-quality CFD paper-style visualizations: PyVista filled contour/colormap plots and streamlines for field data, plus line plots (via matplotlib) for extracted profiles or time histories as needed\n"
-        "- avoid sparse dot-only plots; ensure every figure is informative and readable with font sizes >= 18 for titles, labels, ticks, legends, and colorbars\n"
+        "- generate high-quality CFD paper-style visualizations: PyVista contours/streamlines/mesh, plus matplotlib line plots; for long thin 2D domains, match window/figure aspect to domain so the geometry is visible\n"
+        "- avoid sparse dot-only plots; ensure every figure is informative and readable with font sizes >= 18 (ticks/legend/colorbar ticks) and >= 20 for titles and axis/colorbar titles\n"
         "- choose camera positions and zoom/cropping so that the requested feature(s) are resolved and readable; "
         "include zoomed-in frames for localized features (recirculation/reattachment/shear layer/step lip/walls) "
         "and optionally include a wider full-domain context view if it helps interpretation\n"
-        "- make sure colorbars/legends do not overlap important contour/streamline regions; reposition them when needed\n"
+        "- colorbars and legends must stay clear of the data region: use scalar_bar_args (position, size, vertical=False for horizontal bar if side space is tight), extra margins, or subplot layout; never let the bar cover contours\n"
         "- save PNG files into viz_dir\n"
         "- exit with code 0 on success and non-zero on fatal error.\n"
     )
 
-    viz_check_system = (
+    script_user_tpl_paper = (
+        _PAPER_PYVISTA_ONLY_USER_EXTRA
+        + "User requirement for this experiment:\n"
+        "{user_requirement}\n\n"
+        "What to visualize:\n"
+        "{what_to_visualize}\n\n"
+        "{reference_block}"
+        "foam_output_dir (input data):\n"
+        "{foam_output_dir}\n\n"
+        "viz_dir (where PNGs must be saved):\n"
+        "{viz_dir}\n\n"
+        "marker_name (.foam file inside foam_output_dir):\n"
+        "{marker_name}\n\n"
+        "Previous feedback / error (if any):\n"
+        "{previous_error}\n\n"
+        "Previous viz script that failed or was rejected (if any):\n"
+        "{previous_script}\n\n"
+        "Write ONLY a complete Python script. Output raw code only—no markdown fences.\n"
+        "The first line must be 'import ...'. Requirements:\n"
+        "- import pyvista as pv; use OpenFOAMReader on foam_output_dir/marker_name; latest time value\n"
+        "- ALL PNGs via PyVista plotter.screenshot only (no matplotlib savefig)\n"
+        "- Long thin 2D channel: use horizontal layout (window_size wider along streamwise)\n"
+        "- Only plot nuEff/effective viscosity if the field exists on the dataset\n"
+        "- Colorbar/legend must not overlap data; large fonts\n"
+        "- save PNG files into viz_dir; exit 0 on success\n"
+    )
+
+    active_user_tpl = script_user_tpl_paper if paper_pyvista_only else script_user_tpl
+
+    _viz_check_system_strict = (
         "You are a visualization output checker (NOT a physics/simulation judge). Your ONLY job is to decide "
         "whether the generated images show the REQUESTED types of data (contours, profiles, plots, etc.) "
-        "and are non-empty and readable.\n"
+        "and are non-empty and readable for a journal-style figure (these images may be embedded in a paper).\n"
         "Check that contour/field figures are framed and zoomed appropriately for a CFD paper: "
         "the requested feature(s) must be readable when printed. "
         "If the request is about localized features (recirculation/reattachment/shear layer/step lip/walls/Cp/Cf/y+), "
         "accept zoomed-in feature framing even if the full computational domain is not visible. "
         "Reject if the only views are extremely zoomed-out such that the feature is too small to inspect.\n"
+        "**2D domain / geometry legibility:** REJECT full-domain (or primary) 2D contour/surface plots where the flow domain appears as a **negligible thin strip or line** (one in-plane dimension visually collapsed), so a reader cannot recognize the geometry (e.g. channel height vs length). "
+        "This is a common PyVista failure for high-aspect-ratio meshes—not acceptable for publication even if a colormap is present. "
+        "Accept only if both in-plane directions are visibly resolved OR a companion zoom clearly shows wall-bounded structure.\n"
+        "Publication layout (use your vision): REJECT if a colorbar, scalar bar, or legend overlaps or obscures "
+        "meaningful contour, streamline, mesh, or plot data (common PyVista issue). REJECT if axis labels, tick labels, "
+        "titles, legend text, or colorbar text are clearly too small to read when the figure is viewed at moderate zoom "
+        "(typical manuscript single-column width). Accept only when annotations are legible and the data region is unobstructed; "
+        "suggest in 'reason' that the next attempt use a horizontal colorbar, different bar position, larger fonts, or more margin if you reject for these reasons.\n"
         "REJECT when: (1) images are blank/empty or show no data, (2) images are broken or unreadable, "
         "(3) the requested visualization types are completely missing (e.g. contours requested but no contour "
-        "figures at all), or (4) the camera/zoom makes the domain or key features too small to inspect in a paper figure.\n"
+        "figures at all), (4) the camera/zoom makes the domain or key features too small to inspect in a paper figure, "
+        "(5) colorbar/legend overlaps plotted data, (6) fonts are too small for publication, or (7) 2D domain is visually degenerate (thin-line full-domain view).\n"
         "Do NOT reject based on: whether the simulation physics looks wrong, whether the flow field is "
-        "physically plausible, axis orientation, numerical noise, failed simulation, or plug flow. Judging "
+        "physically plausible, numerical noise, failed simulation, or plug flow. Judging "
         "simulation correctness is the interpreter's job later. If the figures show the requested data "
-        "(even if the underlying simulation seems wrong), accept them.\n"
+        "(even if the underlying simulation seems wrong), accept them—unless they fail the layout, legibility, or **geometry/aspect** checks above.\n"
         "Return ONLY JSON: {\"viz_acceptable\": bool, \"reason\": \"string\"}."
     )
+
+    # Relaxed quality check for interpret stage — only reject on hard failures (blank/missing/broken).
+    # Cosmetic issues (colorbar overlap, font size, aspect ratio) are acceptable for physics assessment.
+    _viz_check_system_relaxed = (
+        "You are a visualization output checker (NOT a physics/simulation judge). Your ONLY job is to decide "
+        "whether the generated images contain actual readable data for the requested visualization types.\n"
+        "REJECT ONLY when: (1) images are completely blank or empty with no data, (2) images are broken/corrupted/unreadable, "
+        "(3) the requested visualization types are entirely absent (e.g. contours requested but no contour figures at all), "
+        "(4) the domain or key features are so small they are completely invisible (e.g. a single pixel).\n"
+        "ACCEPT despite: colorbar or legend overlapping data, small fonts, axis crowding, imperfect aspect ratio, "
+        "thin-strip 2D domain views, cosmetic layout issues, or physically wrong-looking results. "
+        "These images are for physics interpretation only, not publication. Minor cosmetic issues do not matter here.\n"
+        "Do NOT reject because physics looks wrong — that is the interpreter's job.\n"
+        "Return ONLY JSON: {\"viz_acceptable\": bool, \"reason\": \"string\"}."
+    )
+
+    viz_check_system = _viz_check_system_strict if strict_quality else _viz_check_system_relaxed
 
     viz_check_user_tpl = (
         "User requirement:\n"
@@ -201,13 +304,15 @@ def viz_creator(
         "{what_to_visualize}\n\n"
         "Previous feedback / error (if any):\n"
         "{previous_error}\n\n"
-        "You will see the generated images below. Check ONLY: "
-        "(1) Are the images non-empty and readable? "
-        "(2) Do they contain the requested types of plots (e.g. contours, profiles) with actual data drawn? "
-        "(3) If the request targets localized features, is there at least one zoomed-in framing where that feature is inspectable in a paper figure? "
-        "If yes, set viz_acceptable=true. Do NOT reject because the physics or simulation results look wrong "
-        "or unphysical—that is for the interpreter to judge. Reject only if figures are blank, empty, "
-        "missing the requested plot types entirely, or broken.\n"
+        "You will see the generated images below. Check: "
+        "(1) Non-empty and readable? "
+        "(2) Requested plot types present with actual data? "
+        "(3) If localized features were requested, is there a zoomed-in view where they are inspectable? "
+        "(4) Do colorbars/legends avoid overlapping the plotted flow/domain (reject if they cover contours/mesh/curves)? "
+        "(5) Are fonts large enough for a paper figure (title, ticks, colorbar labels legible)? "
+        "(6) For 2D channel/duct-style plots: can you see **both** wall-normal and streamwise extent (not a single vertical/horizontal sliver)? "
+        "If (1)-(6) pass, set viz_acceptable=true. Do NOT reject because physics looks wrong—that is for the interpreter. "
+        "Reject for bad layout (overlap), illegible typography, or degenerate domain aspect even when a colormap exists.\n"
         "Return ONLY JSON with keys viz_acceptable (bool) and reason (string)."
     )
 
@@ -238,7 +343,7 @@ def viz_creator(
 
     for attempt in range(1, max_retries + 1):
         # Ask LLM for script
-        user_prompt = script_user_tpl.format(
+        user_prompt = active_user_tpl.format(
             user_requirement=user_requirement,
             what_to_visualize=what_to_visualize,
             reference_block=reference_block,
@@ -326,6 +431,20 @@ def viz_creator(
         _log(f"attempt {attempt}: viz rejected - {reason}")
         last_error = f"Viz unacceptable: {reason}"
         last_script = script_text
+
+        # Final-attempt fallback: if the script ran and produced images, keep them
+        # rather than discarding. The reviewer has been observed to hallucinate
+        # missing/uniform figures on legitimately usable output; losing the whole
+        # case over that wastes the simulation.
+        if attempt >= max_retries:
+            _log(
+                f"attempt {attempt}: max retries reached — accepting {len(pngs)} images "
+                f"from final attempt despite reviewer rejection"
+            )
+            images = pngs
+            last_error = f"Viz accepted on final attempt with reviewer rejection: {reason}"
+            break
+
         for p in pngs:
             try:
                 p.unlink()

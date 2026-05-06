@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from langchain_core.callbacks import BaseCallbackHandler
+import os
+from cfd_langgraph.llm.token_usage_logger import append_usage_call
 
 
 @dataclass
@@ -47,6 +49,19 @@ class TokenStatsCallbackHandler(BaseCallbackHandler):
         try:
             _GLOBAL_STATS.prompt_tokens += int(prompt or 0)
             _GLOBAL_STATS.completion_tokens += int(completion or 0)
+            provider = (
+                os.getenv("CFD_SCIENTIST_LLM_PROVIDER")
+                or os.getenv("CFD_SCIEINTIST_LLM_PROVIDER")
+                or ""
+            )
+            model = str(llm_output.get("model_name") or llm_output.get("model") or "")
+            append_usage_call(
+                provider=provider,
+                model=model,
+                input_tokens=int(prompt or 0),
+                output_tokens=int(completion or 0),
+                token_source="provider_usage",
+            )
         except Exception:
             # Swallow any casting issues; stats are best-effort only.
             return

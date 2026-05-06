@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Dict, Any
 
 
-DEFAULT_SUBPROCESS_TIMEOUT = 7200  # 2 hours
+DEFAULT_SUBPROCESS_TIMEOUT = int(
+    os.environ.get("CFD_FOAM_RUN_TIMEOUT_SECONDS", str(6 * 3600))
+)  # default 6 hours for long CFD cases
 DEFAULT_STD_TAIL_CHARS = 1000  # keep only tail for JSON payload
 
 
@@ -54,11 +56,11 @@ class FoamAgentRunner:
         ).strip()
 
         if cfd_provider:
-            # Foam-Agent allowed values include: openai, openai-codex, ollama, bedrock, anthropic.
+            # Foam-Agent allowed values include: openai, openai-codex, claude-code, ollama, bedrock, anthropic.
             foam_provider = cfd_provider
             if foam_provider == "gemini":
                 foam_provider = "openai"
-            if foam_provider in {"openai", "openai-codex", "ollama", "bedrock", "anthropic"}:
+            if foam_provider in {"openai", "openai-codex", "claude-code", "ollama", "bedrock", "anthropic"}:
                 env["FOAMAGENT_MODEL_PROVIDER"] = foam_provider
             # else: leave Foam-Agent default as-is.
 

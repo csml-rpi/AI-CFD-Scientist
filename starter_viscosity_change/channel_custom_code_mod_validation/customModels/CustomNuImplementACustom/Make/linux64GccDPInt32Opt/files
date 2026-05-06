@@ -1,0 +1,3 @@
+SOURCE += CustomNuImplementACustom.C
+
+LIB = ./platforms/$(WM_OPTIONS)/lib/libCustomNuImplementACustom

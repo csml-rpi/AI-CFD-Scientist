@@ -15,9 +15,11 @@ sent directly; only a short synthesized text snippet is included.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import random
 import subprocess
+from io import BytesIO
 import sys
 import time
 from pathlib import Path
@@ -64,6 +66,17 @@ def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
 class ResultsInterpreterAgent:
     """Max distinct visualization types to suggest per experiment (tweak as needed)."""
     MAX_EXP_VIZ = 10
+    # Bedrock Converse rejects images when max(width, height) > 8000; stay under with margin.
+    # Cap longest image side before base64 encoding. Vision models accept
+    # up to 1568-2048 px without quality loss for plot/diagnostic figures
+    # (matplotlib output, paraview snapshots, etc.). Anything larger inflates
+    # the request payload and increases per-call latency without giving the
+    # model more useful information. 1280 is a safe sweet-spot.
+    _VISION_IMAGE_MAX_SIDE = 1280
+    # Per-attempt invoke timeout (seconds). If the provider stream stalls or
+    # the model takes longer than this, we cancel and retry from the top
+    # rather than hard-failing. Generic across providers.
+    _VISION_INVOKE_TIMEOUT_S = 600
 
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
@@ -219,22 +232,59 @@ class ResultsInterpreterAgent:
 
     @staticmethod
     def _image_path_to_data_url(image_path: Path) -> Optional[str]:
-        """Encode one image file as a data URL (base64), with MIME type from extension."""
+        """Encode one image file as a data URL (base64), with MIME type from extension.
+
+        Oversized PNG/JPEG/GIF/WebP are downscaled so vision providers (e.g. Bedrock)
+        do not fail with per-dimension limits.
+        """
         if not image_path.exists() or not image_path.is_file():
             return None
-        try:
-            b = image_path.read_bytes()
-            b64 = base64.b64encode(b).decode("utf-8")
-            ext = image_path.suffix.lower()
-            if ext in (".jpg", ".jpeg"):
-                return f"data:image/jpeg;base64,{b64}"
-            if ext == ".png":
+        ext = image_path.suffix.lower()
+        max_side = ResultsInterpreterAgent._VISION_IMAGE_MAX_SIDE
+
+        def _raw_bytes_data_url() -> Optional[str]:
+            try:
+                b = image_path.read_bytes()
+                b64 = base64.b64encode(b).decode("utf-8")
+                if ext in (".jpg", ".jpeg"):
+                    return f"data:image/jpeg;base64,{b64}"
+                if ext == ".png":
+                    return f"data:image/png;base64,{b64}"
+                if ext == ".gif":
+                    return f"data:image/gif;base64,{b64}"
                 return f"data:image/png;base64,{b64}"
-            if ext == ".gif":
-                return f"data:image/gif;base64,{b64}"
-            return f"data:image/png;base64,{b64}"
+            except Exception:
+                return None
+
+        if ext not in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
+            return _raw_bytes_data_url()
+
+        try:
+            from PIL import Image
+        except ImportError:
+            return _raw_bytes_data_url()
+
+        try:
+            with Image.open(image_path) as im:
+                im.load()
+                w, h = im.size
+                if max(w, h) > max_side:
+                    scale = max_side / float(max(w, h))
+                    w2 = max(1, int(round(w * scale)))
+                    h2 = max(1, int(round(h * scale)))
+                    im = im.resize((w2, h2), Image.Resampling.LANCZOS)
+                buf = BytesIO()
+                if ext in (".jpg", ".jpeg"):
+                    im.convert("RGB").save(buf, format="JPEG", quality=88)
+                    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                    return f"data:image/jpeg;base64,{b64}"
+                if im.mode not in ("RGB", "L"):
+                    im = im.convert("RGB")
+                im.save(buf, format="PNG", optimize=True)
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return f"data:image/png;base64,{b64}"
         except Exception:
-            return None
+            return _raw_bytes_data_url()
 
     @staticmethod
     def _image_paths_to_content(image_paths: List[Path], max_images: int = 20) -> List[Dict[str, Any]]:
@@ -264,9 +314,32 @@ class ResultsInterpreterAgent:
 
         messages = [SystemMessage(content=system_prompt), HumanMessage(content=content)]
         last_error: Optional[Exception] = None
+        timeout_s = float(self._VISION_INVOKE_TIMEOUT_S)
         for attempt in range(max_retries + 1):
             try:
-                out = self.llm.invoke(messages)
+                # Run the invoke in a worker thread so we can abort it if the
+                # provider stream stalls. We do NOT hard-fail on timeout —
+                # the call is retried from the top up to `max_retries` times.
+                # The orphaned worker thread is left to die naturally; on
+                # provider stall it's blocked on a network read that will
+                # eventually error or be GC'd when the process exits.
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    fut = ex.submit(self.llm.invoke, messages)
+                    try:
+                        out = fut.result(timeout=timeout_s)
+                    except concurrent.futures.TimeoutError as te:
+                        # Don't wait for the worker on shutdown — let the
+                        # context manager release without blocking.
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        last_error = te
+                        if attempt >= max_retries:
+                            raise TimeoutError(
+                                f"vision LLM invoke exceeded {timeout_s:.0f}s on every attempt "
+                                f"({max_retries + 1} tries). Last error: stream stall."
+                            ) from te
+                        delay = min(30.0, 2.0 * (attempt + 1)) + random.uniform(0, 0.5)
+                        time.sleep(delay)
+                        continue
                 return getattr(out, "content", str(out)) if out else ""
             except Exception as e:
                 last_error = e
@@ -345,6 +418,8 @@ class ResultsInterpreterAgent:
                 "Focus on scientifically useful plots that help assess whether the simulation "
                 "meets the requirement (e.g., mesh outline, key scalar/vector fields at important times, "
                 "pressure or velocity contours, centerline/line profiles, etc.). "
+                "Figures should be publication-ready: mention that outputs must keep colorbars/legends off the data "
+                "(horizontal colorbar or extra margin if needed) and use large, readable labels for paper embedding. "
                 f"CRITICAL: suggest at most {max_viz} distinct visualization types per experiment; "
                 "this is a hard upper limit and you must NOT exceed it. "
                 "Do NOT write code. Return only a short paragraph or a few sentences describing "
@@ -488,6 +563,7 @@ class ResultsInterpreterAgent:
             user_requirement=user_req,
             reference_viz_script=None,
             max_retries=VIZ_MAX_RETRIES,
+            strict_quality=False,
         )
 
         image_paths: List[Path] = [Path(p) for p in viz_result.get("images", [])]
@@ -518,11 +594,33 @@ class ResultsInterpreterAgent:
 
         system_interp = self.prompts.get(
             "interpretation_system_prompt",
-            "You are a CFD results interpreter. Given the user requirement and visualization images from a simulation, decide: (1) Did the simulation run successfully and satisfy the user requirement? (2) What issues exist, if any? (3) Should the run be redone (rerun_required)? Scope is strictly this single experiment; do not infer results about other experiments unless explicitly visible in the provided images, and do not assume fabricated data unless explicitly shown. Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), issues (string or list), rerun_required (bool), summary (string), reasons (string).",
+            "You are a CFD results interpreter. Given the user requirement and visualization images "
+            "from a simulation, decide: "
+            "(1) Did the simulation run successfully? "
+            "(2) Does the simulation MATCH the experiment specification? If the requirement specifies "
+            "particular model settings, coefficients, boundary conditions, or physics parameters "
+            "(often listed as 'Target parameters'), verify the results are consistent with those "
+            "specifications. Results that look generic or default when specific non-default behavior "
+            "was requested indicate a configuration mismatch. "
+            "(3) Are the flow results physically plausible and consistent with the specified parameters? "
+            "(4) What issues exist, if any? "
+            "(5) Should the run be redone (rerun_required)? Set rerun_required=true if EITHER the physics "
+            "are wrong OR the case configuration does not match the experiment specification. "
+            "Scope is strictly this single experiment. "
+            "Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), "
+            "issues (string or list), rerun_required (bool), summary (string), reasons (string).",
         )
         user_interp = self.prompts.get(
             "interpretation_user_prompt",
-            "User requirement:\n{user_requirement}\n\nBelow are visualizations from the run. Evaluate only this current experiment from the provided images. Do not use or assume other experiment outputs unless they are explicitly present in these images. Did the simulation satisfy the requirement? Any issues? check if flow field develops accuratley, expected flow features are well visible. Set rerun_required true if results are not acceptable. Return JSON only.",
+            "User requirement:\n{user_requirement}\n\n"
+            "Below are visualizations from the run. Evaluate only this current experiment from the provided images. "
+            "Did the simulation satisfy the requirement? Any issues? "
+            "Check if flow field develops accurately and expected flow features are visible. "
+            "CRITICAL: Also verify that the experiment setup matches the requirement. If the requirement "
+            "specifies particular model parameters or settings, but the results look inconsistent with those "
+            "(e.g., default/generic behavior when non-default was requested), flag as rerun_required=true. "
+            "Set rerun_required true if results are not acceptable OR the configuration appears wrong. "
+            "Return JSON only.",
         )
         if verbose:
             print("[Interpreter] Invoking vision LLM for interpretation...", flush=True)

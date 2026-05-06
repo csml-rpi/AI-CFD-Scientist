@@ -1,0 +1,11 @@
+{
+  "case_name": "channel_newtonian",
+  "case_type": "channel",
+  "model": "Newtonian",
+  "reference_label": "Newtonian ν=0.01, periodic horizontal channel (L=2 m, H=0.1 m)",
+  "channel_height": 0.1,
+  "channel_length": 2.0,
+  "U_bar": 1.0,
+  "nu_constant": 0.01,
+  "notes": "Streamwise +x (long); walls at y=0 and y=H; cyclic inlet/outlet on x-faces; 2D empty in z."
+}

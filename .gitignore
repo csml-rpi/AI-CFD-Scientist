@@ -23,7 +23,16 @@ dist/
 *.egg-info/
 *.egg
 
-# Local data / runs (optional – uncomment if you don’t want to track)
-# data/
-# runs/
+# Local data / runs
+runs/
+data/
+
+# Large / vendored trees (keep repo lean)
 Foam-Agent/
+
+# Duplicates kept explicit for tooling
+.venv/
+__pycache__/
+*.pyc
+*.so
+*.o
