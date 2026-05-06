@@ -36,3 +36,24 @@ __pycache__/
 *.pyc
 *.so
 *.o
+
+# Starter cases (per-study, large, kept locally)
+/starter/
+/starter_multiphase/
+/starter_turbulence_model_change/
+/starter_viscosity_change/
+
+# One-off testers /                                                                           
+  scratch
+/test_bedrock_model.py
+/test_claude_sdk.py
+/test_hypothesis_from_ideation.py
+/test_ideation_generic.py
+/test_improved_validation.py
+/test_validation_demo.py
+/test_validation.py
+/writer_agent_tester.py
+
+# Reference                   
+  papers
+/viscosity.pdf

@@ -1,6 +1,0 @@
-Take the standard Spalart-Allmaras model and change only the production term.
-Original SA production term:
-Cb1 * Stilda * nu_tilde
-New custom production term:
-pMult * Cb1 * Stilda * nu_tilde, where pMult = clamp(1 + beta*(S/Omega - Rref), pMin, pMax) and S = sqrt(2)*|symm(gradU)| Omega = sqrt(2)*|skew(gradU)|
-In our case the added constants are: beta = 6.0 Rref = 0.82 pMin = 0.05 pMax = 5.0. So the only change from the base SA model is: Cb1 * Stilda * nu_tilde clamp(1 + 6.0*(S/Omega - 0.82), 0.05, 5.0) * Cb1 * Stilda * nu_tildeAll other terms in the SA model remain unchanged.
