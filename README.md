@@ -303,5 +303,13 @@ When you change the OPENFOAM 10 code-mod protocol:
 ---
 
 ## License and citation
+MIT. 
 
-See repository license. If you use this pipeline in research, cite the repo and any Foam-Agent / OpenFOAM references as appropriate. The writer agent adds a mandatory sentence that the draft was generated with an automated CFD Scientist (AI-assisted) pipeline.
+```
+@article{somasekharan2026ai,
+  title={AI CFD Scientist: Toward Open-Ended Computational Fluid Dynamics Discovery with Physics-Aware AI Agents},
+  author={Somasekharan, Nithin and Pathak, Rabi and Dhanakoti, Manushri and Zhang, Tingwen and Yue, Ling and Zhu, Andy and Pan, Shaowu},
+  journal={arXiv preprint arXiv:2605.06607},
+  year={2026}
+}
+```
