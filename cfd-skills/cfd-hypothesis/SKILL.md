@@ -5,7 +5,21 @@ description: Convert literature + topic into a list of testable, FoamAgent-execu
 
 # cfd-hypothesis
 
+## ⚠ HARD STOP — read this before any other step
+
+If `<out-dir>/checkpoints/metric_setup_done.json` does **not** exist, STOP. The orchestrator chain enters this skill only after `cfd-literature` and `cfd-pipeline` (baseline_setup + metric_setup) have completed. Return to `Skill cfd-orchestrator` and start from the first skill — do not author `hypotheses.json` here. Skipping upstream stages is the exact failure mode this gate prevents.
+
 Generate concrete, testable CFD hypotheses from `lit.json` and the topic. Each hypothesis is later expanded by `cfd-requirements` into a FoamAgent user-requirement string.
+
+## Step 0 — Preflight gate (HARD; slice 14)
+
+Before any other work, verify every REQUIRED predecessor checkpoint exists on disk:
+
+```bash
+python scripts/stage_gate_audit.py --out-dir <out-dir> --mode preflight --target-stage hypothesis
+```
+
+If `rc != 0`, STOP. The script lists exactly which upstream skill must run first (typically `cfd-literature` so `lit.json` and `checkpoints/literature_done.json` exist). Do NOT author `hypotheses.json` or write `checkpoints/hypothesis_done.json` with predecessors absent — the agent jumping ahead is the failure mode slice 14 closes.
 
 ## Inputs
 - `out-dir` (required) — must contain `lit.json` and `state.json` with the topic
@@ -229,3 +243,11 @@ python scripts/hypothesis.py \
   --timeline <out-dir>/timeline.json
 ```
 The script implements the same recipe; same artifact contract. Use whichever is more convenient for the calling agent's environment.
+
+## Next
+
+After `<out-dir>/hypotheses.json` and `<out-dir>/checkpoints/hypothesis_done.json` are on disk, your next action is:
+
+`Skill cfd-skills/cfd-requirements`
+
+Do not stop, summarize, or wait — the chain continues automatically.

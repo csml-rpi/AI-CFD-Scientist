@@ -22,6 +22,7 @@ Run it two ways:
 8. **Interpreter** → PyVista figures + vision-LLM call → `decision.json` (PROCEED / REVISE / RERUN).
 9. **Cross-case analysis** → QoI table, trends, correlations, conclusions → `analysis.json`.
 10. **Paper writer** → planner → batch PyVista figures with VLM QA → LaTeX draft → reviewer loop (up to 10 iterations).
+11. **Stage-gate audit** → `scripts/stage_gate_audit.py` verifies every gate; the run is complete only once it writes a signed `audit_passed.json`. See [Verifying a run](#verifying-a-run--the-stage-gate-audit).
 
 For open-ended model discovery, replace steps 3–9 with the `cfd-open-discovery` loop: propose candidate → cfd-code-modify → cfd-experiment → score → repeat until budget.
 
@@ -43,7 +44,11 @@ python scripts/orchestrator_run.py \
   --topic "LES of backward-facing step at Re=5100, compare against Le-Moin DNS" \
   --out-dir runs/bfs_les \
   --provider claude-code --model claude-sonnet-4-6 \
-  --starter-dir starter
+  --starter-dir starter_turbulence_model_change
+# --starter-dir is optional. The bundled starters (each with reference data) are
+# starter_viscosity_change/, starter_turbulence_model_change/,
+# starter_oed_turbulence/, starter_multiphase/. Omit it to let FoamAgent
+# generate the base case from scratch.
 
 # Resume from a specific stage (literature, hypothesis, requirements, code_mod,
 # mesh_gate_resume, baseline_synthesis, experiments, analysis, paper_review,
@@ -65,8 +70,9 @@ Use this when you want one command to do everything, automatic resume on failure
 Invoke individual skills from any LLM agent. Each `cfd-skills/cfd-<stage>/SKILL.md` is self-contained: the expert prompts (HypothesisAgent, IdeationAgent, ResultsInterpreterAgent, WriterAgent, PaperReviewerAgent, RunValidityAgent, MetricProposer, ComparatorAuthor, ComparatorVerifier, MetricSetupAgent, MetricSetupVerifier from `prompts/prompts.yaml`, plus the OPENFOAM 10 LITERATURE CHANGE AGENT v2 protocol) are embedded verbatim. Scripts are an *optional fast-path*; the agent recipe is primary.
 
 ```text
-# Top-level chain
-/cfd-pipeline topic="LES of backward-facing step Re=5100" out-dir=runs/bfs_skill
+# Top-level chain — start at the router; it picks the route and walks the whole
+# chain (literature → … → paper → stage-gate audit) to an audited paper.
+/cfd-orchestrator topic="LES of backward-facing step Re=5100" out-dir=runs/bfs_skill
 
 # Or stage-by-stage
 /cfd-literature   topic="..." out-dir=runs/bfs_skill
@@ -84,7 +90,7 @@ Invoke individual skills from any LLM agent. Each `cfd-skills/cfd-<stage>/SKILL.
 
 # Open-ended model discovery
 /cfd-open-discovery out-dir=runs/oed topic="novel SA mod for periodic hill Re=5600 beating baseline on Cf" \
-  starter-dir=starter/periodic_hill budget=20
+  starter-dir=starter_oed_turbulence budget=20
 ```
 
 Use this when you want manual control, are integrating into another agent framework, or want to run only part of the pipeline ad-hoc. See [`cfd-skills/README.md`](cfd-skills/README.md) for the complete skill catalog and contracts.
@@ -138,7 +144,7 @@ pip install -r requirements.txt
 
 ### Foam-Agent
 
-The Foam-Agent framework is vendored under `Foam-Agent/`. The Python pipeline calls it through `scripts/foam_run.py`; the skill mode calls the same script (this is the one place a script is unavoidable, because Foam-Agent *is* the framework — see `cfd-skills/cfd-experiment/SKILL.md`). For full FoamAgent install/usage, see `Foam-Agent/README.md`.
+The Foam-Agent framework is vendored under `Foam-Agent/`. Mode A calls it through `scripts/foam_run.py`. Mode B drives the same planner → write → Allrun → run → review loop **agent-natively** via `cfd-skills/cfd-foamagent/SKILL.md` (FoamAgent prompts embedded verbatim); its only scripted dependency is FAISS retrieval through `scripts/rag_query.py`. Build the RAG index once with `python Foam-Agent/init_database.py`. For full FoamAgent install/usage, see `Foam-Agent/README.md`.
 
 ### Environment variables
 
@@ -207,15 +213,16 @@ The interpreter / analysis / vision-QA steps need a **vision-capable** model (th
 
 | Path | What's there |
 |---|---|
-| `scripts/` | LangGraph pipeline scripts (`orchestrator_run.py`, `lit.py`, `hypothesis.py`, `requirements.py`, `foam_run.py`, `viz.py`, `interpret.py`, `analyze.py`, `paper_unified.py`, `open_ended_discovery.py`, `oed_extensions.py`, etc.). All Python source for Mode A. |
+| `scripts/` | Per-stage workers + shared tooling — `orchestrator_run.py` (Mode A driver), `lit.py`, `hypothesis.py`, `requirements.py`, `foam_run.py`, `rag_query.py`, `viz.py`, `interpret.py`, `analyze.py`, `paper_unified.py`, `open_ended_discovery.py`, `oed_extensions.py`, … plus the cross-mode **audit tooling**: `stage_gate_audit.py` (per-run gate), `audit_bundle.py` (batch verifier), `sanitize_bundle.py` (release hygiene). Mode B calls the audit tooling + `foam_run.py` / `rag_query.py`; only `orchestrator_run.py` is Mode-A-only. |
 | `src/cfd_langgraph/` | Mode A's Python package: agents, prompts loader, workflow graph. |
-| `cfd-skills/` | Mode B's per-stage skill recipes (ARIS/DS-style; expert prompts embedded). 12 SKILLs. |
+| `cfd-skills/` | Mode B's per-stage skill recipes (ARIS/DS-style; expert prompts embedded). 16 SKILLs — see [`cfd-skills/README.md`](cfd-skills/README.md). |
 | `skills/` | Skill router + FoamAgent runtime contract + thin aliases (`cfd-orchestrator`, `cfd-foamagent-runtime`, `cfd-mesh-independence`, `cfd-research`, `cfd-code-mod`). |
+| `.claude/skills/` | **Local, gitignored** — per-checkout symlinks so Claude Code discovers the skills. Regenerate per `cfd-skills/README.md`; never committed. |
 | `prompts/prompts.yaml` | Authoritative source for all expert prompts. Embedded verbatim in `cfd-skills/`. |
 | `openfoam_literature_change_agent_prompt_v2.txt` | OPENFOAM 10 LITERATURE CHANGE AGENT v2 protocol. Mirrored verbatim inside `cfd-skills/cfd-code-modify/SKILL.md`. |
 | `Foam-Agent/` | Vendored FoamAgent framework (RAG + planner + reviewer for case generation). |
 | `runs/` | Per-study output directories. |
-| `starter/` | Per-flow starter case templates (BFS, periodic hill, channel, ...) with reference DNS data. |
+| `starter_*/` | Per-flow starter case templates with reference DNS/experimental data — `starter_viscosity_change/`, `starter_turbulence_model_change/`, `starter_oed_turbulence/`, `starter_multiphase/`. Read-only inputs. |
 | `AGENTS.md` | Orchestrator-agnostic stage-by-stage pipeline spec. |
 | `CLAUDE.md` | Routing rules for Claude Code / similar agents. |
 | `pyproject.toml`, `requirements.txt`, `setup_env.sh` | Packaging + setup. |
@@ -226,7 +233,8 @@ The interpreter / analysis / vision-QA steps need a **vision-capable** model (th
 
 ```
 runs/<study>/
-├─ state.json                      # current routing, stage, checkpoint
+├─ state.json                      # routing + current_stage + status (reconciled by the audit)
+├─ checkpoints/<stage>_done.json   # per-stage completion markers (the real progress truth)
 ├─ timeline.json                   # append-only event log
 ├─ lit.json                        # cfd-literature
 ├─ hypotheses.json                 # cfd-hypothesis
@@ -241,26 +249,50 @@ runs/<study>/
 ├─ mesh_independence_context.json
 ├─ mesh_gate/<group>/{baseline,refined,refined_v2}/   # per-level cases
 ├─ cases/case_NNN/                 # per-experiment OpenFOAM cases
-│  ├─ run_result.json
+│  ├─ run_result.json              # status (success only with a clean End log, no FATAL)
 │  ├─ decision.json
+│  ├─ runtime_dependencies.json    # declared .so dependencies (code-mod cases)
 │  ├─ figs/*.png                   # diagnostic figures
 │  └─ vision_analysis.json
 ├─ analysis.json                   # cfd-analyze
+├─ cross_experiment_analysis/      # cfd-cross-analyze (aggregate.csv, *.png, interpretation.md)
 ├─ paper_unified_plan.json         # cfd-paper planner
 ├─ paper_figs/*.png                # cfd-paper figures (full mode)
 ├─ paper/main.tex
-├─ paper/references.bib
-├─ paper/paper_draft.pdf           # FINAL PDF
+├─ paper/refs.bib
+├─ paper/main.pdf                  # FINAL PDF
 ├─ review.json                     # cfd-paper reviewer's last verdict
-└─ open_ended_discovery/           # OED only
-   ├─ history.json
-   ├─ best.json
-   ├─ baseline_metric_vector.json
-   ├─ bound_comparators.json
-   ├─ candidates/<id>/case
-   └─ comparators/*.py
-oed_artifact.json                  # post-OED handoff (or regular code_mod)
+├─ open_ended_discovery/           # OED only
+│  ├─ history.json                 # one record per iteration (honest status)
+│  ├─ best.json
+│  ├─ baseline_metric_vector.json
+│  ├─ bound_comparators.json
+│  ├─ candidates/<id>/case
+│  └─ comparators/*.py
+├─ oed_artifact.json               # post-OED handoff (or regular code_mod)
+├─ bridge.json, manifest.json      # OED → analyze/paper bridge (cfd-open-discovery Step 14)
+└─ audit_passed.json               # written ONLY by stage_gate_audit.py on rc=0 — the
+                                   #   authoritative "run complete" signal
 ```
+
+---
+
+## Verifying a run — the stage-gate audit
+
+Completion is **not** "the agent said it finished". A run is complete only when `scripts/stage_gate_audit.py` exits `rc == 0` and has written a signed `<out-dir>/audit_passed.json` (`audit_signature: "stage_gate_audit.py:v1"`). In Mode B the orchestrator skill runs this as its mandatory final loop; in Mode A it is the post-run check.
+
+```bash
+# Audit one run (skill mode runs this automatically as its last step)
+python scripts/stage_gate_audit.py --out-dir runs/<study>
+
+# Verify every task in a batch carries a valid audit record
+python scripts/audit_bundle.py --bundle runs/<batch>
+
+# Before sharing/zipping a batch: portable paths + reproducibility manifest
+python scripts/sanitize_bundle.py --bundle runs/<batch> --apply
+```
+
+The audit hard-fails on a failed `run_result.json` whose rerun budget is not documented as exhausted, a `FOAM FATAL ERROR` in any solver log, incomplete OED iteration bookkeeping, a mesh-gate self-exemption lacking a live-verified DOI citation, and paper-quality gaps (missing governing/closure equations, near-duplicate or filler paragraphs, inconsistent reference values, …). It also reconciles a stale `state.json` against the checkpoints on disk. The full gate list lives in `skills/cfd-orchestrator/SKILL.md` Step 5 and `cfd-skills/cfd-paper-writer/SKILL.md`.
 
 ---
 
@@ -284,6 +316,8 @@ oed_artifact.json                  # post-OED handoff (or regular code_mod)
 - **PDF compilation fails** — `pdflatex` is missing; install `texlive-latex-extra` (Debian/Ubuntu) or `mactex` (macOS).
 - **HTTP 503 in `paper_unified.py` / `batch_paper_viz`** — transient upstream API outage during per-figure VLM QA; resume with `--resume-from paper_review` once the upstream is healthy. No state is lost.
 - **OED post-bridge produces a degenerate 2-case plan** — `oed_artifact.json.provenance == "regular_code_mod"` is being treated as a real OED winner. The gate is documented in `cfd-skills/cfd-open-discovery/SKILL.md` (Step 13); the fix is to honor `provenance != "regular_code_mod" && best_iteration > 0` before firing the bridge.
+- **The audit fails a run I thought was finished** — the stage-gate audit hard-fails a failed `run_result.json` unless its rerun budget is documented as exhausted, a `FOAM FATAL ERROR` in any solver log, a `success` case with no clean `End` line, incomplete OED bookkeeping (H33), or a mesh-gate self-exemption without a verifiable DOI (H31). Read the printed failure list and fix each gap — that is the intended behaviour, not a regression. `audit_passed.json` only appears when every gate passes.
+- **`audit_bundle.py` reports "audit_passed.json absent"** — the task's chain stopped before the final audit. Re-run that task through `Skill cfd-orchestrator` Step 5 (or `scripts/stage_gate_audit.py`) until it reaches `rc=0`.
 
 ---
 

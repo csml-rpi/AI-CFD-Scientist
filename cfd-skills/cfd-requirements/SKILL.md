@@ -5,7 +5,21 @@ description: Convert hypotheses (or a direct simulation request) into FoamAgent-
 
 # cfd-requirements
 
+## ⚠ HARD STOP — read this before any other step
+
+If `<out-dir>/checkpoints/hypothesis_done.json` does **not** exist (and `state.json` does not have a `simulation_request` field for the simulation-only flow), STOP. The orchestrator chain enters this skill only after `cfd-hypothesis` has completed. Return to `Skill cfd-orchestrator` and start from the first skill — do not author `requirements.json` here.
+
 Produce exactly N concrete FoamAgent `user_requirement_text` strings, one per case. Each is a single self-contained English paragraph specifying geometry, solver, BCs, mesh, and run-control — directly executable by `cfd-experiment` / `cfd-foamagent-runtime` without further user input.
+
+## Step 0 — Preflight gate (HARD; slice 14)
+
+Before any other work, run:
+
+```bash
+python scripts/stage_gate_audit.py --out-dir <out-dir> --mode preflight --target-stage requirements
+```
+
+If `rc != 0`, STOP. The script lists missing predecessors — typically `literature_done`, `baseline_setup_done`, `metric_setup_done`, and `hypothesis_done`. Do NOT author `requirements.json` with `hypotheses.json` absent (the simulation-only flow still needs `state.json#simulation_request` to be set, AND `metric_setup_done`/`baseline_setup_done` to be on disk).
 
 ## Inputs
 - `out-dir` (required)
@@ -189,3 +203,14 @@ python scripts/requirements.py \
   --timeline <out-dir>/timeline.json
 ```
 Same artifact contract. Uses the same prompts internally.
+
+## Next
+
+After `<out-dir>/requirements.json` and `<out-dir>/checkpoints/requirements_done.json` are on disk, invoke the next skill. Read `<out-dir>/state.json#mode`:
+
+| `mode` | Next skill |
+|---|---|
+| `code_mod` | `Skill cfd-skills/cfd-code-modify` |
+| `research` | `Skill cfd-skills/cfd-mesh-gate` |
+
+Do not stop, summarize, or wait. The chain continues automatically.

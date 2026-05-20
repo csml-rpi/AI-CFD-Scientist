@@ -66,8 +66,12 @@ Run Mode A for the main pipeline; invoke skills (Mode B) ad-hoc for one-off task
 | [`cfd-open-discovery`](cfd-open-discovery/SKILL.md) | OED loop: propose → run → score → repeat | `MetricProposer.*`, `ComparatorAuthor.*`, `ComparatorVerifier.*`, plus the LLM-judge prompt |
 | [`cfd-viz`](cfd-viz/SKILL.md)                       | PyVista figure generation | `ResultsInterpreterAgent.viz_quality_*`; QA via `vision_*` |
 | [`cfd-interpret`](cfd-interpret/SKILL.md)           | PROCEED/REVISE/RERUN decision per case | `ResultsInterpreterAgent.interpretation_*`, `vision_system_prompt`, `vision_user_prompt` |
-| [`cfd-analyze`](cfd-analyze/SKILL.md)               | Cross-case metrics → `analysis.json` | `ResultsInterpreterAgent.system_prompt`, `user_prompt` (cross-case adapter included) |
+| [`cfd-analyze`](cfd-analyze/SKILL.md)               | Per-case + cross-case TEXT/JSON metrics → `analysis.json` (no figure generation) | `ResultsInterpreterAgent.system_prompt`, `user_prompt` (cross-case adapter included) |
+| [`cfd-cross-analyze`](cfd-cross-analyze/SKILL.md)   | Agent-authored Python scripts that load every PROCEED case, compute aggregated metrics, and generate quantitative cross-case figures (Cf overlays vs reference, RMSE bars, parametric trends, Δ-fields). Vision-LLM interpretation pass over generated plots → `cross_experiment_interpretation.md` for the writer. Mirrors LangGraph `analysis_agent.run_cross_experiment_data_processing`. | Cross-experiment planner, script-writer, and interpretation prompts mirrored verbatim from `src/cfd_langgraph/agents/analysis_agent.py` |
+| [`cfd-foamagent`](cfd-foamagent/SKILL.md)           | Agent-driven FoamAgent loop (planner → write → Allrun → run → review). Replaces `scripts/foam_run.py` for skill-mode case generation. RAG via `scripts/rag_query.py`. (All other scripts under `scripts/` except `scripts/orchestrator_run.py` are also callable from any skill.) | `parse_system_prompt`, `decompose_system_prompt`, `INITIAL_WRITE_SYSTEM_PROMPT`, `EDIT_WRITE_SYSTEM_PROMPT`, `command_system_prompt`, `REVIEWER_SYSTEM_PROMPT`, `planner_system_prompt` (verbatim from `Foam-Agent/src/services/`) |
+| [`cfd-stats`](cfd-stats/SKILL.md)                   | Numerical patterns: D²-law K, Cf, drag, residual plateau, Richardson/GCI, two-extractor agreement. Agent runs 30-line snippets via Bash; no wrapper. | (no LLM prompt — reference patterns only) |
 | [`cfd-paper`](cfd-paper/SKILL.md)                   | Figure + LaTeX + review loop → `paper/main.pdf` | `WriterAgent.system_prompt`, `user_prompt`; `PaperReviewerAgent.compile_fix_*`, `citation_*`, review `system_prompt`, `user_prompt`; `vision_*` |
+| [`cfd-paper-writer`](cfd-paper-writer/SKILL.md)     | Section-by-section academic writing guide + reviewer rubric. **Content skill** — invoked *by* `cfd-paper` Phase D (writer) and Phase F (reviewer), never standalone. | Master-cai writing-skill adaptation; consumed alongside `WriterAgent.*` / `PaperReviewerAgent.*` |
 
 ### Supporting stages (no dedicated skill — invocations live in `cfd-pipeline`)
 
@@ -85,33 +89,66 @@ The Python orchestrator runs five additional thin stages that do not justify a d
 
 ---
 
-## Installation as Claude Code skills
+## Connecting the skills to an agent (Claude Code / Codex / any orchestrator)
 
-Symlink each skill into your project's `.claude/skills/` directory so Claude Code discovers them via the Skill tool:
+The skills are **plain, self-contained Markdown** (`SKILL.md` files) plus a few helper scripts under `scripts/`. There is no runtime, no daemon, no registry. "Connecting" the skills to an agent means just two things:
+
+1. the agent can **read** the `SKILL.md` files (any agent with a file-read tool can); and
+2. the agent **starts at the router** — `skills/cfd-orchestrator/SKILL.md` — and follows each skill's `## Next` block to the next one.
+
+Everything else — artifact contracts, embedded expert prompts, the stage-gate audit — lives inside the files. The same skill set has been driven by Claude (Opus / Sonnet) and GPT-5.x Codex against identical artifact contracts.
+
+### Claude Code
+
+Claude Code discovers skills under `.claude/skills/`. Symlink them once from the repo root:
 
 ```bash
-# from repo root
 mkdir -p .claude/skills
-for s in cfd-skills/*/; do
-  ln -sf "$(pwd)/$s" ".claude/skills/$(basename $s)"
-done
-
-# also expose the router-level skills
-for s in skills/*/; do
-  ln -sf "$(pwd)/$s" ".claude/skills/$(basename $s)"
-done
+ln -sf "$(pwd)/cfd-skills"/*/ .claude/skills/
+ln -sf "$(pwd)/skills"/*/     .claude/skills/
 ```
 
-Or symlink whole directories once:
+Restart Claude Code. Every skill is then invocable as a `/slash` command and via the Skill tool — `/cfd-orchestrator`, `/cfd-pipeline`, `/cfd-mesh-gate`, … `CLAUDE.md` at the repo root carries the routing rules Claude Code loads automatically.
+
+To run a full study: open Claude Code in the repo and invoke `/cfd-orchestrator` with your topic. It picks the route, initialises the run directory, and walks the fixed skill chain to a finished, audited paper.
+
+### Codex CLI (and other `AGENTS.md`-based agents)
+
+Codex CLI has no skill registry — it reads `AGENTS.md` at the repo root automatically. `AGENTS.md` is the orchestrator-agnostic pipeline spec and points at `skills/cfd-orchestrator/SKILL.md`. Codex is therefore "connected" simply by running it inside the repo:
 
 ```bash
-ln -sf "$(pwd)/cfd-skills"/* .claude/skills/
-ln -sf "$(pwd)/skills"/*     .claude/skills/
+cd <repo>     # AGENTS.md is auto-loaded by Codex
+codex         # give it the topic; it routes via AGENTS.md → cfd-orchestrator
 ```
 
-Restart Claude Code; the skills appear under `/cfd-pipeline`, `/cfd-literature`, `/cfd-orchestrator`, etc.
+To make the skill chain explicit, prompt Codex with:
 
-For other agent frameworks (Cursor, Codex CLI), point the framework's skill-discovery path at `cfd-skills/` and `skills/`.
+> Read `skills/cfd-orchestrator/SKILL.md` and follow it end-to-end for this topic: "&lt;topic&gt;".
+
+No symlinks are needed — Codex reaches the skill files with its normal file-read tool.
+
+### Cursor / Windsurf / other IDE agents
+
+Add a one-line project rule (`.cursor/rules/…` or the IDE's equivalent), or paste it into the chat:
+
+> For any CFD-Scientist task, read `skills/cfd-orchestrator/SKILL.md` first and follow its routing.
+
+The agent then reads the `SKILL.md` files directly.
+
+### Any other LLM agent / custom orchestrator
+
+The contract is framework-agnostic:
+
+1. Point the agent at the repo — it needs file read/write and a shell.
+2. Tell it: **"Start at `skills/cfd-orchestrator/SKILL.md`."**
+3. The orchestrator skill picks a route, writes `state.json`, and hands off to the first stage skill. From there each `SKILL.md`'s `## Next` block names the next skill; the agent walks the chain.
+4. Completion is **not** "the agent says done". It is a signed `audit_passed.json`, written only by `scripts/stage_gate_audit.py` on a fully-passing audit (`cfd-orchestrator` Step 5). For a batch of runs, `scripts/audit_bundle.py` verifies every task carries that record.
+
+The skills assume the agent can run Bash, read/write files, and (for figure interpretation) accept images. They assume no particular model.
+
+### Environment (all agents)
+
+Whichever agent you use, activate the environment first (`conda activate cfd-scientist`) and have OpenFOAM 10 on `PATH` for any real CFD run. Skill mode calls `scripts/stage_gate_audit.py`, `scripts/foam_run.py`, `scripts/rag_query.py`, and the batch tools `scripts/audit_bundle.py` / `scripts/sanitize_bundle.py`; the **only** off-limits script is `scripts/orchestrator_run.py` (the LangGraph driver, which bypasses skill chaining).
 
 ---
 

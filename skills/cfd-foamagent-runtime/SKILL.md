@@ -1,13 +1,24 @@
 ---
 name: cfd-foamagent-runtime
-description: Run Foam-Agent workflow as orchestrated skill stages while preserving Foam-Agent RAG and prompt behavior.
+description: LangGraph-mode runtime contract for scripts/foam_run.py — preserves Foam-Agent RAG and prompt behavior. For skill-mode case generation, use cfd-skills/cfd-foamagent/SKILL.md instead (fully self-sufficient, agent-driven, no foam_run.py wrapper).
 allowed-tools: Bash, Read, Write
 ---
 
-# Foam-Agent runtime (skillized)
+# Foam-Agent runtime contract (LangGraph mode)
 
-## Purpose
-Execute one CFD case using Foam-Agent workflow stages, but controlled by the top-level orchestrator skill instead of a separate external orchestration API.
+## Two modes — pick the right one
+
+This skill documents the **LangGraph-mode** contract for `scripts/foam_run.py`. It is what `scripts/orchestrator_run.py` invokes per case requirement. **For skill-mode (agent-driven, no Python wrapper), use `cfd-skills/cfd-foamagent/SKILL.md` instead** — that skill embeds the FoamAgent planner/writer/reviewer prompts verbatim and the agent runtime drives the loop natively via Read/Write/Bash.
+
+| Mode | Driver | Use when |
+|---|---|---|
+| Skill mode | `cfd-skills/cfd-foamagent/SKILL.md` (agent-driven, embedded prompts, RAG via `scripts/rag_query.py`) | Skill-driven workflow (Claude Code / Codex / Cursor); fresh case generation that needs RAG |
+| LangGraph mode | `scripts/foam_run.py` (this contract) | Unattended long runs through `scripts/orchestrator_run.py`; existing Python pipeline |
+
+Both modes use the **same prompts** (verbatim from `Foam-Agent/src/services/`) and produce the **same** `run_result.json`. Skill mode's only Python dependency is FAISS retrieval; LangGraph mode wraps the entire loop in a Python supervisor.
+
+## Purpose (LangGraph mode)
+Execute one CFD case using Foam-Agent workflow stages, controlled by the top-level orchestrator skill instead of a separate external orchestration API.
 
 ## Hard requirements
 - Preserve Foam-Agent workflow order and behavior.

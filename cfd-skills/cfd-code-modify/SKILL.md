@@ -5,12 +5,26 @@ description: Implement a custom OpenFOAM model (viscosity / turbulence / source 
 
 # cfd-code-modify
 
+## ⚠ HARD STOP — read this before any other step
+
+If you are reading this skill and `<out-dir>/checkpoints/requirements_done.json` does **not** exist, STOP. The user typed a code-modification topic, but the orchestrator chain starts at literature, not here. Return to `Skill cfd-orchestrator` and start over. Compiling a custom `.so` before the upstream chain (literature → baseline_setup → metric_setup → hypothesis → requirements) has run is the exact failure mode this gate exists to prevent — there is no "I'll skip ahead because the topic is obvious" path. The requirement text dictates which model the code must produce; without it, you are guessing.
+
 Custom OpenFOAM model implementation. Case-local, compiled, validated. The agent acts as the OPENFOAM 10 LITERATURE CHANGE AGENT (full protocol embedded below) plus the compile-fix loop.
 
 ## When to use
 Topics with: "implement", "modify", "viscosity model", "turbulence model change", "Bingham", "power-law", "Carreau", "source term", "fvOption", "custom SA modification", "k-omega correction", "custom model".
 
 For OED of turbulence models, this skill is invoked **inside** the `cfd-open-discovery` loop for each candidate.
+
+## Step 0 — Preflight gate (HARD; slice 14)
+
+Before any other work (before reading payload, before drafting C++, before `wmake`), run:
+
+```bash
+python scripts/stage_gate_audit.py --out-dir <out-dir> --mode preflight --target-stage code_mod
+```
+
+If `rc != 0`, STOP. The route-2 predecessors are `literature_done`, `baseline_setup_done`, `metric_setup_done`, `hypothesis_done`, `requirements_done`. Code-mod is downstream of the hypothesis-then-requirement chain by design: the requirement text dictates which model the code change must produce. Compiling a custom `.so` before the upstream chain runs is the exact "fast-validate shortcut" failure mode slice 14 closes. Run `cfd-literature → cfd-hypothesis → cfd-requirements → baseline_setup/metric_setup` first, then re-invoke this skill.
 
 ## Hard rules
 - **Never** edit `$WM_PROJECT_DIR`, `$FOAM_SRC`, or any OpenFOAM installation/source directory.
@@ -31,8 +45,10 @@ For OED of turbulence models, this skill is invoked **inside** the `cfd-open-dis
 - `<case_path>/customModels/<ClassName>/<ClassName>.C`
 - `<case_path>/customModels/<ClassName>/Make/files`
 - `<case_path>/customModels/<ClassName>/Make/options`
+- `<case_path>/customModels/<ClassName>/lib<ClassName>.so` (the **case-local** compiled library — built inside the case, never in `$FOAM_USER_LIBBIN`)
 - `<case_path>/customModels/<ClassName>/build.log`
 - `<case_path>/customModels/<ClassName>/smoke_test.log`
+- `<case_path>/runtime_dependencies.json` (every `.so` the case's `controlDict` loads, with source + sha256 — see Step 7)
 - `<out-dir>/code_mod/<ClassName>/build_result.json`:
   ```json
   {
@@ -550,6 +566,70 @@ Do not change boundary fields, initial fields, fvSchemes, fvSolution, or mesh fi
 If exact implementation details remain ambiguous after validation, return NEEDS_INFO.
 ```
 
+## Agentic compile-fix discipline (skill mode)
+
+The protocol above tells you **what** to build. This section tells you **how to iterate** when `wmake libso` fails, without handing off to a Python supervisor. The pattern below is the same one the LangGraph mode encodes in `scripts/code_mod_agentic.py`'s tool-call loop — replicated here as agent self-discipline so the skill is self-sufficient.
+
+### The four-tool inner loop
+
+In skill mode you have the agent runtime's native tools (Read, Write, Bash). Use them in this exact pattern, one operation per "turn":
+
+1. **Read** parent / reference source files **before writing** — but only **once per file**. Subsequent edits are guided by actual build stderr, not by re-reading your own writes.
+2. **Write** the file (Class.H, Class.C, Make/files, Make/options) — small, well-shaped, not perfect. Move on; the build will tell you what's wrong.
+3. **Bash:** `cd <case>/customModels/<Class> && wmake libso 2>&1 | tee build.log`. Capture rc + the last 16K chars of stdout/stderr. The OpenFOAM bashrc must be sourced first (see "Environment activation" in the orchestrator skill).
+4. **Done** — only after both `lib<Class>.so` exists AND a smoke-test of the actual case-application (read from `system/controlDict`) ends with `End` in its log.
+
+### Inspect compile errors with TAIL bias
+
+Compile errors land at the **end** of `build.log`. Every retry should:
+1. Look at the last ~300 lines of `build.log` first (`tail -300 build.log`).
+2. Pre-extract the error lines (gcc `error:`, `undefined reference`, `make: ***`, `Failed wmake`) **with 2 lines of context above and below**.
+3. Fix the **specific** offending line — do not rewrite the whole file. Most wmake failures are: missing `#include`, wrong namespace, wrong virtual signature for the resolved OpenFOAM 10 base class, missing entry in `Make/options:EXE_INC` or `Make/options:LIB_LIBS`, wrong basename in `Make/files:LIB`. None of those need a full-file rewrite.
+
+If you need more than 16K of output (rare), pipe through `tail -300` to a file and read it:
+```bash
+wmake libso 2>&1 | tail -300 > /tmp/build_tail.log
+```
+
+### Perfectionism-stall guard (HARD)
+
+**You may write any single file at most 3 times in one session.** If you find yourself drafting "the perfect" header before writing the implementation, stop. Get every required artifact (`*.H`, `*.C`, `Make/files`, `Make/options`) to a *good enough* state first, run the build, and let the build/run errors drive subsequent edits.
+
+Counter-pattern (what NOT to do): write `Class.H` → re-read `Class.H` → tweak whitespace → re-read → polish a comment → re-read. Each of those is a wasted turn. The build is the only authority on whether your code is correct.
+
+### Workflow checklist (track which step you are on)
+
+**Class derivation (compiled custom library) — 8 steps:**
+1. Write the class header (declarations: members, virtual overrides).
+2. Write the class implementation (definitions of overridden methods + `addToRunTimeSelectionTable` registration if needed).
+3. Write `Make/files` (source list + a **case-local** LIB target: `LIB = lib<Class>` — a bare relative name, so `wmake libso` writes the shared object to `<case>/customModels/<Class>/lib<Class>.so` *inside the case*. Do **NOT** use `LIB = $(FOAM_USER_LIBBIN)/lib<Class>`: installing into the global user libbin makes the case non-portable and is the root cause of the bare-name / cross-case `.so` load defect — the library must travel with the case.).
+4. Write `Make/options` (use **verified** `$LIB_SRC` paths and `-l<name>` from the OPENFOAM ENVIRONMENT FACTS resolved earlier in the protocol; do **not** invent paths).
+5. `wmake libso`. Iterate on errors per the TAIL-bias rule above. Each error message references a file and line — fix that, do not refactor.
+6. Activate in the case dictionary appropriate for THIS modification family (turbulence model → `constant/momentumTransport`; viscosity → `constant/transportProperties`; volumetric source → `constant/fvModels`; field BC → `0/<field>`; numerical scheme → `system/fvSchemes`). Add a **case-relative** `libs ("customModels/<Class>/lib<Class>.so");` entry to `system/controlDict` — never a bare `lib<Class>.so` name. OpenFOAM `dlopen`s a `libs` token containing a `/` as a path relative to the run (case) directory, so the case-relative form is self-contained; the bare form resolves through `FOAM_USER_LIBBIN` / the global search path and breaks when the case is copied or moved.
+7. Run the application named in `system/controlDict` (whatever it is — `simpleFoam`, `pimpleFoam`, `foamRun`, `chtMultiRegionFoam`, `interFoam`, etc., **not** a hardcoded one). Verify the log ends in `End` cleanly.
+8. Done.
+
+**Runtime (`coded*` / dictionary edit only) — 4 steps:**
+1. Edit the relevant case dictionary in-place (e.g. add a `coded` entry to `constant/fvModels`, or replace a BC in `0/<field>`).
+2. Run the case (application from `system/controlDict`). Coded blocks are JIT-compiled by OpenFOAM at solver startup; no `wmake` needed.
+3. If JIT compile fails, fix the C++ in the **same** dictionary file and re-run.
+4. Verify `End` in the log. Done.
+
+### Safety rules (hard)
+
+1. `$WM_PROJECT_DIR` is **read-only**. You may read source and tutorials there but never write. Never run `wmake` inside `$WM_PROJECT_DIR`.
+2. The starter folder is **read-only**. Read it; copy files into the case directory before editing.
+3. All writes go inside the run/case directory. The custom library is built case-local at `<case>/customModels/<Class>/` via `wmake libso` (cwd inside that dir).
+4. Activation by case dictionaries only: `system/controlDict.libs` and one activation dictionary. Do not patch `fvSchemes`, `fvSolution`, mesh files, or initial conditions.
+5. **Case-local libraries only (item 10/11).** The compiled `.so` lives at `<case>/customModels/<Class>/lib<Class>.so` and `controlDict.libs` references it by that case-relative path. A case must **never** load a `.so` from another case directory, another OED iteration's directory, `$FOAM_USER_LIBBIN`, or any absolute path — each case carries its own compiled library. Record every loaded `.so` in `<case>/runtime_dependencies.json` (Step 7) so the dependency is declared, not implicit.
+
+### Stop conditions
+
+- **Success:** `lib<Class>.so` exists AND the case application reaches `End` cleanly. Write `build_result.json` with `status: OK`.
+- **NEEDS_INFO:** the protocol returned `status: NEEDS_INFO` (missing API context). Surface the missing pieces; do not guess.
+- **UNSUPPORTED / UNSUPPORTED_WITHOUT_SOLVER_EDIT:** the protocol declared the request out of scope. Do not work around it.
+- **Compile failed after 5 attempts:** write `build_result.json` with `status: NEEDS_INFO`, `reason: "compile failed after 5 attempts"`, and the last `build.log` tail. Stop.
+
 ## End-to-end recipe (how to drive the protocol above)
 
 ### Step 1 — Build the payload
@@ -585,12 +665,18 @@ Expect a JSON response. Validate against the OUTPUT CONTRACT (§15):
 
 ### Step 4 — Compile
 
+`Make/files` must carry a case-local LIB target (`LIB = lib<ClassName>`) so the
+shared object lands inside the case, not in the global `$FOAM_USER_LIBBIN`:
+
 ```bash
 cd <case_path>/customModels/<ClassName>
 wmake libso 2>&1 | tee build.log
 ```
 
-Verify `lib<ClassName>.so` is created (typically under `$FOAM_USER_LIBBIN`).
+Verify `<case_path>/customModels/<ClassName>/lib<ClassName>.so` exists. If
+`wmake` instead wrote the `.so` to `$FOAM_USER_LIBBIN`, fix `Make/files`
+(`LIB = lib<ClassName>`) and rebuild — the library must live inside the case
+so it travels with it.
 
 ### Step 5 — Compile-fix loop (when wmake fails)
 
@@ -668,8 +754,8 @@ A short run to confirm the library loads and the model executes without crash:
 
 ```bash
 cd <case_path>
-# Make sure controlDict.libs includes the new lib
-foamDictionary system/controlDict -entry libs   # should list lib<ClassName>.so
+# controlDict.libs must reference the case-relative path (not a bare name)
+foamDictionary system/controlDict -entry libs   # should list customModels/<ClassName>/lib<ClassName>.so
 
 # Run the verification commands from the agent's response, then a tiny solver run
 checkMesh > smoke_test.log 2>&1
@@ -696,7 +782,7 @@ For a more thorough smoke test, run the actual solver for ~5–20 timesteps with
     "customModels/CustomSpalartAllmarasNEQ/Make/options"
   ],
   "dictionary_patches": [
-    {"path": "system/controlDict", "patch_text": "libs (\"libCustomSpalartAllmarasNEQ.so\");"},
+    {"path": "system/controlDict", "patch_text": "libs (\"customModels/CustomSpalartAllmarasNEQ/libCustomSpalartAllmarasNEQ.so\");"},
     {"path": "constant/momentumTransport", "patch_text": "RAS { model CustomSpalartAllmarasNEQ; ... }"}
   ],
   "build_commands": ["cd customModels/CustomSpalartAllmarasNEQ", "wmake libso"],
@@ -709,6 +795,41 @@ For a more thorough smoke test, run the actual solver for ~5–20 timesteps with
   "smoke_test_passed": true
 }
 ```
+
+Note the `dictionary_patches` `controlDict` entry uses the **case-relative** path `customModels/<Class>/lib<Class>.so`, not a bare `lib<Class>.so` name.
+
+#### Step 7b — Write `runtime_dependencies.json` (item 11)
+
+Declare every shared library the case's `controlDict` loads, so the runtime dependency is explicit and the case is provably self-contained:
+
+```bash
+python3 - <<'PY'
+import hashlib, json, re, pathlib
+case = pathlib.Path("<case_path>")
+cd = (case / "system/controlDict").read_text(errors="replace")
+m = re.search(r"\blibs\s*\(([^)]*)\)", cd)
+libs = re.findall(r'"([^"]+)"', m.group(1)) if m else []
+deps = []
+for lib in libs:
+    p = (case / lib)
+    inside = case.resolve() in p.resolve().parents
+    deps.append({
+        "lib": lib,
+        "resolved": str(p),
+        "case_local": bool(inside and p.is_file()),
+        "exists": p.is_file(),
+        "sha256": hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None,
+        "source": "customModels/<Class>/ (built case-local by cfd-code-modify)"
+                  if inside else "EXTERNAL — reproducibility risk",
+    })
+(case / "runtime_dependencies.json").write_text(json.dumps(
+    {"case": str(case), "libraries": deps,
+     "all_case_local": all(d["case_local"] for d in deps)}, indent=2))
+print(json.dumps(deps, indent=2))
+PY
+```
+
+If any entry has `case_local: false`, the case loads a library from outside itself — **stop and fix it**: rebuild that library case-locally under `<case_path>/customModels/` and repoint `controlDict.libs`. A case that depends on another case's (or another OED iteration's) compiled `.so` is not reproducible and fails the audit.
 
 Append to timeline:
 ```json
@@ -724,10 +845,20 @@ After this skill, run `cfd-mesh-gate` against the modified physics group, then p
 - Never widen scope (e.g. add a second equation modification because "it might help").
 - Never edit files outside `<case>/customModels/<ClassName>/` and the two activation dictionaries.
 
-## Optional script fast-path
-```bash
-python scripts/foam_code_builder.py \
-  --payload <out-dir>/code_mod/<ClassName>/payload.json \
-  --case-path <case_path>
-```
-The script implements the same recipe (it loads the LITERATURE CHANGE AGENT prompt internally). Use whichever is more convenient.
+## LangGraph mode only — do NOT call from skill mode
+
+The Python pipeline (`scripts/orchestrator_run.py`) invokes `scripts/code_mod_agentic.py` and `scripts/foam_code_builder.py` internally for the LangGraph workflow. Those wrappers exist to keep that pipeline working unchanged and run their own bounded sandbox + tool-call loop.
+
+## Two valid execution paths
+
+1. **Inline agent recipe (above).** The agent acts as the OPENFOAM 10 LITERATURE CHANGE AGENT — reads the payload, writes the C++/headers, runs `wmake libso`, parses build errors, retries. Native Read/Write/Bash via the agent runtime.
+
+2. **Script fast-path.** `scripts/code_mod_agentic.py` and `scripts/foam_code_builder.py` run the same supervised tool-call loop in Python with the same prompts. Invoke via Bash. The skill-mode-forbidden script is `scripts/orchestrator_run.py` only — the per-stage code-mod scripts are callable.
+
+## Next
+
+After `<case_path>/customModels/<ClassName>/build.log` shows `wmake libso` success AND `<out-dir>/code_mod/<ClassName>/build_result.json` shows `status: "OK"` AND `<out-dir>/checkpoints/code_mod_done.json` is on disk, your next action is:
+
+`Skill cfd-skills/cfd-mesh-gate`
+
+Mesh-gate runs against the modified physics group so the locked mesh reflects the new model's behavior (separation/reattachment can shift after a model change). Do not stop, summarize, or wait — the chain continues automatically.

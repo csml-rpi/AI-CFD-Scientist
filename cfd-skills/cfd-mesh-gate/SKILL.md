@@ -5,7 +5,21 @@ description: Mandatory mesh-independence study before any experiments. Per physi
 
 # cfd-mesh-gate
 
+## ⚠ HARD STOP — read this before any other step
+
+For routes 1, 2, 6 (research / code_mod / open_discovery): if `<out-dir>/checkpoints/requirements_done.json` does **not** exist (or for `code_mod`, if `code_mod_done.json` does not exist), STOP. Return to `Skill cfd-orchestrator` and start the chain from literature. Mesh-refining a starter geometry before requirements (and code-mod for route 2) have been authored is a shortcut that produces a mesh selected against the wrong physics. The route-3 mesh-independence-only path has no upstream predecessors and passes through trivially — but routes 1/2/6 require the upstream chain.
+
 Mesh independence is **mandatory** for every CFD Scientist study (per `CLAUDE.md`). This skill is the canonical implementation. The full mesh-sensitivity protocol — STEPS A–E — is embedded below; the per-level case execution goes through `cfd-experiment` (which itself wraps `scripts/foam_run.py` with `--mesh-gate-role`); the analysis (QoI comparison, percent-difference, GCI) is fully agent-driven.
+
+## Step 0 — Preflight gate (HARD; slice 14)
+
+Before any mesh-level case is launched:
+
+```bash
+python scripts/stage_gate_audit.py --out-dir <out-dir> --mode preflight --target-stage mesh_gate
+```
+
+If `rc != 0`, STOP. On routes 1, 2, and 6 the script requires `literature_done`, `baseline_setup_done`, `metric_setup_done`, `hypothesis_done`, `requirements_done` (and `code_mod_done` on route 2) before mesh-gate can launch. Mesh refinement against a starter geometry without the upstream requirement set is the failure mode where the agent treats mesh-gate as the first stage of the run. Route 3 (mesh-independence-only) has no upstream predecessors and passes preflight trivially.
 
 ## When to use
 After `cfd-requirements` (or after `cfd-code-modify`) and before bulk `cfd-experiment` calls. Every pathway — general, code-mod, OED — passes through this gate.
@@ -15,6 +29,8 @@ After `cfd-requirements` (or after `cfd-code-modify`) and before bulk `cfd-exper
 - `starter-dir` (optional) — starter case for baseline geometry/numerics
 - `qoi_tolerance_percent` (optional, default 5.0) — threshold for declaring mesh-insensitivity
 - `near_wall_tolerance_percent` (optional, default 10.0) — looser threshold for wall-bounded QoIs
+
+> **Starter directory is READ-ONLY** (per `skills/cfd-orchestrator/SKILL.md` non-negotiable constraints). Each mesh level's case lives at `<out-dir>/mesh_gate/<group>/<level>/`; copy from starter via `cp -r` before any mesh-refinement edits.
 
 ## Outputs
 - `<out-dir>/selected_mesh_spec.json` — per-physics-group selected mesh:
@@ -230,6 +246,35 @@ If `selected_mesh_spec.json` exists with all groups having a non-empty `selected
 
 **Important:** if `selected_level` is empty for any group, the gate is **incomplete** — do not skip; finish it.
 
+## Starter-mesh lock — the only mesh-gate self-exemption (item 9)
+
+A study may skip the baseline-vs-refined comparison **only** when the starter ships a mesh whose grid-independence is already established in the peer-reviewed literature — e.g. an OED sweep on a published-benchmark periodic-hill mesh, where re-refining per candidate would confound scoring by mixing mesh and model effects. This is a deliberate, narrow exemption, not a shortcut, and it is **not** justified by a free-text rationale.
+
+To take the exemption, emit `<out-dir>/checkpoints/mesh_gate_done.json` with this exact schema:
+
+```json
+{
+  "stage": "mesh_gate",
+  "status": "starter_mesh_locked",
+  "mesh_source": "<starter path>/constant/polyMesh  (or system/blockMeshDict)",
+  "citation": {
+    "doi": "10.xxxx/xxxxx",
+    "title": "<the paper whose validated mesh the starter reproduces>",
+    "what_it_validates": "<one line: which grid-independence result this DOI establishes>"
+  },
+  "rationale": "<why locking is correct for THIS study — e.g. the mesh is a study control for the OED sweep>",
+  "ts": "<iso>"
+}
+```
+
+Hard requirements — the audit's H31 gate enforces every one:
+
+- `mesh_source` must name the actual mesh path the lock applies to.
+- `citation.doi` must be a real, published DOI. **The audit resolves it live against doi.org** — a DOI that 404s fails the gate (if the auditor itself is offline the check degrades to a warning, never a silent pass). A free-text `rationale` alone is no longer accepted; it is kept only as human-readable context *alongside* the verified citation.
+- The cited work must genuinely establish mesh-independence for this geometry / Reynolds number — not merely use the geometry.
+
+If you cannot point to a published mesh-validation DOI, you do **not** qualify for the lock — run the real STEP A–E protocol above.
+
 ## Optional shortcut — let the orchestrator run only this stage
 If you're already in the LangGraph repo and `requirements.json` exists, the orchestrator's resume-from feature is the fastest path:
 ```bash
@@ -251,3 +296,15 @@ If a baseline or refined run fails (compilation error, divergence), do NOT pick 
 - The mesh gate is per-physics-group, **not** per-parameter-sweep value. If you have 6 BFS cases at 6 expansion ratios with the same turbulence model, that's ONE group ⇒ one mesh study, applied to all 6.
 - Do **not** re-do mesh independence per OED candidate. The gate runs once on baseline physics; OED candidates inherit the locked mesh.
 - For deep-dive mesh studies (Richardson, GCI conventions, more refinement levels), the long-form protocol reference is `skills/cfd-mesh-independence/SKILL.md` — it covers the same STEPS A–E with extra commentary.
+
+## Next
+
+After `<out-dir>/selected_mesh_spec.json` and `<out-dir>/checkpoints/mesh_gate_done.json` are on disk, invoke the next skill. Read `<out-dir>/state.json#mode`:
+
+| `mode` | Next skill |
+|---|---|
+| `research`, `code_mod` | `Skill cfd-skills/cfd-experiment` for the first case in `requirements.json` (the orchestrator chain then loops one case at a time through `cfd-experiment → cfd-viz → cfd-interpret`, then advances to `cfd-analyze` when all cases have `decision.json`). |
+| `open_discovery` | `Skill cfd-skills/cfd-open-discovery` |
+| `mesh_gate` (route 3, standalone) | Chain ends here. Run the final audit per `Skill cfd-orchestrator` Step 5. |
+
+Do not stop, summarize, or wait. The chain continues automatically.

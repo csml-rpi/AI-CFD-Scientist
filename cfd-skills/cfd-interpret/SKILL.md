@@ -5,12 +5,16 @@ description: Per-case decision agent — PROCEED, REVISE, or RERUN. Reads run_re
 
 # cfd-interpret
 
+## ⚠ HARD STOP — read this before any other step
+
+If `<case_dir>/figs/` does not contain at least one `.png`, STOP. The orchestrator chain enters this skill only after `cfd-viz mode=interpret` has produced per-case PyVista renders. Return to `Skill cfd-skills/cfd-viz` with `mode=interpret case_dir=<case_dir>`, then come back. Authoring `decision.json` from `run_result.json` + numerics alone is forbidden — vision-LLM judgment over rendered flow fields is the entire point of this skill.
+
 After `cfd-experiment` runs a case, decide whether the result is acceptable, needs a tweaked rerun (numerical), or needs the requirement revised (physics).
 
 ## Inputs
 - `out-dir` (required)
 - `case_id` (required)
-- Implicit: `<case_dir>/run_result.json`, `<case_dir>/figs/*.png`. If figs are missing, run `/cfd-viz mode=interpret case_dir=<case_dir>` first.
+- Implicit: `<case_dir>/run_result.json`, `<case_dir>/figs/*.png`. **`figs/` is a HARD precondition** — the skill MUST invoke `cfd-viz mode=interpret` first when `figs/` is empty, and MUST hard-fail with `RERUN` if viz can't produce figures. Numerics-only verdicts are forbidden. See "Hard preconditions" section below.
 
 ## Output
 `<case_dir>/decision.json`:
@@ -33,14 +37,29 @@ After `cfd-experiment` runs a case, decide whether the result is acceptable, nee
 - **REVISE** — flow is unphysical or violates the requirement (reattachment far off, pressure profile wrong, mass not conserved, geometry/scenario in figures doesn't match what the requirement asked for). Action: regenerate the requirement (`cfd-requirements` style) and rerun.
 - **RERUN** — numerical issue despite valid physics: timeout, divergence, NaN, oscillating residuals. Action: apply CFL-aware tweak in `cfd-experiment`, keep physics identical, rerun.
 
+## Hard preconditions (skill-mode enforcement)
+
+This skill is **vision-first**. The embedded `interpretation_*` prompts below are multimodal — they expect rendered case figures attached to the LLM call as image inputs. **Authoring a `decision.json` from numerics alone (residuals, log tail, extracted metrics) is forbidden.**
+
+Hard rules:
+
+1. **`<case_dir>/figs/` MUST contain at least one `.png` before this skill writes `decision.json`.** If `figs/` is empty or missing, the skill MUST invoke `cfd-viz mode=interpret` first (Step 1 below) and only proceed to Step 2 once at least one figure exists.
+2. **If `cfd-viz mode=interpret` returns without producing any PNG**, hard-fail with `decision.json: {"status": "RERUN", "reason": "viz failed — cannot interpret without figures", "viz_failed": true, "no_figures": true}`. **Do NOT silently fall back to a numerics-only verdict.** A numerics-only judgment is a different (weaker) check; it cannot stand in for the vision-LLM check this skill is for.
+3. **If the vision-LLM call (Step 3 below) cannot be made** (e.g. provider down, auth missing): `decision.json: {"status": "RERUN", "reason": "vision-LLM call failed; retry when provider is healthy", "vision_call_failed": true}`. Same principle — don't fabricate a verdict from text outputs.
+
+These rules close the failure mode where a clean-converging RANS run gets a textual PROCEED on residuals alone, bypassing the geometry/scenario / unphysical-recirculation / wrong-patch-sampling / y+-violation checks that the vision pass is the only place to catch.
+
 ## Recipe (primary, agent-driven)
 
-### Step 1 — Ensure figures
-If `<case_dir>/figs/` is missing or stale, invoke:
-```text
-/cfd-viz out-dir=<out-dir> mode=interpret case_dir=<case_dir>
-```
-This produces a small set of diagnostic PNGs sufficient for the interpreter to judge physics plausibility (mesh, U-magnitude contour, p contour, residuals, y+ map).
+### Step 1 — Ensure figures (HARD PRECONDITION)
+**Mandatory before Step 2.** Check `<case_dir>/figs/`:
+- If it contains zero `.png` files (or doesn't exist), **invoke `cfd-viz mode=interpret`** before continuing:
+  ```text
+  /cfd-viz out-dir=<out-dir> mode=interpret case_dir=<case_dir>
+  ```
+- After `cfd-viz` returns, re-check `<case_dir>/figs/`. If still empty, apply hard rule #2 above (write `RERUN` decision.json with `viz_failed=true` and stop).
+
+`cfd-viz mode=interpret` produces 5–8 diagnostic PNGs sufficient for the vision-LLM physics check (mesh overview + zoomed near-wall, U-magnitude contour at latest time, pressure contour at latest time, streamlines on midplane, y+ map on no-slip walls, residual history). The PyVista call ensures these are real flow-field renders, not metrics-derived gnuplot plots.
 
 ### Step 2 — Assemble context
 Read:
@@ -277,12 +296,29 @@ if status != PROCEED: mark case "failed_with_max_retries"
 
 The rerun-selector logic — picking a similar successful case as a template when `REVISE` requires rewriting the requirement — lives in the calling pipeline (`cfd-pipeline` step 10's loop), not in this skill. This skill produces the decision; the pipeline handles the rerun mechanics.
 
-## Optional script fast-path
+## LangGraph mode only — do NOT call from skill mode
+
+## Two valid execution paths
+
+1. **Inline agent recipe (above).** The agent reads `figs/*.png` directly via its native multimodal capability, applies the embedded `interpretation_*` prompts as judgment criteria, and writes `decision.json`.
+
+2. **Script fast-path.** `scripts/interpret.py` (full retry loop) and `scripts/quick_interpret.py` (single-shot, faster) implement the same logic. Same prompts, same `decision.json` schema. Invoke via Bash with `--case-dir`, `--out-dir`, etc. The skill-mode-forbidden script is `scripts/orchestrator_run.py` only.
+
+## Next
+
+After `<case_dir>/decision.json` is on disk, walk the per-case loop:
+
 ```bash
-python scripts/interpret.py \
-  --case <case_dir> \
-  --figs <case_dir>/figs/ \
-  --output <case_dir>/decision.json \
-  --timeline <out-dir>/timeline.json
+# Find the next case (in requirements.json order) that does not yet have a decision.json.
+NEXT=$(jq -r '.[].case_id' "<out-dir>/requirements.json" 2>/dev/null | while read c; do
+  [ -f "<out-dir>/cases/$c/decision.json" ] || { echo "$c"; break; }
+done | head -1)
 ```
-Same artifact contract. Uses the same prompts internally.
+
+| Condition | Next action |
+|---|---|
+| `$NEXT` non-empty | `Skill cfd-skills/cfd-experiment` for case `$NEXT` (chain continues: experiment → viz → interpret → next case). |
+| `$NEXT` empty (every case has `decision.json`) | Write `<out-dir>/checkpoints/experiments_done.json` after the orchestrator's per-case file-system gate passes, then invoke `Skill cfd-skills/cfd-analyze`. |
+| `decision.json#status == REVISE` (after max revisions) or `RERUN` (after max retries) | Halt the per-case loop, surface to the user, and stop. |
+
+Do not stop, summarize, or wait between cases — the chain continues automatically.

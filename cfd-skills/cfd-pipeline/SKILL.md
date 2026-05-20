@@ -23,6 +23,8 @@ If the user wants the standard Python orchestrator, send them to `scripts/orches
 - `provider`, `model` (optional): LLM provider/model hints (default: inherit from agent)
 - `enable_reference_verify` (optional, default false): post-paper bibliography verification
 
+> **Starter directory is READ-ONLY** (per `skills/cfd-orchestrator/SKILL.md` non-negotiable constraints). Every stage that consumes the starter (`baseline_setup`, `mesh_gate`, `code_mod`, `experiments`) copies into `<out-dir>/` before editing. Never `sed -i`, `> file`, or otherwise mutate paths under the starter tree.
+
 ## Routing — pick the subflow first
 
 Read the topic and decide which pathway:
@@ -422,3 +424,27 @@ Output `<out-dir>` is fully compatible with the Python orchestrator. To take ove
 python scripts/orchestrator_run.py --topic "..." --out-dir <same out-dir> --resume-from <next_stage>
 ```
 Supported `--resume-from` stages: `literature, hypothesis, requirements, code_mod, mesh_gate_resume, baseline_synthesis, experiments, analysis, paper_review, reference_verify, analysis_without_viz_full`.
+
+## ⚠ HARD STOP — read this before any other step
+
+This skill is invoked from the orchestrator chain after `cfd-literature` has completed. If `<out-dir>/checkpoints/literature_done.json` does **not** exist, STOP. The orchestrator chain starts at `cfd-literature`, not here. Return to `Skill cfd-orchestrator` (or invoke `Skill cfd-skills/cfd-literature` directly), then come back.
+
+This file documents the full end-to-end recipe for historical reference. **When invoked from the orchestrator chain, run only Steps 5 (baseline_setup) and 6 (metric_setup).** Each of those steps writes its `checkpoints/baseline_setup_done.json` / `checkpoints/metric_setup_done.json` and appends a timeline event. After Step 6, follow `## Next` below — do not continue with Steps 7+ inside this file (those stages are owned by their own per-stage skills).
+
+## Next
+
+After both `<out-dir>/checkpoints/baseline_setup_done.json` and `<out-dir>/checkpoints/metric_setup_done.json` exist, invoke the next skill. Read `<out-dir>/state.json#mode`:
+
+| `mode` | Next skill |
+|---|---|
+| `research`, `code_mod` | `Skill cfd-skills/cfd-hypothesis` |
+| `open_discovery` | `Skill cfd-skills/cfd-mesh-gate` (skips hypothesis + requirements; the discovery loop owns its own ideation) |
+
+Do not stop, summarize, or wait. The chain continues automatically.
+
+**For `open_discovery`: do NOT skip `cfd-mesh-gate` by hand-writing `checkpoints/mesh_gate_done.json`.** The audit's H31 gate and `cfd-open-discovery`'s Step 0 preflight both detect a fabricated mesh-gate checkpoint (no `selected_mesh_spec.json`, no `mesh_independence_context.json`, no `mesh_gate/` directory) and abort the run. Two valid paths:
+
+1. **Run `cfd-mesh-gate` for real.** Even an OED study benefits from a baseline-vs-refined comparison on the starter geometry — it bounds the QoI's mesh sensitivity, which is what every reviewer asks first.
+2. **Declare `starter_mesh_locked` explicitly.** If the starter ships a validated mesh that you want to lock for the entire OED sweep, emit `checkpoints/mesh_gate_done.json` with `{"stage": "mesh_gate", "status": "starter_mesh_locked", "rationale": "<one-sentence justification citing starter README>", "mesh_source": "<starter blockMeshDict path>"}`. The audit accepts this honest declaration.
+
+Both paths satisfy the audit. The fabricated stub does not.

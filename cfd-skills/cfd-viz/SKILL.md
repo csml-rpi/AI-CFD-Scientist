@@ -198,22 +198,29 @@ Max 10 inner attempts per figure. After that, keep the latest version and emit a
 - Never invent reference data. If a comparison-vs-DNS plot is requested but no reference CSV exists in `reference_data/`, skip the comparison series (don't draw a fake DNS line) and add a caption note.
 - Never report a figure as "accepted" without an actual QA response from the vision LLM.
 
-## Optional script fast-path
+## LangGraph mode only — do NOT call from skill mode
 
-Two existing helpers do similar work:
+## Two valid execution paths
 
-**`scripts/viz.py`** — single-case interpret-mode helper:
-```bash
-python scripts/viz.py --case <case_dir> --mode interpret --output <case_dir>/figs/
-```
+This skill has **two equally valid paths** — pick whichever fits the situation. Both produce the same artifacts.
 
-**`scripts/batch_paper_viz.py`** — full-mode batch generator (one monolithic PyVista script for all paper figures, regenerated each loop). Used by `paper_unified.py` internally; you can shell out to it for `mode=full` if you want a one-shot:
-```bash
-# Invoked indirectly through paper_unified.py — see cfd-paper for the full-mode shortcut.
-```
+1. **Inline agent recipe (above).** The agent authors the PyVista script, runs it via Bash, validates each PNG with the embedded vision-QA prompt, and retries on rejection. Use this when the visualization is per-case and easy to spec.
 
-Use either when convenient; the agent recipe above is the authoritative source.
+2. **Script fast-path.** `scripts/viz.py` (interpret mode) and `src/cfd_langgraph/paper_unified/batch_paper_viz.py` (paper-batch mode) implement the same loop in Python. They use the same prompts as the inline recipe and write the same outputs. Invoke them via Bash with the relevant CLI args. The `scripts/orchestrator_run.py` LangGraph end-to-end driver is the only Python file skill-mode should NOT call directly — it bypasses skill mode entirely. Everything else under `scripts/` is fair game.
+
+Both paths use `import pyvista` + `pv.start_xvfb()` for headless rendering; both write PNGs ≥ 20 KB; both attach the rendered images for the vision-QA pass. The audit only checks the artifacts, not which path produced them.
 
 ## Notes
 - PyVista off-screen rendering needs `xvfb` on headless systems. If `pv.start_xvfb()` fails, the script should fall back to `pv.OFF_SCREEN = True` (which uses the default off-screen path on most builds).
 - For very large cases, decimate the internal mesh before rendering: `internal.decimate(0.5)` for visualization-only purposes (don't use decimated data to compute QoIs).
+
+## Next
+
+This skill is invoked in two contexts; the next-step depends on which invocation just completed.
+
+| Invocation mode | Next action |
+|---|---|
+| `mode=interpret` (called from `cfd-experiment` per-case loop) — figs are in `<case_dir>/figs/*.png` | `Skill cfd-skills/cfd-interpret` with `case_dir=<case_dir>` to author `<case_dir>/decision.json` from the rendered figures. |
+| `mode=full` (called from `cfd-paper` figure planner) — figs are in `<out-dir>/paper_figs/*.png` | Return control to the calling `Skill cfd-skills/cfd-paper`; do not chain to `cfd-interpret`. |
+
+Do not stop, summarize, or wait. The chain continues automatically.
