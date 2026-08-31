@@ -29,6 +29,7 @@ data/
 
 # Large / vendored trees (keep repo lean)
 Foam-Agent/
+starter_*/
 
 # Duplicates kept explicit for tooling
 .venv/
@@ -58,3 +59,13 @@ __pycache__/
   papers
 /viscosity.pdf
 mechanism.md
+
+# Benchmark data and run artifacts — large, and the held-out set is upstream's
+/heldout_closure_challenge/
+/starter_closure_challenge/
+/submissions/
+/knowledge_bundle/
+/custom_sa_models/
+/.debuglogs/
+/llm_token_usage.json
+/llm_token_usage.json.lock

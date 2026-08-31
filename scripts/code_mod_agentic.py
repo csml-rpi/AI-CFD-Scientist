@@ -117,6 +117,9 @@ class Sandbox:
         self.max_read_bytes = max_read_bytes
         self.max_write_bytes = max_write_bytes
         self.bash_timeout = bash_timeout
+        # Real solver launches this candidate has made — the measured cost the
+        # search charges it. See _note_solver_invocations.
+        self.solver_invocations = 0
         # Per-path write counter for the perfectionism-stall circuit-breaker.
         # Generic across topics — any file written more than
         # MAX_WRITES_PER_PATH times in a single session triggers a reject
@@ -236,9 +239,40 @@ class Sandbox:
             out["warning"] = warning
         return out
 
+    # Solver executables whose invocation is what a candidate actually costs.
+    # Counted from the command text rather than assumed from the action type:
+    # measured on run oed_20260822_1626_codex_high, candidate
+    # sa_sr_destruction ran 35 simpleFoam solves inside a single candidate
+    # doing its own coefficient sweep, and the search recorded it as cost 2 —
+    # the same as a candidate that solved once. With strategy a free choice
+    # rather than a fixed enum, an unmeasured cost makes an expensive strategy
+    # look free, and the archive cannot honestly compare strategies at all.
+    _SOLVER_TOKENS = (
+        "simpleFoam", "pimpleFoam", "pisoFoam", "rhoCentralFoam", "rhoPimpleFoam",
+        "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam",
+        "potentialFoam", "sonicFoam", "Allrun",
+    )
+
+    def _note_solver_invocations(self, cmd: str) -> None:
+        """Count solver launches implied by one shell command.
+
+        A loop body counts once per token occurrence, not once per iteration:
+        the exact count inside a `for` loop is not knowable from the text. That
+        under-counts a sweep, so the number is a floor on real cost, never an
+        over-estimate — a bound in the safe direction for budget accounting.
+        """
+        text = str(cmd or "")
+        for token in self._SOLVER_TOKENS:
+            hits = text.count(token)
+            if hits:
+                self.solver_invocations += hits
+
     # ---- tool: run_bash
     def run_bash(self, cmd: str, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
-        # cwd must be inside run_dir
+        # A cwd check alone is not a filesystem sandbox: a shell command can
+        # still redirect to the OpenFOAM installation or point wmake's LIB at
+        # $FOAM_USER_LIBBIN. Run inside a mount namespace where the host is
+        # read-only and only this candidate's run_dir is writable.
         cwd_p = Path(cwd).expanduser().resolve() if cwd else self.run_dir
         if not self._is_under(cwd_p, self.run_dir):
             return {"ok": False, "error": f"cwd must be inside run_dir: {cwd_p}"}
@@ -246,6 +280,7 @@ class Sandbox:
             return {"ok": False, "error": f"cwd does not exist: {cwd_p}"}
         if not isinstance(cmd, str) or not cmd.strip():
             return {"ok": False, "error": "empty command"}
+        self._note_solver_invocations(cmd)
         # Ensure OpenFOAM env is sourced (so wmake works) — find a bashrc.
         bashrc_candidates = []
         if self.wm:
@@ -257,11 +292,54 @@ class Sandbox:
         bashrc = next((b for b in bashrc_candidates if Path(b).is_file()), None)
         prefix = f". \"{bashrc}\" >/dev/null 2>&1 && " if bashrc else ""
         full = f"{prefix}{cmd}"
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            return {
+                "ok": False,
+                "error": (
+                    "bubblewrap is required for code-mod shell isolation; "
+                    "refusing to run an unrestricted shell"
+                ),
+            }
+        sandbox_cmd = [
+            bwrap,
+            "--die-with-parent",
+            "--new-session",
+            # Own PID namespace, so nothing this command starts can outlive it.
+            #
+            # Without it --die-with-parent bounds only the bwrap process, and a
+            # `nohup ... &` inside the shell escapes onto the host and keeps
+            # running. Measured on run closure_20260826_codex:
+            # crossgrad_ksource_solver_fit backgrounded its optimiser, the
+            # agent was killed at the wall clock 0.9 hours in, and the orphan
+            # ran a further 5.7 hours -- finishing 16 of the 32 objective
+            # evaluations it needed and writing them to a ledger nobody was
+            # left to read. Under a PID namespace, bwrap's init exiting takes
+            # every descendant with it, so the work either completes inside the
+            # call that started it or does not happen at all. That is a
+            # lifecycle guarantee rather than a check on what the command says,
+            # so it cannot be worked around by phrasing the command differently.
+            "--unshare-pid",
+            "--ro-bind", "/", "/",
+        ]
+        try:
+            self.run_dir.relative_to(Path("/tmp"))
+            run_is_under_tmp = True
+        except ValueError:
+            run_is_under_tmp = False
+        if not run_is_under_tmp:
+            sandbox_cmd += ["--tmpfs", "/tmp"]
+        sandbox_cmd += [
+            "--bind", str(self.run_dir), str(self.run_dir),
+            "--proc", "/proc",
+            "--dev", "/dev",
+            "--chdir", str(cwd_p),
+            "bash", "-lc", full,
+        ]
         t = min(timeout or self.bash_timeout, self.bash_timeout)
         try:
             proc = subprocess.run(
-                ["bash", "-lc", full],
-                cwd=str(cwd_p),
+                sandbox_cmd,
                 text=True,
                 capture_output=True,
                 timeout=t,
@@ -311,12 +389,16 @@ TOOLS:
       Returns {ok, path, bytes_written}.
 
   {"tool": "run_bash", "args": {"cmd": "<command>", "cwd": "<absolute path inside run_dir>", "timeout": <seconds, optional>}}
-      Run a shell command. cwd must be inside the run directory. The OpenFOAM
+      Run a shell command in a filesystem sandbox: the host is read-only and
+      only the run directory (plus an ephemeral /tmp) is writable. The OpenFOAM
       bashrc is auto-sourced before each command, so wmake / blockMesh /
       simpleFoam etc. are on PATH. Returns {rc, stdout, stderr, timeout,
       error_summary}. ALWAYS check `error_summary` first — it pre-extracts
       gcc/wmake/FOAM/runtime error lines (with 2-line context) so you don't
-      need to scan a long stdout to find the failure. `stdout` and `stderr`
+      need to scan a long stdout to find the failure. A Make/files entry that
+      targets $FOAM_USER_LIBBIN will fail because it is read-only: LIB output
+      must be an absolute path below the case's customModels directory.
+      `stdout` and `stderr`
       contain the LAST 16K chars (truncation is tail-biased — recent output
       preserved). Plan your next edit from `error_summary`.
 
@@ -337,8 +419,9 @@ PROTOCOL RULES:
     error lines with context), then scan the tail of `stdout`/`stderr` (last
     16K chars are preserved). Edit the offending file based on the actual
     diagnostic — do not guess. If you need more than 16K of output, re-run
-    the build piping through `2>&1 | tail -300 > /tmp/build.log` and
-    read_file that log. Do not give up after one failure — iterate until
+    the build while redirecting the log to a path inside the candidate run
+    directory (not /tmp, which is private to each shell call), then read that
+    file. Do not give up after one failure — iterate until
     it builds.
   - Activate the new component by editing whichever case dictionary is
     appropriate for THIS modification family (turbulence model → the
@@ -364,7 +447,8 @@ PROTOCOL RULES:
     [1] Write the class header  (declarations: members, virtual overrides)
     [2] Write the class implementation (definitions of overridden methods,
         and the runtime-selection-table macro registration if needed)
-    [3] Write Make/files     (source list + LIB output basename)
+    [3] Write Make/files     (source list + an absolute LIB output path below
+        this case's customModels tree; never $FOAM_USER_LIBBIN)
     [4] Write Make/options   (use the verified $LIB_SRC paths and -l<name>
         from the OPENFOAM ENVIRONMENT FACTS block above; do NOT invent)
     [5] Run the build (`wmake libso` or equivalent). Iterate on errors —
@@ -400,15 +484,19 @@ _SAFETY = """SAFETY RULES (every tool call enforces these; violations get a deni
    before editing.
 3. All writes go into the run directory. Custom OpenFOAM libraries must be
    built case-local at <run_dir>/<case_name>/customModels/<ClassName>/ via
-   `wmake libso` (cwd inside that dir).
+   `wmake libso` (cwd inside that dir), with Make/files LIB output also below
+   that case-local customModels tree. $FOAM_USER_LIBBIN is not an allowed
+   compilation target.
 4. Activation by case dictionaries only: system/controlDict.libs and the
    relevant constant/ dictionary (constant/momentumTransport, etc.).
 """
 
 
-def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str,
+def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: str = "",
                        starter_case: Path, run_dir: Path,
-                       wm_project_dir: Optional[Path]) -> str:
+                       wm_project_dir: Optional[Path],
+                       prior_attempt: str = "", repair_goal: str = "",
+                       timeout_s: int = 0) -> str:
     """Generic deliverable template across CFD modification kinds: turbulence
     closure, viscosity / non-Newtonian model, thermophysical property model,
     custom boundary condition, custom fvOption / fvModel source term, custom
@@ -435,9 +523,134 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str,
         + "============================================================\n\n"
         + f"Topic: {topic.strip()}\n\n"
         + f"Hypothesis to implement (variant_name={variant_name}):\n{hypothesis.strip()}\n\n"
+        + (
+            "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP (read before you start\n"
+            "one -- every one of these rules is here because ignoring it destroyed a\n"
+            "real candidate on run closure_20260826_codex):\n\n"
+            "  1. NEVER background it. No `nohup`, no trailing `&`, no detached\n"
+            "     process. Run it in the foreground and wait. When the wall clock\n"
+            "     kills you, a backgrounded fit keeps running with nobody left to\n"
+            "     collect its answer: crossgrad_ksource_solver_fit's agent died at\n"
+            "     0.9 hours and its orphaned fit burned another 5.7 hours of CPU,\n"
+            "     completed 16 of 32 evaluations, and was thrown away.\n\n"
+            "  2. Probe the ends of the range BEFORE optimising. Evaluate the\n"
+            "     objective at the lowest and highest coefficient you would consider.\n"
+            "     If the objective barely moves between them, the coefficient does not\n"
+            "     matter: stop, report that finding, and do not spend the budget\n"
+            "     searching a flat function. crossgrad_ksource_solver_fit ran a\n"
+            "     32-evaluation differential evolution over an objective that varied\n"
+            "     by 0.13% end to end -- six hours to discover nothing.\n\n"
+            "  3. Set bounds you are willing to be wrong about, and check them. If\n"
+            "     the optimiser returns a value sitting on a bound, the optimum is\n"
+            "     probably outside it and your answer is an artefact of the box.\n"
+            "     bradshaw_b1_solver_fit measured its best objective at b=0.92, then\n"
+            "     fitted inside [0.35, 0.70] and 'converged' to the edge at 0.617.\n\n"
+            "  4. A handful of evaluations is not a fit. If your optimiser reports\n"
+            "     success after two or three objective calls, it has not searched\n"
+            "     anything -- say so rather than reporting the number as fitted.\n\n"
+            "  5. Write every objective evaluation to a ledger file on disk AS IT\n"
+            "     HAPPENS -- one JSON line per evaluation with the coefficient, the\n"
+            "     per-case scores, the mean, and the elapsed seconds. If you are\n"
+            "     killed, that ledger is the only evidence the fit was working, and\n"
+            "     it is read when deciding whether to give this candidate more time.\n\n"
+            "  6. When the fit finishes, WRITE THE SELECTED COEFFICIENT INTO THE CASE\n"
+            "     DICTIONARY and verify it took effect. A fitted value that stays in\n"
+            "     a Python variable or a JSON file leaves the model running at its\n"
+            "     class default, which scores as the unmodified baseline while\n"
+            "     looking like a real experiment. Six candidates did exactly this.\n\n"
+            "STRATEGY PLAN — carry these steps out. They may require work before any\n"
+            "model code is written: reading high-fidelity data, running a fit or an\n"
+            "optimiser, and turning the fitted result into the model's coefficients or\n"
+            "form. You have a shell and the study's Python libraries; use them. The\n"
+            "deliverable below is unchanged either way — a compiled model and a case\n"
+            "that runs — but HOW you arrive at the model is what this plan specifies.\n"
+            f"{plan.strip()}\n\n"
+            if str(plan or "").strip() else ""
+        )
+        + (
+            # A continued attempt, not a fresh one. Without this the agent
+            # restarts from an empty mental slate against a directory that
+            # already holds its own compiled library, its fit artifacts and
+            # its half-finished case, and spends its second budget redoing
+            # the first one. Measured on run closure_20260826_codex: every
+            # solver_fit candidate died at the wall clock mid-optimisation,
+            # and a plain re-run would have repeated the compile and the
+            # first optimiser iterations before reaching new ground.
+            "============================================================\n"
+            "THIS IS A CONTINUATION OF AN EARLIER ATTEMPT\n"
+            "============================================================\n"
+            f"{prior_attempt.strip()}\n\n"
+            "Your run directory already contains whatever that attempt produced.\n"
+            "INSPECT IT FIRST and build on it. Re-compiling a library that is\n"
+            "already built, or re-running an optimiser iteration whose result is\n"
+            "already on disk, spends the extra time you were granted on work that\n"
+            "is already done. Only redo something if you find it is wrong or\n"
+            "incomplete.\n\n"
+            if str(prior_attempt or "").strip() else ""
+        )
+        + (
+            # The agent could not previously see its own deadline, so it could
+            # not plan against it. Measured on run closure_20260826_codex:
+            # crossgrad_ksource_solver_fit launched a differential-evolution
+            # fit needing 32 objective evaluations at ~23 minutes each -- 12.4
+            # hours of solver time against a 52-minute fence. It was killed at
+            # 16 evaluations having never had a chance. The arithmetic was
+            # knowable before the first solve; the agent just was not told the
+            # one number that makes it possible.
+            "============================================================\n"
+            "YOUR TIME BUDGET\n"
+            "============================================================\n"
+            f"You have {timeout_s} seconds ({timeout_s / 60:.0f} minutes) of wall clock.\n"
+            "When it runs out you are killed where you stand, and anything not\n"
+            "finished and written to disk is lost.\n\n"
+            "BEFORE you start any fit, sweep, or optimiser loop, cost it out and say\n"
+            "the arithmetic out loud in your reasoning:\n"
+            "    (number of objective evaluations) x (cases per evaluation)\n"
+            "        x (seconds per case) = total seconds\n"
+            "Time ONE case first if you do not know the per-case cost -- guessing it\n"
+            "is what makes the arithmetic worthless. If the total does not fit in the\n"
+            "budget above with room to spare for compiling, deploying and verifying,\n"
+            "DO NOT START IT. Shrink it until it fits: fewer fit cases, fewer\n"
+            "optimiser evaluations, a coarser convergence criterion, a scalar\n"
+            "bounded search instead of a population method. A smaller fit that\n"
+            "FINISHES is worth more than a thorough one that is killed halfway,\n"
+            "because a killed fit scores as the unmodified baseline and teaches the\n"
+            "search that the whole approach fails.\n\n"
+            "If the honest arithmetic says the work cannot fit even after shrinking,\n"
+            "say so and call `done` with what you have, explaining the cost. That is a\n"
+            "useful result. Being killed at the fence is not.\n\n"
+            if timeout_s > 0 else ""
+        )
         + f"WM_PROJECT_DIR (read-only OpenFOAM install): {wm_project_dir or '(unset)'}\n"
         + f"Starter case (read-only base): {starter_case}\n"
         + f"Run directory (your writable workspace): {run_dir}\n\n"
+        + (
+            # Repair mode: the model and the case already exist and something
+            # about the plumbing around them is broken. The full deliverable
+            # below would have the agent rebuild from scratch, which is both
+            # wasteful and dangerous -- a "repair" that re-derives the closure
+            # is a different experiment, not a repair.
+            "============================================================\n"
+            "REPAIR TASK — this overrides the deliverable below\n"
+            "============================================================\n"
+            "A previous attempt already produced this candidate. It is broken in a\n"
+            "specific, diagnosed way. Carry out EXACTLY this repair and nothing\n"
+            "else:\n\n"
+            f"{repair_goal.strip()}\n\n"
+            "Hard limits on what a repair may touch. You may fix our own plumbing:\n"
+            "a library that is not being loaded, a missing or misspelled entry in a\n"
+            "case dictionary, a coefficient the earlier attempt computed but never\n"
+            "wrote into the case, a solver tolerance, a broken post-processing step.\n"
+            "You may NOT change the mesh, the boundary conditions, the physics, the\n"
+            "endTime, the numerics being graded, or the closure itself -- changing\n"
+            "any of those makes this a different experiment and invalidates the\n"
+            "comparison. If the repair you were given cannot be carried out without\n"
+            "crossing that line, do NOT improvise a different one: call `done` and\n"
+            "say so plainly in the summary.\n\n"
+            "When the repair is made, re-run the case exactly as it was configured\n"
+            "and confirm it reaches End, then call `done`.\n\n"
+            if str(repair_goal or "").strip() else ""
+        )
         + "DELIVERABLE (generic — applies to ANY OpenFOAM modification family):\n"
         + "  (a) Copy the starter case into the run dir under a case folder\n"
         + f"      named {variant_name}/ (use run_bash with `cp -a`).\n"
@@ -484,6 +697,44 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str,
 # ---------------------------------------------------------------------------
 # JSON parsing tolerant of markdown fences / extra whitespace
 # ---------------------------------------------------------------------------
+
+_NO_FUNCTION_CALL_OVERRIDE = (
+    "\n\nOVERRIDE (highest priority): no callable tool is registered for this "
+    "turn. Ignore any impulse to emit a function call. The tools described "
+    "above are invoked by writing a JSON object as ordinary text — reply with "
+    "that JSON object and nothing else."
+)
+
+
+def _message_text(message: Any) -> str:
+    """Text of an LLM reply, or "" when it carries none.
+
+    Gemini answers a prompt that describes a tool protocol by attempting a
+    real function call; when that call is malformed the API returns
+    finish_reason=MALFORMED_FUNCTION_CALL and NO content parts. The previous
+    `getattr(resp, "content", None) or str(resp)` then fell through to
+    stringifying the whole AIMessage, producing "content=[] additional_kwargs=
+    {...}" — text that can never parse as a tool call, so the run burned its
+    parse-fail budget and aborted. Every code-mod candidate in a Gemini run
+    died this way.
+    """
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            else:
+                text_attr = getattr(block, "text", None)
+                if isinstance(text_attr, str):
+                    parts.append(text_attr)
+        return "".join(parts).strip()
+    return ""
+
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not text:
@@ -535,6 +786,7 @@ def run_agent_loop(
     *,
     repo_root: Path,
     hypothesis: str,
+    plan: str = "",
     variant_name: str,
     run_dir: Path,
     starter_case: Path,
@@ -542,6 +794,8 @@ def run_agent_loop(
     model: str,
     max_turns: int,
     timeout_s: int,
+    prior_attempt: str = "",
+    repair_goal: str = "",
 ) -> Dict[str, Any]:
     _bootstrap_paths(repo_root)
     try:
@@ -559,12 +813,22 @@ def run_agent_loop(
     )
     trajectory_log = run_dir / "agentic_trajectory.log"
     trajectory_log.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(trajectory_log, "w", encoding="utf-8")
+    # Appended, never truncated, when this is a continuation or a repair: the
+    # earlier attempt's trajectory is the evidence that justified granting more
+    # time, and overwriting it would destroy the record of why. A fresh attempt
+    # still starts clean.
+    continuing = bool(str(prior_attempt or "").strip() or str(repair_goal or "").strip())
+    log_fh = open(trajectory_log, "a" if continuing else "w", encoding="utf-8")
 
     def log(msg: str) -> None:
         log_fh.write(msg + "\n")
         log_fh.flush()
 
+    if continuing:
+        log("\n" + "=" * 60)
+        log(f"# CONTINUATION at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(timeout_s={timeout_s}, max_turns={max_turns})")
+        log("=" * 60)
     log(f"# agentic loop start variant={variant_name} model={model}")
     log(f"# run_dir={run_dir}")
     log(f"# starter_case={starter_case}")
@@ -578,10 +842,14 @@ def run_agent_loop(
     initial_user_prompt = build_agent_prompt(
         topic=topic,
         hypothesis=hypothesis,
+        plan=plan,
         variant_name=variant_name,
         starter_case=starter_case,
         run_dir=run_dir,
         wm_project_dir=wm_path,
+        prior_attempt=prior_attempt,
+        repair_goal=repair_goal,
+        timeout_s=timeout_s,
     )
 
     # IMPORTANT: do NOT accumulate AIMessage / HumanMessage pairs across turns.
@@ -595,15 +863,16 @@ def run_agent_loop(
     transcript_chunks: List[str] = []
     TRANSCRIPT_CAP = 60_000  # chars; truncate oldest entries above this
 
-    def render_transcript() -> str:
+    def render_transcript(cap: Optional[int] = None) -> str:
+        cap = TRANSCRIPT_CAP if cap is None else cap
         if not transcript_chunks:
             return ""
         full = "\n\n=== CONVERSATION SO FAR ===\n" + "\n".join(transcript_chunks) + "\n=== END CONVERSATION ===\n\nNow output your next tool-call JSON object."
-        if len(full) <= TRANSCRIPT_CAP:
+        if len(full) <= cap:
             return full
         # Truncate from the front (keep most recent turns); always keep the
         # marker lines so the agent knows it's seeing a truncated view.
-        keep = full[-TRANSCRIPT_CAP:]
+        keep = full[-cap:]
         return ("\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n"
                 + keep)
 
@@ -634,6 +903,15 @@ def run_agent_loop(
         "throttl",
         "service unavailable",
         "temporarily unavailable",
+        # claude-agent-sdk subprocess transport dying mid-stream. The CLI exits
+        # non-zero writing nothing to stderr, so the only signature is this
+        # text. Measured on run oed_20260823_opus_low: all seven candidates
+        # died here, and because the message matched none of the patterns above
+        # the loop treated it as permanent and broke after ONE attempt while
+        # reporting four. The provider wrapper now retries first; this stays as
+        # the outer net for the case where the wrapper exhausts its own.
+        "command failed with exit code",
+        "fatal error in message reader",
     )
     MAX_TRANSIENT_RETRIES = 3
 
@@ -674,15 +952,48 @@ def run_agent_loop(
                     f"{type(exc).__name__}: {str(exc)[:200]}; sleeping {backoff:.1f}s and retrying.")
                 time.sleep(backoff)
         if ai_resp is None:
-            aborted_reason = (f"llm.invoke raised after {MAX_TRANSIENT_RETRIES + 1} attempts: "
+            # attempt+1, not MAX+1: a non-transient error breaks out after the
+            # first try, and reporting a fixed "4 attempts" there sent the
+            # investigation of run oed_20260823_opus_low looking for a retry
+            # exhaustion that had never happened.
+            aborted_reason = (f"llm.invoke raised after {attempt + 1} attempt(s): "
                               f"{type(last_exc).__name__ if last_exc else 'Unknown'}: "
                               f"{str(last_exc)[:300] if last_exc else ''}")
             log(f"# {aborted_reason}")
             break
-        ai_text = getattr(ai_resp, "content", None) or str(ai_resp)
-        if isinstance(ai_text, list):
-            ai_text = " ".join(getattr(p, "text", str(p)) for p in ai_text)
-        ai_text = str(ai_text)
+        ai_text = _message_text(ai_resp)
+        if not ai_text:
+            # Empty reply: retry with the tool-call impulse countermanded in
+            # the SYSTEM message, which is where the tool protocol is
+            # described. Measured: a user-turn nudge is not enough, the same
+            # words in the system message are.
+            #
+            # Escalate rather than trying once. On a real run this override
+            # recovered 6 of 9 empty replies, but the three it missed were
+            # consecutive and ended the candidate at the parse-fail cap, so
+            # the case ran with stock SpalartAllmaras and produced nothing.
+            # Each retry also shrinks the transcript: MALFORMED_FUNCTION_CALL
+            # gets likelier as context grows (these turns follow several 10k
+            # source-file reads), so re-sending the identical prompt is the
+            # one variation least likely to help.
+            finish = (getattr(ai_resp, "response_metadata", {}) or {}).get("finish_reason", "")
+            for override_attempt, cap in enumerate(
+                (TRANSCRIPT_CAP, TRANSCRIPT_CAP // 3, TRANSCRIPT_CAP // 10), start=1
+            ):
+                log(f"# empty reply (finish_reason={finish!r}); tool-call override "
+                    f"attempt {override_attempt}/3 (transcript cap {cap})")
+                try:
+                    ai_resp = llm.invoke([
+                        SystemMessage(content=sys_msg_text + _NO_FUNCTION_CALL_OVERRIDE),
+                        HumanMessage(content=initial_user_prompt + render_transcript(cap)),
+                    ])
+                    ai_text = _message_text(ai_resp)
+                except Exception as exc:
+                    log(f"# override retry raised: {type(exc).__name__}: {str(exc)[:200]}")
+                    ai_text = ""
+                if ai_text:
+                    break
+                finish = (getattr(ai_resp, "response_metadata", {}) or {}).get("finish_reason", "")
         log(f"AI: {ai_text[:1200]}{'…' if len(ai_text) > 1200 else ''}")
 
         tool_call = _extract_json_object(ai_text)
@@ -752,6 +1063,7 @@ def run_agent_loop(
         "aborted_reason": aborted_reason,
         "duration_s": duration,
         "turns_used": turn,
+        "solver_invocations": getattr(sandbox, "solver_invocations", 0),
         "trajectory_log": str(trajectory_log),
         "final_payload": final_payload,
     }
@@ -771,50 +1083,50 @@ def _find_compiled_artifacts(  # noqa: C901
 ) -> Dict[str, Any]:
     """
     Locate the .so the agent just compiled, the case dir, and check
-    convergence. wmake places the .so wherever Make/files's `LIB =` directive
-    points — typically one of:
-      (a) case-local: <case>/customModels/<X>/platforms/<arch>/lib<X>.so
-      (b) user libbin: $FOAM_USER_LIBBIN/lib<X>.so  (wmake's default when
-          the agent uses LIB = $(FOAM_USER_LIBBIN)/lib<X>)
-    We scan both and filter by mtime to avoid picking up stale .so files left
-    over from previous runs of the same study.
+    convergence. Only artifacts below <case>/customModels/... are eligible.
+    $FOAM_USER_LIBBIN and the OpenFOAM installation are excluded: all source
+    and compilation outputs must remain local to the candidate case.
 
     Generic across modification kinds — turbulence, viscosity, BC class, source,
     or any other custom OpenFOAM derivative; only the file pattern matters.
     """
     candidates: List[Path] = []
-    # (0) Trust the agent's claimed .so path when it actually exists, lives
-    # inside the run directory, and was modified during this run. This avoids
-    # false negatives when the agent picks an unconventional but valid LIB
-    # output location (e.g. `../lib/libX.so` instead of `platforms/<arch>/`).
+    # Trust the claimed .so only when it is under run_dir/customModels.
     if agent_compiled_so:
         ap = Path(agent_compiled_so)
         try:
-            ap.resolve().relative_to(run_dir.resolve())
-            if ap.is_file() and ap.name.startswith("lib") and ap.suffix == ".so":
+            rel = ap.resolve().relative_to(run_dir.resolve())
+            if "customModels" in rel.parts and ap.is_file() and ap.name.startswith("lib") and ap.suffix == ".so":
                 candidates.append(ap)
         except Exception:
             pass
-    # (a) case-local — scan ANY .so under customModels/, regardless of whether
+    # Scan any case-local .so under customModels/, regardless of whether
     # the agent used the conventional `platforms/<arch>/` layout or pointed
     # `LIB =` at a sibling directory like `../lib/lib<X>`. Both are valid
     # outputs of `wmake libso`.
-    candidates.extend(run_dir.rglob("customModels/**/lib*.so"))
-    # (b) FOAM_USER_LIBBIN
-    user_libbin = os.environ.get("FOAM_USER_LIBBIN", "").strip()
-    if not user_libbin:
-        # heuristic: $HOME/OpenFOAM/<user>-<ver>/platforms/.../lib
-        home = Path(os.environ.get("HOME", str(Path.home())))
-        for ulb in home.glob("OpenFOAM/*-*/platforms/*/lib"):
-            user_libbin = str(ulb)
-            break
-    if user_libbin and Path(user_libbin).is_dir():
-        candidates.extend(Path(user_libbin).glob("lib*.so"))
+    for candidate in run_dir.rglob("customModels/**/lib*.so"):
+        try:
+            rel = candidate.resolve().relative_to(run_dir.resolve())
+        except Exception:
+            continue
+        # Reject symlinks that resolve outside the case-local tree.
+        if "customModels" in rel.parts:
+            candidates.append(candidate)
 
     if started_at > 0:
         # Filter to .so files modified DURING this run only — avoid stale.
         fresh = [p for p in candidates if p.is_file() and p.stat().st_mtime >= started_at - 5]
         candidates = fresh
+    # A text file named lib*.so is not compilation evidence. Read only the
+    # header; real OpenFOAM libraries can be large.
+    def _has_elf_header(path: Path) -> bool:
+        try:
+            with path.open("rb") as fh:
+                return fh.read(4) == b"\x7fELF"
+        except OSError:
+            return False
+
+    candidates = [p for p in candidates if p.is_file() and _has_elf_header(p)]
 
     # Variant-name preference: a .so whose basename mentions the variant_name
     # is much more likely to be ours than a random match.
@@ -849,7 +1161,11 @@ def _find_compiled_artifacts(  # noqa: C901
     case_dir: Optional[Path] = None
     if so:
         cm = next((p for p in so.parents if p.name == "customModels"), None)
-        if cm and cm.parent.is_dir():
+        if (
+            cm
+            and (cm.parent / "constant").is_dir()
+            and (cm.parent / "system" / "controlDict").is_file()
+        ):
             case_dir = cm.parent
     if case_dir is None and agent_case_dir:
         cand = Path(agent_case_dir)
@@ -871,24 +1187,26 @@ def _find_compiled_artifacts(  # noqa: C901
 
     converged = False
     if case_dir is not None:
-        # The application name comes from controlDict — could be simpleFoam,
-        # pimpleFoam, foamRun, chtMultiRegionFoam, etc. Look for any log.<app>.
-        log_files = list(case_dir.glob("log.*"))
-        # Prefer log.simpleFoam if present (most common), else any solver log.
-        candidate_logs = [p for p in log_files if p.name in (
-            "log.simpleFoam", "log.pimpleFoam", "log.foamRun",
-            "log.icoFoam", "log.rhoSimpleFoam", "log.buoyantSimpleFoam",
-        )]
-        if not candidate_logs:
-            # any non-mesh log
-            candidate_logs = [p for p in log_files
-                              if p.name not in ("log.blockMesh", "log.checkMesh", "log.snappyHexMesh")]
+        control_text = (case_dir / "system" / "controlDict").read_text(
+            encoding="utf-8", errors="replace"
+        )
+        app_match = re.search(r"(?m)^\s*application\s+([^;\s]+)\s*;", control_text)
+        application = app_match.group(1) if app_match else ""
+        candidate_logs = [case_dir / f"log.{application}"] if application else []
         for log in candidate_logs:
+            if not log.is_file():
+                continue
             try:
-                tail = log.read_text(encoding="utf-8", errors="replace")[-4000:]
+                text = log.read_text(encoding="utf-8", errors="replace")
             except Exception:
                 continue
-            if re.search(r"(?:^|\n)End\s*$", tail) or ("ExecutionTime" in tail and "End" in tail):
+            tail = text[-8000:]
+            if (
+                "OpenFOAM" in text[:8000]
+                and "ExecutionTime" in tail
+                and re.search(r"(?m)^\s*End\s*$", tail)
+                and "FOAM FATAL" not in tail
+            ):
                 converged = True
                 break
     return {
@@ -906,6 +1224,7 @@ def _find_compiled_artifacts(  # noqa: C901
 def run(
     *,
     hypothesis: str,
+    plan: str = "",
     variant_name: str,
     run_dir: Path,
     starter_case: Path,
@@ -914,6 +1233,8 @@ def run(
     model: str,
     timeout_s: int,
     max_turns: int,
+    prior_attempt: str = "",
+    repair_goal: str = "",
 ) -> Dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     if not starter_case.exists():
@@ -924,9 +1245,11 @@ def run(
 
     repo_root = Path(__file__).resolve().parent.parent
     started_at = time.time()
+    continuing = bool(str(prior_attempt or "").strip() or str(repair_goal or "").strip())
     loop = run_agent_loop(
         repo_root=repo_root,
         hypothesis=hypothesis,
+        plan=plan,
         variant_name=variant_name,
         run_dir=run_dir,
         starter_case=starter_case,
@@ -934,10 +1257,11 @@ def run(
         model=model,
         max_turns=max_turns,
         timeout_s=timeout_s,
+        prior_attempt=prior_attempt,
+        repair_goal=repair_goal,
     )
-    # Use the agent's claimed case_dir (from done) and variant_name to find
-    # the .so even if wmake placed it in $FOAM_USER_LIBBIN. Filter by mtime
-    # so stale .so files from prior runs are ignored.
+    # Use the claimed case_dir and variant_name to find a fresh case-local
+    # .so. Outputs in $FOAM_USER_LIBBIN are never accepted.
     final_payload = loop.get("final_payload") or {}
     agent_case = str(final_payload.get("case_dir", "") or "")
     agent_so = str(final_payload.get("compiled_so", "") or "")
@@ -946,13 +1270,22 @@ def run(
         variant_name=variant_name,
         agent_case_dir=agent_case,
         agent_compiled_so=agent_so,
-        started_at=started_at,
+        # The staleness filter exists to reject a library left behind by an
+        # earlier, different build. On a continuation or a repair the earlier
+        # build is this candidate's own work and is exactly what we want the
+        # agent to reuse -- filtering it out would report FAILED for a
+        # continuation that finished the fit without needing to recompile,
+        # which is the common case. Scoping to this run_dir's customModels,
+        # the ELF-header check, and the clean-solver-log requirement for
+        # `converged` all still apply.
+        started_at=0.0 if continuing else started_at,
     )
     success = bool(artifacts.get("compiled_so")) and artifacts.get("converged")
     result = {
         "status": "OK" if success else "FAILED",
         "duration_s": loop.get("duration_s", 0),
         "turns_used": loop.get("turns_used", 0),
+        "solver_invocations": loop.get("solver_invocations", 0),
         "aborted_reason": loop.get("aborted_reason", ""),
         "case_dir": artifacts.get("case_dir") or "",
         "class_name": artifacts.get("class_name") or variant_name,
@@ -967,7 +1300,7 @@ def run(
     }
     if not success:
         if not artifacts.get("compiled_so"):
-            result["error"] = "no .so produced under customModels/ or $FOAM_USER_LIBBIN"
+            result["error"] = "no fresh case-local .so produced under customModels/"
         elif not artifacts.get("converged"):
             result["error"] = "compiled .so but simpleFoam did not reach End"
         else:
@@ -992,7 +1325,22 @@ def main() -> int:
                         help="Wall-clock timeout in seconds for the agentic loop. "
                              "0 (default) disables the wall-clock cap and bounds the loop only by --max-turns. "
                              "Set a positive value if you want a hard wall-clock fence.")
+    parser.add_argument("--plan", default="", type=str,
+                        help="Optional strategy steps: what to read, what to fit or optimise, "
+                             "and what the fitted result becomes. When empty, the hypothesis "
+                             "is the whole instruction.")
     parser.add_argument("--max-turns", default=120, type=int)
+    parser.add_argument("--prior-attempt", default="", type=str,
+                        help="What an earlier attempt at this same candidate did and why it "
+                             "stopped. Turns this into a CONTINUATION: the agent is told to "
+                             "inspect and build on the work already in the run dir rather than "
+                             "start over, the trajectory log is appended instead of truncated, "
+                             "and a library compiled by the earlier attempt is accepted.")
+    parser.add_argument("--repair-goal", default="", type=str,
+                        help="A specific, diagnosed defect to fix in an existing candidate. "
+                             "Replaces the build deliverable with a bounded repair task that "
+                             "may touch our own plumbing but never the mesh, physics, endTime "
+                             "or the closure under test.")
     args = parser.parse_args()
 
     model = args.model.strip() or os.environ.get("CFD_SCIENTIST_MODEL", "").strip() \
@@ -1000,6 +1348,7 @@ def main() -> int:
 
     result = run(
         hypothesis=args.hypothesis,
+        plan=args.plan,
         variant_name=args.variant_name,
         run_dir=Path(args.run_dir).expanduser().resolve(),
         starter_case=Path(args.starter_case).expanduser().resolve(),
@@ -1008,6 +1357,8 @@ def main() -> int:
         model=model,
         timeout_s=args.timeout,
         max_turns=args.max_turns,
+        prior_attempt=args.prior_attempt,
+        repair_goal=args.repair_goal,
     )
     print(json.dumps({k: v for k, v in result.items()
                       if k not in ("agent_final_payload",)}, indent=2, default=str))

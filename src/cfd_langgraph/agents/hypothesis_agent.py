@@ -22,6 +22,7 @@ class HypothesisAgent:
         idea: Dict[str, Any],
         simulation: Dict[str, Any],
         run_topic: str = "",
+        case_context: str = "",
         all_experiment_ideas: str = "",
         current_experiment_idea: str = "",
         previous_requirement: str = "",
@@ -31,6 +32,14 @@ class HypothesisAgent:
             print("[Hypothesis] Generating requirement for %s..." % simulation.get("simulation_id", "?"), flush=True)
         sys_t = self.prompts.get("hypothesis_system_prompt", "")
         usr_t = self.prompts.get("hypothesis_user_prompt", "")
+        if case_context:
+            # Blind to the real case, this stage invented a whole study:
+            # OpenFOAM v2312 (the machine runs OpenFOAM 10), a custom solver
+            # cloned from pimpleFoam (the case is simpleFoam), and reference
+            # paths that do not exist. 13 of 17 requirements failed validation
+            # for exactly that, so requirements.json was never published and
+            # the manager re-ran the stage forever.
+            sys_t = sys_t + """ + repr(CTX) + """ + case_context
         if not sys_t or not usr_t:
             raise ValueError("Missing HypothesisAgent prompts")
 
@@ -73,13 +82,21 @@ class HypothesisAgent:
             print("[Hypothesis] Requirement generated (%d chars)" % len(out), flush=True)
         return out
 
-    def llm_validate_requirement(self, req: str, verbose: bool = False) -> Dict[str, Any]:
+    def llm_validate_requirement(
+        self, req: str, verbose: bool = False, case_context: str = ""
+    ) -> Dict[str, Any]:
         """
         LLM semantic validator for Foam-Agent prompt quality and consistency.
         Non-deterministic by design (requested).
         """
         system = (
-            "You are a strict CFD QA checker for Foam-Agent prompts. "
+            (
+                # The validator has to judge against the same reality the
+                # generator writes for, or it rejects correct requirements and
+                # accepts ones that name a case that does not exist.
+                """ + repr(CTX) + """ + case_context + "\n\n" if case_context else ""
+            )
+            + "You are a strict CFD QA checker for Foam-Agent prompts. "
             "Decide whether this requirement is logically consistent and executable by Foam-Agent. "
             "Validate things like solver presence, time-control consistency, boundary-condition completeness, "
             "mesh details, physics coherence, units. "
@@ -166,44 +183,43 @@ class HypothesisAgent:
             }
         ).content.strip()
 
-    @staticmethod
-    def _strip_visualization_mentions(req: str) -> str:
-        banned_tokens = [
-            "visualize",
-            "visualization",
-            "plot",
-            "contour",
-            "streamline",
-            "stream line",
-            "save as png",
-            "screenshot",
-            "render",
-            "paraview",
-            "para view",
-            "pyvista",
-            "vtk",
-            "glyph",
-            "quiver",
-            "vector",
-            "post-process",
-            "postprocess",
-            "post processing",
-            "figure",
-            "image",
-            "png",
-            "jpg",
-            "jpeg",
-        ]
-        sentences = [s.strip() for s in req.replace("\n", " ").split(".")]
-        kept = []
-        for s in sentences:
-            low = s.lower()
-            if any(tok in low for tok in banned_tokens):
-                continue
-            if s:
-                kept.append(s)
-        out = ". ".join(kept).strip()
-        return (out + ".") if out and not out.endswith(".") else out
+    def _strip_visualization_mentions(self, req: str) -> str:
+        """Remove visualization instructions without touching anything else.
+
+        This used to split on every "." and rejoin with ". ", which corrupted
+        every decimal and filename in the requirement — `h=1.0` became
+        `h=1. 0`, `Cf.csv` became `Cf. csv`, 30 times in a single generated
+        requirement — and flattened newlines. It was damaging far more than
+        the plotting sentences it existed to delete.
+
+        Deciding which sentences are visualization instructions is a reading
+        task, so it is given to the model. If that call fails the text is
+        returned UNCHANGED: the generation prompt and the validator already
+        both forbid visualization, so this is a third line of defence, and a
+        third line of defence must never be the thing that breaks the output.
+        """
+        text = str(req or "")
+        if not text.strip():
+            return text
+        try:
+            cleaned = self.llm.invoke(
+                "Remove any sentence that instructs visualization, plotting, contouring, "
+                "streamlines, figure or image generation, or post-processing output.\n"
+                "Change NOTHING else: keep every number, filename, path, newline and "
+                "sentence that remains exactly as written. Do not summarise, reword, or "
+                "reformat. If no such sentence is present, return the text verbatim.\n"
+                "Return only the resulting text.\n\n"
+                f"TEXT:\n{text}"
+            )
+            out = getattr(cleaned, "content", cleaned)
+            out = out if isinstance(out, str) else str(out)
+            # A model that returns something drastically shorter has summarised
+            # rather than filtered; keep the original over a lossy rewrite.
+            if out.strip() and len(out) >= 0.5 * len(text):
+                return out.strip()
+        except Exception:
+            pass
+        return text
 
     def generate_validated_requirement(
         self,
@@ -215,6 +231,8 @@ class HypothesisAgent:
         previous_requirement: str = "",
         max_retries: int = 3,
         verbose: bool = False,
+        case_context: str = "",
+        validator_context: str = "",
     ) -> Dict[str, Any]:
         req = self._strip_visualization_mentions(
             self.generate_user_requirement(
@@ -225,6 +243,7 @@ class HypothesisAgent:
                 current_experiment_idea=current_experiment_idea,
                 previous_requirement=previous_requirement,
                 verbose=verbose,
+                case_context=case_context,
             )
         )
         history: List[Dict[str, Any]] = []
@@ -232,7 +251,25 @@ class HypothesisAgent:
         for attempt in range(max(1, max_retries + 1)):
             if verbose and attempt > 0:
                 print("[Hypothesis] Retry %d/%d (validation failed)" % (attempt, max_retries), flush=True)
-            verdict = self.llm_validate_requirement(req, verbose=verbose)
+            verdict = self.llm_validate_requirement(
+                req, verbose=verbose, case_context=validator_context or case_context
+            )
+            if not verdict.get("valid", False):
+                # Confirm before rejecting. This validator is non-deterministic
+                # by design, and it was measured contradicting itself: a
+                # requirement marked valid during a run came back invalid on an
+                # immediate re-check of the identical text. With 17 requirements
+                # and every one required to pass, a single unstable verdict
+                # blocks the entire study and the stage silently re-runs for
+                # ever. A genuinely bad requirement fails both times, so the
+                # gate still catches what it is for.
+                second = self.llm_validate_requirement(
+                    req, verbose=verbose, case_context=validator_context or case_context
+                )
+                if second.get("valid", False):
+                    verdict = second
+                    if verbose:
+                        print("[Hypothesis] first verdict not reproduced; accepting", flush=True)
             history.append({"requirement": req, "verdict": verdict})
             if verdict.get("valid", False):
                 return {

@@ -100,6 +100,40 @@ def _extract_from_pyvista_robust(case_dir: Path) -> Dict[str, Any]:
             out["Umag_mean"] = float(np.mean(umag))
             out["Umag_max"] = float(np.max(umag))
 
+        # Wall quantities, straight off the boundary patches. These are ordinary
+        # fields sitting in the same reader as U — a wall patch commonly carries
+        # wallShearStress and yPlus — but this extractor only ever opened U, so
+        # a study asking for a wall metric (Cf) got nothing and the mesh gate
+        # silently judged convergence on centreline velocity instead.
+        try:
+            boundary = data["boundary"] if "boundary" in data.keys() else None
+        except Exception:
+            boundary = None
+        if boundary is not None:
+            for patch_name in list(boundary.keys()):
+                try:
+                    patch = boundary[patch_name]
+                except Exception:
+                    continue
+                fields = getattr(patch, "cell_data", {}) or {}
+                if "wallShearStress" not in fields:
+                    continue
+                wss = np.asarray(fields["wallShearStress"])
+                if wss.ndim != 2 or wss.shape[1] < 1 or wss.size == 0:
+                    continue
+                tau_x = wss[:, 0]
+                out[f"{patch_name}_wallShearStress_x_mean"] = float(np.mean(tau_x))
+                out[f"{patch_name}_wallShearStress_x_min"] = float(np.min(tau_x))
+                out[f"{patch_name}_wallShearStress_x_max"] = float(np.max(tau_x))
+                # Cf needs the case's reference velocity, which is a property of
+                # the study rather than of the mesh; the LLM extractor derives it.
+                # What is deterministic here is the shear itself.
+                if "yPlus" in fields:
+                    yplus = np.asarray(fields["yPlus"]).ravel()
+                    if yplus.size:
+                        out[f"{patch_name}_yPlus_mean"] = float(np.mean(yplus))
+                        out[f"{patch_name}_yPlus_max"] = float(np.max(yplus))
+
         b = mesh.bounds
         xmin, xmax, ymin, ymax, zmin, zmax = b
         cy = 0.5 * (ymin + ymax)
@@ -225,7 +259,17 @@ def _extract_from_wall_shear(case_dir: Path) -> Dict[str, Any]:
         return {}
 
 
+# Why the last llm_pyvista batch gave up. Kept so the caller can report it —
+# a silent fallback to the deterministic extractor looks identical to success
+# until a study-specific metric turns up missing several minutes later.
+_LAST_BATCH_ERROR = ""
+
+
 def _run_python_script(script_path: Path, cwd: Path, timeout_s: int = 600) -> tuple[int, str, str]:
+    """Run a generated script. The path is resolved because ``cwd`` is usually
+    the script's own directory: a relative path would be resolved against it a
+    second time and doubled, which no file matches."""
+    script_path = Path(script_path).resolve()
     try:
         proc = subprocess.run(
             [sys.executable, str(script_path)],
@@ -245,6 +289,7 @@ def _llm_pyvista_batch_qoi(
     model: str,
     work_dir: Path,
     max_retries: int = 4,
+    metric_hints: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     Ask an LLM to write one PyVista script that loads all cases, samples fields, and writes QoIs to JSON.
@@ -255,6 +300,16 @@ def _llm_pyvista_batch_qoi(
     from cfd_langgraph.llm.factory import create_langchain_llm
     from cfd_langgraph.utils import strip_json_fences
 
+    # Absolute, because the script is executed with cwd set to this directory.
+    # A relative work_dir makes `python <relative script path>` resolve against
+    # that same directory and doubles it —
+    #   <work_dir>/<work_dir>/qoi_batch_script.py — which no file matches.
+    # This is the identical mistake already fixed in
+    # `agents/analysis_agent.py`; it existed in two places and only one was
+    # repaired. It hid for four mesh-gate runs because every direct test used
+    # an absolute --output under /tmp and so never doubled, while the gate
+    # passes a repo-relative path and always did.
+    work_dir = Path(work_dir).resolve()
     work_dir.mkdir(parents=True, exist_ok=True)
     out_json = work_dir / "qoi_batch_out.json"
     script_path = work_dir / "qoi_batch_script.py"
@@ -274,22 +329,43 @@ def _llm_pyvista_batch_qoi(
         "- Use only: pathlib, json, numpy, pyvista (as pv). No network.\n"
         "- For EACH case directory in CASE_DIRS, the .foam marker file has already been created; "
         "use the marker path from FOAM_MARKERS dict. Load via pv.OpenFOAMReader(marker_path). "
-        "Select the **latest** simulation time "
-        "(max of time_values; set_active_time_value).\n"
-        "- **Mesh convergence / cross-case comparison:** Extract every requested QoI from that **final timestep only** "
-        "— do not loop over or average intermediate write times. For each case, use its own latest time; "
-        "cases should match the same nominal **endTime**; record the active time in `pyvista_time_used` for audit.\n"
+        "Select the **latest** simulation time (max of time_values; set_active_time_value).\n"
+        "- **Mesh convergence / cross-case comparison:** Extract every requested QoI from that **final "
+        "timestep only** — do not loop over or average intermediate write times. For each case use its own "
+        "latest time; record it in `pyvista_time_used` for audit.\n"
+        "\n"
+        "SIMULATION DATA COMES FROM THE MESH. Read the case with PyVista and take every simulated "
+        "quantity from the loaded data — not from OpenFOAM's postProcessing/ text files and not from "
+        "log files; you do not need them.\n"
+        "You MAY read files the metric definition below explicitly names — a reference/DNS data file, "
+        "or a case dictionary such as constant/transportProperties for a constant. Read those with "
+        "numpy/pathlib. What you must not do is invent a value for a constant the definition tells "
+        "you where to find.\n"
+        "\n"
+        "WHAT THE READER GIVES YOU. reader.read() returns a MultiBlock, typically with an 'internalMesh' "
+        "block and a 'boundary' block:\n"
+        "  data['internalMesh']            -> volume fields, e.g. U, p, nut, nuTilda\n"
+        "  data['boundary']                -> a MultiBlock of patches, addressable BY NAME\n"
+        "  list(data['boundary'].keys())   -> e.g. ['inlet','outlet','topWall','bottomWall','defaultFaces']\n"
+        "  data['boundary']['bottomWall']  -> that patch, carrying its own cell_data\n"
+        "Wall quantities are ORDINARY FIELDS on the patch, not something to approximate: a wall patch "
+        "commonly exposes wallShearStress, yPlus, U, p, nut alongside each other. Inspect "
+        "`sorted(patch.cell_data.keys())` and use what is there. Patch face coordinates come from "
+        "`patch.cell_centers().points`.\n"
+        "\n"
+        "THE REQUESTED METRICS ARE THE JOB. You are given METRICS — the exact quantities this study is "
+        "judged on. Produce every one of them. They are not a menu and not examples; a study that asked "
+        "for a metric cannot proceed on a different one. Derive them from the fields above, including "
+        "standard definitions, for example a skin-friction coefficient from wall shear stress and the "
+        "case's reference velocity (Cf = -2 * wallShearStress_x / Ub**2, with Ub read from the case's "
+        "constant/transportProperties or its documented value). Emit a scalar per case: a summary "
+        "(mean/RMS/extremum) of a profile is fine, but it must be that metric, computed from that field.\n"
+        "Return null for a requested metric ONLY if the underlying field genuinely does not exist in the "
+        "case. In that case also add a key '<metric>__why_null' with a one-line reason naming what you "
+        "looked for and which patches/fields you found — a bare null with no explanation is a defect.\n"
+        "\n"
+        "- Also report `mesh_n_cells` and `mesh_n_points` for every case.\n"
         "- read() and combine MultiBlock meshes when needed (mesh.combine() or first non-empty block).\n"
-        "- Compute scalar QoIs comparable across meshes for mesh independence / sensitivity from **field data**, "
-        "not from postProcessing text files. Prefer:\n"
-        "  * Streamwise centreline profile: sample_over_line from (xmin, ymid, zmid) to (xmax, ymid, zmid) "
-        "with resolution ~400; report centreline_Ux_mean, centreline_Ux_max, centreline_Ux_min from sampled Ux.\n"
-        "  * Volume |U| mean/max on available point or cell data (Umag_mean, Umag_max).\n"
-        "  * If patches allow, sample wall velocity gradient or wall shear proxy — optional.\n"
-        "  * reattachment_length: only if you detect sign change of Ux on centreline; else omit or null.\n"
-        "- Do NOT use OpenFOAM postProcessing folder parsers.\n"
-        "- requested metric names (may include Cd, Cl, y_plus, reattachment_length): fill keys where physically "
-        "possible from the mesh; use JSON null for unavailable.\n"
         "- At the end, write ONLY valid JSON to OUT_JSON path with schema:\n"
         '  {"results": [{"case": "<exact path string from CASE_DIRS>", "qoi": {str->number}} ... ]}\n'
         "- use float values; every listed case must appear exactly once in results, same string as in CASE_DIRS.\n"
@@ -297,6 +373,22 @@ def _llm_pyvista_batch_qoi(
         "Output ONLY raw Python. No markdown fences. First non-empty line must be an import.\n"
     )
 
+    # The study's own definition of each metric, decided once and carried here
+    # so the script never re-derives it. Two runs of this extractor on the same
+    # case produced Cf = -2.755e-04 and -3.939e-07 — the second having quietly
+    # used Ub = 1.0 instead of the case's 0.028, a factor of 1276.
+    hint_block = ""
+    if metric_hints:
+        lines = "".join(
+            f"  {h.get('name')}: {h.get('computation_hint') or h.get('description') or ''}\n"
+            for h in metric_hints
+        )
+        hint_block = (
+            "\nHOW EACH METRIC IS DEFINED FOR THIS STUDY — follow exactly, do not re-derive, "
+            "do not substitute a default for any constant:\n" + lines + "\n"
+        )
+
+    global _LAST_BATCH_ERROR
     last_err = ""
     last_script = ""
     for attempt in range(1, max_retries + 1):
@@ -305,6 +397,7 @@ def _llm_pyvista_batch_qoi(
             f"CASE_DIRS = {case_strs!r}\n"
             f"FOAM_MARKERS = {foam_markers!r}\n"
             f"REQUESTED_METRIC_NAMES = {metrics!r}\n"
+            f"{hint_block}"
             f"OUT_JSON = pathlib.Path({out_json_path_str!r})\n\n"
             "Start from `import json, pathlib`, `import numpy as np`, `import pyvista as pv`.\n"
             "Iterate over CASE_DIRS; for each, load via pv.OpenFOAMReader(FOAM_MARKERS[case_dir]).\n"
@@ -386,6 +479,7 @@ def _llm_pyvista_batch_qoi(
 
         return qmap
 
+    _LAST_BATCH_ERROR = last_err or "(no error recorded)"
     return {}
 
 
@@ -463,6 +557,12 @@ def main() -> int:
         default="pyvista",
         help="pyvista=robust OpenFOAM reader only; llm_pyvista=LLM-written PyVista batch script; legacy=old postProcessing path.",
     )
+    parser.add_argument(
+        "--metric-spec",
+        default="",
+        help="JSON file of study metric specs (name + computation_hint). Carried verbatim into "
+             "the extractor prompt so constants are never re-derived.",
+    )
     args = parser.parse_args()
 
     from cfd_langgraph.agents.analysis_agent import AnalysisAgent
@@ -476,9 +576,22 @@ def main() -> int:
     llm_map: Dict[str, Dict[str, Any]] = {}
     if args.qoi_source == "llm_pyvista":
         work_dir = out_path.parent / f".qoi_llm_{out_path.stem}"
-        llm_map = _llm_pyvista_batch_qoi(resolved, metrics, get_settings().model, work_dir)
+        hints = None
+        if args.metric_spec:
+            try:
+                hints = json.loads(Path(args.metric_spec).read_text(encoding="utf-8"))
+            except Exception as exc:
+                print(f"[analyze] could not read --metric-spec: {exc}", file=sys.stderr)
+        llm_map = _llm_pyvista_batch_qoi(
+            resolved, metrics, get_settings().model, work_dir, metric_hints=hints
+        )
         if not llm_map:
-            print("[analyze] llm_pyvista batch failed; falling back to pyvista per case.", file=sys.stderr)
+            print(
+                "[analyze] llm_pyvista batch failed after all attempts; falling back to the "
+                "deterministic pyvista extractor, which cannot compute study-specific metrics. "
+                f"Last error:\n{_LAST_BATCH_ERROR[:1500]}",
+                file=sys.stderr,
+            )
 
     raw: List[Dict[str, Any]] = []
     for p in resolved:

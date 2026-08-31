@@ -50,6 +50,22 @@ class Settings(BaseModel):
     workflow_max_experiments_total: int = int(os.environ.get("CFD_WORKFLOW_MAX_EXPERIMENTS_TOTAL", "50"))
     workflow_max_reruns_per_experiment: int = int(os.environ.get("CFD_WORKFLOW_MAX_RERUNS_PER_EXPERIMENT", "10"))
 
+    # Hypothesis generation (propose -> critique -> rank)
+    hypothesis_num_candidates: int = int(os.environ.get("CFD_HYPOTHESIS_NUM_CANDIDATES", "6"))
+
+    # Hardware-aware concurrency for running cases (see scheduling/).
+    # None/unset means "auto-detect from a calibration run"; set to force a fixed cap.
+    max_parallel_cases: int | None = (
+        int(os.environ["CFD_MAX_PARALLEL_CASES"]) if os.environ.get("CFD_MAX_PARALLEL_CASES") else None
+    )
+    resource_safety_margin: float = float(os.environ.get("CFD_RESOURCE_SAFETY_MARGIN", "0.85"))
+
+    # Knowledge bundle / self-evolution (see knowledge_bundle/, evolution/).
+    knowledge_bundle_dir: Path = Path(
+        os.environ.get("CFD_KNOWLEDGE_BUNDLE_DIR", str(_REPO_ROOT / "knowledge_bundle"))
+    )
+    evolution_min_validation_studies: int = int(os.environ.get("CFD_EVOLUTION_MIN_VALIDATION_STUDIES", "3"))
+
 
 
 def get_settings() -> Settings:

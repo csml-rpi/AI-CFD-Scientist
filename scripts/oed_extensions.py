@@ -46,7 +46,17 @@ from typing import Any, Dict, List, Optional, Tuple
 # Shared helpers
 # ---------------------------------------------------------------------------
 
-_METRIC_NUMBER_RE = re.compile(r"(?i)([A-Za-z_][A-Za-z0-9_]*)\s*[:=]\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)")
+_EMPTY_PROPOSAL_CORRECTIVE = (
+    "You returned ZERO metrics. That is not an acceptable answer: this study "
+    "cannot score any candidate without at least one scored metric, so an "
+    "empty list stops the whole search.\n"
+    "Emit a final JSON object {\"metrics\": [ ... ]} containing AT LEAST ONE "
+    "metric. Every metric's `data_source` must be copied exactly from the "
+    "available inventory listed above. If you were unsure which quantity to "
+    "choose, pick the single most directly relevant one to the stated "
+    "objective and propose that."
+)
+
 
 
 def _read_json(p: Path, default: Any) -> Any:
@@ -62,11 +72,62 @@ def _write_json(p: Path, obj: Any) -> None:
 
 
 def _strip_code_fences(s: str) -> str:
+    """Remove markdown code fences, whether or not the text opens with one.
+
+    The earlier version only stripped when the response STARTED with a fence,
+    so a reply that began with bare code but ended with a stray ``` left the
+    closing fence in the file — every authored comparator written that way was
+    a SyntaxError. Leading and trailing fences are now handled independently.
+    """
     s = s.strip()
     if s.startswith("```"):
         s = "\n".join(s.split("\n")[1:])
-        s = s.rsplit("```", 1)[0]
-    return s.strip()
+    # A trailing fence can appear with or without a matching opener.
+    lines = s.split("\n")
+    while lines and lines[-1].strip().startswith("```"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def _valid_python_source(code: str) -> bool:
+    """True if ``code`` parses, so we never persist a broken comparator."""
+    try:
+        compile(code, "<authored>", "exec")
+        return True
+    except SyntaxError:
+        return False
+
+
+_NO_FUNCTION_CALL_OVERRIDE = (
+    "\n\nOVERRIDE (highest priority): no tool is available in this turn. Ignore "
+    "every earlier instruction about issuing tool calls or returning "
+    '{"tool": ...} JSON. Do not emit a function call of any kind. Reply with '
+    "the final JSON answer only, as plain text."
+)
+
+
+def _message_text(message: Any) -> str:
+    """The text of an LLM response, or "" if it carries none.
+
+    Deliberately not ``str(message.content)``: Gemini returns content as a
+    list of typed blocks, so stringifying an EMPTY list produced the literal
+    string "[]" — which the proposer's parser then read as a valid JSON array
+    meaning "zero metrics proposed". A failed call therefore looked exactly
+    like a considered empty answer, and the study silently continued with no
+    metrics, no comparators, and no way to score anything.
+    """
+    content = getattr(message, "content", message)
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+        return "".join(parts).strip()
+    return ""
 
 
 def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None:
@@ -84,7 +145,43 @@ def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None
             msgs.append(cls(content=content))
         llm = create_langchain_llm(model=model, temperature=temp)
         raw = llm.invoke(msgs)
-        queue.put(("ok", str(getattr(raw, "content", raw))))
+        text = _message_text(raw)
+        if not text:
+            # Gemini 3 answers a prompt that *describes* a tool-call protocol
+            # (this module's proposer/verifier loops all do) by attempting a
+            # real function call, which comes back as
+            # finish_reason=MALFORMED_FUNCTION_CALL with NO content parts.
+            # Verified: the identical prompt plus the instruction below
+            # returns a full, valid answer. Retried here rather than in each
+            # caller, since every tool-loop prompt in this module is exposed
+            # to it.
+            reason = (getattr(raw, "response_metadata", {}) or {}).get("finish_reason", "")
+            # The override has to go in the SYSTEM message, not appended as a
+            # user turn: measured on the real verifier prompt, a user-turn
+            # nudge still came back empty, while the same words appended to
+            # the system message produced a complete, correct verdict. The
+            # tool protocol is described in the system message, so that is
+            # where it has to be countermanded.
+            retry_msgs = []
+            patched = False
+            for message in msgs:
+                if isinstance(message, SystemMessage) and not patched:
+                    retry_msgs.append(SystemMessage(content=message.content + _NO_FUNCTION_CALL_OVERRIDE))
+                    patched = True
+                else:
+                    retry_msgs.append(message)
+            if not patched:
+                retry_msgs.insert(0, SystemMessage(content=_NO_FUNCTION_CALL_OVERRIDE.strip()))
+            raw = llm.invoke(retry_msgs)
+            text = _message_text(raw)
+            if not text:
+                queue.put((
+                    "err",
+                    f"Model returned no content (finish_reason={reason!r}), and returned none "
+                    f"again after being told not to emit a function call.",
+                ))
+                return
+        queue.put(("ok", text))
     except Exception as e:  # pragma: no cover — child-process error path
         import traceback
         queue.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=5)}"))
@@ -189,8 +286,46 @@ _PROPOSER_MAX_TURNS = 8
 # "Baseline SA error: |7.7529 - 4.7256| ~ 3.027". Captures (label, value).
 # Topic-agnostic. Matches `~`, `≈`, OR `=` followed by a number.
 _NAMED_EXPECTATION_RE = re.compile(
-    r"([A-Za-z][A-Za-z0-9_\-/ ]{0,60}?)\s*[~≈=]\s*(-?\d+(?:\.\d+)?)",
+    r"([A-Za-z][A-Za-z0-9_\-/ ]{0,60}?)\s*(?:[~≈=:]|\bis\b|\bof\b)\s*"
+    r"(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)",
 )
+
+
+def topic_expectations(topic: str) -> Dict[str, float]:
+    """Expected metric values stated in the user's own topic text.
+
+    The study prompt routinely pins the baseline ("the correct baseline Cf
+    RMSE is 0.004297"). That number is the only independent check available
+    on an LLM-authored comparator, and using it is what stops a comparator
+    that is wrong by orders of magnitude from silently becoming the yardstick
+    the whole search is scored against. Keys are normalised metric-ish names.
+    """
+    found: Dict[str, float] = {}
+    for match in _NAMED_EXPECTATION_RE.finditer(topic or ""):
+        label = re.sub(r"[^a-z0-9]+", "_", (match.group(1) or "").lower()).strip("_")
+        try:
+            value = float(match.group(2))
+        except Exception:
+            continue
+        if not label or value == 0.0:
+            continue
+        found.setdefault(label, value)
+    return found
+
+
+def expectation_for_metric(metric_name: str, expectations: Dict[str, float]) -> Optional[float]:
+    """The stated expectation matching ``metric_name``, or None.
+
+    Matches on the metric's own tokens (``cf_rmse`` -> "cf", "rmse") so
+    "baseline Cf RMSE is 0.004297" binds to cf_rmse but not to cf_mae.
+    """
+    tokens = [t for t in re.split(r"[^a-z0-9]+", (metric_name or "").lower()) if t]
+    if not tokens:
+        return None
+    for label, value in expectations.items():
+        if all(token in label for token in tokens):
+            return value
+    return None
 
 
 def _extract_all_expectations(spec: Dict[str, Any]) -> List[Tuple[str, float]]:
@@ -850,6 +985,11 @@ def propose_metric_set(
             arr = json.loads(body[i_arr:end])
         except Exception:
             return "unknown", {"raw": body[i_arr:end]}
+        if not arr:
+            # An empty array is never a considered answer here — the task is
+            # to name at least one metric. Treating it as "final" is how a
+            # content-less response became a silent zero-metric result.
+            return "unknown", {"raw": body}
         return "final", _coerce_specs(arr)
 
     allowed_paths = list(inventory.get("all_paths") or [])
@@ -1011,21 +1151,28 @@ def propose_metric_set(
                 "reason": "exceeded_rounds"}
 
     try:
-        max_attempts = 3 if enforce else 1  # original + up to 2 retries
+        # Retries only fire on a failed attempt (invalid data_source, or an
+        # empty proposal), so allowing them unconditionally costs nothing on
+        # the happy path and is what makes the empty-proposal retry reachable.
+        max_attempts = 3  # original + up to 2 retries
         last_specs: List[Dict[str, Any]] = []
         for attempt in range(1, max_attempts + 1):
             specs, last_raw, messages = _run_tool_loop(messages)
             last_specs = specs
 
             if not enforce:
-                final_valid = specs
+                retry_empty = not specs and attempt < max_attempts
                 attempts_log.append({
                     "attempt": attempt,
                     "n_metrics_proposed": len(specs),
                     "n_invalid": 0,
                     "invalid_paths": [],
-                    "retry": False,
+                    "retry": retry_empty,
                 })
+                if retry_empty:
+                    messages = messages + [("user", _EMPTY_PROPOSAL_CORRECTIVE)]
+                    continue
+                final_valid = specs
                 break
 
             valid: List[Dict[str, Any]] = []
@@ -1039,13 +1186,26 @@ def propose_metric_set(
                     invalid.append(s)
                     invalid_paths.append(ds)
 
+            # An empty proposal is a failure, not a clean pass. Without this,
+            # `not invalid` is trivially true for zero metrics, so the loop
+            # broke immediately on the first attempt, reported
+            # "n_invalid: 0, retry: false", and left the study with no
+            # comparators and therefore no way to score any candidate — the
+            # observed failure in two consecutive live runs.
             attempts_log.append({
                 "attempt": attempt,
                 "n_metrics_proposed": len(specs),
                 "n_invalid": len(invalid),
                 "invalid_paths": invalid_paths,
-                "retry": (len(invalid) > 0 and attempt < max_attempts),
+                "retry": ((len(invalid) > 0 or not specs) and attempt < max_attempts),
             })
+
+            if not specs:
+                if attempt < max_attempts:
+                    messages = messages + [("user", _EMPTY_PROPOSAL_CORRECTIVE)]
+                    continue
+                final_valid = []
+                break
 
             if not invalid:
                 final_valid = valid
@@ -1334,7 +1494,25 @@ def author_comparator(
             "script that computes ONE specific metric from an OpenFOAM case "
             "against a reference dataset.\n\n"
             "STRICT RULES:\n"
-            "- Imports: argparse, pathlib, numpy, csv, json, re, sys. Nothing else.\n"
+            "- Imports: argparse, pathlib, numpy, csv, json, re, sys, pyvista as pv. "
+            "Nothing else.\n"
+            "\n"
+            "READING THE CASE — use exactly this, it is verified against these cases:\n"
+            "    marker = case_dir / 'case.foam'\n"
+            "    marker.touch()\n"
+            "    reader = pv.OpenFOAMReader(str(marker))\n"
+            "    reader.set_active_time_value(<the pinned time>)\n"
+            "    data = reader.read()\n"
+            "    patch = data['boundary']['<patchName>']      # e.g. 'bottomWall'\n"
+            "    values = np.asarray(patch.cell_data['<fieldName>'])   # e.g. 'wallShearStress'\n"
+            "    coords = np.asarray(patch.cell_centers().points)      # real face centres\n"
+            "A wall patch carries its fields in `cell_data` directly — wallShearStress, "
+            "yPlus, U, p, nut all sit there alongside each other. Do NOT write recursive "
+            "block searches, do NOT call enable_*_arrays, do NOT fall back to point_data, "
+            "and do NOT parse polyMesh or postProcessing text files. Repeated attempts that "
+            "did any of those reported 'field not found on patch' for a field that is "
+            "plainly present.\n"
+            "\n"
             "- CLI: --case <dir>, --reference <file>, optional --time <t>, "
             "optional --baseline-time <float>, optional --out <dir>.\n"
             "- When --baseline-time is given, pin to that exact time directory; "
@@ -1345,6 +1523,12 @@ def author_comparator(
             "an additional REQUIRED diagnostic line 'TIME_USED: <float>'.\n"
             "- Wrap every file read in try/except; on failure print "
             "'PARSE_WARNING: <path> <reason>' and continue.\n"
+            "- SPATIAL COORDINATES: take face centres from `patch.cell_centers().points` as shown above — they are the real, "
+            "mesh-accurate centres. Never assume faces are evenly spaced and never "
+            "synthesise coordinates with linspace/arange over a domain length; on a "
+            "graded or curved wall (a hill, an aerofoil, any refined boundary layer) "
+            "that misplaces every point and silently corrupts the metric. Parsing "
+            "constant/polyMesh by hand is unnecessary now that the reader provides them. "
             "- Output ONLY raw Python code. No markdown."
         )
         user_msg = (
@@ -1625,6 +1809,9 @@ def _author_comparator_corrective(
         code = _strip_code_fences(raw)
         if not code or "import" not in code:
             return None
+        if not _valid_python_source(code):
+            print(f"[OED-EXT][phase1] authored comparator for {metric_name} did not parse; discarding")
+            return None
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(code, encoding="utf-8")
         return out_path
@@ -1715,10 +1902,26 @@ def _selftest_comparator_full(
 # Verifier LLM (independently re-derives a metric to catch wrong-quantity bugs)
 # ---------------------------------------------------------------------------
 
+# Total re-authoring attempts per comparator is text + pyvista. Held at 10
+# combined: a comparator that is still wrong after ten rewrites is not
+# going to be fixed by an eleventh, and each round costs an authoring
+# call plus a full self-test evaluation.
 MAX_TEXT_ATTEMPTS = 5
-MAX_PYVISTA_ATTEMPTS = 10
+MAX_PYVISTA_ATTEMPTS = 5
 _VERIFIER_MAX_TURNS = 8
 _VERIFIER_SCRIPT_TIMEOUT_S = 30
+
+
+def _verifier_errored(vres: Dict[str, Any]) -> bool:
+    """True when the verifier failed to run, rather than judging the
+    comparator to be doubtful. The two are recorded identically as
+    SUSPICIOUS, but only one of them says anything about the comparator."""
+    rationale = str((vres or {}).get("rationale", "")).lower()
+    return any(
+        marker in rationale
+        for marker in ("verifier llm error", "prompts not loadable", "prompt format error",
+                       "returned no content", "timed out")
+    )
 
 
 def _run_verifier_script_sandboxed(code: str, timeout_s: int = _VERIFIER_SCRIPT_TIMEOUT_S) -> Tuple[str, str, int]:
@@ -1974,6 +2177,64 @@ def _verify_comparator_llm(
     }
 
 
+_COORD_SYNTHESIS_RE = re.compile(r"\b(?:np|numpy)\.(?:arange|linspace)\s*\(")
+
+# Any genuine source of per-element geometry. Direct polyMesh parsing is one
+# way; a VTK/pyvista reader is an equally valid one and is a first-class
+# method here (comparators switch to pyvista after repeated text-parse
+# failures), as is any file that carries coordinates in its own columns.
+_REAL_COORDINATE_SOURCES = (
+    "polymesh",          # constant/polyMesh/{boundary,faces,points}
+    "openfoamreader",    # pyvista / VTK reader exposes real coordinates
+    "pyvista",
+    "cell_centers", "cellcentres", "cell_centres",
+    ".points", "face_centres", "face_centers",
+    "sample_over_line",  # samples the real mesh, not an invented axis
+    "getpoints", "point_data", "cell_data",
+)
+
+
+def metric_needs_element_coordinates(metric: Dict[str, Any]) -> bool:
+    """True if this metric's values arrive without coordinates attached.
+
+    Field files — ``<time>/<fieldName>`` and the boundary-field-like
+    postProcessing outputs — list one value per face or cell in mesh order and
+    carry no positions, so anything spatial must get positions from the mesh.
+    A postProcessing ``.dat`` aggregate is the opposite case: it is a
+    per-timestep summary that already carries its own independent variable, so
+    the question does not arise.
+    """
+    source = str(metric.get("data_source", "") or "").strip().lower()
+    if not source:
+        return True          # unknown shape: assume it needs real geometry
+    return not source.endswith(".dat")
+
+
+def fabricated_coordinates(source: str, metric: Optional[Dict[str, Any]] = None) -> bool:
+    """True if a comparator invents element coordinates instead of reading them.
+
+    A field file holds one value per element in mesh order and carries NO
+    coordinates. Models persistently synthesise ``(np.arange(n) + 0.5) * L/n``,
+    which is only valid on a uniformly spaced straight wall; on a graded or
+    curved boundary — a hill, an aerofoil, any boundary-layer refinement — it
+    evaluates the metric at the wrong locations and distorts exactly the
+    spatial features (separation, reattachment, peak position) such metrics
+    exist to measure. Telling the model not to do this was tried and did not
+    hold, so it is enforced rather than requested.
+
+    Three conditions must all hold, which keeps this from firing on the other
+    comparator shapes: the metric must actually need per-element coordinates,
+    the source must synthesise a coordinate array, and no genuine geometry
+    source may be referenced anywhere in the script.
+    """
+    if metric is not None and not metric_needs_element_coordinates(metric):
+        return False
+    lowered = source.lower()
+    if any(marker in lowered for marker in _REAL_COORDINATE_SOURCES):
+        return False
+    return bool(_COORD_SYNTHESIS_RE.search(source))
+
+
 def author_and_selftest(
     metric: Dict[str, Any],
     *,
@@ -1989,6 +2250,7 @@ def author_and_selftest(
     flow_params: Optional[Dict[str, Any]] = None,
     exemplar_text: str = "",
     pyvista_after_attempt: int = 5,
+    expected_value: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Author + self-test a comparator with up to ``max_attempts`` retries.
 
@@ -2028,13 +2290,35 @@ def author_and_selftest(
         preferred_method = "auto"
     max_text_attempts = MAX_TEXT_ATTEMPTS
     max_pyvista_attempts = MAX_PYVISTA_ATTEMPTS
-    if preferred_method == "pyvista":
-        # Skip text entirely.
+    # A spatial metric needs per-element coordinates, and the reader hands
+    # those over directly (cell_centers() on the patch). Hand-parsing
+    # constant/polyMesh to rebuild face centres is the fragile route: it
+    # breaks on binary-format meshes and on the compact `faces` encoding, and
+    # when it breaks the authored script's own fallback is to invent evenly
+    # spaced coordinates and report a plausible wrong number. The metric
+    # proposer names a preferred_method by guesswork and routinely says
+    # "text" for spatial metrics, so that guess is overridden here — but text
+    # stays available as a fallback rather than being switched off, so a
+    # missing or failing pyvista never leaves the metric unbindable.
+    spatial = metric_needs_element_coordinates(metric)
+    if spatial and preferred_method in {"auto", "text"}:
+        print(
+            f"[OED-EXT][phase1] {metric.get('name','?')} is spatial "
+            f"(data_source={metric.get('data_source','')!r}); trying pyvista first so "
+            f"coordinates come from the mesh reader rather than being reconstructed "
+            f"(proposer asked for {preferred_method!r})"
+        )
+        preferred_method = "pyvista"
+        text_budget = max_text_attempts
+        pyvista_budget = max_pyvista_attempts
+        current_method = "pyvista"
+    elif preferred_method == "pyvista":
+        # Explicitly requested: skip text entirely.
         text_budget = 0
         pyvista_budget = max_pyvista_attempts
         current_method = "pyvista"
     else:
-        # 'text' or 'auto' -> try text first, fall back.
+        # 'text' or 'auto' on a non-spatial metric -> try text first.
         text_budget = max_text_attempts
         pyvista_budget = max_pyvista_attempts
         current_method = "text"
@@ -2059,6 +2343,14 @@ def author_and_selftest(
         if current_method == "text" and text_used >= text_budget:
             current_method = "pyvista"
             first_attempt_in_method = True
+        if (
+            current_method == "pyvista"
+            and pyvista_used >= pyvista_budget
+            and text_used < text_budget
+        ):
+            # Exhausted the reader route but text attempts remain: use them
+            # rather than abandoning the metric entirely.
+            current_method = "text"
         if current_method == "pyvista" and pyvista_used >= pyvista_budget:
             break  # all budgets exhausted
         if current_method == "text" and text_budget == 0:
@@ -2149,6 +2441,49 @@ def author_and_selftest(
             reference_file=reference_file, metric_name=metric_name,
             baseline_time=baseline_final_time,
         )
+        # Coordinates must come from the mesh, never be invented.
+        if st["ok"] and fabricated_coordinates(prev_source, metric):
+            st = {
+                **st,
+                "ok": False,
+                "reason": (
+                    "this comparator synthesises the streamwise coordinate with "
+                    "numpy.arange/linspace and never reads constant/polyMesh. A boundary "
+                    "field lists one value per face in mesh order with no coordinates, and "
+                    "this wall is curved and graded, so evenly spaced coordinates evaluate "
+                    "the metric at the wrong locations. Read nFaces and startFace for the "
+                    "patch from constant/polyMesh/boundary, the face point indices from "
+                    "constant/polyMesh/faces, and the coordinates from "
+                    "constant/polyMesh/points, then average each face's points to get its "
+                    "centre."
+                ),
+            }
+
+        # A comparator that runs cleanly can still be wrong by orders of
+        # magnitude — a hardcoded Ub=1.0 once produced 6.68 where the study's
+        # own stated baseline was 0.004297, and nothing caught it because the
+        # script exited 0. The user-stated baseline is the only independent
+        # check available, so use it: a factor-of-3 band passes ordinary
+        # methodological differences (smoothing, interpolation) while
+        # rejecting a normalisation that is simply wrong.
+        if st["ok"] and expected_value and st["value"] is not None:
+            try:
+                ratio = abs(float(st["value"])) / abs(float(expected_value))
+            except Exception:
+                ratio = 1.0
+            if ratio > 3.0 or ratio < (1.0 / 3.0):
+                st = {
+                    **st,
+                    "ok": False,
+                    "reason": (
+                        f"self-test produced {st['value']:.6g} but the study states the "
+                        f"baseline {metric_name} is {expected_value:.6g} — off by a factor "
+                        f"of {ratio:.4g}. This is a normalisation or unit error, not a "
+                        f"methodological difference. Re-derive the normalisation from the "
+                        f"case's own constant/transportProperties; do not hardcode 1.0."
+                    ),
+                }
+
         failure_mode = "ok" if st["ok"] else _classify_selftest_failure(
             stdout=st["stdout"], stderr=st["stderr"], value=st["value"],
             baseline_time=baseline_final_time, time_used=st["time_used"],
@@ -2235,10 +2570,28 @@ def author_and_selftest(
                     "preferred_method": preferred_method,
                 }
             if verifier_verdict == "SUSPICIOUS":
-                # Don't bind on SUSPICIOUS — verifier couldn't validate, which
-                # historically masked wrong-physics-window comparators. Re-author
-                # with a corrective hint pointing at the most common failure
-                # modes so the next attempt is more likely to be checkable.
+                # A verifier that ERRORED is not a verifier with doubts. When
+                # the check itself fails to run (an API error, an empty
+                # response), re-authoring a comparator whose self-test passed
+                # is pure waste: the rewrite cannot fix an outage, so the loop
+                # burns a fresh authoring call plus a fresh case evaluation
+                # every round. Observed: 15 rewrites of one comparator, all
+                # discarded, none of them wrong. Bind it and record that it is
+                # unverified, so the failure is visible without being fatal.
+                if _verifier_errored(vres):
+                    return {
+                        "ok": True,
+                        "path": str(comparator_path),
+                        "selftest_ok": True,
+                        "selftest_value": st["value"],
+                        "selftest_reason": st["reason"],
+                        "attempts": attempt,
+                        "final_method": current_method,
+                        "verifier_verdict": "UNVERIFIED",
+                        "verifier_unavailable": True,
+                        "verifier_rationale": vres.get("rationale", ""),
+                        "preferred_method": preferred_method,
+                    }
                 failure_mode = "verifier_suspicious"
                 rec["failure_mode"] = failure_mode
                 prev_failure_mode = failure_mode
@@ -2341,6 +2694,7 @@ def resolve_metric_comparators(
     sample_pp_data: str = "",
     exemplar_text: str = "",
     baseline_final_time: Optional[float] = None,
+    topic: str = "",
 ) -> Dict[str, Dict[str, Any]]:
     """
     For each metric:
@@ -2350,6 +2704,9 @@ def resolve_metric_comparators(
                             "selftest_ok": bool, "selftest_value": float|None}}.
     """
     existing = discover_existing_comparators(search_roots=search_roots, metrics=metrics)
+    expectations = topic_expectations(topic)
+    if expectations:
+        print(f"[OED-EXT] baseline values stated in the topic: {expectations}")
     bound: Dict[str, Dict[str, Any]] = {}
     for m in metrics:
         name = m["name"]
@@ -2407,6 +2764,7 @@ def resolve_metric_comparators(
             flow_params=flow_params,
             exemplar_text=exemplar_text,
             pyvista_after_attempt=5,
+            expected_value=expectation_for_metric(name, expectations),
         )
         bound[name] = result
         if not result.get("selftest_ok"):
@@ -2477,11 +2835,22 @@ def compute_metric_vector(
         m = re.search(rf"METRIC\s+{re.escape(name)}\s*:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?|nan)",
                       blob, re.IGNORECASE)
         if not m:
-            # also accept any RMSE-like value if metric name not found
-            m2 = _METRIC_NUMBER_RE.search(blob)
-            if m2:
+            # Fall back only to a line that names THIS metric — e.g.
+            # "cf_rmse = 0.0043" without the METRIC prefix. The previous
+            # fallback took the first `identifier: number` anywhere in
+            # stdout+stderr, so a comparator that failed to compute anything
+            # still produced a number: "nPoints = 12800" in the preamble was
+            # recorded as cf_rmse=12800, which then flowed into scoring and
+            # could become a niche elite. A comparator that produced no value
+            # must say so.
+            m2 = re.search(
+                rf"(?i)(?<![A-Za-z0-9_]){re.escape(name)}\s*[:=]\s*"
+                r"(-?\d+\.?\d*(?:[eE][+-]?\d+)?|nan)",
+                blob,
+            )
+            if m2 and m2.group(1).lower() != "nan":
                 try:
-                    metrics[name] = float(m2.group(2))
+                    metrics[name] = float(m2.group(1))
                     continue
                 except Exception:
                     pass
@@ -2947,24 +3316,181 @@ def render_diversity_constraint(
     )
 
 
-def classify_family(model_description: str, model_class: str = "") -> Tuple[str, str]:
+def llm_classify_family(model_description: str, model_class: str = "") -> Optional[Tuple[str, str]]:
+    """Ask the model which family a modification belongs to, or None.
+
+    The keyword table below only knows the handful of families someone wrote
+    down, so anything outside it collapses into "unknown" — measured on a real
+    proposal batch, Kato-Launder and Edwards-Chandra both landed there and
+    SA-QCR2000 was filed as plain "SA". That matters more than a cosmetic
+    mislabel: the family IS the niche identity for the quality-diversity
+    archive, so distinct mechanisms sharing a label shadow each other's elite
+    and the explore/exploit selection stops discriminating. It also cannot
+    generalise to a study about a different model class, since the table is
+    turbulence-model specific.
+
+    Returns None on any failure, leaving ``classify_family``'s keyword table
+    as the fallback.
     """
-    Heuristic classifier mapping a model description to (family, equation_touched).
-    Generic — uses keyword matching. Returns ('SA-RC', 'production'), etc.
+    try:
+        raw = _llm_invoke(
+            [
+                (
+                    "system",
+                    "Classify a proposed model modification into a FAMILY and the "
+                    "EQUATION TERM it touches.\n"
+                    "Reply with STRICT JSON only: "
+                    '{"family": "<short-label>", "equation_touched": "<term>"}.\n'
+                    "The family names the specific mechanism, using its established "
+                    "name where one exists (SA-RC, SA-QCR2000, Kato-Launder, "
+                    "Wray-Agarwal, k-omega-SST, ...). Two modifications share a family "
+                    "only if they alter the same mechanism in the same way — the label "
+                    "is used to tell approaches apart, so an over-broad one hides real "
+                    "differences. equation_touched is one of: production, destruction, "
+                    "diffusion, source, limiter, constitutive, wall-treatment, other.",
+                ),
+                ("user", f"MODEL CLASS: {model_class}\n\nMODIFICATION:\n{model_description}"),
+            ],
+            temperature=0.0,
+        )
+        match = re.search(r"\{.*\}", _strip_code_fences(raw or ""), re.S)
+        if not match:
+            return None
+        parsed = json.loads(match.group(0))
+        family = str(parsed.get("family", "")).strip()
+        eq = str(parsed.get("equation_touched", "")).strip().lower() or "unknown"
+        if not family or family.lower() in {"unknown", "n/a", "none", ""}:
+            return None
+        return (family, eq)
+    except Exception as exc:
+        print(f"[OED-EXT] family classification fell back to keywords: {exc}")
+        return None
+
+
+STRATEGY_LABELS = ("analytic", "sweep", "solver_fit", "offline_fit")
+
+
+def llm_classify_strategy(
+    plan: str, hypothesis: str = "", declared: str = ""
+) -> Optional[str]:
+    """Ask the model which SEARCH STRATEGY a plan actually describes, or None.
+
+    The keyword table in ``oed_search_archive.classify_strategy`` cannot make
+    this call, and measured failure on run closure_20260826_codex shows why.
+    Candidate ``sst_a1_limiter_025`` declared ``solver_fit``; its plan read
+    "U_LES, k_LES and tauij_LES training fields may be read offline only for
+    sign/branch diagnostics ... Implement the fixed a1=0.25 runtime closure
+    exactly as specified, with no fitted or case-dependent parameters." That
+    is a hand-chosen constant — ``analytic``. The table saw the word "offline",
+    returned ``offline_fit``, and so accepted the ``solver_fit`` claim.
+
+    The distinction is about where the numbers in the final model come from,
+    which no keyword can see: reading high-fidelity fields to check a sign is
+    not fitting, and the word "offline" appears in both cases. Strategy is the
+    second axis of the quality-diversity archive, so a wrong label puts the
+    candidate in the wrong niche and makes the strategy scoreboard report
+    fitting work that never happened.
+
+    Returns None on any failure, leaving the keyword table as the fallback.
     """
+    try:
+        raw = _llm_invoke(
+            [
+                (
+                    "system",
+                    "Classify how a proposed experiment DETERMINES THE NUMBERS in "
+                    "its final model. Judge only what the plan actually does, not "
+                    "what it calls itself.\n"
+                    'Reply with STRICT JSON only: {"strategy": "<one label>"}.\n'
+                    "Labels:\n"
+                    "  analytic    - the model form and every coefficient are fixed "
+                    "up front by reasoning, physics or hand-choice. Still analytic "
+                    "if stored high-fidelity data is read to check a sign, pick a "
+                    "branch, or sanity-check a value that was chosen by hand.\n"
+                    "  sweep       - an already-compiled model is re-run with "
+                    "different coefficient values and the best is kept.\n"
+                    "  solver_fit  - coefficients are chosen by running the solver "
+                    "and optimising the scored objective (a-posteriori, "
+                    "solver-in-the-loop).\n"
+                    "  offline_fit - a correction or model is fitted or regressed to "
+                    "stored data before it ever meets the solver.\n"
+                    "Decisive test: if you deleted the data or skipped the runs, "
+                    "would any number in the final model change? If no number would "
+                    "change, it is analytic or sweep, never a fit.",
+                ),
+                (
+                    "user",
+                    f"DECLARED STRATEGY (may be wrong, ignore if the plan disagrees): "
+                    f"{declared or '(none)'}\n\n"
+                    f"HYPOTHESIS:\n{hypothesis}\n\nPLAN:\n{plan}",
+                ),
+            ],
+            temperature=0.0,
+        )
+        match = re.search(r"\{.*\}", _strip_code_fences(raw or ""), re.S)
+        if not match:
+            return None
+        value = str(json.loads(match.group(0)).get("strategy", "")).strip().lower()
+        value = value.replace("-", "_").replace(" ", "_")
+        return value if value in STRATEGY_LABELS else None
+    except Exception as exc:
+        print(f"[OED-EXT] strategy classification fell back to keywords: {exc}")
+        return None
+
+
+def classify_family(
+    model_description: str, model_class: str = "", *, use_llm: bool = True
+) -> Tuple[str, str]:
+    """
+    Map a model description to (family, equation_touched).
+
+    Asks the model first — see ``llm_classify_family`` for why the keyword
+    table below is not sufficient — and falls back to keyword matching when
+    that is unavailable or unusable. Pass ``use_llm=False`` for the pure
+    deterministic path (tests, offline replay of an existing archive).
+    """
+    if use_llm:
+        decided = llm_classify_family(model_description, model_class)
+        if decided is not None:
+            return decided
     text = f"{model_class} {model_description}".lower()
     family = "unknown"
     eq = "unknown"
-    if "spalart" in text or "salmaras" in text or "sa-" in text or "sa_" in text:
+
+    def has(*terms: str) -> bool:
+        """Whole-token match.
+
+        Bare substring tests are actively dangerous here, because the family
+        label IS the niche identity for the quality-diversity archive: two
+        unrelated models sharing a label collapse into one niche and shadow
+        each other's elite. ``"rc" in text`` matched every description
+        containing "sou*rc*e" or "fo*rc*e", so any SA variant adding a source
+        term was filed as rotation-curvature, while an actual
+        "SA with rotation-curvature correction" missed the SA gate entirely
+        (no "spalart"/"sa-"/"sa_") and landed in "unknown".
+        """
+        return any(re.search(rf"(?<![a-z0-9]){re.escape(t)}(?![a-z0-9])", text) for t in terms)
+
+    if has("spalart", "allmaras", "salmaras", "sa", "s-a", "sa-", "sa_"):
         family = "SA"
-        if "rotation" in text or "rc" in text:
+        if has("rc", "rotation", "rotational", "curvature", "rotation-curvature"):
             family = "SA-RC"
-        elif "neq" in text or "non-equilibrium" in text or "non_equilibrium" in text:
+        elif has("neq", "non-equilibrium", "nonequilibrium", "non_equilibrium"):
             family = "SA-NEQ"
-        elif "apg" in text:
+        elif has("apg", "adverse"):
             family = "SA-APG"
-        elif "cb1" in text or "production" in text:
+        elif has("cb1", "production", "stilde", "s-tilde"):
             family = "SA-Production"
+        elif has("cw1", "destruction", "fw", "wall-destruction"):
+            # A destruction-side modification is a genuinely different
+            # mechanism from a production-side one; without its own label it
+            # would share the undifferentiated "SA" niche with everything
+            # else that doesn't match a more specific rule.
+            family = "SA-Destruction"
+        elif has("diffusion", "sigma", "cb2"):
+            family = "SA-Diffusion"
+    elif has("wray", "wray-agarwal"):
+        family = "Wray-Agarwal"
     elif "k-omega" in text or "komega" in text or "k_omega" in text or "sst" in text:
         family = "k-omega-SST"
     elif "k-epsilon" in text or "k_epsilon" in text or "kepsilon" in text:

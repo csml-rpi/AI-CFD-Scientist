@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from timeline_logger import append_timeline_event, resolve_timeline_path
+from oed_search_archive import SearchArchive
 
 # run_validity is sibling-imported lazily inside helpers so the module remains
 # safe to import even when the optional CFD-langgraph stack is unavailable.
@@ -604,11 +605,31 @@ def _maybe_preflight_allrun(case_dir: Path, repo_root: Path) -> Optional[Dict[st
         return None
 
 
-def _compact_history(history: List[Dict[str, Any]]) -> str:
-    """Build a concise text summary of all past iterations for the decision LLM."""
+_HISTORY_PROMPT_MAX_ENTRIES = 12
+
+
+def _compact_history(history: List[Dict[str, Any]], max_entries: int = _HISTORY_PROMPT_MAX_ENTRIES) -> str:
+    """Build a concise text summary of past iterations for the decision LLM.
+
+    Bounded: this string is rebuilt into every decision prompt, and each entry
+    can carry up to ~1500 characters of script output. Rendering the whole
+    history meant the prompt grew without limit as the search ran, so a long
+    study spent an increasing share of every call re-reading its own early,
+    least relevant attempts. The most recent ``max_entries`` are what the next
+    decision actually turns on; the rest are summarised by count so nothing is
+    silently pretended away.
+    """
     if not history:
         return "No experiments run yet."
     lines = []
+    omitted = len(history) - max_entries
+    if omitted > 0:
+        history = history[-max_entries:]
+        lines.append(
+            f"[{omitted} earlier iteration(s) omitted from this prompt for length; "
+            f"the full record is in history.json and the archive summary covers "
+            f"the best result per family.]"
+        )
     for h in history:
         it = h.get("iteration", "?")
         atype = h.get("action_type", "?")
@@ -1890,17 +1911,20 @@ def _run_code_mod_iteration(
         topic=topic,
     )
 
-    # foam_run
+    # The compiled case is already complete — copy it, source OpenFOAM, run
+    # Allrun. This used to go through foam_run.py, whose reviewer-led rewrite
+    # loop needs Foam-Agent vendored; it also rewrites momentumTransport /
+    # fvOptions / Make on a failed Allrun, which is the wrong repair for a
+    # case whose whole point is the custom model already compiled into it.
     exp_dir = iter_dir / "experiment"
+    validation_run_result_path = iter_dir / "validation_run_result.json"
     rc, out, err = _call(
         [
-            sys.executable, "scripts/foam_run.py",
-            "--requirement", requirement,
+            sys.executable, "scripts/foam_run_simple.py",
+            "--base-case", compiled_case,
             "--output-dir", str(exp_dir),
-            "--base-case-dir", compiled_case,
-            "--max-loop", "10",
-            "--max-time-limit", "21600",
-            "--timeline", str(timeline_path),
+            "--output", str(validation_run_result_path),
+            "--timeout", "21600",
         ],
         cwd=repo_root,
         timeout=22000,
@@ -3074,49 +3098,80 @@ def _run_experiment_iteration(
             "runtime_apply_error": hint,
         }
 
-    # Class-derivation experiment (legacy path) — go through foam_run.py with
-    # the FoamAgent reviewer.
-    requirement = _build_experiment_requirement(
-        iteration=iteration,
-        kind="parameter_sweep",
-        model_desc=model_desc,
-        model_name=model_name,
-        params=params,
-        ref_info=ref_info,
-        topic=topic,
-    )
-    rc, out, err = _call(
-        [
-            sys.executable, "scripts/foam_run.py",
-            "--requirement", requirement,
-            "--output-dir", str(exp_dir),
-            *(["--base-case-dir", base_case] if base_case else []),
-            "--max-loop", "10",
-            "--max-time-limit", "21600",
-            "--timeline", str(timeline_path),
-        ],
-        cwd=repo_root,
-        timeout=22000,
-        env=env,
-    )
-    print(out)
-
-    _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
-    metrics = _extract_case_metrics(
-        exp_dir,
-        starter_dir=starter_dir,
-        repo_root=repo_root,
-        starter_understanding=starter_understanding,
-        objective_contract=objective_contract,
-    )
-    decision = _read_json(exp_dir / "decision.json", {})
-
+    # Class-derivation parameter sweep (legacy path). This went through
+    # foam_run.py, whose LLM was what actually applied `params` to the case —
+    # and foam_run.py needs Foam-Agent vendored. There is no safe drop-in:
+    # copying and running the base case would execute the *unmodified*
+    # configuration and still yield a real, scoreable metric, i.e. a confident
+    # wrong answer attributed to a parameter set that was never applied.
+    # Refuse instead. Runtime-model experiments (the branch above) are
+    # unaffected and are what every current proposer emits.
+    print("[OED] class-derivation parameter sweep is unsupported; use a runtime-coefficient model")
     return {
         "case_dir": str(exp_dir),
-        "status": decision.get("status", "UNKNOWN"),
-        "interpreter_reason": str(decision.get("reason", ""))[:500],
-        "metrics_summary": metrics,
+        "status": "FAILED",
+        "interpreter_reason": (
+            "Class-derivation parameter sweeps are no longer supported (they required "
+            "Foam-Agent's reviewer to apply the parameters). Propose this as a runtime "
+            "coefficient change instead, which the runtime path applies directly."
+        ),
+        "metrics_summary": "",
     }
+
+
+def _latest_case_time(case_dir: Path) -> Optional[float]:
+    """The largest numeric time directory in a finished OpenFOAM case.
+
+    Time 0 is excluded deliberately: a case whose only time directory is 0 has
+    not run, and scoring it would compare initial conditions against reference
+    data. Returns None in that case so the caller can refuse rather than
+    silently score nothing.
+    """
+    try:
+        times = []
+        for child in Path(case_dir).iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                value = float(child.name)
+            except ValueError:
+                continue
+            if value > 0:
+                times.append(value)
+        return max(times) if times else None
+    except Exception:
+        return None
+
+
+def _comparator_exemplar_text(
+    *, search_roots: List[Path], metrics: List[Dict[str, Any]], fallback: str = ""
+) -> str:
+    """Source of the study's own comparator, to author a new one from.
+
+    A discovered script usually cannot be used as-is — this harness scores by
+    reading a `METRIC <name>: <value>` line from stdout, and a hand-written
+    comparator generally reports differently. But it is the authoritative
+    statement of how the metric is computed, including the edge cases a fresh
+    derivation gets wrong, so it is worth far more as an exemplar than as a
+    rejected candidate.
+    """
+    try:
+        from oed_extensions import discover_existing_comparators
+    except Exception:
+        return fallback
+    try:
+        found = discover_existing_comparators(search_roots=search_roots, metrics=metrics)
+    except Exception:
+        return fallback
+    for path in found.values():
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+        if text.strip():
+            print(f"[OED-EXT][phase1] authoring from the study's own comparator: {path}", flush=True)
+            return text
+    return fallback
 
 
 def _run_interpret(
@@ -3252,6 +3307,8 @@ def run_open_ended_discovery(
     env: Dict[str, str],
     verbose: bool = True,
     baseline_metrics: Optional[Dict[str, Any]] = None,
+    saturation_window: Optional[int] = None,
+    setup_only: bool = False,
     # OED extensions:
     # - multi_metric is always-on (no flag): the LLM proposes metrics from
     #   topic+ref+baseline at startup; if ≥1 useful metric, the loop tracks
@@ -3299,6 +3356,28 @@ def run_open_ended_discovery(
                 baseline_final_time = float(bft)
         except Exception:
             baseline_final_time = None
+
+    if baseline_final_time is None and base_case_dir:
+        # Read it off the case. `baseline_metrics.json` is written by a later
+        # stage, so on a fresh --setup-only there is nothing to read it from
+        # and it stayed None — and a None here is not harmless: comparators are
+        # required to pin scoring to an explicit time and to refuse rather than
+        # guess, so the self-test invoked them with no --baseline-time, every
+        # one correctly returned nan, and the study ended with a null baseline
+        # score after five authoring attempts. The finished case knows its own
+        # final time; nothing needs to be inferred.
+        baseline_final_time = _latest_case_time(Path(base_case_dir))
+        if baseline_final_time is not None:
+            print(
+                f"[OED-EXT][phase1] baseline final time read from the case: {baseline_final_time}",
+                flush=True,
+            )
+        else:
+            print(
+                "[OED-EXT][phase1] WARNING: could not determine the baseline case's final time; "
+                "comparators cannot be pinned and will refuse to score",
+                flush=True,
+            )
     disc_dir = run_dir / "open_ended_discovery"
     disc_dir.mkdir(parents=True, exist_ok=True)
     objective_contract = _resolve_objective_contract(
@@ -3455,17 +3534,50 @@ def run_open_ended_discovery(
                 _rfp = Path(_rf).parent
                 if _rfp.is_dir() and _rfp not in _ref_search:
                     _ref_search.append(_rfp)
-            specs = _oedx.propose_metric_set(
-                topic=topic,
-                starter_understanding=starter_understanding,
-                reference_files=ref_files,
-                sample_postprocessing=sample_pp_tree,
-                baseline_case_dir=base_case_p,
-                reference_search_paths=_ref_search,
-                out_dir=disc_dir,
-                baseline_metrics_path=run_dir / "baseline_metrics.json",
-                objective_contract=objective_contract,
-            )
+            # The study already decided what it is judged on, before the mesh
+            # gate ran, and wrote it with the full computation rule (see
+            # manager/tools.py::_study_metrics). Re-deriving it here would be a
+            # second, independent answer to a question already answered — the
+            # pattern that produced Cf computed with Ub = 1.0 instead of the
+            # case's 0.028, a factor of 1276, when one derivation had less
+            # context than the other. Comparators are still authored below,
+            # because the metric needs an executable form; what is reused is
+            # the decision and its definition, so the authored comparator has
+            # nothing to invent.
+            specs = []
+            _study_specs_path = run_dir / "study_metrics.json"
+            if _study_specs_path.is_file():
+                try:
+                    _study_specs = json.loads(_study_specs_path.read_text(encoding="utf-8"))
+                except Exception:
+                    _study_specs = None
+                if isinstance(_study_specs, list) and _study_specs:
+                    specs = [dict(m) for m in _study_specs if isinstance(m, dict) and m.get("name")]
+                    for _m in specs:
+                        # propose_metric_set's schema, filled from the decision.
+                        _m.setdefault("direction", "min")
+                        _m.setdefault("description", "")
+                        _m.setdefault("computation_hint", "")
+                        _m.setdefault("data_source", "")
+                        _m.setdefault("ref_column", "")
+                        _m.setdefault("preferred_method", "pyvista")
+                    print(
+                        f"[OED-EXT][phase1] reusing the study's metric decision "
+                        f"({[m['name'] for m in specs]}) from {_study_specs_path}",
+                        flush=True,
+                    )
+            if not specs:
+                specs = _oedx.propose_metric_set(
+                    topic=topic,
+                    starter_understanding=starter_understanding,
+                    reference_files=ref_files,
+                    sample_postprocessing=sample_pp_tree,
+                    baseline_case_dir=base_case_p,
+                    reference_search_paths=_ref_search,
+                    out_dir=disc_dir,
+                    baseline_metrics_path=run_dir / "baseline_metrics.json",
+                    objective_contract=objective_contract,
+                )
             if specs:
                 # Stamp baseline_final_time into each spec so downstream
                 # comparator invocations can pin scoring to that exact time.
@@ -3476,18 +3588,66 @@ def run_open_ended_discovery(
                 ext_state["metric_specs"] = specs
 
                 # Resolve comparators for each metric (existing or LLM-authored + self-test)
+                #
+                # `starter_dir` is the CASE directory
+                # (starter_oed_turbulence/periodic_hill_sa). The study's own
+                # working comparator lives beside it, not inside it
+                # (starter_oed_turbulence/reference_data/compare_exactmatch_cf.py),
+                # so searching only the case directory never sees it — and the
+                # study then authors a fresh comparator instead of using the one
+                # the prompt explicitly names as authoritative. Measured: five
+                # authoring attempts, and the result returned nan because it
+                # treated reference stations just outside the mesh range as
+                # fatal, where the existing script handles them.
+                #
+                # The reference files are the reliable pointer: whatever
+                # directory holds the reference data is where its reader lives.
                 search_roots: List[Path] = []
                 if starter_dir and starter_dir.is_dir():
                     search_roots.append(starter_dir.resolve())
-                search_roots.append(repo_root.resolve())
+                    if starter_dir.resolve().parent.is_dir():
+                        search_roots.append(starter_dir.resolve().parent)
+                for _rf in ref_files:
+                    _rfp = Path(_rf).parent
+                    if _rfp.is_dir() and _rfp.resolve() not in search_roots:
+                        search_roots.append(_rfp.resolve())
+                # Deliberately NOT repo_root. discover_existing_comparators
+                # scores candidates by raw keyword counts, so a large unrelated
+                # repo file outscores the study's own comparator: measured, it
+                # picked scripts/skill_bootstrap.py over
+                # reference_data/compare_exactmatch_cf.py, failed its self-test,
+                # and authored a fresh comparator that returned nan. The
+                # function's own docstring says it must not walk the repo; the
+                # caller was adding it back. With no starter-local comparator,
+                # finding nothing and authoring one is the correct outcome.
                 ref_for_self = ref_files[0] if ref_files else (starter_dir or repo_root) / "reference.csv"
                 bound = _oedx.resolve_metric_comparators(
                     metrics=specs, search_roots=search_roots,
                     reference_file=ref_for_self, flow_params=starter_understanding.get("flow_parameters", {}) or {},
                     baseline_case_dir=base_case_p, out_dir=disc_dir / "authored_comparators",
                     sample_pp_tree=sample_pp_tree, sample_pp_data=sample_pp_data,
-                    exemplar_text=(objective_contract.get("comparator_script") or "")[:0],
+                    # The study's own working comparator, as the exemplar the
+                    # authored one is written from.
+                    #
+                    # This was `[:0]` — truncated to an empty string, so the
+                    # authoring never saw it. That is why a freshly authored
+                    # comparator reinvented the method and got it subtly wrong:
+                    # it treated reference stations lying just outside the mesh
+                    # coordinate range as fatal and returned nan, where the
+                    # existing script masks them and returns 0.004297.
+                    #
+                    # The existing script cannot be used directly — it writes a
+                    # summary and a plot rather than printing the
+                    # `METRIC <name>: <value>` line this harness scores from,
+                    # so its self-test correctly fails. What it can do is show
+                    # the authored script exactly how the quantity is computed.
+                    exemplar_text=_comparator_exemplar_text(
+                        search_roots=search_roots,
+                        metrics=specs,
+                        fallback=objective_contract.get("comparator_script") or "",
+                    ),
                     baseline_final_time=baseline_final_time,
+                    topic=topic,
                 )
                 _write_json(disc_dir / "bound_comparators.json", bound)
                 ext_state["bound_comparators"] = bound
@@ -3516,6 +3676,73 @@ def run_open_ended_discovery(
     # End extensions setup
     # ---------------------------------------------------------------- #
 
+    if baseline_score_value is None:
+        # Derive it from the vector setup just computed. `baseline_score_value`
+        # is read from baseline_metrics.json, which a later stage writes — so
+        # on a fresh --setup-only it is always None, and the search then has no
+        # baseline to measure candidates against or to apply the improvement
+        # target to. The value is already on disk in baseline_metric_vector.json
+        # (measured: cf_rmse = 0.004321, self-test verified); nothing needs to
+        # be recomputed, only read.
+        _bv = (ext_state.get("baseline_metric_vector") or {}).get("metrics") or {}
+        _specs_for_primary = ext_state.get("metric_specs") or []
+        _primary_name = ""
+        for _s in _specs_for_primary:
+            if isinstance(_s, dict) and _s.get("primary") and _s.get("name") in _bv:
+                _primary_name = str(_s["name"])
+                break
+        if not _primary_name:
+            # No metric declared primary: with a single metric there is no
+            # ambiguity, and with several the first spec is the one the study
+            # named first.
+            for _s in _specs_for_primary:
+                if isinstance(_s, dict) and _s.get("name") in _bv:
+                    _primary_name = str(_s["name"])
+                    break
+        if not _primary_name and len(_bv) == 1:
+            _primary_name = next(iter(_bv))
+        if _primary_name:
+            try:
+                baseline_score_value = float(_bv[_primary_name])
+                for _s in _specs_for_primary:
+                    if isinstance(_s, dict) and _s.get("name") == _primary_name:
+                        _d = str(_s.get("direction", "")).strip().lower()
+                        if _d in ("min", "max"):
+                            baseline_direction = _d
+                        break
+                print(
+                    f"[OED-EXT][phase1] baseline score taken from the measured vector: "
+                    f"{_primary_name} = {baseline_score_value} ({baseline_direction})",
+                    flush=True,
+                )
+            except Exception:
+                baseline_score_value = None
+
+    if setup_only:
+        # Everything a per-candidate caller needs to score independently is
+        # now on disk: objective_contract.json (reference files),
+        # bound_comparators.json (scored-metric comparator scripts, already
+        # authored/discovered — never re-derive this per candidate),
+        # ext_state.json. Return here instead of entering the iteration
+        # loop — the deepagents manager drives iteration itself now (see
+        # manager/tools.py's oed_propose_candidates / oed_run_*_candidate /
+        # oed_record_candidate_results), so this script's own while-loop
+        # below is only reached when it's run standalone (e.g. via
+        # orchestrator_run.py), not from that path.
+        _write_json(disc_dir / "baseline_score.json", {
+            "value": baseline_score_value, "direction": baseline_direction,
+        })
+        return {
+            "status": "setup_complete",
+            "disc_dir": str(disc_dir),
+            "objective_contract_path": str(disc_dir / "objective_contract.json"),
+            "bound_comparators_path": str(disc_dir / "bound_comparators.json"),
+            "baseline_score_path": str(disc_dir / "baseline_score.json"),
+            "ext_state_path": str(disc_dir / "ext_state.json"),
+            "baseline_score": baseline_score_value,
+            "baseline_direction": baseline_direction,
+        }
+
     # Resume from previous run if history.json exists
     history_path = disc_dir / "history.json"
     if history_path.is_file():
@@ -3539,7 +3766,9 @@ def run_open_ended_discovery(
             {"name": h["compiled_model_name"],
              "description": h.get("compiled_model_description", ""),
              "case_dir": h.get("compiled_case_dir", ""),
-             "is_runtime": bool(h.get("is_runtime"))}
+             "is_runtime": bool(h.get("is_runtime")),
+             "family": h.get("family") or SearchArchive.classify(
+                 h.get("compiled_model_description", ""), h["compiled_model_name"])}
             for h in history
             if h.get("action_type") == "code_mod" and h.get("compiled_model_name")
         ]
@@ -3551,6 +3780,15 @@ def run_open_ended_discovery(
         compiled_models = []
         budget_used = 0
         iteration = 0
+
+    # Search-policy archive: one elite (best-scoring history entry) per model
+    # family, replacing the old flat single-chain + fixed-period diversity
+    # nudge. See scripts/oed_search_archive.py for the full design rationale.
+    # Replaying resumed history keeps exploration progress across a
+    # pause/resume instead of resetting the archive to empty every time.
+    search_archive = SearchArchive()
+    if history:
+        search_archive.replay(history, baseline_direction=baseline_direction)
 
     consecutive_scripts = 0          # track back-to-back python_script actions
     MAX_CONSECUTIVE_SCRIPTS = 2      # force a real action sooner
@@ -3623,19 +3861,15 @@ def run_open_ended_discovery(
     # and renders a prompt fragment to feed to _llm_decide_next_action.   #
     # ---------------------------------------------------------------- #
     def _build_extension_context() -> str:
-        if _oedx is None:
-            return ""
-        if not (ext_state["multi_metric"] or ext_state["multi_flow"]
-                or ext_state["diversity_mode"] != "off"):
-            return ""
         parts: List[str] = []
+        _run_metric_enrichment = _oedx is not None and (ext_state["multi_metric"] or ext_state["multi_flow"])
         # Phase 1 / 3: enrich any history entry that has a case_dir but no
         # metric_vector yet.
         ref_files = [Path(p) for p in (objective_contract.get("reference_files") or []) if Path(p).is_file()]
         bound = ext_state.get("bound_comparators") or {}
         baseline_vec = ext_state.get("baseline_metric_vector") or {}
         specs = ext_state.get("metric_specs") or []
-        for h in history:
+        for h in (history if _run_metric_enrichment else []):
             if not isinstance(h, dict):
                 continue
             cdir = h.get("case_dir") or h.get("compiled_case_dir") or ""
@@ -3782,20 +4016,6 @@ def run_open_ended_discovery(
                     )
                     h["per_flow_metrics"] = per_flow_metrics
                     h["flow_aggregated"] = flow_agg
-            # Phase 2: family tracking on PROCEED-d iterations
-            if ext_state["diversity_mode"] != "off" and h.get("status") == "PROCEED":
-                if not h.get("family_recorded"):
-                    fam, eq = _oedx.classify_family(
-                        h.get("model_description", ""),
-                        h.get("compiled_model_name", ""),
-                    )
-                    _oedx.update_family_tracker(
-                        disc_dir, iteration=int(h.get("iteration", 0)),
-                        family=fam, model_class=h.get("compiled_model_name", ""),
-                        equation_touched=eq, decision="PROCEED",
-                        score=h.get("score") if isinstance(h.get("score"), (int, float)) else None,
-                    )
-                    h["family_recorded"] = True
         # Persist enriched history
         try:
             _write_json(disc_dir / "history.json", history)
@@ -3823,31 +4043,43 @@ def run_open_ended_discovery(
                 metric_specs_per_flow={fid: specs for fid in recent["per_flow_metrics"]},
             ))
 
-        # Phase 2: diversity constraint
-        if ext_state["diversity_mode"] != "off":
-            mode = _oedx.decide_search_mode(
-                iteration=iteration + 1,  # next iteration index
-                total_budget=budget,
-                history=history,
-                far_ratio=ext_state["diversity_far_ratio"],
-                diversity_mode=ext_state["diversity_mode"],
+        # Search-policy archive: always included (this is the standing search
+        # policy now, not an optional extension — see oed_search_archive.py).
+        # Tells the LLM the best known result per model family tried so far,
+        # and which niche this iteration's proposal should build on (picked
+        # by search_archive.select_niche(...) at the top of this loop
+        # iteration, before this function was called).
+        parts.append(search_archive.render_summary(
+            baseline_score=baseline_score_value, baseline_direction=baseline_direction,
+        ))
+        if selected_niche.get("is_new"):
+            parts.append(
+                "NEXT PROPOSAL SHOULD TARGET A NEW MODEL FAMILY not listed in the "
+                "archive above — every existing family is either well-explored or "
+                "not currently promising enough to justify another attempt right "
+                "now. Propose a structurally different mechanism (a different "
+                "equation term or physical effect), not a parameter tweak of "
+                "something already in the archive."
             )
-            seen = _oedx.families_seen(disc_dir)
-            best_fam: Optional[str] = None
-            best_score: Optional[float] = None
-            for h in history:
-                if not (isinstance(h, dict) and h.get("status") == "PROCEED"):
-                    continue
-                s = h.get("score")
-                if isinstance(s, (int, float)) and (best_score is None or s < best_score):
-                    best_score = float(s)
-                    fam, _eq = _oedx.classify_family(
-                        h.get("model_description", ""), h.get("compiled_model_name", ""),
-                    )
-                    best_fam = fam
-            parts.append(_oedx.render_diversity_constraint(
-                mode=mode, families_seen_list=seen, current_best_family=best_fam,
-            ))
+        else:
+            elite = selected_niche.get("elite") or {}
+            elite_formula = str(
+                elite.get("formula") or elite.get("model_description")
+                or elite.get("compiled_model_description") or ""
+            )[:800]
+            parts.append(
+                f"NEXT PROPOSAL SHOULD BUILD ON family '{selected_niche.get('family')}' "
+                f"(its current best result, from iteration {elite.get('iteration', '?')}): "
+                f"{elite_formula}. Refine or extend this specific direction rather than "
+                "starting over from scratch."
+            )
+        if search_saturated:
+            parts.append(
+                f"SEARCH ARCHIVE APPEARS SATURATED: the best score across every family "
+                f"has not improved over the last {effective_saturation_window} real evaluations. "
+                "If a valid PROCEED case already exists, strongly consider stopping now "
+                "rather than continuing to spend budget on marginal variation."
+            )
         return "\n\n".join(p for p in parts if p)
     # End extensions hook
     # ---------------------------------------------------------------- #
@@ -3856,6 +4088,19 @@ def run_open_ended_discovery(
         iteration += 1
         budget_remaining = budget - budget_used
         print(f"\n[OED] === Iteration {iteration} | budget used={budget_used}/{budget} ===")
+
+        # Which niche (model family) the next proposal should be conditioned
+        # on — computed once per iteration, before the decision call, so
+        # _build_extension_context can tell the LLM which elite to mutate
+        # from (or that it should try a family never attempted yet).
+        selected_niche = search_archive.select_niche(budget_remaining, budget)
+        # Saturation-based stop signal: nudges the LLM toward stopping (it
+        # still writes the auditable stop_reason itself via allow_stop=True
+        # below) rather than force-quitting — see SearchArchive.is_saturated.
+        effective_saturation_window = (
+            saturation_window if saturation_window is not None else max(3, budget // 4)
+        )
+        search_saturated = search_archive.is_saturated(effective_saturation_window)
 
         # Ask LLM what to do next.
         # Retry transient parse/network errors a few times before giving up;
@@ -4167,6 +4412,8 @@ def run_open_ended_discovery(
                             "name": r["compiled_model_name"],
                             "description": f"(batch iter {iteration}) {r['variant_name']}",
                             "case_dir": r.get("case_dir", ""),
+                            "family": SearchArchive.classify(
+                                r.get("variant_name", ""), r["compiled_model_name"]),
                         })
                 history_entry["batch_results"] = batch_results
                 consecutive_scripts = 0
@@ -4246,6 +4493,8 @@ def run_open_ended_discovery(
                         "description": result.get("compiled_model_description", ""),
                         "case_dir": result.get("compiled_case_dir", ""),
                         "is_runtime": True,
+                        "family": SearchArchive.classify(
+                            result.get("compiled_model_description", ""), result["compiled_model_name"]),
                     })
             elif mcat == "class_derivation":
                 # Class-derivation path — agentic runner via codex exec, with
@@ -4282,6 +4531,8 @@ def run_open_ended_discovery(
                         "description": result.get("compiled_model_description", ""),
                         "case_dir": result.get("compiled_case_dir", ""),
                         "is_runtime": False,
+                        "family": SearchArchive.classify(
+                            result.get("compiled_model_description", ""), result["compiled_model_name"]),
                     })
             else:
                 # Legacy class-derivation path — fall-back when modification_category
@@ -4385,6 +4636,8 @@ def run_open_ended_discovery(
                         "description": result.get("compiled_model_description", ""),
                         "case_dir": result.get("compiled_case_dir", ""),
                         "is_runtime": False,
+                        "family": SearchArchive.classify(
+                            result.get("compiled_model_description", ""), result["compiled_model_name"]),
                     })
 
             budget_used += cost_charged
@@ -4548,6 +4801,38 @@ def run_open_ended_discovery(
             else:
                 consecutive_cheap_code_mods += 1
 
+        # Record this iteration's lineage and update the search archive. The
+        # niche this iteration was actually conditioned on (`selected_niche`,
+        # computed at the top of this loop iteration) becomes its
+        # parent_iteration — the field that did not exist anywhere in this
+        # file before this change (see oed_search_archive.py).
+        if atype in ("code_mod", "experiment"):
+            family = None
+            if atype == "experiment":
+                reused_name = action.get("model_name_to_reuse", "")
+                reused = next((m for m in compiled_models if m.get("name") == reused_name), None)
+                if reused is None and compiled_models:
+                    reused = compiled_models[-1]
+                family = (reused or {}).get("family")
+            if not family:
+                family = SearchArchive.classify(
+                    history_entry.get("model_description", "")
+                        or history_entry.get("compiled_model_description", ""),
+                    history_entry.get("compiled_model_name", ""),
+                )
+            history_entry["family"] = family
+            history_entry["parent_iteration"] = (
+                (selected_niche.get("elite") or {}).get("iteration")
+                if not selected_niche.get("is_new") else None
+            )
+            _score_for_archive = history_entry.get("score")
+            _direction_for_archive = baseline_direction
+            if isinstance(_score_for_archive, dict):
+                _vd = str(_score_for_archive.get("direction", "")).strip().lower()
+                if _vd in ("min", "max"):
+                    _direction_for_archive = _vd
+            search_archive.update(family, iteration, _score_for_archive, _direction_for_archive, history_entry)
+
         history.append(history_entry)
 
         append_timeline_event(timeline_path, {
@@ -4658,11 +4943,23 @@ def main() -> int:
                              "(without this flag) is multi-metric + LLM-as-judge.")
     parser.add_argument("--diversity-mode", default="off",
                         choices=["off", "hybrid", "aggressive"],
-                        help="Phase 2: close+far search. 'hybrid' alternates close-refinement "
-                             "with far-from-baseline exploration. 'aggressive' alternates "
-                             "every iteration. 'off' preserves greedy single-direction.")
+                        help="DEPRECATED, no-op: the fixed-period close/far nudge this used "
+                             "to control has been superseded by the family-niched search "
+                             "archive's visit/quality-based selection (always on — see "
+                             "scripts/oed_search_archive.py). Kept parseable only so existing "
+                             "callers (e.g. orchestrator_run.py) don't break.")
     parser.add_argument("--diversity-far-ratio", default=0.3, type=float,
-                        help="Phase 2 (hybrid): fraction of iterations forced to FAR mode.")
+                        help="DEPRECATED, no-op — see --diversity-mode.")
+    parser.add_argument("--saturation-window", default=None, type=int,
+                        help="Stop-nudge window: recommend stopping once the search "
+                             "archive's best score hasn't improved over this many real "
+                             "evaluations. Default: max(3, budget // 4).")
+    parser.add_argument("--setup-only", action="store_true",
+                        help="Run only the one-time per-study setup (objective contract, "
+                             "bound_comparators.json, baseline metric vector) and exit "
+                             "before the iteration loop. For callers (e.g. the deepagents "
+                             "manager) that drive iteration themselves and just need the "
+                             "setup artifacts on disk.")
     parser.add_argument("--multi-flow", action="store_true",
                         help="Phase 3: validate candidates against multiple reference flows. "
                              "Use --starter-dirs to provide flow folders or place multiple "
@@ -4740,6 +5037,8 @@ def main() -> int:
         timeline_path=timeline_path,
         env=env,
         baseline_metrics=baseline_metrics,
+        saturation_window=args.saturation_window,
+        setup_only=bool(args.setup_only),
         multi_metric=(not bool(args.single_metric)),
         diversity_mode=str(args.diversity_mode),
         diversity_far_ratio=float(args.diversity_far_ratio),

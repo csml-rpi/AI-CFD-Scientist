@@ -866,6 +866,16 @@ class AnalysisAgent:
 
         last_error = ""
         last_script = ""
+        # Absolute. The script is executed with cwd set to the case directory,
+        # so a path relative to the repo root gets resolved against the case
+        # directory and doubled —
+        #   <case>/runs/<run>/mesh_gate/<group>/cross_experiment_analysis/...
+        # — which no file matches. Every attempt then failed with Errno 2, and
+        # because the runner treats any non-zero exit as "the script was
+        # wrong", it spent all ten retries asking the model to repair a script
+        # that had never been executed. Measured: 10 attempts x 2 groups, ~30
+        # minutes, every one identical.
+        proc_dir = Path(proc_dir).resolve()
         script_path = proc_dir / "data_processing_script.py"
         print(
             f"[Analysis] cross_experiment: generating & running Python script (max {max_retries} attempts) -> {script_path}",
@@ -915,6 +925,15 @@ class AnalysisAgent:
                 if rc != 0:
                     stdout_tail = (proc.stdout or "")[-2000:]
                     stderr_tail = (proc.stderr or "")[-4000:]
+                    if "can't open file" in stderr_tail or "No such file or directory" in stderr_tail:
+                        # The interpreter could not find the script at all, so
+                        # nothing the model writes next can help. Fail loudly
+                        # instead of burning the retry budget rewriting a file
+                        # that is never run.
+                        raise RuntimeError(
+                            "cross_experiment analysis could not execute its generated script — "
+                            f"this is an invocation fault, not a script fault:\n{stderr_tail[-600:]}"
+                        )
                     last_error = (
                         f"Return code: {rc}\n"
                         f"STDOUT (tail):\n{stdout_tail}\n\n"

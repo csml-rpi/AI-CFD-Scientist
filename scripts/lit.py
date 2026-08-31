@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import re
 import requests
 import sys
 import time
@@ -43,13 +45,26 @@ _STOP_WORDS = frozenset({
     "using", "based", "via", "into", "between", "over", "under", "through",
 })
 
+_INTENT_WORDS = frozenset({
+    "analysis", "cfd", "compare", "comparison", "discover", "discovery",
+    "effect", "effects", "ended", "find", "investigate", "modification",
+    "novel", "open", "open-ended", "simulation", "study", "using",
+})
+
+
+def _topic_keywords(topic: str) -> List[str]:
+    words = re.findall(r"[A-Za-z0-9][A-Za-z0-9_+./-]*", str(topic or ""))
+    return [
+        word for word in words
+        if word.lower() not in _STOP_WORDS
+        and word.lower() not in _INTENT_WORDS
+        and len(word) > 1
+    ]
+
 
 def _shorten_query(topic: str, max_keywords: int = 6) -> str:
     """S2 search needs short keyword queries (~5-6 content words)."""
-    cleaned = topic.split(":")[0] if ":" in topic else topic
-    cleaned = cleaned.replace(",", " ").replace(";", " ").replace("(", " ").replace(")", " ")
-    words = cleaned.split()
-    keywords = [w for w in words if w.lower() not in _STOP_WORDS and len(w) > 1]
+    keywords = _topic_keywords(topic)
     if len(keywords) <= max_keywords:
         return " ".join(keywords).strip()
     return " ".join(keywords[:max_keywords]).strip()
@@ -67,24 +82,20 @@ def _generate_multi_queries(topic: str, max_queries: int = 4) -> List[str]:
       - Query 4: the shortest form (top 3 keywords) for maximum recall
     Deduplicates before returning.
     """
-    # Use the FULL topic for keyword extraction — don't strip the pre-colon
-    # label (e.g. "Open-ended discovery:") early because for some topics the
-    # real content lives after the colon.
-    cleaned = topic.replace(":", " ").replace(",", " ").replace(";", " ")
-    cleaned = cleaned.replace("(", " ").replace(")", " ")
-    words = cleaned.split()
-    kws = [w for w in words if w.lower() not in _STOP_WORDS and len(w) > 1]
+    kws = _topic_keywords(topic)
 
     queries: List[str] = []
     if len(kws) >= 1:
         queries.append(" ".join(kws[:6]).strip())                         # primary
     if len(kws) > 6:
-        queries.append(" ".join(kws[6:12]).strip())                       # secondary
+        queries.append(" ".join(kws[-6:]).strip())                        # complementary tail
     if len(kws) >= 4:
-        # noun-phrase pairs (adjacent pairs after stopword removal)
-        pairs = " ".join(" ".join(kws[i:i + 2]) for i in range(0, min(len(kws), 8), 2))
-        if pairs and pairs not in queries:
-            queries.append(pairs)
+        # Join anchors from both ends so this is not just query 1 with two
+        # extra words (the previous "pair" construction reconstructed the
+        # same prefix and added almost no retrieval diversity).
+        anchors = " ".join((kws[:3] + kws[-3:])).strip()
+        if anchors and anchors not in queries:
+            queries.append(anchors)
     if len(kws) >= 3:
         short3 = " ".join(kws[:3]).strip()
         if short3 and short3 not in queries:
@@ -115,18 +126,17 @@ def collect_papers_via_requests(topic: str, limit: int) -> List[Dict[str, Any]]:
     queries = _generate_multi_queries(topic)
     print(f"[LIT] Using {len(queries)} queries: {queries}")
 
-    for q_idx, query in enumerate(queries, 1):
-        if len(out) >= limit:
-            break
-        print(f"[LIT] === Query {q_idx}/{len(queries)}: {query!r} ===")
-        out_before = len(out)
-        res = _collect_papers_single_query(query, limit - len(out))
-        for rec in res:
+    if limit <= 0:
+        return []
+
+    def add_unique(records: List[Dict[str, Any]]) -> int:
+        before = len(out)
+        for rec in records:
+            if len(out) >= limit:
+                break
             doi = (rec.get("doi") or "").strip().lower()
             title = (rec.get("title") or "").strip().lower()
-            if doi and doi in seen_dois:
-                continue
-            if not doi and title and title in seen_titles:
+            if (doi and doi in seen_dois) or (title and title in seen_titles):
                 continue
             if doi:
                 seen_dois.add(doi)
@@ -135,12 +145,37 @@ def collect_papers_via_requests(topic: str, limit: int) -> List[Dict[str, Any]]:
             out.append(rec)
             if len(out) >= limit:
                 break
-        print(f"[LIT] Query {q_idx} added {len(out) - out_before} unique paper(s); total now {len(out)}.")
+        return len(out) - before
+
+    # Give every query an initial share before any one query can consume the
+    # whole paper budget. This is the part the former implementation missed:
+    # it asked query 1 for `limit` results and normally never reached query 2.
+    initial_quota = max(1, math.ceil(limit / len(queries)))
+    for q_idx, query in enumerate(queries, 1):
+        if len(out) >= limit:
+            break
+        print(f"[LIT] === Query {q_idx}/{len(queries)}: {query!r} ===")
+        added = add_unique(_collect_papers_single_query(query, initial_quota))
+        print(f"[LIT] Query {q_idx} added {added} unique paper(s); total now {len(out)}.")
+
+    # Duplicates or sparse result sets may leave the balanced first pass
+    # short. Continue each query after its initial offset until the global
+    # budget is full or every query is exhausted.
+    if len(out) < limit:
+        for q_idx, query in enumerate(queries, 1):
+            remaining = limit - len(out)
+            if remaining <= 0:
+                break
+            print(f"[LIT] Fill pass query {q_idx}/{len(queries)}: {query!r}")
+            added = add_unique(
+                _collect_papers_single_query(query, remaining, offset_start=initial_quota)
+            )
+            print(f"[LIT] Fill pass added {added} unique paper(s); total now {len(out)}.")
     print(f"[LIT] Finished {len(queries)} queries: {len(out)} unique papers.")
     return out
 
 
-def _collect_papers_single_query(query: str, limit: int) -> List[Dict[str, Any]]:
+def _collect_papers_single_query(query: str, limit: int, offset_start: int = 0) -> List[Dict[str, Any]]:
     """Original single-query collector, renamed. Used by multi-query above."""
     out: List[Dict[str, Any]] = []
     base = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -149,7 +184,7 @@ def _collect_papers_single_query(query: str, limit: int) -> List[Dict[str, Any]]
     if api_key:
         headers["x-api-key"] = api_key
     page_size = 5
-    offset = 0
+    offset = max(0, int(offset_start))
     total_available: Optional[int] = None
     while len(out) < limit:
         want = min(page_size, limit - len(out))

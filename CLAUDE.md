@@ -7,6 +7,61 @@ conda activate cfd-scientist
 ```
 Alternative (venv from repo): `source .venv/bin/activate`
 
+## Model providers
+
+`CFD_SCIENTIST_LLM_PROVIDER` + `CFD_SCIENTIST_MODEL` select the model for the CLI
+and every script it shells out to. All of these can drive the manager (they
+implement `bind_tools`; `deep_agent.py` refuses one that does not).
+
+```bash
+# API-billed
+export CFD_SCIENTIST_LLM_PROVIDER=gemini    CFD_SCIENTIST_MODEL=gemini-3.7-flash   # + GOOGLE_GENAI_USE_VERTEXAI=true
+export CFD_SCIENTIST_LLM_PROVIDER=bedrock   CFD_SCIENTIST_MODEL=us.anthropic.claude-sonnet-4-6
+
+# subscription-billed, no API key — uses the local CLI's own OAuth cache
+export CFD_SCIENTIST_LLM_PROVIDER=claude-code   CFD_SCIENTIST_MODEL=claude-sonnet-4-6   # ~/.claude, via claude-agent-sdk
+export CFD_SCIENTIST_LLM_PROVIDER=openai-codex  CFD_SCIENTIST_MODEL=codex               # ~/.codex/auth.json
+```
+
+`CFD_SCIENTIST_EFFORT` sets reasoning effort for every stage. The accepted set
+differs by provider and an unsupported value is refused rather than silently
+downgraded: `openai-codex` takes none/minimal/low/medium/high/xhigh,
+`claude-code` takes low/medium/high/max.
+
+`CFD_SCIENTIST_MODEL=codex` resolves to whatever `~/.codex/config.toml` sets, so
+it tracks the Codex CLI rather than pinning a name. Sign in with `claude` /
+`codex login`; an expired token is reported up front, not as an HTTP 401.
+
+Both subscription providers use native tool calling (Claude via an in-process
+SDK MCP server, Codex via Responses `tools`), so neither depends on parsing
+tool calls out of prose. One difference worth knowing: Codex issues parallel
+tool calls, `claude-code` issues one per turn, so manager fan-outs serialize on
+that provider.
+
+## FoamAgent
+
+The execution loop (parse, RAG, decompose, write, Allrun, run, review/retry) is
+ported into `src/cfd_langgraph/foam_native/`. Nothing on the CLI path imports
+the vendored `Foam-Agent/` package any more — verified by tracing imports across
+every script the CLI shells out to.
+
+What remains is *data*: the prebuilt FAISS tutorial indices. Point at them with
+
+```bash
+export CFD_SCIENTIST_FAISS_DIR=/path/to/faiss     # default: <repo>/database/faiss
+```
+
+falling back to `Foam-Agent/database/faiss/` if neither exists. Copy the ~34 MB
+`Qwen_Qwen3-Embedding-0.6B/` index into `<repo>/database/faiss/` and the
+`Foam-Agent` symlink can go. Without any index, case writing still works — it
+degrades to reading a tutorial from `$WM_PROJECT_DIR/tutorials/`.
+
+Two legacy execution paths were removed rather than ported: the
+`run_case_scripted` tool, and the OED class-derivation parameter sweep (which
+now refuses explicitly instead of running an unmodified case and reporting a
+score for parameters it never applied). Runtime-coefficient models — what every
+current proposer emits — are unaffected.
+
 ## Routing
 
 The skill recipes live under `cfd-skills/`. After the Nov 2026 ARIS/DS-style refactor every recipe is self-contained — expert prompts from `prompts/prompts.yaml` are embedded verbatim, and scripts are an optional fast-path rather than the primary mechanism. The `skills/` dir keeps `cfd-orchestrator` (router), `cfd-foamagent-runtime` (canonical FoamAgent execution contract), `cfd-mesh-independence` (deeper protocol commentary), plus thin aliases at `cfd-research` and `cfd-code-mod`.

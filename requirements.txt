@@ -26,3 +26,13 @@ Pillow>=10.0  # Image downscaling for Bedrock many-image requests
 
 # Bedrock runtime client (used by langchain-aws / ChatBedrockConverse)
 boto3>=1.34.0
+
+# Interactive CLI console (live status line + persistent input bar; the CLI
+# falls back to plain print/input without it, so it is not load-bearing)
+prompt_toolkit>=3.0.43
+
+# Manager agent (parallel subagents, interrupt/resume), hardware-aware scheduling,
+# and durable checkpointing for the interactive CLI.
+deepagents>=0.7.6
+psutil>=7.0
+langgraph-checkpoint-sqlite>=2.0

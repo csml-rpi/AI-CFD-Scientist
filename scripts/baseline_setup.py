@@ -209,13 +209,36 @@ _METRIC_RE = re.compile(
     # means we still capture signed numbers correctly.
 )
 
-_MIN_METRICS = ("rmse", "rms", "l2", "l1", "mae", "mse", "maxerror", "deviation", "relativeerror")
-_MAX_METRICS = ("correlation", "pearson", "spearman", "r2", "r^2", "agreement", "accuracy")
+_MIN_METRICS = ("rmse", "rms", "l2", "l1", "mae", "mse", "maxerror", "deviation",
+                "relativeerror", "error", "residual", "loss", "discrepancy")
+_MAX_METRICS = ("correlation", "pearson", "spearman", "r2", "r^2", "agreement",
+                "accuracy", "iou", "dice", "skill", "precision", "recall", "auc")
 
 
 def _direction_for_metric(name: str) -> str:
+    """Is higher better for this metric, or lower?
+
+    Containment, not ``startswith``. The prefix test only ever saw the bare
+    tokens this module's own regex captures, and silently returned "min" for
+    every real metric name built around one of them:
+    ``velocity_profile_shape_correlation`` and ``recirculation_region_iou``
+    are both max-metrics that were classified as min, which would have driven
+    a search to minimise a correlation. Both are live names in a study's
+    metric_specs.json.
+
+    Min-family is tested first so a compound like "correlation_error" reads as
+    an error measure, which is what such a name means.
+
+    A name matching neither family still falls back to "min" — the CFD
+    convention — so this is a heuristic and not a substitute for the direction
+    the metric proposer states explicitly in metric_specs.json. Prefer that
+    field wherever it exists; this exists only for free-text comparator output
+    that carries no such field.
+    """
     n = re.sub(r"[\s_\-^]", "", name.lower())
-    if any(n.startswith(k) for k in _MAX_METRICS):
+    if any(k in n for k in _MIN_METRICS):
+        return "min"
+    if any(k in n for k in _MAX_METRICS):
         return "max"
     return "min"
 

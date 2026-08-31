@@ -4373,10 +4373,15 @@ def main() -> int:
                              "path. Default is multi-metric + LLM-as-judge.")
     parser.add_argument("--oed-diversity-mode", default="off",
                         choices=["off", "hybrid", "aggressive"],
-                        help="OED Phase 2: close+far search. 'hybrid' periodically forces "
-                             "far-from-baseline; 'aggressive' alternates every iteration.")
+                        help="DEPRECATED, no-op: superseded by the search archive's "
+                             "quality-based selection, always on in open_ended_discovery.py. "
+                             "Kept parseable for backward compatibility.")
     parser.add_argument("--oed-diversity-far-ratio", type=float, default=0.3,
-                        help="OED Phase 2: fraction of iterations forced to FAR mode in hybrid.")
+                        help="DEPRECATED, no-op — see --oed-diversity-mode.")
+    parser.add_argument("--oed-saturation-window", type=int, default=None,
+                        help="OED: recommend stopping once the search archive's best score "
+                             "hasn't improved over this many real evaluations. "
+                             "Default: max(3, budget // 4).")
     parser.add_argument("--oed-multi-flow", action="store_true",
                         help="OED Phase 3: validate candidates against multiple reference flows.")
     parser.add_argument("--oed-starter-dirs", nargs="+", default=[],
@@ -5248,6 +5253,8 @@ def main() -> int:
             if getattr(args, "oed_diversity_mode", "off") and args.oed_diversity_mode != "off":
                 oed_cmd += ["--diversity-mode", str(args.oed_diversity_mode),
                             "--diversity-far-ratio", str(args.oed_diversity_far_ratio)]
+            if getattr(args, "oed_saturation_window", None) is not None:
+                oed_cmd += ["--saturation-window", str(args.oed_saturation_window)]
             if getattr(args, "oed_multi_flow", False):
                 oed_cmd += ["--multi-flow"]
             if getattr(args, "oed_starter_dirs", None):

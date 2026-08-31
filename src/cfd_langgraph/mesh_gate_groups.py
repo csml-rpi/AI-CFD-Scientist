@@ -223,3 +223,175 @@ def resolve_mesh_seed_path(
             if p.exists() and (p / "system" / "controlDict").is_file():
                 return str(p)
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Pairwise mesh-convergence judgment.
+#
+# Ported (not just wrapped) from scripts/orchestrator_run.py's
+# ``_llm_mesh_gate_pair_convergence`` / ``_heuristic_mesh_gate_pair_fallback`` /
+# ``_merge_mesh_gate_metrics`` so a clean, in-process caller (this repo's new
+# manager tools) doesn't need the flat sys.path hack that script relies on
+# (``from timeline_logger import ...``) just to reuse three self-contained
+# functions. orchestrator_run.py's own copies are left untouched — this is a
+# second, public copy for the same logic, not a redirect, so the existing
+# Mode A pipeline is never at risk from this change.
+#
+# There is no formal Richardson-extrapolation/GCI-number computation anywhere
+# in this codebase (checked): "converged" is decided by an LLM judging raw
+# QoIs and their percent change between a parent (coarser) and child (finer)
+# mesh against a ~5% rule for physically trustworthy quantities, with a
+# non-LLM heuristic fallback and a metric-name magnitude floor to avoid
+# treating noise-dominated QoIs as mesh sensitivity.
+# ---------------------------------------------------------------------------
+
+
+def merge_mesh_gate_metrics(current: List[str], suggested: List[str], max_metrics: int = 10) -> List[str]:
+    out: List[str] = []
+    for m in suggested + current:
+        s = str(m).strip()
+        if s and s not in out:
+            out.append(s)
+    return out[:max_metrics]
+
+
+def heuristic_mesh_gate_pair_fallback(
+    q_a: Dict[str, Any],
+    q_b: Dict[str, Any],
+    pct_changes: Dict[str, float],
+    *,
+    magnitude_floor: float = 1e-9,
+) -> Dict[str, Any]:
+    """If the LLM is unavailable: never trust relative % when both sides are ~zero/noise.
+
+    Only apply the 5% rule to metrics whose magnitude exceeds a small floor.
+    If none qualify, stop refinement (converged=True) to avoid an infinite
+    spiral on garbage QoIs.
+    """
+    reliable_pct: Dict[str, float] = {}
+    for k, p in pct_changes.items():
+        va, vb = q_a.get(k), q_b.get(k)
+        if not isinstance(va, (int, float)) or not isinstance(vb, (int, float)):
+            continue
+        fa, fb = float(va), float(vb)
+        if max(abs(fa), abs(fb)) >= magnitude_floor:
+            reliable_pct[k] = float(p)
+    if not reliable_pct:
+        return {
+            "converged": True,
+            "reason": (
+                "Heuristic fallback: no paired QoI exceeded the magnitude floor; "
+                "relative percent change is not meaningful — stopping refinement spiral."
+            ),
+            "qoi_reliability": "unreliable",
+            "recommended_metrics_for_retry": [],
+            "source": "heuristic_fallback",
+        }
+    conv = all(v <= 5.0 for v in reliable_pct.values())
+    return {
+        "converged": conv,
+        "reason": f"Heuristic fallback: applied 5% rule only to {list(reliable_pct.keys())} (|Q|>={magnitude_floor}).",
+        "qoi_reliability": "mixed",
+        "recommended_metrics_for_retry": [],
+        "source": "heuristic_fallback",
+    }
+
+
+def llm_mesh_gate_pair_convergence(
+    llm: Any,
+    *,
+    parent_label: str,
+    child_label: str,
+    q_a: Dict[str, Any],
+    q_b: Dict[str, Any],
+    pct_changes: Dict[str, float],
+    metrics_requested: List[str],
+    topic_excerpt: str,
+    requirement_excerpt: str,
+    metric_attempt_index: int,
+    max_metric_attempts: int,
+) -> Dict[str, Any]:
+    """LLM judges mesh sensitivity for one parent -> child pair using raw QoIs
+    and naive percent deltas. May recommend different metrics for a re-run of
+    analyze.py when values are noise-dominated."""
+
+    class _MeshGatePairDecision(BaseModel):
+        converged: bool = Field(
+            description=(
+                "True if the coarser (parent) mesh is adequate: for QoIs you judge trustworthy, "
+                "parent vs child differ by at most ~5% (standard mesh-independence target), "
+                "OR QoIs are unreliable/noise-dominated and further refinement should stop."
+            )
+        )
+        reason: str = Field(description="Short engineering rationale referencing magnitudes, not only %.")
+        qoi_reliability: str = Field(
+            description="One of: good, mixed, unreliable — are extracted QoIs trustworthy for a % comparison?"
+        )
+        recommended_metrics_for_retry: List[str] = Field(
+            default_factory=list,
+            description=(
+                "If qoi_reliability is unreliable and a different metric set could help "
+                "(e.g. early-time bulk U, pressure_drop_proxy, wall shear), suggest metric names "
+                "for scripts/analyze.py. Empty if no retry or attempt budget exhausted."
+            ),
+        )
+
+    payload_preview = {
+        "parent": parent_label,
+        "child": child_label,
+        "metrics_requested": metrics_requested,
+        "qoi_parent": {k: q_a.get(k) for k in sorted(q_a.keys()) if not str(k).startswith("_")},
+        "qoi_child": {k: q_b.get(k) for k in sorted(q_b.keys()) if not str(k).startswith("_")},
+        "naive_percent_change_parent_to_child": pct_changes,
+        "metric_attempt_index": metric_attempt_index,
+        "max_metric_attempts": max_metric_attempts,
+    }
+    system_prompt = (
+        "You are a senior CFD engineer judging mesh sensitivity between two OpenFOAM runs "
+        "(parent = coarser mesh, child = finer mesh).\n"
+        "You receive raw QoIs from an automated PyVista/LLM extraction and naive relative percent changes "
+        "computed as |v_child - v_parent| / max(|v_parent|, 1e-12) * 100.\n\n"
+        "Rules:\n"
+        "- If expected velocities are O(1) m/s but reported QoIs are ~1e-12 or smaller, treat them as "
+        "noise / wrong time window / missing driving force — NOT as mesh sensitivity. "
+        "Percent changes between noise floors are meaningless (often 10^4-10^5 %).\n"
+        "- Prefer metrics anchored in physics: sustained bulk or centreline speed, pressure drop proxy, "
+        "wall shear, integrated flow rate — evaluated at the final timestep (developed steady state when applicable).\n"
+        "- If current metrics are unreliable, set qoi_reliability=unreliable and suggest "
+        "recommended_metrics_for_retry (e.g. bulk_velocity_Ux, pressure_drop_proxy, wall_shear_mean).\n"
+        "- If metric_attempt_index >= max_metric_attempts - 1, do NOT suggest retries; "
+        "set converged=true if further refinement would only chase numerical noise, and explain.\n"
+        "- 5% convergence rule (for trustworthy QoIs only): when qoi_reliability is good or mixed, "
+        "if all key physics QoIs you rely on change by <= 5% from parent to child, that IS an acceptable "
+        "mesh convergence outcome — set converged=true and say so in reason.\n"
+        "- If any trustworthy key QoI changes by > 5%, set converged=false so refinement can continue "
+        "(unless the change is clearly a numerical artifact — then explain).\n"
+        "- converged=true means: stop refining (parent mesh is the selected level for this gate). "
+        "converged=false means: trustworthy QoIs still differ by more than ~5% — continue refinement.\n"
+    )
+    user_prompt = (
+        f"Study topic (excerpt):\n{topic_excerpt[:3000]}\n\n"
+        f"Requirement (excerpt):\n{requirement_excerpt[:6000]}\n\n"
+        f"Pair data (JSON):\n{json.dumps(payload_preview, indent=2)[:14000]}\n"
+    )
+    try:
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        structured = llm.with_structured_output(_MeshGatePairDecision)
+        out: _MeshGatePairDecision = structured.invoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        )
+        return {
+            "converged": bool(out.converged),
+            "reason": str(out.reason or "").strip(),
+            "qoi_reliability": str(out.qoi_reliability or "mixed").strip().lower(),
+            "recommended_metrics_for_retry": [
+                str(x).strip() for x in (out.recommended_metrics_for_retry or []) if str(x).strip()
+            ],
+            "source": "llm",
+        }
+    except Exception as exc:
+        fb = heuristic_mesh_gate_pair_fallback(q_a, q_b, pct_changes)
+        fb["reason"] = f"LLM mesh-gate decision failed ({exc}); {fb.get('reason', '')}"
+        fb["source"] = "heuristic_after_llm_error"
+        return fb
