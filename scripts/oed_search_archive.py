@@ -253,6 +253,7 @@ class SearchArchive:
         exploration_floor: int = 8,
         strategy_transfer: float = 1.0,
         strategy_prior_visits: int = 0,
+        population_size: int = 3,
     ) -> None:
         # q is min-max normalized into [0, 1] (see select_niche), so
         # exploration_c must be calibrated against THAT range, not raw score
@@ -288,6 +289,19 @@ class SearchArchive:
         # already known, while the eventual winner had come from a family
         # first tried at evaluation 24.
         self.exploration_floor = exploration_floor
+        # How many scored candidates each cell keeps, best-first. Two or three
+        # holds "the tuned version" and "the structurally new but untuned one"
+        # at once -- the pair strict elitism collapses into a single winner.
+        self.population_size = max(1, int(population_size))
+        # iteration -> history entry, so a chain can be walked back through
+        # parent_iteration without rescanning history on every call.
+        self._by_iteration: Dict[int, Dict[str, Any]] = {}
+        # Arm statistics for select_action. Start at the prior (0/0 -> Beta(1,1),
+        # a coin flip) so no action is favoured before there is evidence.
+        self._widen_wins = 0
+        self._widen_losses = 0
+        self._newfam_wins = 0
+        self._newfam_losses = 0
         # How much of a mechanism's proven score carries over to a strategy
         # never tried on it, in [0, 1]: 0 treats an empty cell as knowing
         # nothing (neutral q, like a brand-new family), 1 treats "this
@@ -338,12 +352,107 @@ class SearchArchive:
         logic doesn't need to branch on direction."""
         return value if direction != "max" else -value
 
+    # -- lineage bookkeeping -------------------------------------------------
+    #
+    # A "lineage" is a chain of refinements: a root candidate and everything
+    # descended from it by mutation. The archive needs these because the
+    # allocation question -- refine what we have, or start something new -- is
+    # a question about chains, not about individual candidates.
+    #
+    # Reconstructed from `parent_iteration`, which the proposer already records
+    # whenever a pick carried an elite to mutate from. Entries with no parent
+    # are roots of their own lineage.
+
+    def _lineage_id(self, history_entry: Dict[str, Any], iteration: int) -> int:
+        """Which chain this candidate belongs to, as the iteration of its root."""
+        if not isinstance(history_entry, dict):
+            return iteration
+        seen = set()
+        cur, cur_iter = history_entry, iteration
+        while True:
+            parent = cur.get("parent_iteration")
+            if parent is None or parent in seen:
+                return cur_iter
+            seen.add(parent)
+            nxt = self._by_iteration.get(parent)
+            if nxt is None:
+                # Parent not in the archive (a failed or unscored ancestor).
+                # The chain is still real; root it at the highest ancestor we
+                # can actually see rather than dropping the relationship.
+                return parent
+            cur, cur_iter = nxt, parent
+
+    def _depth_of(self, history_entry: Dict[str, Any]) -> int:
+        """How many refinement steps from the root. A root is depth 0."""
+        if not isinstance(history_entry, dict):
+            return 0
+        depth, seen = 0, set()
+        cur = history_entry
+        while True:
+            parent = cur.get("parent_iteration")
+            if parent is None or parent in seen:
+                return depth
+            seen.add(parent)
+            depth += 1
+            nxt = self._by_iteration.get(parent)
+            if nxt is None:
+                return depth
+            cur = nxt
+
+    def lineages(self) -> Dict[int, Dict[str, Any]]:
+        """Every chain in the archive, with the trace the allocator needs.
+
+        A lineage's value is not its best score but whether it is still
+        *moving*: a chain improving 1.7% per step is worth another pull even
+        while it trails a flat chain that is already better. That is the case
+        strict elitism cannot express, and it is why this returns the score
+        trace rather than a single number.
+        """
+        chains: Dict[int, List[Dict[str, Any]]] = {}
+        for niche in self.niches.values():
+            for member in niche.get("population", []):
+                chains.setdefault(member["lineage_id"], []).append(member)
+        out: Dict[int, Dict[str, Any]] = {}
+        for root, members in chains.items():
+            members = sorted(members, key=lambda m: m["iteration"])
+            trace = [m["score"] for m in members]
+            tip = min(members, key=lambda m: m["norm_score"])
+            # Improvement of the most recent step, in normalized space so it is
+            # comparable across cells. Positive means the chain is still moving.
+            last_gain = 0.0
+            if len(members) >= 2:
+                last_gain = members[-2]["norm_score"] - members[-1]["norm_score"]
+            out[root] = {
+                "root_iteration": root,
+                "members": members,
+                "score_trace": trace,
+                "depth": max(m["depth"] for m in members),
+                "tip": tip,
+                "best_norm_score": tip["norm_score"],
+                "last_gain": last_gain,
+            }
+        return out
+
     def _new_niche(self) -> Dict[str, Any]:
         return {
             "elite_score": None,
             "elite_norm_score": None,
             "elite_iteration": None,
             "elite_history_entry": None,
+            # Runners-up, best-first, capped at `population_size`. The elite
+            # fields above stay as they were -- everything reading this archive
+            # expects them -- and this is strictly additional.
+            #
+            # Why keep losers at all: a structurally new variant arrives with
+            # untuned coefficients. Under strict elitism it is compared once
+            # against a cell whose elite has already been tuned, loses by a
+            # little, and is discarded with its compiled model and its case
+            # directory. There is then nothing to tune next round. Measured on
+            # run closure_20260826_codex, every one of the 5 refinements that
+            # did happen beat its parent (median 0.1089 vs 0.1135 for fresh
+            # starts, 5/5 vs 28/39 beating baseline) -- refinement is the move
+            # that works, and it had 7% of the budget.
+            "population": [],
             "visits": 0,
             # Visits to this family since its elite last improved. A family
             # whose sweep is mined out keeps scoring well without learning
@@ -355,6 +464,16 @@ class SearchArchive:
     def replay(self, history: List[Dict[str, Any]], baseline_direction: str = "min") -> None:
         """Rebuild archive state from a resumed history.json — so resuming a
         paused/crashed run doesn't reset exploration progress to empty."""
+        prior_best: Optional[float] = None
+        # Index everything up front. History is not guaranteed ordered, and an
+        # entry may name a parent that appears later in the list; walking a
+        # chain must not depend on the order entries happen to be written in.
+        for h in history:
+            if isinstance(h, dict) and h.get("iteration") is not None:
+                try:
+                    self._by_iteration[int(h["iteration"])] = h
+                except (TypeError, ValueError):
+                    pass
         for h in history:
             if not isinstance(h, dict):
                 continue
@@ -380,6 +499,28 @@ class SearchArchive:
                 family, iteration, score, direction, h,
                 strategy=h.get("strategy") or h.get("strategy_label") or "",
             )
+            # Replay the allocator's arms too, or a resumed study forgets which
+            # kind of move has been paying off and restarts from the priors.
+            # "Improved" means it beat the best score the archive held BEFORE
+            # this entry -- the question the arm is actually being asked.
+            action = str(h.get("search_action") or "").strip()
+            if action:
+                value = None
+                if isinstance(score, dict):
+                    try:
+                        value = float(score.get("value"))
+                    except (TypeError, ValueError):
+                        value = None
+                if value is not None:
+                    norm = self._normalize(value, direction)
+                    self.record_action_outcome(
+                        action, norm < (prior_best if prior_best is not None else float("inf"))
+                    )
+            prior_best = min(
+                (n["elite_norm_score"] for n in self.niches.values()
+                 if n["elite_norm_score"] is not None),
+                default=prior_best,
+            )
 
     def update(
         self,
@@ -402,6 +543,12 @@ class SearchArchive:
         # the reverse-flow diffusivity family on a single no-op.
         if isinstance(history_entry, dict) and history_entry.get("no_op"):
             return
+
+        # Indexed before any lineage walk, so a chain can be followed back
+        # through parent_iteration. Without this every candidate roots at its
+        # own parent and depth never exceeds 1.
+        if isinstance(history_entry, dict):
+            self._by_iteration[iteration] = history_entry
 
         key = (family, normalize_strategy(strategy))
         if key[0] not in {k[0] for k in self.niches}:
@@ -445,6 +592,22 @@ class SearchArchive:
             niche["stale_visits"] = 0
         else:
             niche["stale_visits"] += 1
+
+        # Population, kept independently of the elite so that admitting a
+        # runner-up cannot change which entry is the elite. Anything scored
+        # competes; the cap keeps the archive small and the summary legible.
+        if norm is not None:
+            pop = niche.setdefault("population", [])
+            pop.append({
+                "norm_score": norm,
+                "score": val,
+                "iteration": iteration,
+                "history_entry": history_entry,
+                "lineage_id": self._lineage_id(history_entry, iteration),
+                "depth": self._depth_of(history_entry),
+            })
+            pop.sort(key=lambda m: m["norm_score"])
+            del pop[self.population_size:]
 
         # Failed/unscored attempts still consume a visit and therefore reduce
         # this family's exploration bonus, but they are not score samples and
@@ -498,6 +661,193 @@ class SearchArchive:
         if not scored:
             return rows[0]
         return min(scored, key=lambda n: n["elite_norm_score"])
+
+    def select_action(
+        self,
+        budget_remaining: int,
+        budget_total: int,
+        rng: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """Decide the KIND of move to make next, then which lineage to make it on.
+
+        The archive's older question was "which cell should the next proposal
+        target". That is a breadth question and it only ever has breadth
+        answers, which is why run closure_20260826_codex opened 33 mechanism
+        families over 55 evaluations -- 1.1 evaluations per cell, 46 of 50
+        cells visited exactly once, and 50 of 55 candidates with no parent at
+        all. There was no depth to allocate.
+
+        This asks the allocation question instead, over three actions:
+
+          deepen      refine the tip of an existing lineage
+          widen       start a new lineage inside a family already in the archive
+          new_family  open a mechanism not yet tried
+
+        Chosen by Thompson sampling, following Xin26 (BaSE), who found it beat
+        UCB and EXP3.P on this exact depth-versus-breadth allocation, and Mis25
+        (AB-MCTS), whose GEN node is the same "or make something new" arm. Both
+        are validated from ~8 evaluations upward, which is the regime we are
+        in; a fixed depth/breadth schedule is not, because the optimal split is
+        task-dependent and unknown in advance.
+
+        The reward a lineage is sampled against is its most recent IMPROVEMENT,
+        not its score. A chain still moving 1.7% per step deserves another pull
+        even while it trails a flat chain that is already better -- that is the
+        case the elite-only archive cannot express, and on our own data every
+        refinement that happened beat its parent (5 of 5).
+
+        Returns {"action", "lineage_id", "family", "strategy", "elite",
+        "is_new", "rationale"}. `elite` is the entry to mutate from, so a
+        caller that only understands select_niche's contract still works.
+        """
+        import random as _random
+        rng = rng or _random.Random()
+
+        if budget_remaining <= 0:
+            return {"action": "stop", "family": None, "strategy": None,
+                    "is_new": False, "elite": None, "lineage_id": None,
+                    "budget_exhausted": True,
+                    "rationale": "no budget remains"}
+
+        lineages = self.lineages()
+        if not lineages:
+            return {"action": "new_family", "family": None, "strategy": None,
+                    "is_new": True, "elite": None, "lineage_id": None,
+                    "rationale": "archive is empty; nothing to refine yet"}
+
+        # Sampled value of deepening each lineage. Beta over "did the last step
+        # improve", so a chain with a run of gains is pulled more often, and a
+        # chain that has stalled decays toward its prior WITHOUT being deleted
+        # -- it can still win a draw later, which is the whole point of keeping
+        # it. Depth is not penalised: there is no evidence a deep chain is
+        # exhausted, and the one depth-2 lineage we have is the second-best
+        # model in the study.
+        #
+        # Two-stage on purpose, and the second stage does NOT reuse the first
+        # stage's draw. Sampling every lineage and taking the max decides the
+        # action by arithmetic rather than merit: the maximum of N Beta(1,1)
+        # draws concentrates at N/(N+1), which is 0.976 for the 39 lineages in
+        # our own archive, so "deepen" wins ~98% of draws however badly those
+        # chains are doing. Handing that winning draw forward unchanged does
+        # not fix it -- the number is still an order statistic over N.
+        #
+        # So: sampling picks WHICH lineage (that is Thompson sampling doing its
+        # job, exploring among chains), and the chosen lineage's posterior MEAN
+        # -- one number, not a maximum -- competes against the other two arms.
+        # A single fresh draw against that mean keeps the action choice
+        # stochastic without the order-statistic inflation.
+        best: Optional[Tuple[float, Dict[str, Any]]] = None
+        best_sample = 0.0
+        for root, lin in lineages.items():
+            gains = [
+                lin["members"][i - 1]["norm_score"] - lin["members"][i]["norm_score"]
+                for i in range(1, len(lin["members"]))
+            ]
+            wins = sum(1 for g in gains if g > 0)
+            # A root with no refinement yet is an unknown, not a failure: prior
+            # alpha=1,beta=1 is a coin flip, so it competes rather than being
+            # ranked below any chain that has improved once.
+            sample = rng.betavariate(1.0 + wins, 1.0 + (len(gains) - wins))
+            # Break ties toward chains that are actually good, so exploration
+            # does not spend the budget deepening hopeless roots.
+            quality = 1.0 / (1.0 + max(0.0, lin["best_norm_score"]))
+            value = sample * (0.5 + 0.5 * quality)
+            if best is None or value > best[0]:
+                best = (value, lin)
+                # Posterior MEAN of the chosen lineage's improve-rate, not its
+                # draw: (wins+1)/(trials+2). An unrefined root sits at 0.5, a
+                # chain that has improved twice at 0.75, a stalled one below
+                # 0.5. This is what competes against the other arms.
+                best_sample = (wins + 1.0) / (len(gains) + 2.0)
+
+        # The two "make something new" arms, sampled the same way from how
+        # often each has historically paid off, so the split between refining
+        # and exploring is learned rather than fixed.
+        widen_value = rng.betavariate(1.0 + self._widen_wins, 1.0 + self._widen_losses)
+        new_value = rng.betavariate(1.0 + self._newfam_wins, 1.0 + self._newfam_losses)
+
+        # Exploration floor still applies: it exists to stop the search
+        # circling known physics, and deepening is circling by construction.
+        new_family_reserve = max(4, int(0.10 * max(1, budget_total)))
+        if (
+            self.exploration_floor > 0
+            and self._visits_since_new_family >= self.exploration_floor
+            and budget_remaining >= new_family_reserve
+        ):
+            return {"action": "new_family", "family": None, "strategy": None,
+                    "is_new": True, "elite": None, "lineage_id": None,
+                    "forced_by_exploration_floor": True,
+                    "rationale": (
+                        f"{self._visits_since_new_family} visits since the last new "
+                        f"mechanism; the exploration floor forces one"
+                    )}
+        if budget_remaining < new_family_reserve:
+            new_value = 0.0  # too little left to develop a new mechanism
+
+        assert best is not None
+        _, lin = best
+        # One fresh draw for the deepen arm, centred on the chosen lineage's
+        # posterior mean, so all three arms are single comparable draws.
+        deepen_draw = rng.betavariate(
+            max(1e-6, 2.0 * best_sample), max(1e-6, 2.0 * (1.0 - best_sample))
+        )
+        chosen = max(
+            (deepen_draw, "deepen"), (widen_value, "widen"), (new_value, "new_family")
+        )[1]
+
+        if chosen == "deepen":
+            tip = lin["tip"]
+            entry = tip["history_entry"] or {}
+            return {
+                "action": "deepen",
+                "lineage_id": lin["root_iteration"],
+                "family": entry.get("family"),
+                "strategy": entry.get("strategy"),
+                "elite": entry,
+                "is_new": False,
+                "depth": lin["depth"],
+                "score_trace": lin["score_trace"],
+                "rationale": (
+                    f"lineage rooted at iteration {lin['root_iteration']} is at depth "
+                    f"{lin['depth']} with trace {[round(x, 6) for x in lin['score_trace']]}; "
+                    f"refining its best member"
+                ),
+            }
+        if chosen == "widen":
+            # A new lineage inside a family we already know something about --
+            # the middle ground between refining one chain and opening an
+            # untried mechanism.
+            pick = self.select_niche(budget_remaining, budget_total)
+            pick["action"] = "widen"
+            pick["lineage_id"] = None
+            pick["elite"] = None  # a new chain, not a refinement of the elite
+            pick.setdefault(
+                "rationale",
+                "starting a new lineage in a family already in the archive",
+            )
+            return pick
+        return {"action": "new_family", "family": None, "strategy": None,
+                "is_new": True, "elite": None, "lineage_id": None,
+                "rationale": "opening a mechanism not yet in the archive"}
+
+    def record_action_outcome(self, action: str, improved: bool) -> None:
+        """Tell the allocator whether a move paid off, so its arms can learn.
+
+        Called once per recorded candidate. Without it the widen/new_family
+        arms stay at their priors forever and the split between refining and
+        exploring never adapts to the problem -- which is the fixed schedule
+        Xin26 shows is suboptimal.
+        """
+        if action == "widen":
+            if improved:
+                self._widen_wins += 1
+            else:
+                self._widen_losses += 1
+        elif action == "new_family":
+            if improved:
+                self._newfam_wins += 1
+            else:
+                self._newfam_losses += 1
 
     def select_niche(
         self, budget_remaining: int, budget_total: int, force_new_family: bool = False

@@ -3810,11 +3810,29 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     }
                 else:
                     break
-            else:
+            elif force_new_families:
                 sel = archive.select_niche(
                     budget_remaining=budget_remaining,
                     budget_total=total_budget,
-                    force_new_family=bool(force_new_families),
+                    force_new_family=True,
+                )
+            else:
+                # Allocation, not just niche choice: deepen an existing lineage,
+                # widen into a family already known, or open a new mechanism --
+                # decided by Thompson sampling over what each has actually
+                # returned (Xin26, Mis25). select_niche remains the cold-start
+                # and forced-exploration path, and select_action falls back to
+                # it for `widen`, so the older contract is unchanged.
+                #
+                # This exists because the previous loop could only ask a
+                # breadth question. On run closure_20260826_codex that produced
+                # 33 mechanism families over 55 evaluations -- 1.1 evaluations
+                # per cell -- while the 5 refinements that did happen beat
+                # their parent 5 times out of 5 and beat baseline 100% of the
+                # time against 72% for fresh starts, on 7% of the budget.
+                sel = archive.select_action(
+                    budget_remaining=budget_remaining,
+                    budget_total=total_budget,
                 )
             if sel.get("budget_exhausted"):
                 break
@@ -3905,6 +3923,21 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 elite = sel.get("elite") or {}
                 formula = str(elite.get("formula") or elite.get("model_description") or "")[:500]
                 elite_strategy = str(sel.get("strategy") or "").strip()
+                # When the allocator chose to deepen, say so and show the
+                # chain's trajectory. "Refine this" and "refine this, it has
+                # improved twice in a row and is still moving" are different
+                # instructions, and the second is the one that produced the
+                # only depth-2 lineage in the last study.
+                trace = sel.get("score_trace") or []
+                if sel.get("action") == "deepen" and len(trace) > 1:
+                    steps = " -> ".join(f"{v:.6g}" for v in trace)
+                    niche_lines.append(
+                        f"{i}. DEEPEN an existing lineage (depth {sel.get('depth')}, "
+                        f"rooted at iteration {sel.get('lineage_id')}). Its scores so far: "
+                        f"{steps}. This chain is being refined because it is still "
+                        f"improving; continue in the same direction rather than starting "
+                        f"over, and change ONE thing so the next step is attributable."
+                    )
                 niche_lines.append(
                     f"{i}. Build on family '{sel.get('family')}'"
                     + (
@@ -4143,6 +4176,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # the subagent later — a candidate's parent is a fact about the
             # selection, not something to be re-typed through two prompts.
             candidate["parent_iteration"] = (elite or {}).get("iteration")
+            # From this candidate's own `selection` -- the same pick that set
+            # parent_iteration just above -- so it stays correct however many
+            # candidates the loop skips. Recorded so record_candidate_results
+            # can tell the allocator whether this arm paid off.
+            candidate["search_action"] = selection.get("action")
+            candidate["lineage_id"] = selection.get("lineage_id")
             committed_cost += cost
             candidates.append(candidate)
 
@@ -4165,6 +4204,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "model_name_to_reuse": candidate.get("model_name_to_reuse", ""),
                 "strategy": candidate.get("strategy", ""),
                 "plan": candidate.get("plan", ""),
+                # Which allocation arm produced this candidate, so its outcome
+                # can be fed back to that arm. Without it the widen/new_family
+                # arms never leave their priors and the refine-versus-explore
+                # split stays fixed -- the schedule Xin26 shows is suboptimal.
+                "search_action": candidate.get("search_action"),
+                "lineage_id": candidate.get("lineage_id"),
             }
         _write_json(disc_dir / "proposals.json", proposals)
 
@@ -6063,6 +6108,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "strategy": strategy_label,
             "family": family,
             "parent_iteration": proposal.get("parent_iteration"),
+            # Read back by SearchArchive.replay to relearn which allocation arm
+            # has been paying off, so a resumed study keeps what it learned
+            # instead of restarting from the priors.
+            "search_action": proposal.get("search_action"),
+            "lineage_id": proposal.get("lineage_id"),
             "parameters": proposal.get("parameters") or {},
             "model_name_to_reuse": proposal.get("model_name_to_reuse", ""),
             "model_description": model_description,

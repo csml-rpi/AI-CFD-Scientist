@@ -1034,6 +1034,144 @@ def test_case_difficulty_respects_metric_direction() -> None:
           out.index("bad") < out.index("good"))
 
 
+def _ln(i, fam, score, parent=None, action=None, strategy="analytic"):
+    e = {"action_type": "code_mod", "variant_name": f"v{i}", "family": fam,
+         "strategy": strategy, "iteration": i,
+         "score": {"metric": "m", "value": score, "direction": "min"}}
+    if parent is not None:
+        e["parent_iteration"] = parent
+    if action is not None:
+        e["search_action"] = action
+    return e
+
+
+def test_a_cell_keeps_more_than_its_winner() -> None:
+    """Strict elitism discards a structurally new variant that arrives untuned.
+
+    It is compared once against an already-tuned elite, loses by a little, and
+    goes -- with its compiled model and its case directory -- so there is
+    nothing to tune next round.
+    """
+    a = SearchArchive()
+    a.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.11), _ln(3, "F", 0.12)],
+             baseline_direction="min")
+    niche = list(a.niches.values())[0]
+    check("the elite is still the best entry", niche["elite_score"] == 0.10)
+    check("runners-up are kept too", len(niche["population"]) == 3)
+    check("population is ordered best-first",
+          [m["score"] for m in niche["population"]] == [0.10, 0.11, 0.12])
+
+    b = SearchArchive(population_size=2)
+    b.replay([_ln(i, "F", 0.10 + 0.01 * i) for i in range(1, 6)], baseline_direction="min")
+    check("the population is capped", len(list(b.niches.values())[0]["population"]) == 2)
+
+
+def test_lineages_are_reconstructed_from_parents() -> None:
+    a = SearchArchive()
+    a.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.09, parent=1), _ln(3, "F", 0.08, parent=2),
+              _ln(4, "G", 0.20)], baseline_direction="min")
+    lin = a.lineages()
+    check("one chain per root", len(lin) == 2)
+    chain = lin[1]
+    check("depth counts refinement steps", chain["depth"] == 2, chain["depth"])
+    check("the trace is in order", chain["score_trace"] == [0.10, 0.09, 0.08])
+    check("the tip is the best member", chain["tip"]["score"] == 0.08)
+    check("a still-improving chain reports a positive last gain", chain["last_gain"] > 0)
+
+    # A chain whose ancestor never scored must not be dropped.
+    c = SearchArchive()
+    c.replay([_ln(9, "F", 0.09, parent=7)], baseline_direction="min")
+    check("a chain with an unscored ancestor still forms a lineage", len(c.lineages()) == 1)
+
+
+def test_allocator_asks_the_allocation_question() -> None:
+    import random
+    a = SearchArchive()
+    check("an empty archive can only open a new family",
+          a.select_action(100, 100)["action"] == "new_family")
+
+    a.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.09, parent=1)], baseline_direction="min")
+    seen = {a.select_action(500, 1000, rng=random.Random(s))["action"] for s in range(60)}
+    check("all three actions are reachable",
+          seen == {"deepen", "widen", "new_family"}, seen)
+
+    d = [a.select_action(500, 1000, rng=random.Random(s)) for s in range(200)]
+    deep = [x for x in d if x["action"] == "deepen"]
+    check("a deepen decision names the lineage it will refine",
+          all(x.get("lineage_id") is not None for x in deep))
+    check("a deepen decision carries the elite to mutate from",
+          all(x.get("elite") for x in deep))
+    check("a deepen decision explains itself",
+          all("still improving" in x["rationale"] or "refining" in x["rationale"] for x in deep))
+    check("no budget means no action", a.select_action(0, 100)["action"] == "stop")
+
+
+def test_allocation_follows_the_evidence() -> None:
+    """The split between refining and exploring must be learned, not fixed.
+
+    Xin26's result is that the optimal depth/breadth split is task-dependent
+    and unknown in advance, so a fixed schedule is the wrong shape.
+    """
+    import random
+    from collections import Counter
+
+    def share(hist, new_wins, new_losses, n=400):
+        a = SearchArchive()
+        a.replay(hist, baseline_direction="min")
+        a._newfam_wins, a._newfam_losses = new_wins, new_losses
+        rng = random.Random(11)
+        c = Counter(a.select_action(500, 1000, rng=rng)["action"] for _ in range(n))
+        return {k: c[k] / n for k in ("deepen", "widen", "new_family")}
+
+    improving = [_ln(1, "F", 0.10)] + [_ln(i, "F", 0.10 - 0.005 * i, parent=i - 1)
+                                       for i in range(2, 6)]
+    flat = [_ln(1, "F", 0.10)] + [_ln(i, "F", 0.10, parent=i - 1) for i in range(2, 6)]
+
+    good_chain = share(improving, 1, 12)   # chain works, new families do not
+    dead_chain = share(flat, 12, 1)        # chain stalled, new families work
+
+    check("a productive chain is deepened more than a stalled one",
+          good_chain["deepen"] > dead_chain["deepen"],
+          f"{good_chain['deepen']:.2f} vs {dead_chain['deepen']:.2f}")
+    check("new families are opened more when they have been paying off",
+          dead_chain["new_family"] > good_chain["new_family"],
+          f"{dead_chain['new_family']:.2f} vs {good_chain['new_family']:.2f}")
+
+
+def test_deepen_does_not_win_by_arithmetic() -> None:
+    """The maximum of N Beta(1,1) draws concentrates at N/(N+1).
+
+    Sampling every lineage and taking the max would pick "deepen" ~98% of the
+    time with 39 lineages -- as it did on our own archive -- however badly
+    those chains were doing. That is the count winning, not the evidence.
+    """
+    import random
+    from collections import Counter
+    many = SearchArchive()
+    many.replay([_ln(i, f"F{i}", 0.10) for i in range(1, 40)], baseline_direction="min")
+    check("39 unrefined roots exist", len(many.lineages()) == 39)
+    rng = random.Random(3)
+    c = Counter(many.select_action(500, 1000, rng=rng)["action"] for _ in range(400))
+    deepen = c["deepen"] / 400
+    check("deepen does not dominate merely because there are many lineages",
+          deepen < 0.60, f"deepen share {deepen:.2f} over 39 unrefined roots")
+
+
+def test_replay_relearns_the_arms() -> None:
+    a = SearchArchive()
+    a.replay([_ln(1, "F", 0.10, action="new_family"),
+              _ln(2, "F", 0.09, parent=1, action="deepen"),
+              _ln(3, "G", 0.20, action="new_family")], baseline_direction="min")
+    check("a resumed study remembers which arms paid off",
+          (a._newfam_wins, a._newfam_wins + a._newfam_losses) == (1, 2),
+          f"{a._newfam_wins}/{a._newfam_wins + a._newfam_losses}")
+
+    b = SearchArchive()
+    b.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.09, parent=1)], baseline_direction="min")
+    check("history without search_action leaves the arms at their priors",
+          b._newfam_wins == 0 and b._widen_wins == 0)
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1078,6 +1216,12 @@ def main() -> int:
     test_an_aggregate_comparator_does_not_fake_a_breakdown()
     test_missing_per_case_data_is_harmless()
     test_case_difficulty_respects_metric_direction()
+    test_a_cell_keeps_more_than_its_winner()
+    test_lineages_are_reconstructed_from_parents()
+    test_allocator_asks_the_allocation_question()
+    test_allocation_follows_the_evidence()
+    test_deepen_does_not_win_by_arithmetic()
+    test_replay_relearns_the_arms()
 
     print(f"\n{'ALL PASS' if FAILURES == 0 else f'{FAILURES} FAILURE(S)'}")
     return 1 if FAILURES else 0

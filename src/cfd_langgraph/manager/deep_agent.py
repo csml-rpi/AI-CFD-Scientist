@@ -98,10 +98,16 @@ selected case and cannot invent a separate baseline requirement:
      authors the scored comparators every candidate will be judged against, and computes
      the baseline score to gate on.
   b. Call `oed_propose_candidates(topic, num_candidates=<how many to try this round, e.g.
-     2-4>)`. It reads the search archive — one best-known result per model family — and
-     proposes that many concrete candidates, each explicitly targeting either a promising
-     under-explored family or a brand-new one, never the same exhausted direction on
-     repeat.
+     2-4>)`. It reads the search archive and decides, per candidate, whether to DEEPEN an
+     existing lineage, WIDEN into a family already tried, or open a NEW FAMILY — chosen by
+     Thompson sampling over what each of those moves has actually returned in this study,
+     not by a fixed schedule.
+
+     When it says DEEPEN, it hands you that lineage's score trace and asks for a
+     refinement. Treat that as the instruction it is: continue the chain in the same
+     direction and change ONE thing, so the next step is attributable. Do not restart the
+     mechanism from scratch — a chain that is still improving is the most reliable move
+     the search has, and it cannot get deeper if every visit rebuilds from the elite.
   c. Launch every returned candidate as a `task` call with subagent_type="oed-candidate-runner"
      — a single message with one task call per candidate, concurrently, same as launching
      cases in step 7. Give each one its full candidate spec from step b, including its
