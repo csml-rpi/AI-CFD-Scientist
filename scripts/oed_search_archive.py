@@ -251,8 +251,19 @@ class SearchArchive:
         exploration_c: float = 0.3,
         stale_halflife: int = 3,
         exploration_floor: int = 8,
-        strategy_transfer: float = 1.0,
-        strategy_prior_visits: int = 0,
+        # The values this class's own comments below argue for, and which were
+        # never applied: at 1.0/0 an empty strategy cell carries the family's
+        # full q PLUS the maximal zero-visit exploration bonus, so it strictly
+        # dominates the niche it inherited from. Measured over the real
+        # archive, select_niche could then never hand back an existing niche
+        # with an elite while budget_remaining >= the new-family reserve --
+        # 515 of 572 sampled budgets returned an empty cell, 57 a real elite,
+        # and those 57 were exactly the rows below the reserve. Since
+        # select_action's `widen` arm is served entirely by select_niche,
+        # every widen came back elite=None: a scratch start, not the "new
+        # lineage in a family we already know something about" it promises.
+        strategy_transfer: float = 0.5,
+        strategy_prior_visits: int = 1,
         population_size: int = 3,
     ) -> None:
         # q is min-max normalized into [0, 1] (see select_niche), so
@@ -478,9 +489,39 @@ class SearchArchive:
             # The cap never drops the best member (the population is sorted
             # best-first before truncation), so the tip is always present.
             tip = min(members, key=lambda m: m["norm_score"])
-            history = sorted(
+            all_scored = sorted(
                 self._chain_scores.get(root, []), key=lambda m: m["iteration"]
             ) or members
+            # A lineage is a TREE, not a sequence.
+            #
+            # `deepen` hands back the lineage's BEST member, so when a
+            # refinement regresses the next deepen re-refines the same parent
+            # and produces a SIBLING, not a next step. Reading every member in
+            # iteration order as though it were a chain then invents momentum
+            # out of the gap between two siblings: measured on a six-candidate
+            # tree, `gained` came out 0.0710 against a true best-path gain of
+            # 0.0183 -- a 3.9x inflation, worth +4.3 pseudo-counts at
+            # _gain_weight 60 against a _lineage_prior of 3.0. Every regression
+            # manufactured a large fake gain on the recovery step, and
+            # `last_gain` reported the difference between two siblings as the
+            # chain's momentum.
+            #
+            # The path from the root to the tip is the actual refinement
+            # sequence, so momentum, depth and the trace shown to the proposer
+            # all come from that. The full set stays for the failure and
+            # quality counts, where every attempt legitimately counts.
+            by_iter = {m["iteration"]: m for m in all_scored}
+            path: List[Dict[str, Any]] = []
+            cursor: Optional[int] = tip["iteration"]
+            seen_path: set = set()
+            while cursor is not None and cursor not in seen_path:
+                seen_path.add(cursor)
+                node = by_iter.get(cursor)
+                if node is not None:
+                    path.append(node)
+                entry = self._by_iteration.get(cursor) or {}
+                cursor = entry.get("parent_iteration")
+            history = list(reversed(path)) or all_scored
             trace = [m["score"] for m in history]
             last_gain = 0.0
             if len(history) >= 2:
@@ -488,10 +529,15 @@ class SearchArchive:
             out[root] = {
                 "root_iteration": root,
                 "members": members,
+                # The refinement path root -> tip. Momentum and depth read this.
                 "history": history,
+                # Every scored attempt in the chain, siblings included.
+                "all_scored": all_scored,
                 "score_trace": trace,
                 "failures": self._chain_failures.get(root, 0),
-                "depth": max(m["depth"] for m in members),
+                # Length of the actual refinement path, not the max recorded
+                # depth over a star of siblings.
+                "depth": max(0, len(history) - 1),
                 "tip": tip,
                 "best_norm_score": tip["norm_score"],
                 "last_gain": last_gain,
@@ -902,10 +948,6 @@ class SearchArchive:
         best: Optional[Tuple[float, Dict[str, Any]]] = None
         best_sample = 0.0
         for lin in deduped:
-            gains = [
-                lin["members"][i - 1]["norm_score"] - lin["members"][i]["norm_score"]
-                for i in range(1, len(lin["members"]))
-            ]
             # Evidence is the SIZE of each step, not its sign. A binary
             # improved/did-not throws away the thing that distinguishes a
             # chain worth pursuing from one crawling: under it a chain sitting
@@ -955,7 +997,10 @@ class SearchArchive:
             # value however good its best member scores -- and score alone is
             # static, so without this a chain stayed top of the order through
             # any number of consecutive failed builds.
-            scored_n = len(lin.get("history") or lin["members"])
+            # Every scored attempt, siblings included: buildability is about
+            # how often this chain produces anything, which the path alone
+            # understates once a chain has branched.
+            scored_n = len(lin.get("all_scored") or lin.get("history") or lin["members"])
             failures = lin.get("failures", 0)
             buildable = scored_n / float(scored_n + failures) if scored_n else 0.0
             effective_quality = quality * buildable
@@ -1029,6 +1074,9 @@ class SearchArchive:
             entry = tip["history_entry"] or {}
             return {
                 "action": "deepen",
+                # So the prompt can tell an improving step from a regressing
+                # one without re-deriving the objective's direction.
+                "direction": self._direction or "min",
                 "lineage_id": lin["root_iteration"],
                 "family": entry.get("family"),
                 "strategy": entry.get("strategy"),

@@ -94,7 +94,7 @@ case-launch/interpret steps 7-8 with this loop; the search needs the mesh gate's
 selected case and cannot invent a separate baseline requirement:
 
   a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's selected_level>,
-     total_budget=<a number you pick, e.g. 10-20>)` once. It resolves reference data and
+     total_budget=<in SOLVER RUNS, not candidates: a code-mod candidate costs roughly 50 runs on a multi-case benchmark and ~2 on a single-case one, so budget for the number of candidates you want times that — e.g. 2000-4000 for a 40-80 candidate campaign>)` once. It resolves reference data and
      authors the scored comparators every candidate will be judged against, and computes
      the baseline score to gate on.
   b. Call `oed_propose_candidates(topic, num_candidates=<how many to try this round, e.g.

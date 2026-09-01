@@ -589,6 +589,11 @@ def test_a_still_improving_family_keeps_being_exploited() -> None:
     check("an improving family carries no staleness",
           archive.niche_for("Improving")["stale_visits"] == 0)
     sel = archive.select_niche(budget_remaining=70, budget_total=100)
+    # Asserting only the family name passed vacuously while `elite` was None
+    # and the pick was an empty strategy cell that merely INHERITED the name --
+    # nothing was being exploited.
+    check("it is a real exploit, not an empty cell inheriting the family name",
+          sel.get("elite") is not None and not sel.get("is_new_strategy"), sel)
     check("it is still selected for exploitation", sel.get("family") == "Improving",
           detail=str(sel.get("family")))
 
@@ -1506,6 +1511,76 @@ def test_a_failed_candidate_is_a_loss_for_the_arm_that_chose_it() -> None:
           b._newfam_wins == 0, b._newfam_wins)
 
 
+def test_a_lineage_is_a_tree_not_a_sequence() -> None:
+    """deepen hands back the lineage's BEST member, so a regression makes the
+    next refinement a SIBLING rather than a next step.
+
+    Reading every member in iteration order as a chain then invents momentum
+    out of the gap between two siblings: on a six-candidate tree `gained` came
+    out 0.0710 against a true best-path gain of 0.0183 -- a 3.9x inflation,
+    worth +4.3 pseudo-counts at _gain_weight 60 against a _lineage_prior of
+    3.0. Every regression manufactured a large fake gain on the recovery step.
+    """
+    a = SearchArchive()
+    a.replay([_ch(1, "F", 0.110), _ch(2, "F", 0.112, 1), _ch(3, "F", 0.109, 1),
+              _ch(4, "F", 0.113, 3), _ch(5, "F", 0.108, 3), _ch(6, "F", 0.111, 5)],
+             baseline_direction="min")
+    lin = a.lineages()[1]
+
+    check("the trace is the path from root to tip, not every attempt",
+          lin["score_trace"] == [0.110, 0.109, 0.108], lin["score_trace"])
+    check("every scored attempt is still retained separately",
+          len(lin["all_scored"]) == 6, len(lin["all_scored"]))
+    check("depth is the length of that path", lin["depth"] == 2, lin["depth"])
+    check("the tip is the best member", lin["tip"]["iteration"] == 5)
+
+    hist = lin["history"]
+    rel = [(hist[i - 1]["norm_score"] - hist[i]["norm_score"]) / abs(hist[i - 1]["norm_score"])
+           for i in range(1, len(hist))]
+    gained = sum(max(0.0, g) for g in rel)
+    check("momentum is not inflated by sibling-to-sibling gaps",
+          abs(gained - 0.0183) < 0.001, f"{gained:.4f} (inflated value was 0.0710)")
+
+    # A pure star -- one root, five siblings, no chain -- must not read as depth.
+    star = SearchArchive()
+    star.replay([_ch(1, "F", 0.110)] + [_ch(i, "F", 0.111 + 0.001 * i, 1) for i in range(2, 7)],
+                baseline_direction="min")
+    check("a star of siblings has depth 0", star.lineages()[1]["depth"] == 0,
+          star.lineages()[1]["depth"])
+
+
+def test_select_niche_can_actually_hand_over_an_elite() -> None:
+    """At strategy_transfer=1.0 / prior_visits=0 an empty strategy cell carries
+    the family's full q PLUS the maximal zero-visit bonus, so it strictly
+    dominates the niche it inherited from -- and select_niche could never
+    return a real elite while budget_remaining >= the new-family reserve. Since
+    select_action's `widen` arm is served entirely by select_niche, every widen
+    came back elite=None: a scratch start, not a new lineage in a known family.
+    """
+    import json as _json
+    from pathlib import Path as _P
+    from collections import Counter
+    hist = _json.loads(
+        _P("runs/closure_20260826_codex/open_ended_discovery/history.json").read_text()
+    )
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+    c = Counter()
+    for budget in range(1, 4000, 7):
+        sel = a.select_niche(budget, 4000)
+        if sel.get("is_new"):
+            c["new"] += 1
+        elif sel.get("is_new_strategy"):
+            c["empty_cell"] += 1
+        elif sel.get("elite"):
+            c["real_exploit"] += 1
+    check("an elite is reachable at ordinary budgets",
+          c["real_exploit"] > c["empty_cell"], dict(c))
+    check("the defaults match the calibration the comments argue for",
+          (SearchArchive().strategy_transfer, SearchArchive().strategy_prior_visits) == (0.5, 1),
+          (SearchArchive().strategy_transfer, SearchArchive().strategy_prior_visits))
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1560,6 +1635,8 @@ def main() -> int:
     test_widen_can_never_open_a_new_family()
     test_a_batch_does_not_pick_the_same_lineage_twice()
     test_a_failed_candidate_is_a_loss_for_the_arm_that_chose_it()
+    test_a_lineage_is_a_tree_not_a_sequence()
+    test_select_niche_can_actually_hand_over_an_elite()
     test_a_cell_keeps_more_than_its_winner()
     test_lineages_are_reconstructed_from_parents()
     test_allocator_asks_the_allocation_question()

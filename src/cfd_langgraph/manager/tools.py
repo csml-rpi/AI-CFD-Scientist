@@ -422,20 +422,37 @@ def _expected_candidate_cost(history: List[Dict[str, Any]], action: str) -> int:
     Falls back to the old flat figures until there is something to measure.
     """
     flat = 2 if action == "code_mod" else 1
-    costs = [
-        int(h.get("cost", 0) or 0)
-        for h in history
-        if isinstance(h, dict)
-        and h.get("action_type") in {"code_mod", "experiment"}
-        and int(h.get("cost", 0) or 0) > 0
-    ]
-    if not costs:
+    def _median(rows: List[int]) -> Optional[int]:
+        if not rows:
+            return None
+        rows = sorted(rows)
+        return rows[len(rows) // 2]
+
+    def _costs_for(kind: Optional[str]) -> List[int]:
+        return [
+            int(h.get("cost", 0) or 0)
+            for h in history
+            if isinstance(h, dict)
+            and (h.get("action_type") == kind if kind
+                 else h.get("action_type") in {"code_mod", "experiment"})
+            and int(h.get("cost", 0) or 0) > 0
+        ]
+
+    # Partitioned by action type. Pooling them and applying a flat 0.75 fudge
+    # for experiments got both wrong whenever the mix was uneven: a history of
+    # 30 experiments at 32 and 20 code_mods at 48 estimated a code_mod at 32
+    # (truth 48, undercharged by a third) and an experiment at 24 (truth 32).
+    # An undercharged code_mod lets a batch through the affordability guard
+    # that then overruns the budget, and it skews the saturation window too.
+    own = _median(_costs_for(action))
+    if own is not None:
+        return max(flat, own)
+    pooled = _median(_costs_for(None))
+    if pooled is None:
         return flat
-    costs.sort()
-    median = costs[len(costs) // 2]
-    # An `experiment` reuses a compiled model, so it skips the build but still
-    # runs the same graded cases; it is cheaper, not an order cheaper.
-    scaled = median if action == "code_mod" else max(1, int(round(median * 0.75)))
+    # No history for this action type yet: an experiment reuses a compiled
+    # model, so it skips the build but still runs the same graded cases.
+    scaled = pooled if action == "code_mod" else max(1, int(round(pooled * 0.75)))
     return max(flat, scaled)
 
 
@@ -3470,7 +3487,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         return out_dir / "open_ended_discovery"
 
     def oed_setup_search(
-        topic: str, baseline_case_dir: str = "", total_budget: int = 10,
+        topic: str, baseline_case_dir: str = "", total_budget: int = 2000,
         starter_dir: str = "", evaluation_cases: Optional[List[str]] = None,
         prescribed_mesh_reason: str = "",
     ) -> dict:
@@ -3868,7 +3885,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         picks: List[Dict[str, Any]] = []
         picked_lineages: set = set()
         for _ in range(min(max(1, num_candidates), budget_remaining)):
-            if budget_remaining == 1 and archive.niches:
+            # Keyed to the measured cheap-candidate cost, not to a literal 1.
+            # Costs step in units of ~32-97, so `== 1` was never reached and
+            # this last-scraps branch was unreachable.
+            if (
+                archive.niches
+                and budget_remaining < _expected_candidate_cost(history, "code_mod")
+                and budget_remaining >= _expected_candidate_cost(history, "experiment")
+            ):
                 reusable = [
                     (key, niche)
                     for key, niche in archive.niches.items()
@@ -3889,6 +3913,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         "is_new": False,
                         "elite": niche["elite_history_entry"],
                         "experiment_only": True,
+                        # Labelled, or search_action lands as None and replay
+                        # skips it -- so the arms never learn from these.
+                        "action": "deepen",
                     }
                 else:
                     break
@@ -3898,6 +3925,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     budget_total=total_budget,
                     force_new_family=True,
                 )
+                # These are genuine new_family moves, and force_new_families is
+                # the escape hatch used exactly when the search is stuck -- so
+                # they are the evaluations that best say whether opening new
+                # mechanisms is still paying. Unlabelled, search_action was
+                # None and replay skipped them entirely.
+                sel["action"] = "new_family"
             else:
                 # Allocation, not just niche choice: deepen an existing lineage,
                 # widen into a family already known, or open a new mechanism --
@@ -4074,19 +4107,40 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     # for exactly three candidates -- and a short batch aborts
                     # the round.
                     steps = " -> ".join(f"{v:.6g}" for v in trace) or "n/a"
-                    started = (
-                        f"It has been refined {sel.get('depth')} time(s) so far, scoring "
-                        f"{steps}; continue in the same direction"
-                        if len(trace) > 1 else
-                        f"It scores {steps} and has never been refined; this is the first "
-                        f"refinement of it"
-                    )
+                    # "Continue in the same direction" is wrong advice after a
+                    # step that went backwards. The trace is now the path from
+                    # the root to the current best, so its last entry IS the
+                    # model being handed over, and the sign of the last step
+                    # says which instruction is correct.
+                    _dir = str(sel.get("direction") or "min").strip().lower()
+                    improving = None
+                    if len(trace) > 1:
+                        delta = trace[-1] - trace[-2]
+                        improving = delta < 0 if _dir != "max" else delta > 0
+                    if improving is True:
+                        started = (
+                            f"Its refinement path so far: {steps} — the last step improved, "
+                            f"so continue in the same direction"
+                        )
+                    elif improving is False:
+                        started = (
+                            f"Its refinement path so far: {steps} — the last step made it "
+                            f"WORSE, so do not repeat that change; make a different single "
+                            f"change from the same parent"
+                        )
+                    else:
+                        started = (
+                            f"It scores {steps} and has never been refined; this is the "
+                            f"first refinement of it"
+                        )
                     coeffs = _runtime_coefficients(Path(str(elite.get("case_dir", ""))))
                     niche_lines.append(
                         f"{i}. DEEPEN the lineage rooted at iteration "
                         f"{sel.get('lineage_id')}, family '{sel.get('family')}'"
                         + (f" via strategy '{elite_strategy}'" if elite_strategy else "")
-                        + f". {started}. Its current best model: {formula or '(not recorded)'}. "
+                        + (f" (refinement {sel.get('depth')} of this chain)"
+                           if sel.get("depth") else "")
+                        + f". {started}. The model to change: {formula or '(not recorded)'}. "
                         + (
                             f"It exposes these coefficients at runtime: {', '.join(coeffs)} — "
                             f"changing one ALONE needs no recompile, so use "
@@ -4397,14 +4451,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # so explicitly with a way forward — an empty list and no error
             # reads as "nothing to do", and the manager can loop on it forever
             # without budget_used ever advancing.
-            affordable = budget_remaining >= 2
+            # Against what a candidate ACTUALLY costs, not the old flat 2.
+            # With a measured cost of ~48, any remainder in [2, 47] left this
+            # saying "affordable" while every pick was dropped by the cost
+            # filter -- so the tool returned nothing, told the manager not to
+            # treat it as finished, and the manager looped, paying a proposer
+            # call per round and never reaching the paper stage.
+            cheapest = _expected_candidate_cost(history, "experiment")
+            affordable = budget_remaining >= cheapest
             guidance = (
                 "Call this tool again with force_new_families=True — that requires every "
                 "niche to be a family the archive has never seen, which is what breaks the "
                 "loop. Do NOT treat this as the search being finished: "
                 f"budget_remaining={budget_remaining} of {total_budget}."
                 if affordable else
-                f"budget_remaining={budget_remaining} is below the 2 units a code_mod costs, "
+                f"budget_remaining={budget_remaining} is below the {cheapest} units the "
+                f"cheapest candidate has been costing in this study, "
                 "so the search really is finished."
             )
             result["error"] = (
