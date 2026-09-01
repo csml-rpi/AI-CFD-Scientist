@@ -348,6 +348,30 @@ def _oed_candidate_timeout(disc_dir: Path, strategy: str = "") -> Optional[int]:
     return int(max(fence, max(inliers))) if inliers else int(fence)
 
 
+def _render_archive_summary(archive: Any, disc_dir: Path) -> str:
+    """The archive summary WITH the baseline it should be read against.
+
+    Both call sites used to invoke render_summary() with no arguments, so the
+    "Δ vs baseline" column never rendered and the per-case difficulty block had
+    nothing to compare against -- the proposer saw absolute scores with no way
+    to tell a win from a loss without doing the arithmetic itself. The baseline
+    is sitting in baseline_score.json next to the archive; this passes it in.
+    """
+    baseline = _read_json(disc_dir / "baseline_score.json") or {}
+    value = baseline.get("value")
+    per_case = baseline.get("per_case")
+    try:
+        return archive.render_summary(
+            baseline_score=float(value) if isinstance(value, (int, float)) else None,
+            baseline_direction=str(baseline.get("direction") or "min"),
+            baseline_per_case=per_case if isinstance(per_case, dict) else None,
+        )
+    except TypeError:
+        # An older archive without the per-case parameter must not break the
+        # loop -- the summary is guidance, not a gate.
+        return archive.render_summary()
+
+
 def _approved_hypothesis_directions(out_dir: Path) -> List[Dict[str, str]]:
     """The concrete modifications the hypothesis stage already produced.
 
@@ -4146,7 +4170,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
         result = {
             "candidates": candidates,
-            "archive_summary": archive.render_summary(),
+            "archive_summary": _render_archive_summary(archive, disc_dir),
             "budget_used": budget_used,
             "budget_remaining": budget_remaining,
             "proposed_cost": committed_cost,
@@ -4457,7 +4481,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "budget_exhausted": budget_exhausted,
             "is_saturated": saturated,
             "search_complete": search_complete,
-            "archive_summary": archive.render_summary(),
+            "archive_summary": _render_archive_summary(archive, disc_dir),
             "missing_candidate_records": missing,
             # Finished candidates found on disk that were not passed in. Named
             # explicitly so a recovered result is visible rather than silently

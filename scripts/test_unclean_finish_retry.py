@@ -833,5 +833,51 @@ try:
 finally:
     T._run_script = saved
 
+
+
+
+# ---------------------------------------------------------------------------
+# 10. The kOmegaSST derivation boilerplate is stated, not rediscovered.
+#
+# On run closure_gemini, sst_sensitized_bradshaw_limiter made 12 wmake attempts
+# over 119 turns and never compiled once. Its 109 errors all read
+# "'dimensionedScalar' does not name a type" and all pointed inside
+# kOmegaSSTBase.H -- a file the agent had not written -- so it spent 58
+# read_file calls searching OpenFOAM source for a type that was never missing.
+# Five rules applied to its own two files took it 109 -> 27 -> 7 -> 1 -> 0.
+# ---------------------------------------------------------------------------
+print("\n--- kOmegaSST derivation guidance ---")
+
+import importlib.util as _i3
+_s3 = _i3.spec_from_file_location(
+    "cma3", Path(__file__).resolve().parents[1] / "scripts" / "code_mod_agentic.py")
+_c3 = _i3.module_from_spec(_s3)
+_s3.loader.exec_module(_c3)
+guide = _c3.build_agent_prompt(
+    topic="t", hypothesis="derive from kOmegaSST", variant_name="v",
+    starter_case=Path("/tmp/s"), run_dir=Path("/tmp/r"), wm_project_dir=None)
+
+for label, needle in [
+    ("prerequisite includes, not just kOmegaSST.H", '#include "eddyViscosity.H"'),
+    ("kOmegaSSTBase.H named as the real base header", "kOmegaSSTBase.H"),
+    ("two template arguments spelled out",
+     "eddyViscosity<RASModel<BasicMomentumTransportModel>>"),
+    ("the 1-vs-2 template-arg error named", "wrong number of template arguments"),
+    ("type is the FIRST constructor argument", "type, alpha, rho, U, alphaRhoPhi"),
+    ("the .C needs its own include guard", "#ifndef MyModel_C"),
+    ("the redefinition symptom named", "redefinition of"),
+    ("registration header and makeRASModel", "makeIncompressibleMomentumTransportModel.H"),
+    ("the NoRepository pairing explained", "#ifdef NoRepository"),
+    ("the key heuristic: errors inside WM_PROJECT_DIR mean YOUR bug",
+     "THE BUG IS IN YOUR"),
+    ("told to copy a working sibling rather than re-derive", "fastest reference"),
+]:
+    check(f"build prompt states: {label}", needle in guide, needle)
+
+# It must not fire for unrelated modification families -- this is one section of
+# a generic prompt, so it should be present but the deliverable must survive.
+check("the generic deliverable is still intact alongside it",
+      "DELIVERABLE (generic" in guide and "wmake libso" in guide)
+
 print(f"\n{'ALL PASS' if F == 0 else str(F) + ' FAILED'}")
 sys.exit(1 if F else 0)

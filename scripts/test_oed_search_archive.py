@@ -947,6 +947,93 @@ def test_replay_never_calls_the_model() -> None:
 
 
 
+def _pc_entry(name, family, score, per_case, iteration=1, strategy="analytic"):
+    return {"action_type": "code_mod", "variant_name": name, "family": family,
+            "strategy": strategy, "iteration": iteration,
+            "score": {"metric": "m", "value": score, "direction": "min"},
+            "per_case_scores": per_case}
+
+
+def test_archive_shows_where_the_score_is_being_lost() -> None:
+    """per_case_scores had one writer and no readers.
+
+    The proposer saw one scalar per niche, so it could tell THAT a family
+    scored 0.09 but never WHERE those 0.09 came from -- the difference between
+    "my model is mediocre" and "my model is excellent on separated flows and no
+    better than baseline on the ducts". Only the second says which mechanism to
+    reach for next.
+    """
+    a = SearchArchive()
+    a.replay([
+        _pc_entry("m1", "famA", 0.09,
+                  {"DUCT_1": 0.30, "DUCT_2": 0.28, "HILL_1": 0.02, "HILL_2": 0.01}),
+        _pc_entry("m2", "famB", 0.11,
+                  {"DUCT_1": 0.32, "DUCT_2": 0.29, "HILL_1": 0.03, "HILL_2": 0.02}, 2),
+    ], baseline_direction="min")
+    out = a.render_summary(
+        baseline_score=0.12, baseline_direction="min",
+        baseline_per_case={"DUCT_1": 0.31, "DUCT_2": 0.30, "HILL_1": 0.05, "HILL_2": 0.04})
+
+    check("difficulty block appears", "PER-CASE DIFFICULTY" in out)
+    check("worst cases lead it", out.index("DUCT_1") < out.index("HILL_1"))
+    check("aggregated over both elites", "over the 2 elite(s)" in out)
+    check("each niche shows its own worst cases", out.count("worst cases:") == 2)
+    check("per-case baseline shown for comparison", "baseline 0.31" in out)
+    check("a case exactly on baseline is called unchanged, not 'better by +0'",
+          "unchanged" in out)
+    check("a case better than baseline is named", "better than baseline" in out)
+
+    # With more cases than fit the list, the easiest one is named so the
+    # reader can see the floor without every row being printed.
+    many = SearchArchive()
+    many.replay([_pc_entry("big", "famA", 0.1,
+                           {f"c{i}": 0.30 - i * 0.02 for i in range(10)})],
+                baseline_direction="min")
+    big = many.render_case_difficulty()
+    check("a long case list is truncated", "more; best case is" in big)
+    check("and the easiest case is still named", "c9" in big)
+
+
+def test_an_aggregate_comparator_does_not_fake_a_breakdown() -> None:
+    """A comparator that scores the whole set in one invocation writes the same
+    aggregate into every key -- run closure_20260826_codex produced 32 identical
+    values per candidate. Printing 32 copies of one number as a breakdown is
+    worse than printing nothing."""
+    d = SearchArchive()
+    d.replay([_pc_entry("agg", "famA", 0.11, {f"case_{i}": 0.11 for i in range(32)})],
+             baseline_direction="min")
+    out = d.render_summary(baseline_score=0.12)
+    check("identical per-case values are suppressed", "PER-CASE DIFFICULTY" not in out)
+    check("and no per-niche worst-case line either", "worst cases:" not in out)
+
+
+def test_missing_per_case_data_is_harmless() -> None:
+    n = SearchArchive()
+    n.replay([{"action_type": "code_mod", "variant_name": "x", "family": "famA",
+               "strategy": "analytic", "iteration": 1,
+               "score": {"metric": "m", "value": 0.1, "direction": "min"}}],
+             baseline_direction="min")
+    out = n.render_summary(baseline_score=0.12)
+    check("no per-case data -> no block, summary still renders",
+          "PER-CASE DIFFICULTY" not in out and "famA" in out)
+    check("render_case_difficulty alone returns empty", n.render_case_difficulty() == "")
+
+    b = SearchArchive()
+    b.replay([_pc_entry("mixed", "famA", 0.1, {"a": 0.3, "b": None, "c": 0.1})],
+             baseline_direction="min")
+    check("non-numeric per-case values are skipped, not raised",
+          "a" in b.render_case_difficulty())
+
+
+def test_case_difficulty_respects_metric_direction() -> None:
+    m = SearchArchive()
+    m.replay([_pc_entry("mx", "famA", 0.9, {"good": 0.95, "bad": 0.10})],
+             baseline_direction="max")
+    out = m.render_case_difficulty(baseline_direction="max")
+    check("with direction=max the LOWEST score is the worst case",
+          out.index("bad") < out.index("good"))
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -987,6 +1074,10 @@ def main() -> int:
     test_keywords_cannot_judge_a_fit_claim_that_merely_reads_data()
     test_llm_decides_strategy_and_may_correct_either_way()
     test_replay_never_calls_the_model()
+    test_archive_shows_where_the_score_is_being_lost()
+    test_an_aggregate_comparator_does_not_fake_a_breakdown()
+    test_missing_per_case_data_is_harmless()
+    test_case_difficulty_respects_metric_direction()
 
     print(f"\n{'ALL PASS' if FAILURES == 0 else f'{FAILURES} FAILURE(S)'}")
     return 1 if FAILURES else 0
@@ -994,3 +1085,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

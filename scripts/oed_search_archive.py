@@ -724,8 +724,91 @@ class SearchArchive:
         tolerance = max(1e-12, abs(before) * 1e-6)
         return not (before - cur > tolerance)
 
+    @staticmethod
+    def _per_case(niche: Dict[str, Any]) -> Dict[str, float]:
+        """The elite's per-case scores, if it recorded any usable ones.
+
+        Degenerate sets are treated as absent. A study whose comparator scores
+        the whole set in one invocation writes the same aggregate into all N
+        keys -- run closure_20260826_codex did exactly that, 32 identical
+        values per candidate -- and printing 32 copies of one number as though
+        it were a breakdown is worse than printing nothing.
+        """
+        entry = niche.get("elite_history_entry") or {}
+        raw = entry.get("per_case_scores") if isinstance(entry, dict) else None
+        if not isinstance(raw, dict) or len(raw) < 2:
+            return {}
+        clean = {k: float(v) for k, v in raw.items() if isinstance(v, (int, float))}
+        if len(clean) < 2 or len(set(clean.values())) < 2:
+            return {}
+        return clean
+
+    def render_case_difficulty(
+        self,
+        baseline_per_case: Optional[Dict[str, float]] = None,
+        baseline_direction: str = "min",
+        worst_n: int = 6,
+    ) -> str:
+        """Where the error actually concentrates, across every elite in the archive.
+
+        The archive used to show one scalar per niche and nothing else, so a
+        proposer could see THAT a family scored 0.09 but never WHERE those 0.09
+        came from. The per-case scores were computed, written to
+        candidate_record.json, and read by nothing -- one writer, no readers.
+
+        That is the difference between "my model is mediocre" and "my model is
+        excellent on separated flows and no better than baseline on the ducts",
+        and only the second tells you which mechanism to reach for next. On run
+        closure_20260826_codex the entire gap to the leaderboard sat in three
+        duct cases while the hills were already competitive; nothing in the
+        search could see that, and the mechanism that addresses it was not
+        proposed until candidate ~56.
+
+        Aggregated over elites rather than shown for one, because a case that
+        every family struggles with is a property of the problem, while a case
+        one family alone fails is a property of that family.
+        """
+        per_case_sets = [pc for pc in (self._per_case(n) for n in self.niches.values()) if pc]
+        if not per_case_sets:
+            return ""
+        totals: Dict[str, List[float]] = {}
+        for pc in per_case_sets:
+            for case, value in pc.items():
+                totals.setdefault(case, []).append(value)
+        means = {c: sum(v) / len(v) for c, v in totals.items()}
+        worse_is = (lambda a, b: a > b) if baseline_direction != "max" else (lambda a, b: a < b)
+        ranked = sorted(means.items(), key=lambda kv: kv[1], reverse=baseline_direction != "max")
+
+        lines = [
+            "PER-CASE DIFFICULTY (mean over the %d elite(s) that recorded per-case scores)."
+            % len(per_case_sets),
+            "  This is where the score is actually being lost. A mechanism that only",
+            "  helps cases already near baseline cannot move the overall mean much.",
+        ]
+        for case, value in ranked[:worst_n]:
+            base = (baseline_per_case or {}).get(case)
+            delta = ""
+            if isinstance(base, (int, float)):
+                gap = value - base
+                if gap == 0:
+                    # Equal is not "better by +0": on this benchmark a case
+                    # sitting exactly on baseline is the signature of a model
+                    # that does nothing there, which is worth seeing as such.
+                    delta = "  (baseline %.6g, unchanged)" % base
+                else:
+                    delta = "  (baseline %.6g, %s baseline by %+.4g)" % (
+                        base, "worse than" if worse_is(value, base) else "better than", gap
+                    )
+            lines.append("    %-28s %.6g%s" % (case, value, delta))
+        if len(ranked) > worst_n:
+            best = ranked[-1]
+            lines.append("    ... %d more; best case is %s at %.6g"
+                         % (len(ranked) - worst_n, best[0], best[1]))
+        return "\n".join(lines)
+
     def render_summary(
-        self, baseline_score: Optional[float] = None, baseline_direction: str = "min"
+        self, baseline_score: Optional[float] = None, baseline_direction: str = "min",
+        baseline_per_case: Optional[Dict[str, float]] = None,
     ) -> str:
         if not self.niches:
             return "SEARCH ARCHIVE: empty — no model family has been scored yet."
@@ -748,8 +831,21 @@ class SearchArchive:
                 f"  - {family} [via {strategy}]: best score={score_str}{delta_str}, "
                 f"visits={niche['visits']}, from iteration {niche['elite_iteration']}"
             )
+            # This elite's own worst cases. The aggregate below says where the
+            # problem is in general; this says where THIS family is losing,
+            # which is what decides whether refining it is worth a visit.
+            per_case = self._per_case(niche)
+            if per_case:
+                worst = sorted(per_case.items(), key=lambda kv: kv[1],
+                               reverse=baseline_direction != "max")[:3]
+                lines.append("      worst cases: "
+                             + ", ".join(f"{c} {v:.4g}" for c, v in worst))
         lines.append("")
         lines.append(self.render_strategy_summary(baseline_score, baseline_direction))
+        difficulty = self.render_case_difficulty(baseline_per_case, baseline_direction)
+        if difficulty:
+            lines.append("")
+            lines.append(difficulty)
         return "\n".join(lines)
 
     def render_strategy_summary(

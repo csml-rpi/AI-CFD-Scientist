@@ -651,6 +651,72 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
             "and confirm it reaches End, then call `done`.\n\n"
             if str(repair_goal or "").strip() else ""
         )
+        + (
+            # Five distinct mistakes, all of which a model can spend its whole
+            # turn budget failing to find, because every compiler error points
+            # into OpenFOAM's own headers rather than at the line responsible.
+            # Measured on run closure_gemini: sst_sensitized_bradshaw_limiter
+            # made 12 wmake attempts over 119 turns and never once compiled,
+            # emitting 109 copies of "'dimensionedScalar' does not name a type"
+            # located in kOmegaSSTBase.H -- a file it had not written. It spent
+            # 58 read_file calls searching OpenFOAM source for a type that was
+            # never missing. Applying the five rules below to its own files
+            # took the error count 109 -> 27 -> 7 -> 1 -> 0.
+            #
+            # This is boilerplate, not science. Stating it costs a few hundred
+            # tokens and saves an entire candidate.
+            "============================================================\n"
+            "DERIVING FROM kOmegaSST IN OPENFOAM 10 — EXACT REQUIRED SHAPE\n"
+            "============================================================\n"
+            "If your model derives from kOmegaSST, follow this exactly. Every rule\n"
+            "here has produced a build that fails with errors pointing at OpenFOAM's\n"
+            "own headers, which is a trap: the error location is never the cause.\n\n"
+            "1. In the .H, include the PREREQUISITES, not just kOmegaSST.H:\n"
+            "       #include \"RASModel.H\"\n"
+            "       #include \"eddyViscosity.H\"\n"
+            "       #include \"kOmegaSSTBase.H\"\n"
+            "   Including only kOmegaSST.H leaves dimensionedScalar undefined when\n"
+            "   kOmegaSSTBase.H is parsed, and you get ~109 errors reported inside\n"
+            "   kOmegaSSTBase.H. Nothing is wrong with that file.\n\n"
+            "2. The base class takes TWO template arguments:\n"
+            "       template<class BasicMomentumTransportModel>\n"
+            "       class MyModel\n"
+            "       :\n"
+            "           public Foam::kOmegaSST\n"
+            "           <\n"
+            "               eddyViscosity<RASModel<BasicMomentumTransportModel>>,\n"
+            "               BasicMomentumTransportModel\n"
+            "           >\n"
+            "   Writing kOmegaSST<BasicMomentumTransportModel> gives\n"
+            "   'wrong number of template arguments (1, should be 2)'.\n\n"
+            "3. The base constructor takes `type` as its FIRST argument:\n"
+            "       MyModel<B>::MyModel(const alphaField& alpha, const rhoField& rho,\n"
+            "                           const volVectorField& U, ..., const word& type)\n"
+            "       :\n"
+            "           Foam::kOmegaSST<eddyViscosity<RASModel<B>>, B>\n"
+            "           (\n"
+            "               type, alpha, rho, U, alphaRhoPhi, phi, viscosity\n"
+            "           )\n"
+            "   Passing type last gives 'no matching function for call to kOmegaSST(...)'.\n\n"
+            "4. The .C MUST have its own include guard, because the .H includes the\n"
+            "   .C under NoRepository AND the .C is compiled directly:\n"
+            "       #ifndef MyModel_C\n"
+            "       #define MyModel_C\n"
+            "       ... entire file ...\n"
+            "       #endif\n"
+            "   Without it every member is defined twice: 'redefinition of ...'.\n\n"
+            "5. The .C includes its own header first, then the registration header:\n"
+            "       #include \"MyModel.H\"\n"
+            "       #include \"makeIncompressibleMomentumTransportModel.H\"\n"
+            "   and ends with  makeRASModel(MyModel);\n"
+            "   The .H ends with  #ifdef NoRepository / #include \"MyModel.C\" / #endif\n"
+            "   and Make/files lists the .C.\n\n"
+            "IF A COMPILER ERROR POINTS INSIDE $WM_PROJECT_DIR, THE BUG IS IN YOUR\n"
+            "FILE, NOT THAT ONE. Re-read your own .H and .C against the five rules\n"
+            "above before reading any more OpenFOAM source. An existing compiled\n"
+            "model under the starter case or a sibling candidate directory is the\n"
+            "fastest reference — copy its skeleton rather than deriving it again.\n\n"
+        )
         + "DELIVERABLE (generic — applies to ANY OpenFOAM modification family):\n"
         + "  (a) Copy the starter case into the run dir under a case folder\n"
         + f"      named {variant_name}/ (use run_bash with `cp -a`).\n"
