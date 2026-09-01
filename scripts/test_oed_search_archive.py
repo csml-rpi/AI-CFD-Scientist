@@ -1353,6 +1353,80 @@ def test_every_arm_carries_the_same_kind_of_evidence() -> None:
           (b._deepen_wins, b._deepen_losses))
 
 
+def test_a_lineage_is_never_deleted_by_the_population_cap() -> None:
+    """The cap bounds stored artifacts; it must not bound WHO can be chosen.
+
+    Deriving lineage membership from the capped per-cell populations deleted
+    whole chains: one whose members all rank below the top `population_size`
+    of their cell vanished from the allocator entirely -- not truncated, gone
+    -- while _chain_scores still held it, so nothing looked broken. The chain
+    most worth continuing is often exactly the one still climbing from a poor
+    start, which is the one this dropped.
+    """
+    import random
+    from collections import Counter
+    a = SearchArchive(population_size=3)
+    a.replay([_ch(1, "A", 0.090), _ch(2, "A", 0.091), _ch(3, "A", 0.092),
+              _ch(4, "A", 0.20), _ch(5, "A", 0.15, 4), _ch(6, "A", 0.12, 5)],
+             baseline_direction="min")
+    lin = a.lineages()
+    check("the buried chain is still a lineage", 4 in lin, sorted(lin))
+    check("its history is intact", lin[4]["score_trace"] == [0.20, 0.15, 0.12])
+    check("the cell population is still capped",
+          len(list(a.niches.values())[0]["population"]) == 3)
+
+    c = Counter()
+    for seed in range(1200):
+        d = a.select_action(500, 1000, rng=random.Random(seed))
+        if d["action"] == "deepen":
+            c[d["lineage_id"]] += 1
+    check("and it can actually be selected", c[4] > 0, dict(c))
+    check("its momentum earns it a real share", c[4] / max(1, sum(c.values())) > 0.15,
+          c[4] / max(1, sum(c.values())))
+
+
+def test_quality_survives_a_degenerate_or_outlier_archive() -> None:
+    """CFD produces both cases routinely, and min-max broke on each.
+
+    A closure that destabilises the solver returns an enormous error and, as
+    the single maximum, compressed every real lineage toward the same quality.
+    And with one lineage or all-equal scores, `(hi - lo) or 1.0` handed 0.0 to
+    everything, so the allocator refused to deepen the only chain it had --
+    the state of every campaign's opening rounds.
+    """
+    import random
+    from collections import Counter
+
+    def actions(hist, n=900):
+        a = SearchArchive()
+        a.replay(hist, baseline_direction="min")
+        return Counter(a.select_action(500, 1000, rng=random.Random(s))["action"]
+                       for s in range(n))
+
+    one = actions([_ch(1, "A", 0.09)])
+    check("a single-lineage archive still deepens", one["deepen"] / 900 > 0.20,
+          one["deepen"] / 900)
+    tied = actions([_ch(1, "A", 0.09), _ch(2, "B", 0.09), _ch(3, "C", 0.09)])
+    check("an all-equal archive still deepens", tied["deepen"] / 900 > 0.20,
+          tied["deepen"] / 900)
+
+    def top_share(hist, n=900):
+        a = SearchArchive()
+        a.replay(hist, baseline_direction="min")
+        c = Counter()
+        for s in range(n):
+            d = a.select_action(500, 1000, rng=random.Random(s))
+            if d["action"] == "deepen":
+                c[round(a.lineages()[d["lineage_id"]]["tip"]["score"], 3)] += 1
+        return c[0.09] / max(1, sum(c.values()))
+
+    clean = top_share([_ch(1, "A", 0.09), _ch(2, "B", 0.10), _ch(3, "C", 0.11)])
+    withdiv = top_share([_ch(1, "A", 0.09), _ch(2, "B", 0.10), _ch(3, "C", 0.11),
+                         _ch(4, "D", 5.0)])
+    check("one diverged candidate does not flatten the ranking",
+          withdiv > 0.5 * clean, f"clean {clean:.2f} -> with outlier {withdiv:.2f}")
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1402,6 +1476,8 @@ def main() -> int:
     test_failed_attempts_count_against_their_chain()
     test_duplicate_models_do_not_multiply_their_odds()
     test_every_arm_carries_the_same_kind_of_evidence()
+    test_a_lineage_is_never_deleted_by_the_population_cap()
+    test_quality_survives_a_degenerate_or_outlier_archive()
     test_a_cell_keeps_more_than_its_winner()
     test_lineages_are_reconstructed_from_parents()
     test_allocator_asks_the_allocation_question()

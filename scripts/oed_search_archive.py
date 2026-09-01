@@ -440,10 +440,38 @@ class SearchArchive:
         # tip has to carry a history_entry the proposer can mutate from. The
         # SCORE HISTORY comes from the uncapped chain record, so a long chain
         # reports all of its steps rather than the last `population_size`.
+        # MEMBERSHIP comes from the uncapped chain record, not from the capped
+        # populations. Deriving it from the populations deleted whole lineages:
+        # a chain whose members all rank below the top `population_size` of
+        # their cell vanished from the allocator completely -- not truncated,
+        # gone -- while _chain_scores still held it, so nothing looked broken.
+        #
+        # Reproduced: a cell holding three flat candidates at 0.090/0.091/0.092
+        # plus a chain running 0.20 -> 0.15 -> 0.12 (+25% per step) offered the
+        # allocator only [1, 2, 3]. The fastest-improving chain in the archive
+        # was unreachable forever -- which is precisely the case this method
+        # exists to serve. Invisible on a wide archive where most cells are
+        # visited once; certain on the deep focused study the design is for.
         chains: Dict[int, List[Dict[str, Any]]] = {}
         for niche in self.niches.values():
             for member in niche.get("population", []):
                 chains.setdefault(member["lineage_id"], []).append(member)
+        # Any chain with scores but no surviving population member is still a
+        # real lineage. Rebuild a minimal member for it so it can be selected;
+        # its history_entry comes from the iteration index.
+        for root, scored in self._chain_scores.items():
+            if root in chains or not scored:
+                continue
+            best = min(scored, key=lambda m: m["norm_score"])
+            entry = self._by_iteration.get(best["iteration"]) or {}
+            chains[root] = [{
+                "norm_score": best["norm_score"],
+                "score": best["score"],
+                "iteration": best["iteration"],
+                "history_entry": entry,
+                "lineage_id": root,
+                "depth": self._depth_of(entry),
+            }]
         out: Dict[int, Dict[str, Any]] = {}
         for root, members in chains.items():
             members = sorted(members, key=lambda m: m["iteration"])
@@ -798,9 +826,32 @@ class SearchArchive:
         # norm_score is already direction-corrected (lower is better for both
         # min and max objectives), so min-max normalising it here gives a real
         # [0, 1] ranking that behaves identically in either direction.
-        norms = [l["best_norm_score"] for l in lineages.values()]
-        lo, hi = min(norms), max(norms)
-        span = (hi - lo) or 1.0
+        # Percentile rank, not raw min-max.
+        #
+        # Min-max is hostage to its own extremes, and in CFD the extremes are
+        # not rare: a closure that destabilises the solver returns an enormous
+        # error, and that single outlier sets `hi` so every real lineage
+        # compresses toward 1.0. Measured: scores [0.09, 0.10, 0.11] give a
+        # decisive 878/59/1 split; adding one diverged candidate at 5.0 turns
+        # it into 339/355/363 -- a three-way coin toss. A rank is immune to how
+        # far away the worst candidate is.
+        #
+        # And min-max is undefined when every lineage ties or there is only
+        # one: `(hi - lo) or 1.0` then handed 0.0 to EVERY lineage, so the
+        # allocator refused to deepen 90% of the time -- which is the state of
+        # every campaign for its first few rounds, exactly when the one chain
+        # it has is the only thing worth refining. select_niche already guards
+        # this (`if span <= 0: return 0.5`); select_action did not.
+        norms = sorted(l["best_norm_score"] for l in lineages.values())
+
+        def _quality(norm: float) -> float:
+            if len(norms) < 2 or norms[0] == norms[-1]:
+                return 0.5
+            # Fraction of lineages this one is at least as good as (lower
+            # norm_score is better for both objective directions).
+            worse = sum(1 for n in norms if n > norm)
+            ties = sum(1 for n in norms if n == norm)
+            return (worse + 0.5 * (ties - 1)) / (len(norms) - 1)
 
         # One entry per DISTINCT model, not per lineage.
         #
@@ -875,7 +926,7 @@ class SearchArchive:
             # picking at random. We do know something about an unrefined root:
             # its score. Folding that in as pseudo-counts means a good root
             # starts ahead of a bad one, and real gains then accumulate on top.
-            quality = (hi - lin["best_norm_score"]) / span
+            quality = _quality(lin["best_norm_score"])
             # Quality is what the chain is WORTH; buildability is the chance a
             # refinement of it produces anything at all. The prior is the
             # product, because a chain that cannot be built has no expected

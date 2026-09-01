@@ -372,6 +372,44 @@ def _render_archive_summary(archive: Any, disc_dir: Path) -> str:
         return archive.render_summary()
 
 
+def _expected_candidate_cost(history: List[Dict[str, Any]], action: str) -> int:
+    """What a candidate of this kind has ACTUALLY cost in this study.
+
+    The planner used a flat `2 if code_mod else 1` while oed_score_candidate
+    charges the measured solver invocations. On run closure_20260826_codex the
+    real costs ran 32 to 97 with a median of 48 -- the plan understated spend
+    by about 24x, and said so to the proposer verbatim ("code_mod costs 2,
+    experiment costs 1").
+
+    Three things broke as a result. The affordability guard never bound, so a
+    batch of four planned at 8 units really cost ~200 and could overspend the
+    remaining budget twofold. The "one unit left, use a cheap experiment"
+    branch was unreachable, because costs never step through 1. And the
+    empty-batch message declared the search finished only below 2 units when it
+    was actually finished below about 40.
+
+    Measured from this study's own history, so it needs no per-benchmark
+    constant: a 32-case benchmark learns ~50, a single-case study learns ~2.
+    Falls back to the old flat figures until there is something to measure.
+    """
+    flat = 2 if action == "code_mod" else 1
+    costs = [
+        int(h.get("cost", 0) or 0)
+        for h in history
+        if isinstance(h, dict)
+        and h.get("action_type") in {"code_mod", "experiment"}
+        and int(h.get("cost", 0) or 0) > 0
+    ]
+    if not costs:
+        return flat
+    costs.sort()
+    median = costs[len(costs) // 2]
+    # An `experiment` reuses a compiled model, so it skips the build but still
+    # runs the same graded cases; it is cheaper, not an order cheaper.
+    scaled = median if action == "code_mod" else max(1, int(round(median * 0.75)))
+    return max(flat, scaled)
+
+
 def _approved_hypothesis_directions(out_dir: Path) -> List[Dict[str, str]]:
     """The concrete modifications the hypothesis stage already produced.
 
@@ -3961,15 +3999,47 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 # instructions, and the second is the one that produced the
                 # only depth-2 lineage in the last study.
                 trace = sel.get("score_trace") or []
-                if sel.get("action") == "deepen" and len(trace) > 1:
-                    steps = " -> ".join(f"{v:.6g}" for v in trace)
-                    niche_lines.append(
-                        f"{i}. DEEPEN an existing lineage (depth {sel.get('depth')}, "
-                        f"rooted at iteration {sel.get('lineage_id')}). Its scores so far: "
-                        f"{steps}. This chain is being refined because it is still "
-                        f"improving; continue in the same direction rather than starting "
-                        f"over, and change ONE thing so the next step is attributable."
+                if sel.get("action") == "deepen":
+                    # Emitted for EVERY deepen, including a depth-0 root.
+                    #
+                    # Gating this on len(trace) > 1 suppressed it for 84% of
+                    # deepen picks on the real archive, because most lineages
+                    # are still a single candidate -- and a root can only ever
+                    # become a chain through exactly those picks. The arm was
+                    # switched off at the one moment it mattered, while the
+                    # manager's prompt promised the opposite.
+                    #
+                    # One line per pick: this used to append a second line
+                    # under the same index, so a batch of three produced
+                    # instructions numbered 1, 1, 2, 3 against a prompt asking
+                    # for exactly three candidates -- and a short batch aborts
+                    # the round.
+                    steps = " -> ".join(f"{v:.6g}" for v in trace) or "n/a"
+                    started = (
+                        f"It has been refined {sel.get('depth')} time(s) so far, scoring "
+                        f"{steps}; continue in the same direction"
+                        if len(trace) > 1 else
+                        f"It scores {steps} and has never been refined; this is the first "
+                        f"refinement of it"
                     )
+                    coeffs = _runtime_coefficients(Path(str(elite.get("case_dir", ""))))
+                    niche_lines.append(
+                        f"{i}. DEEPEN the lineage rooted at iteration "
+                        f"{sel.get('lineage_id')}, family '{sel.get('family')}'"
+                        + (f" via strategy '{elite_strategy}'" if elite_strategy else "")
+                        + f". {started}. Its current best model: {formula or '(not recorded)'}. "
+                        + (
+                            f"It exposes these coefficients at runtime: {', '.join(coeffs)} — "
+                            f"changing one ALONE needs no recompile, so use "
+                            f"action_type=experiment with parameters and "
+                            f"base_case_dir={elite.get('case_dir', '')}. "
+                            if coeffs else
+                            "Use action_type=code_mod. "
+                        )
+                        + "Change ONE thing so the next step is attributable, and do not "
+                        "restart the mechanism from scratch."
+                    )
+                    continue
                 niche_lines.append(
                     f"{i}. Build on family '{sel.get('family')}'"
                     + (
@@ -3995,7 +4065,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
         prompt = (
             f"Research topic: {topic}\n\n"
-            f"Budget remaining: {budget_remaining}/{total_budget} units (code_mod costs 2, experiment costs 1).\n"
+            f"Budget remaining: {budget_remaining}/{total_budget} units. "
+            f"On this study a code_mod has been costing about "
+            f"{_expected_candidate_cost(history, 'code_mod')} units and an experiment about "
+            f"{_expected_candidate_cost(history, 'experiment')} — a unit is one solver run, so "
+            f"the cost is set by how many cases a candidate has to be evaluated on, not by a "
+            f"flat per-candidate charge.\n"
             + _study_resources(out_dir, disc_dir) + "\n\n"
             + (
                 "CHOOSING HOW, NOT ONLY WHAT. Each candidate carries a `strategy`: how you "
@@ -4103,7 +4178,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 action = "code_mod"
             elif selection.get("experiment_only"):
                 action = "experiment"
-            cost = 2 if action == "code_mod" else 1
+            cost = _expected_candidate_cost(history, action)
             if committed_cost + cost > budget_remaining:
                 continue
             candidate["action_type"] = action

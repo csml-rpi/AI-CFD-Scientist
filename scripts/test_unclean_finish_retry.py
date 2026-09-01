@@ -883,5 +883,66 @@ for banned in ("kOmegaSST", "dimensionedScalar", "eddyViscosity", "makeRASModel"
 check("the generic deliverable is still intact alongside it",
       "DELIVERABLE (generic" in guide and "wmake libso" in guide)
 
+
+
+
+# ---------------------------------------------------------------------------
+# 11. Budget arithmetic, and what a deepen pick actually tells the proposer.
+# ---------------------------------------------------------------------------
+print("\n--- candidate cost is measured, not assumed ---")
+
+from cfd_langgraph.manager.tools import _expected_candidate_cost
+
+check("with no history it falls back to the old flat figures",
+      (_expected_candidate_cost([], "code_mod"), _expected_candidate_cost([], "experiment")) == (2, 1))
+
+expensive = [{"action_type": "code_mod", "cost": c} for c in (32, 48, 50, 55, 97)]
+check("an expensive benchmark learns its real cost",
+      _expected_candidate_cost(expensive, "code_mod") >= 32,
+      _expected_candidate_cost(expensive, "code_mod"))
+check("an experiment is cheaper but not an order cheaper",
+      1 < _expected_candidate_cost(expensive, "experiment")
+      <= _expected_candidate_cost(expensive, "code_mod"),
+      _expected_candidate_cost(expensive, "experiment"))
+
+cheap = [{"action_type": "code_mod", "cost": 2} for _ in range(5)]
+check("a cheap single-case study is not inflated",
+      _expected_candidate_cost(cheap, "code_mod") == 2,
+      _expected_candidate_cost(cheap, "code_mod"))
+check("entries with no cost are ignored rather than counted as zero",
+      _expected_candidate_cost([{"action_type": "code_mod"}], "code_mod") == 2)
+
+_src = (Path(__file__).resolve().parents[1] / "src/cfd_langgraph/manager/tools.py").read_text()
+check("the proposer is no longer told the flat 2/1 figures",
+      "code_mod costs 2, experiment costs 1" not in _src)
+# Parsed, not string-matched: the branch's own prose contains the word
+# "continue", and the comment explaining the removed gate contains the gate's
+# source text, so both naive greps test the wrong thing.
+import ast as _ast
+
+_tree = _ast.parse(_src)
+_deepen_branch = None
+for _node in _ast.walk(_tree):
+    if not isinstance(_node, _ast.If):
+        continue
+    _cond = _ast.unparse(_node.test)
+    if "'deepen'" in _cond or '"deepen"' in _cond:
+        if "action" in _cond and "sel" in _cond:
+            _deepen_branch = _node
+            break
+
+check("the proposer has a branch for deepen picks", _deepen_branch is not None)
+if _deepen_branch is not None:
+    _cond = _ast.unparse(_deepen_branch.test)
+    check("it is not gated on the trace having more than one point",
+          "trace" not in _cond, _cond)
+    _appends = sum(
+        1 for n in _ast.walk(_deepen_branch)
+        if isinstance(n, _ast.Call) and _ast.unparse(n.func).endswith("niche_lines.append")
+    )
+    check("it emits exactly one instruction line", _appends == 1, _appends)
+    check("and it does not fall through to the generic text",
+          any(isinstance(n, _ast.Continue) for n in _deepen_branch.body))
+
 print(f"\n{'ALL PASS' if F == 0 else str(F) + ' FAILED'}")
 sys.exit(1 if F else 0)
