@@ -763,8 +763,8 @@ check("fit rules: a value on a bound means the bounds are wrong",
 check("fit rules: a handful of evaluations is not a fit",
       "not a fit" in withplan)
 check("fit rules: write the ledger as it happens", "ledger file on disk AS IT" in withplan)
-check("fit rules: write the fitted value into the case dictionary",
-      "WRITE THE SELECTED COEFFICIENT INTO THE CASE" in withplan)
+check("fit rules: write the fitted value where the run reads it",
+      "WRITE THE FITTED VALUE INTO THE FILE" in withplan)
 
 # And the sandbox must make orphaning impossible, not merely discouraged.
 import inspect as _insp
@@ -854,25 +854,29 @@ _s3 = _i3.spec_from_file_location(
 _c3 = _i3.module_from_spec(_s3)
 _s3.loader.exec_module(_c3)
 guide = _c3.build_agent_prompt(
-    topic="t", hypothesis="derive from kOmegaSST", variant_name="v",
+    topic="t", hypothesis="H", variant_name="v",
     starter_case=Path("/tmp/s"), run_dir=Path("/tmp/r"), wm_project_dir=None)
 
+# The guidance must be transferable, not a recipe for one framework's
+# turbulence closure. An earlier version spelled out five kOmegaSST derivation
+# rules; that fixed one candidate and made every viscosity-model, boundary-
+# condition or scheme study carry irrelevant instructions in a runner whose own
+# docstring calls itself generic.
 for label, needle in [
-    ("prerequisite includes, not just kOmegaSST.H", '#include "eddyViscosity.H"'),
-    ("kOmegaSSTBase.H named as the real base header", "kOmegaSSTBase.H"),
-    ("two template arguments spelled out",
-     "eddyViscosity<RASModel<BasicMomentumTransportModel>>"),
-    ("the 1-vs-2 template-arg error named", "wrong number of template arguments"),
-    ("type is the FIRST constructor argument", "type, alpha, rho, U, alphaRhoPhi"),
-    ("the .C needs its own include guard", "#ifndef MyModel_C"),
-    ("the redefinition symptom named", "redefinition of"),
-    ("registration header and makeRASModel", "makeIncompressibleMomentumTransportModel.H"),
-    ("the NoRepository pairing explained", "#ifdef NoRepository"),
-    ("the key heuristic: errors inside WM_PROJECT_DIR mean YOUR bug",
-     "THE BUG IS IN YOUR"),
-    ("told to copy a working sibling rather than re-derive", "fastest reference"),
+    ("the debugging heuristic, stated generally", "READ-ONLY library"),
+    ("errors in library headers mean YOUR bug", "the bug is almost always in"),
+    ("the three usual causes, framework-agnostic",
+     "wrong order"),
+    ("told to copy a working example's skeleton", "The fastest way to get the skeleton right is to copy it"),
+    ("names what to match, without naming a domain", "registration macro"),
+    ("told to change only the physics under test", "Change only the"),
 ]:
     check(f"build prompt states: {label}", needle in guide, needle)
+
+for banned in ("kOmegaSST", "dimensionedScalar", "eddyViscosity", "makeRASModel",
+               "RASModel", "alphaK2", "crossgrad", "bradshaw", "closure_2026"):
+    check(f"build prompt is free of domain/study specifics: {banned}",
+          banned not in guide, f"'{banned}' leaked into a generic prompt")
 
 # It must not fire for unrelated modification families -- this is one section of
 # a generic prompt, so it should be present but the deliverable must survive.

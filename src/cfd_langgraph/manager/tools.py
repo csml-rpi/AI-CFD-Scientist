@@ -3923,6 +3923,38 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 elite = sel.get("elite") or {}
                 formula = str(elite.get("formula") or elite.get("model_description") or "")[:500]
                 elite_strategy = str(sel.get("strategy") or "").strip()
+
+                if sel.get("action") == "widen" and not elite:
+                    # `widen` means START A NEW CHAIN in a family we already
+                    # know something about -- so select_action deliberately
+                    # clears the elite: there is nothing to refine.
+                    #
+                    # Without this branch it fell through to the "build on the
+                    # elite" text below with an empty one, and the proposer was
+                    # handed "Build on family 'X' (best result so far, from
+                    # iteration ?): ." -- a literal question mark, no formula,
+                    # no runtime coefficients -- and was then told to supply a
+                    # base_case_dir it had never been shown. A candidate that
+                    # answered with action_type=experiment was dropped for
+                    # having no valid base case. Latent on a wide archive,
+                    # where widen is served by the empty-strategy-cell branch
+                    # above, but live as soon as a family's strategy cells fill
+                    # up, which is exactly what a small focused study looks
+                    # like.
+                    niche_lines.append(
+                        f"{i}. WIDEN family '{sel.get('family')}'"
+                        + (f" via strategy '{elite_strategy}'" if elite_strategy else "")
+                        + ". This family has already been tried, and the point here is "
+                        "NOT to refine its best result -- it is to attack the same "
+                        "mechanism a genuinely different way, so the archive learns "
+                        "whether the family has more in it than the one line already "
+                        "explored. Propose an independent formulation: a different "
+                        "functional form, a different place in the equations to act, or "
+                        "a different limiting behaviour. Use action_type=code_mod; there "
+                        "is no parent model to reuse, so do NOT use action_type=experiment "
+                        "and do not reference a base_case_dir."
+                    )
+                    continue
                 # When the allocator chose to deepen, say so and show the
                 # chain's trajectory. "Refine this" and "refine this, it has
                 # improved twice in a row and is still moving" are different

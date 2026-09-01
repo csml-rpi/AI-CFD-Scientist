@@ -1172,6 +1172,187 @@ def test_replay_relearns_the_arms() -> None:
           b._newfam_wins == 0 and b._widen_wins == 0)
 
 
+def test_widen_is_not_mistaken_for_a_refinement() -> None:
+    """`widen` clears the elite on purpose -- it starts a NEW chain.
+
+    The proposer's prompt builder had no branch for that, so a widen pick fell
+    through to the "build on the elite" text with an empty elite and produced
+    "Build on family 'X' (best result so far, from iteration ?): ." -- a
+    literal question mark, no formula, no runtime coefficients -- and then
+    asked for a base_case_dir that had never been shown. A candidate answering
+    with action_type=experiment was dropped for having no valid base case.
+
+    Invisible on a wide archive, where widen is served by the empty-strategy-
+    cell branch, and live as soon as a family's four strategy cells fill up --
+    which is what a small focused study looks like.
+    """
+    import random
+    from pathlib import Path as _P
+
+    def e(i, fam, strat, v):
+        return {"action_type": "code_mod", "variant_name": f"v{i}", "family": fam,
+                "strategy": strat, "iteration": i, "model_description": f"model {i}",
+                "case_dir": f"/tmp/c{i}",
+                "score": {"metric": "m", "value": v, "direction": "min"}}
+
+    # All four strategy cells filled, so there is no empty cell to offer and
+    # select_niche must return a real niche -- the shape that used to break.
+    a = SearchArchive()
+    a.replay([e(1, "A", "analytic", 0.10), e(2, "A", "sweep", 0.11),
+              e(3, "A", "solver_fit", 0.12), e(4, "A", "offline_fit", 0.13)],
+             baseline_direction="min")
+
+    broken_shape = 0
+    for seed in range(400):
+        d = a.select_action(500, 1000, rng=random.Random(seed))
+        if d["action"] != "widen":
+            continue
+        check_once = (not d.get("is_new")) and (not d.get("is_new_strategy"))
+        if check_once:
+            broken_shape += 1
+            check("a widen pick carries no elite to refine", d.get("elite") in (None, {}))
+            check("a widen pick still names its family", bool(d.get("family")))
+            break
+    check("the previously-broken widen shape is reachable at all", broken_shape > 0)
+
+    # The prompt builder must special-case it rather than falling through.
+    src = _P("src/cfd_langgraph/manager/tools.py").read_text()
+    check("the proposer prompt has a widen branch", "WIDEN family" in src)
+    check("widen tells the proposer not to reuse a parent model",
+          "do NOT use action_type=experiment" in src)
+    check("widen asks for a genuinely different formulation",
+          "attack the same" in src and "different way" in src)
+
+
+def _ch(i, fam, v, parent=None, strat="analytic"):
+    d = {"action_type": "code_mod", "variant_name": f"v{i}", "family": fam,
+         "strategy": strat, "iteration": i,
+         "score": {"metric": "m", "value": v, "direction": "min"}}
+    if parent is not None:
+        d["parent_iteration"] = parent
+    return d
+
+
+def _chfail(i, fam, parent, strat="analytic"):
+    return {"action_type": "code_mod", "variant_name": f"f{i}", "family": fam,
+            "strategy": strat, "iteration": i, "parent_iteration": parent,
+            "score": None}
+
+
+def _deepen_share(hist, n=1200):
+    import random
+    from collections import Counter
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+    c = Counter()
+    for seed in range(n):
+        d = a.select_action(500, 1000, rng=random.Random(seed))
+        if d["action"] == "deepen":
+            c[d["lineage_id"]] += 1
+    total = sum(c.values()) or 1
+    return {k: v / total for k, v in c.items()}
+
+
+def test_a_chains_history_is_not_capped_by_the_population() -> None:
+    """The per-cell cap bounds stored artifacts, not what the allocator knows.
+
+    A six-step chain living in one cell reported a three-point trace, so its
+    momentum evidence was clipped to population_size and the trace shown to the
+    proposer was simply wrong.
+    """
+    a = SearchArchive(population_size=3)
+    a.replay([_ch(1, "A", 0.120)] + [_ch(i, "A", 0.120 - 0.004 * i, i - 1) for i in range(2, 7)],
+             baseline_direction="min")
+    lin = list(a.lineages().values())[0]
+    check("a 6-step chain reports all 6 scores", len(lin["score_trace"]) == 6,
+          len(lin["score_trace"]))
+    check("depth is still right", lin["depth"] == 5, lin["depth"])
+    check("the population itself stays capped",
+          len(list(a.niches.values())[0]["population"]) == 3)
+
+
+def test_failed_attempts_count_against_their_chain() -> None:
+    """A chain whose builds keep failing is not as promising as one that works.
+
+    Only scored candidates entered the population, so a chain that had failed
+    to compile three times running was indistinguishable from one that never
+    failed -- same depth, same trace, same last_gain -- and kept collecting
+    refinements it could not use.
+    """
+    a = SearchArchive()
+    a.replay([_ch(1, "A", 0.10), _ch(2, "A", 0.09, 1)] + [_chfail(10 + k, "A", 2) for k in range(3)],
+             baseline_direction="min")
+    lin = list(a.lineages().values())[0]
+    check("failures are recorded against the chain", lin["failures"] == 3, lin["failures"])
+    check("they do not corrupt the score trace", lin["score_trace"] == [0.10, 0.09])
+
+    base = [_ch(1, "A", 0.1000), _ch(2, "A", 0.0985, 1), _ch(3, "A", 0.0970, 2),
+            _ch(10, "B", 0.0971)]
+    clean = _deepen_share(base).get(1, 0.0)
+    failing = _deepen_share(base + [_chfail(20 + k, "A", 3) for k in range(6)]).get(1, 0.0)
+    check("repeated build failures reduce a chain's share of refinements",
+          failing < clean - 0.15, f"clean {clean:.2f} -> failing {failing:.2f}")
+
+
+def test_duplicate_models_do_not_multiply_their_odds() -> None:
+    """Re-implementations of one model are one piece of evidence, not N.
+
+    Each landed as its own root with the same tip score and drew its own
+    sample, so a model implemented eight times was eight times as likely to be
+    picked on no extra evidence.
+    """
+    import random
+    from collections import Counter
+    # Eight copies of a mediocre model against one genuinely better model.
+    # Before deduplication the copies won on count alone; the better model has
+    # to win, or the search refines whatever happened to be re-implemented most.
+    dupes = [_ch(i, f"F{i}", 0.100) for i in range(1, 9)]
+    better = [_ch(20, "G", 0.090)]
+    a = SearchArchive()
+    a.replay(dupes + better, baseline_direction="min")
+    check("all nine start as separate lineages", len(a.lineages()) == 9)
+
+    c = Counter()
+    for seed in range(1200):
+        d = a.select_action(500, 1000, rng=random.Random(seed))
+        if d["action"] == "deepen":
+            c[d["lineage_id"]] += 1
+    total = sum(c.values()) or 1
+    dup_roots = set(range(1, 9))
+    picked = {k for k, v in c.items() if v}
+    check("only one representative of the duplicate set is ever offered",
+          len(picked & dup_roots) <= 1, sorted(picked & dup_roots))
+    check("eight copies cannot outvote one better model",
+          c[20] / total > sum(c[r] for r in dup_roots) / total,
+          f"better {c[20] / total:.2f} vs copies {sum(c[r] for r in dup_roots) / total:.2f}")
+
+
+def test_every_arm_carries_the_same_kind_of_evidence() -> None:
+    """deepen was judged per-lineage while the others were judged globally.
+
+    record_action_outcome dropped "deepen" on the floor, so a study in which
+    every refinement failed learned nothing from it while widen and new_family
+    accumulated win rates -- two scales compared as one.
+    """
+    a = SearchArchive()
+    for action, improved in [("deepen", True), ("deepen", False), ("widen", True),
+                             ("new_family", False)]:
+        a.record_action_outcome(action, improved)
+    check("deepen outcomes are recorded", (a._deepen_wins, a._deepen_losses) == (1, 1),
+          (a._deepen_wins, a._deepen_losses))
+    check("widen outcomes are recorded", (a._widen_wins, a._widen_losses) == (1, 0))
+    check("new_family outcomes are recorded", (a._newfam_wins, a._newfam_losses) == (0, 1))
+
+    b = SearchArchive()
+    b.replay([dict(_ch(1, "A", 0.10), search_action="new_family"),
+              dict(_ch(2, "A", 0.09, 1), search_action="deepen"),
+              dict(_ch(3, "B", 0.20), search_action="new_family")],
+             baseline_direction="min")
+    check("a resumed study relearns the deepen arm too",
+          b._deepen_wins + b._deepen_losses == 1,
+          (b._deepen_wins, b._deepen_losses))
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1216,6 +1397,11 @@ def main() -> int:
     test_an_aggregate_comparator_does_not_fake_a_breakdown()
     test_missing_per_case_data_is_harmless()
     test_case_difficulty_respects_metric_direction()
+    test_widen_is_not_mistaken_for_a_refinement()
+    test_a_chains_history_is_not_capped_by_the_population()
+    test_failed_attempts_count_against_their_chain()
+    test_duplicate_models_do_not_multiply_their_odds()
+    test_every_arm_carries_the_same_kind_of_evidence()
     test_a_cell_keeps_more_than_its_winner()
     test_lineages_are_reconstructed_from_parents()
     test_allocator_asks_the_allocation_question()

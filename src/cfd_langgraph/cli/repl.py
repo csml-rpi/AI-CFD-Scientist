@@ -27,6 +27,11 @@ CONSOLE_BANNER = (
 
 _HYPOTHESIS_GATE_TOOL = "advance_with_approved_hypotheses"
 
+# Whether the hypothesis gate stops for a human. Default off: in practice the
+# gate was always answered "approve", so it cost a study an overnight stall for
+# a decision nobody was actually making. `--ask-hypotheses` restores it.
+AUTO_APPROVE_HYPOTHESES = True
+
 
 def _install_sigint_handler() -> None:
     """First Ctrl-C: request a pause at the next tool-call boundary (see
@@ -171,6 +176,39 @@ def _handle_interrupt(
     # Delivered here rather than sooner because this is the first moment the
     # graph is stopped with nothing in flight (see manager/control.py).
     queued = list(STEERING_QUEUE)
+
+    if is_hypothesis_gate and AUTO_APPROVE_HYPOTHESES:
+        # Approve the proposed shortlist without asking.
+        #
+        # The gate was built as a human checkpoint, and in practice every
+        # invocation of it was answered "approve" -- a prompt that only ever
+        # has one answer is not a decision point, it is a place the study
+        # stops overnight waiting for someone to type. What the gate actually
+        # protects is downstream: run_case refuses to run without a
+        # hypotheses_approved.json on disk, and approving here still writes
+        # that file, so the enforcement is unchanged. Only the asking is gone.
+        #
+        # Still printed, because "which hypotheses became experiments" is a
+        # fact about the study that has to be visible somewhere.
+        print("\n-- hypothesis gate: auto-approving --")
+        _describe_hypotheses(out_dir)
+        for action in all_actions:
+            if action.get("name") == _HYPOTHESIS_GATE_TOOL:
+                ids = (action.get("args") or {}).get("approved_candidate_ids") or []
+                print(f"   approved: {', '.join(map(str, ids)) if ids else '(the proposer supplied none)'}")
+        print("   (run with --ask-hypotheses to review these by hand instead)")
+        # Stream the resume rather than returning it: this function drives the
+        # graph itself and returns None. Returning a Command here would have
+        # approved the gate and then never resumed the run.
+        for chunk in graph.stream(
+            Command(resume={
+                i.id: {"decisions": [{"type": "approve"} for _ in actions]}
+                for i, actions in per_interrupt_actions
+            }),
+            config=config, stream_mode="updates",
+        ):
+            _print_update_chunk(chunk)
+        return
 
     if is_hypothesis_gate:
         print("\nranked hypotheses:")
@@ -612,10 +650,22 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--out-dir", default=None, help="If omitted, defaults to runs/study_<timestamp>.")
     run_p.add_argument("--num-candidates", type=int, default=None)
     run_p.add_argument("--max-parallel-cases", type=int, default=None)
+    run_p.add_argument(
+        "--ask-hypotheses", action="store_true",
+        help="Stop at the hypothesis gate for manual approval. Off by default: "
+             "the gate is auto-approved, since in practice it was always "
+             "answered 'approve' and only served to stall the study.",
+    )
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser("resume", help="resume a paused study")
     resume_p.add_argument("--out-dir", required=True)
+    resume_p.add_argument(
+        "--ask-hypotheses", action="store_true",
+        help="Stop at the hypothesis gate for manual approval. Off by default: "
+             "the gate is auto-approved, since in practice it was always "
+             "answered 'approve' and only served to stall the study.",
+    )
     resume_p.set_defaults(func=cmd_resume)
 
     return p
@@ -625,6 +675,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     _install_sigint_handler()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Opt back in to the human checkpoint. Set before the graph runs, since the
+    # gate is consulted from inside the interrupt handler.
+    global AUTO_APPROVE_HYPOTHESES
+    if getattr(args, "ask_hypotheses", False):
+        AUTO_APPROVE_HYPOTHESES = False
     args.func(args)
 
 

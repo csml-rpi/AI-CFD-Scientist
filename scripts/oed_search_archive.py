@@ -302,6 +302,34 @@ class SearchArchive:
         self._widen_losses = 0
         self._newfam_wins = 0
         self._newfam_losses = 0
+        self._deepen_wins = 0
+        self._deepen_losses = 0
+        # Pseudo-counts for a lineage's prior, from its score rank in the
+        # archive, and the weight given to observed gain magnitude. The prior
+        # has to be strong enough that a well-scoring root outranks a poor one
+        # before any refinement, and weak enough that two real gains overturn
+        # it.
+        # Chain bookkeeping kept OUTSIDE the per-cell population, which is
+        # capped. The cap exists to bound how many candidate artifacts an
+        # archive holds; it must not silently bound how much of a chain's
+        # HISTORY the allocator can see. A six-step chain in one cell was
+        # reporting a three-point trace, so its momentum evidence was clipped
+        # to the cap and the trace shown to the proposer was wrong.
+        # These are a few floats per candidate, so there is no reason to cap.
+        self._chain_scores: Dict[int, List[Dict[str, Any]]] = {}
+        # Attempts that produced no score at all. A chain whose last two builds
+        # failed to compile is not as promising as one that did not fail, and
+        # without this it looked identical: same depth, same trace, same gain.
+        self._chain_failures: Dict[int, int] = {}
+        # A scoreless attempt weighs like one failed trial. Calibrated against
+        # the gain scale: at _gain_weight 60 a typical 1.7% refinement earns
+        # about one pseudo-count, so one failure costing one is symmetric.
+        self._failure_weight = 1.0
+        self._lineage_prior = 3.0
+        # Applied to RELATIVE gains, so a chain improving ~1.7% per step earns
+        # about one pseudo-count per step -- enough to compete with the score
+        # prior after two good steps, not enough to override it on one.
+        self._gain_weight = 60.0
         # How much of a mechanism's proven score carries over to a strategy
         # never tried on it, in [0, 1]: 0 treats an empty cell as knowing
         # nothing (neutral q, like a brand-new family), 1 treats "this
@@ -408,6 +436,10 @@ class SearchArchive:
         strict elitism cannot express, and it is why this returns the score
         trace rather than a single number.
         """
+        # Artifacts come from the (capped) per-cell populations, because the
+        # tip has to carry a history_entry the proposer can mutate from. The
+        # SCORE HISTORY comes from the uncapped chain record, so a long chain
+        # reports all of its steps rather than the last `population_size`.
         chains: Dict[int, List[Dict[str, Any]]] = {}
         for niche in self.niches.values():
             for member in niche.get("population", []):
@@ -415,17 +447,22 @@ class SearchArchive:
         out: Dict[int, Dict[str, Any]] = {}
         for root, members in chains.items():
             members = sorted(members, key=lambda m: m["iteration"])
-            trace = [m["score"] for m in members]
+            # The cap never drops the best member (the population is sorted
+            # best-first before truncation), so the tip is always present.
             tip = min(members, key=lambda m: m["norm_score"])
-            # Improvement of the most recent step, in normalized space so it is
-            # comparable across cells. Positive means the chain is still moving.
+            history = sorted(
+                self._chain_scores.get(root, []), key=lambda m: m["iteration"]
+            ) or members
+            trace = [m["score"] for m in history]
             last_gain = 0.0
-            if len(members) >= 2:
-                last_gain = members[-2]["norm_score"] - members[-1]["norm_score"]
+            if len(history) >= 2:
+                last_gain = history[-2]["norm_score"] - history[-1]["norm_score"]
             out[root] = {
                 "root_iteration": root,
                 "members": members,
+                "history": history,
                 "score_trace": trace,
+                "failures": self._chain_failures.get(root, 0),
                 "depth": max(m["depth"] for m in members),
                 "tip": tip,
                 "best_norm_score": tip["norm_score"],
@@ -584,6 +621,18 @@ class SearchArchive:
             except Exception:
                 norm = None
 
+        # Chain bookkeeping, before the elite/population logic, and for failed
+        # candidates too -- a failure is evidence about the chain even though
+        # it can never be an elite.
+        if isinstance(history_entry, dict):
+            chain = self._lineage_id(history_entry, iteration)
+            if norm is None:
+                self._chain_failures[chain] = self._chain_failures.get(chain, 0) + 1
+            else:
+                self._chain_scores.setdefault(chain, []).append(
+                    {"iteration": iteration, "norm_score": norm, "score": val}
+                )
+
         if norm is not None and (niche["elite_norm_score"] is None or norm < niche["elite_norm_score"]):
             niche["elite_score"] = val
             niche["elite_norm_score"] = norm
@@ -736,29 +785,127 @@ class SearchArchive:
         # -- one number, not a maximum -- competes against the other two arms.
         # A single fresh draw against that mean keeps the action choice
         # stochastic without the order-statistic inflation.
+        # Scores are normalised across the CURRENT lineage set, not by an
+        # absolute formula. Two reasons, both measured:
+        #
+        #   - An absolute quality term spans whatever the metric's magnitude
+        #     happens to be. On our archive 1/(1+score) spread only 18% across
+        #     every lineage, far too little to outweigh the sampling below.
+        #   - `max(0.0, norm)` made quality exactly 1.0 for EVERY lineage when
+        #     the objective direction is "max", because _normalize negates and
+        #     the clamp erased the whole ranking. Direction-dependent silence.
+        #
+        # norm_score is already direction-corrected (lower is better for both
+        # min and max objectives), so min-max normalising it here gives a real
+        # [0, 1] ranking that behaves identically in either direction.
+        norms = [l["best_norm_score"] for l in lineages.values()]
+        lo, hi = min(norms), max(norms)
+        span = (hi - lo) or 1.0
+
+        # One entry per DISTINCT model, not per lineage.
+        #
+        # Re-implementations of the same physics land as separate roots with
+        # the same tip score, and each then draws its own sample -- so a model
+        # implemented three times gets three times the chance of being picked,
+        # on no extra evidence. Measured on run closure_20260826_codex: the
+        # score 0.113601 existed as EIGHT lineages (the no-op candidates, all
+        # scoring exactly baseline) and collected 13% of every deepen. The
+        # duplicates were outvoting the archive.
+        #
+        # Grouped on the tip score to a relative tolerance, keeping the deepest
+        # member as the representative -- if the same model was reached twice,
+        # the chain that got further is the one worth continuing.
+        deduped: List[Dict[str, Any]] = []
+        for lin in sorted(lineages.values(), key=lambda l: (-l["depth"], l["root_iteration"])):
+            twin = next(
+                (d for d in deduped
+                 if abs(d["best_norm_score"] - lin["best_norm_score"])
+                 <= 1e-9 * max(1.0, abs(lin["best_norm_score"]))),
+                None,
+            )
+            if twin is None:
+                deduped.append(lin)
+
         best: Optional[Tuple[float, Dict[str, Any]]] = None
         best_sample = 0.0
-        for root, lin in lineages.items():
+        for lin in deduped:
             gains = [
                 lin["members"][i - 1]["norm_score"] - lin["members"][i]["norm_score"]
                 for i in range(1, len(lin["members"]))
             ]
-            wins = sum(1 for g in gains if g > 0)
-            # A root with no refinement yet is an unknown, not a failure: prior
-            # alpha=1,beta=1 is a coin flip, so it competes rather than being
-            # ranked below any chain that has improved once.
-            sample = rng.betavariate(1.0 + wins, 1.0 + (len(gains) - wins))
-            # Break ties toward chains that are actually good, so exploration
-            # does not spend the budget deepening hopeless roots.
-            quality = 1.0 / (1.0 + max(0.0, lin["best_norm_score"]))
-            value = sample * (0.5 + 0.5 * quality)
-            if best is None or value > best[0]:
-                best = (value, lin)
-                # Posterior MEAN of the chosen lineage's improve-rate, not its
-                # draw: (wins+1)/(trials+2). An unrefined root sits at 0.5, a
-                # chain that has improved twice at 0.75, a stalled one below
-                # 0.5. This is what competes against the other arms.
-                best_sample = (wins + 1.0) / (len(gains) + 2.0)
+            # Evidence is the SIZE of each step, not its sign. A binary
+            # improved/did-not throws away the thing that distinguishes a
+            # chain worth pursuing from one crawling: under it a chain sitting
+            # at 0.1090 ranks below a worse chain at 0.1110 that happened to
+            # tick the right way. Gains are expressed as a fraction of the
+            # archive's own score spread so the scale is metric-independent.
+            # RELATIVE to the chain's own score, not to the archive spread.
+            # A refinement step is small next to the gap between the best and
+            # worst model in the archive: our real refinements gained 0.46% to
+            # 1.69% of their parent's score, which is 0.2%-0.7% of the spread.
+            # Dividing by the spread made the whole momentum term worth ~1% of
+            # the signal -- present in the code, absent from the decision.
+            # Relative improvement is also scale-free, so it behaves the same
+            # whether the objective is 0.1 or 10000.
+            history = lin.get("history") or lin["members"]
+            rel = []
+            for i in range(1, len(history)):
+                prev = history[i - 1]["norm_score"]
+                cur = history[i]["norm_score"]
+                denom = abs(prev) or 1.0
+                rel.append((prev - cur) / denom)
+            gained = sum(max(0.0, g) for g in rel)
+            lost = sum(max(0.0, -g) for g in rel)
+
+            # An attempt that produced no score is evidence against the chain.
+            # Without this a chain whose last two builds failed to compile read
+            # exactly like one that never failed -- same depth, same trace,
+            # same gain -- and the allocator would keep spending refinements on
+            # something that cannot produce a candidate. Weighted like a
+            # middling regression: enough that repeated failure moves the
+            # chain down the order, not so much that one bad build buries an
+            # otherwise productive line.
+
+
+            # An unrefined root is not a coin flip. Beta(1,1) says "no idea",
+            # and with 35 such roots in a 39-lineage archive the maximum of
+            # their draws lands near 0.97 -- so the uninformed crowd wins the
+            # selection on count alone and the one proven chain is reached
+            # about 12% of the time, barely above the 10% it would get from
+            # picking at random. We do know something about an unrefined root:
+            # its score. Folding that in as pseudo-counts means a good root
+            # starts ahead of a bad one, and real gains then accumulate on top.
+            quality = (hi - lin["best_norm_score"]) / span
+            # Quality is what the chain is WORTH; buildability is the chance a
+            # refinement of it produces anything at all. The prior is the
+            # product, because a chain that cannot be built has no expected
+            # value however good its best member scores -- and score alone is
+            # static, so without this a chain stayed top of the order through
+            # any number of consecutive failed builds.
+            scored_n = len(lin.get("history") or lin["members"])
+            failures = lin.get("failures", 0)
+            buildable = scored_n / float(scored_n + failures) if scored_n else 0.0
+            effective_quality = quality * buildable
+
+            alpha = 1.0 + self._lineage_prior * effective_quality + self._gain_weight * gained
+            # Failures are counted in PSEUDO-COUNTS, not in relative-gain
+            # units. A scoreless attempt is a failed attempt at deepening this
+            # chain, so it should weigh like one failed trial -- the same as a
+            # successful step weighs like one won trial. Expressed as a gain
+            # fraction it was worth 0.6% of a trial and moved nothing.
+            beta = (
+                1.0
+                + self._lineage_prior * (1.0 - effective_quality)
+                + self._gain_weight * lost
+                + self._failure_weight * failures
+            )
+            sample = rng.betavariate(alpha, beta)
+            if best is None or sample > best[0]:
+                best = (sample, lin)
+                # Posterior MEAN of the chosen lineage, which is what competes
+                # against the other two arms -- never its draw, which is an
+                # order statistic over however many lineages happen to exist.
+                best_sample = alpha / (alpha + beta)
 
         # The two "make something new" arms, sampled the same way from how
         # often each has historically paid off, so the split between refining
@@ -786,10 +933,19 @@ class SearchArchive:
 
         assert best is not None
         _, lin = best
-        # One fresh draw for the deepen arm, centred on the chosen lineage's
-        # posterior mean, so all three arms are single comparable draws.
+        # One fresh draw for the deepen arm, on the same footing as the other
+        # two: the chosen lineage's posterior mean supplies the centre, and the
+        # study-level record of whether deepening has actually been paying off
+        # supplies the same win/loss counts the other arms carry.
+        #
+        # Before this, deepen was judged purely per-lineage while widen and
+        # new_family were judged on global win rates -- three numbers on two
+        # different scales, compared as though they were one. record_action_
+        # outcome silently ignored "deepen" entirely, so a study where every
+        # refinement failed learned nothing from it.
         deepen_draw = rng.betavariate(
-            max(1e-6, 2.0 * best_sample), max(1e-6, 2.0 * (1.0 - best_sample))
+            max(1e-6, 2.0 * best_sample + self._deepen_wins),
+            max(1e-6, 2.0 * (1.0 - best_sample) + self._deepen_losses),
         )
         chosen = max(
             (deepen_draw, "deepen"), (widen_value, "widen"), (new_value, "new_family")
@@ -833,12 +989,18 @@ class SearchArchive:
     def record_action_outcome(self, action: str, improved: bool) -> None:
         """Tell the allocator whether a move paid off, so its arms can learn.
 
-        Called once per recorded candidate. Without it the widen/new_family
-        arms stay at their priors forever and the split between refining and
-        exploring never adapts to the problem -- which is the fixed schedule
-        Xin26 shows is suboptimal.
+        Called once per recorded candidate, for every action including
+        "deepen" -- which this used to drop on the floor, leaving the deepen
+        arm with no study-level evidence at all while the other two accumulated
+        it. Without it the split between refining and exploring never adapts to
+        the problem, which is the fixed schedule Xin26 shows is suboptimal.
         """
-        if action == "widen":
+        if action == "deepen":
+            if improved:
+                self._deepen_wins += 1
+            else:
+                self._deepen_losses += 1
+        elif action == "widen":
             if improved:
                 self._widen_wins += 1
             else:
