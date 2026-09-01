@@ -944,5 +944,25 @@ if _deepen_branch is not None:
     check("and it does not fall through to the generic text",
           any(isinstance(n, _ast.Continue) for n in _deepen_branch.body))
 
+
+
+
+print("\n--- the plateau stop is reachable ---")
+from cfd_langgraph.manager.tools import _saturation_window
+
+_expensive = [{"action_type": "code_mod", "cost": 48} for _ in range(20)]
+_w = _saturation_window({}, _expensive, 4000)
+check("the window is in evaluations, not budget units", _w < 100, _w)
+check("and it is smaller than the evaluations the budget can buy",
+      _w < 4000 // 48, f"window {_w} vs ~{4000 // 48} affordable")
+check("an explicit setting still wins",
+      _saturation_window({"saturation_window": 7}, _expensive, 4000) == 7)
+check("a fresh study with no history still gets a usable window",
+      _saturation_window({}, [], 4000) >= 4)
+check("a cheap single-case study gets a larger window than an expensive one",
+      _saturation_window({}, [{"action_type": "code_mod", "cost": 2}] * 20, 4000) > _w)
+check("the config no longer hard-codes a budget-unit window",
+      '"saturation_window": max(3, total_budget // 4)' not in _src)
+
 print(f"\n{'ALL PASS' if F == 0 else str(F) + ' FAILED'}")
 sys.exit(1 if F else 0)

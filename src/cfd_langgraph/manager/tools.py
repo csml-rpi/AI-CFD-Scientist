@@ -372,6 +372,35 @@ def _render_archive_summary(archive: Any, disc_dir: Path) -> str:
         return archive.render_summary()
 
 
+def _saturation_window(
+    config: Dict[str, Any], real_evals: List[Dict[str, Any]], total_budget: int
+) -> int:
+    """How many EVALUATIONS of no improvement mean the search has plateaued.
+
+    The window is consumed against the archive's score trace, which has one
+    entry per scored candidate. Deriving it from `total_budget`, which counts
+    solver runs, produced a window of 1000 for a campaign that could afford
+    about 80 evaluations -- so the plateau stop could never fire and the whole
+    budget went to a search that had been flat for 16 evaluations.
+
+    A quarter of the evaluations the budget can buy, measured from what
+    candidates have actually cost. An explicit setting still wins.
+    """
+    explicit = config.get("saturation_window")
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+    per_candidate = _expected_candidate_cost(real_evals, "code_mod")
+    affordable = max(1, int(total_budget) // max(1, per_candidate))
+    # A quarter of the evaluations the budget can buy. Floored at 4 so two
+    # unlucky candidates cannot end a study, capped at 25 because beyond that a
+    # "plateau" is longer than most campaigns and the stop stops meaning
+    # anything. Deliberately NOT tied to how many evaluations have happened:
+    # that both masks the cheap-versus-expensive difference and can put the
+    # window at exactly the trace length, where is_saturated -- which needs
+    # window + 1 entries -- can never fire.
+    return max(4, min(affordable // 4, 25))
+
+
 def _expected_candidate_cost(history: List[Dict[str, Any]], action: str) -> int:
     """What a candidate of this kind has ACTUALLY cost in this study.
 
@@ -3745,7 +3774,21 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "baseline_metric": baseline_doc["metric"],
             "baseline_direction": baseline_doc["direction"],
             "target_improvement_pct": target_pct,
-            "saturation_window": max(3, total_budget // 4),
+            # In EVALUATIONS, not budget units. is_saturated counts entries in
+            # the archive's score trace -- one per scored candidate -- while
+            # total_budget is denominated in solver runs. On a 32-case
+            # benchmark a candidate costs ~48 runs, so `total_budget // 4` gave
+            # a window of 1000 against a campaign that can only afford ~80
+            # evaluations: is_saturated could never be true, search_complete
+            # collapsed to budget_exhausted, and the manager's "stop when
+            # saturated" step was dead code. Measured on run
+            # closure_20260826_codex, the best score had not moved in 16
+            # evaluations and the plateau stop still said False.
+            #
+            # Left unset here on purpose: the per-candidate cost is not known
+            # until candidates have run, so the window is derived at read time
+            # from how many evaluations the remaining budget can actually buy.
+            "saturation_window": None,
             # How this study justified its baseline mesh. Recorded so a reader
             # of the run can tell a gate-converged mesh from a prescribed one
             # without reconstructing the argument.
@@ -3823,6 +3866,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             archive.replay(history, baseline_direction=str(config.get("baseline_direction", "min")))
 
         picks: List[Dict[str, Any]] = []
+        picked_lineages: set = set()
         for _ in range(min(max(1, num_candidates), budget_remaining)):
             if budget_remaining == 1 and archive.niches:
                 reusable = [
@@ -3871,7 +3915,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 sel = archive.select_action(
                     budget_remaining=budget_remaining,
                     budget_total=total_budget,
+                    # Never twice in one batch: two identical "refine lineage
+                    # 17" instructions in one prompt cost a slot, and the
+                    # duplicate is then usually rejected downstream, shrinking
+                    # the batch and wasting the round.
+                    exclude_lineages=picked_lineages,
                 )
+            if sel.get("lineage_id") is not None:
+                picked_lineages.add(sel["lineage_id"])
+            if sel.get("action") == "new_family":
+                # The exploration floor counts visits since the last new
+                # mechanism, and nothing advanced it inside a batch -- so once
+                # it tripped, every pick in the batch was forced, opening four
+                # fresh mechanisms at once for ~200 solver runs and no
+                # refinement. Advancing it provisionally lets the floor be
+                # satisfied by the first pick, as it is between rounds.
+                archive._visits_since_new_family = 0
             if sel.get("budget_exhausted"):
                 break
             picks.append(sel)
@@ -4443,7 +4502,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         budget_used = sum(int(h.get("cost", 0) or 0) for h in real_evals)
         proceed_count = sum(1 for h in real_evals if h.get("status") == "PROCEED")
         total_budget = int(config.get("total_budget", 0) or 0)
-        window = int(config.get("saturation_window", max(3, len(real_evals) // 3 or 1)))
+        window = _saturation_window(config, real_evals, total_budget)
         saturated = archive.is_saturated(window=window)
         budget_exhausted = bool(total_budget and budget_used >= total_budget)
         # Candidates that measurably beat the baseline. This — not an

@@ -1162,8 +1162,11 @@ def test_replay_relearns_the_arms() -> None:
     a.replay([_ln(1, "F", 0.10, action="new_family"),
               _ln(2, "F", 0.09, parent=1, action="deepen"),
               _ln(3, "G", 0.20, action="new_family")], baseline_direction="min")
+    # One new_family entry is recorded, not two: the FIRST scored candidate in
+    # a study has no incumbent to beat, so counting it as a win would credit
+    # every arm for merely going first.
     check("a resumed study remembers which arms paid off",
-          (a._newfam_wins, a._newfam_wins + a._newfam_losses) == (1, 2),
+          (a._newfam_wins, a._newfam_wins + a._newfam_losses) == (0, 1),
           f"{a._newfam_wins}/{a._newfam_wins + a._newfam_losses}")
 
     b = SearchArchive()
@@ -1427,6 +1430,82 @@ def test_quality_survives_a_degenerate_or_outlier_archive() -> None:
           withdiv > 0.5 * clean, f"clean {clean:.2f} -> with outlier {withdiv:.2f}")
 
 
+def test_widen_can_never_open_a_new_family() -> None:
+    """select_action zeroes the new_family arm when the budget reserve forbids
+    one, then delegated `widen` to select_niche, which appended its own
+    unconditional new-family option with no budget gate. The reserve was
+    circumvented, the proposer was told "target a NEW model family", and the
+    outcome was credited to the widen arm.
+    """
+    import random
+    from collections import Counter
+    a = SearchArchive()
+    a.replay([_ch(1, "famA", 0.10), _ch(2, "famA", 0.11)], baseline_direction="min")
+    c = Counter()
+    for seed in range(1500):
+        # budget 50 against a reserve of 400: new families are forbidden.
+        d = a.select_action(50, 4000, rng=random.Random(seed))
+        c[(d["action"], bool(d.get("is_new")))] += 1
+    leaked = sum(v for k, v in c.items() if k == ("widen", True))
+    check("no widen pick comes back as a new family", leaked == 0, dict(c))
+    check("widen still happens", sum(v for k, v in c.items() if k[0] == "widen") > 0)
+    check("and it names a real family",
+          a.select_niche(50, 4000, allow_new_family=False).get("family") is not None)
+
+
+def test_a_batch_does_not_pick_the_same_lineage_twice() -> None:
+    """Two identical "refine lineage 17" instructions in one prompt cost a
+    slot: the duplicate is rejected downstream, the batch shrinks and the round
+    is wasted. The caller's visit bump cannot prevent it because the deepen
+    path never reads `visits`."""
+    import random
+    a = SearchArchive()
+    a.replay([_ch(i, f"F{i}", 0.10 + 0.001 * i) for i in range(1, 6)],
+             baseline_direction="min")
+    repeats = 0
+    for trial in range(300):
+        rng = random.Random(trial)
+        picked, seen_repeat = set(), False
+        for _ in range(4):
+            d = a.select_action(500, 4000, rng=rng, exclude_lineages=picked)
+            lid = d.get("lineage_id")
+            if lid is not None:
+                if lid in picked:
+                    seen_repeat = True
+                picked.add(lid)
+        repeats += seen_repeat
+    check("no batch repeats a lineage", repeats == 0, repeats)
+
+
+def test_a_failed_candidate_is_a_loss_for_the_arm_that_chose_it() -> None:
+    """The arms learned only from scored candidates, so an arm that reliably
+    produced uncompilable candidates was never charged -- 11 of 55 candidates
+    and 21% of the budget on the real archive -- and kept being bought."""
+    hist = [
+        dict(_ch(1, "A", 0.10), search_action="new_family"),
+        {"action_type": "code_mod", "variant_name": "b", "family": "B",
+         "strategy": "analytic", "iteration": 2, "search_action": "new_family",
+         "score": None},
+        {"action_type": "code_mod", "variant_name": "c", "family": "C",
+         "strategy": "analytic", "iteration": 3, "search_action": "new_family",
+         "score": None},
+    ]
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+    check("both failures are charged to the arm",
+          a._newfam_wins + a._newfam_losses == 2,
+          (a._newfam_wins, a._newfam_losses))
+    check("and neither counts as a win", a._newfam_wins == 0, a._newfam_wins)
+
+    # The first scored candidate has no incumbent to beat; it is a baseline,
+    # not evidence that the arm works.
+    b = SearchArchive()
+    b.replay([dict(_ch(1, "A", 0.10), search_action="new_family")],
+             baseline_direction="min")
+    check("the first scored candidate is not recorded as a win",
+          b._newfam_wins == 0, b._newfam_wins)
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1478,6 +1557,9 @@ def main() -> int:
     test_every_arm_carries_the_same_kind_of_evidence()
     test_a_lineage_is_never_deleted_by_the_population_cap()
     test_quality_survives_a_degenerate_or_outlier_archive()
+    test_widen_can_never_open_a_new_family()
+    test_a_batch_does_not_pick_the_same_lineage_twice()
+    test_a_failed_candidate_is_a_loss_for_the_arm_that_chose_it()
     test_a_cell_keeps_more_than_its_winner()
     test_lineages_are_reconstructed_from_parents()
     test_allocator_asks_the_allocation_question()

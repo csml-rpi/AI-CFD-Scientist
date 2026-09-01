@@ -576,11 +576,21 @@ class SearchArchive:
                         value = float(score.get("value"))
                     except (TypeError, ValueError):
                         value = None
-                if value is not None:
+                if value is None:
+                    # A candidate that produced no score is a loss for the arm
+                    # that chose it. Skipping these taught the arms nothing
+                    # from 11 of 55 candidates on the real archive -- 581 of
+                    # 2770 solver runs, 21% of the budget -- so an arm that
+                    # reliably yields uncompilable candidates was never charged
+                    # for it and kept getting bought.
+                    self.record_action_outcome(action, False)
+                else:
                     norm = self._normalize(value, direction)
-                    self.record_action_outcome(
-                        action, norm < (prior_best if prior_best is not None else float("inf"))
-                    )
+                    # An empty archive has no incumbent to beat, so the first
+                    # scored candidate would otherwise always register a win
+                    # against inf. It is a baseline, not evidence about the arm.
+                    if prior_best is not None:
+                        self.record_action_outcome(action, norm < prior_best)
             prior_best = min(
                 (n["elite_norm_score"] for n in self.niches.values()
                  if n["elite_norm_score"] is not None),
@@ -744,6 +754,7 @@ class SearchArchive:
         budget_remaining: int,
         budget_total: int,
         rng: Optional[Any] = None,
+        exclude_lineages: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """Decide the KIND of move to make next, then which lineage to make it on.
 
@@ -787,6 +798,17 @@ class SearchArchive:
                     "rationale": "no budget remains"}
 
         lineages = self.lineages()
+        # Lineages already picked earlier in this batch. Proposing "refine
+        # lineage 17" twice in one message wastes a slot -- the duplicate is
+        # usually killed downstream, shrinking the batch -- and measured on the
+        # real archive 44% of four-candidate batches contained a repeat. The
+        # visit bump the caller does between picks cannot prevent it, because
+        # the deepen path never reads `visits`.
+        if exclude_lineages:
+            lineages = {
+                root: lin for root, lin in lineages.items()
+                if root not in set(exclude_lineages)
+            }
         if not lineages:
             return {"action": "new_family", "family": None, "strategy": None,
                     "is_new": True, "elite": None, "lineage_id": None,
@@ -1024,7 +1046,26 @@ class SearchArchive:
             # A new lineage inside a family we already know something about --
             # the middle ground between refining one chain and opening an
             # untried mechanism.
-            pick = self.select_niche(budget_remaining, budget_total)
+            # allow_new_family=False, because select_action has already
+            # decided this is NOT a new-family move -- possibly having just
+            # zeroed that arm because the budget reserve forbids one. Without
+            # the switch, select_niche appended its own unconditional new-family
+            # option with no budget gate, and widen could hand back
+            # {is_new: True, family: None}: the reserve was circumvented, the
+            # proposer was told "target a NEW model family", and the outcome was
+            # credited to the widen arm. Reproduced with budget_remaining=50
+            # against a reserve of 400 -- 420 of 2000 widen picks came back new.
+            pick = self.select_niche(
+                budget_remaining, budget_total, allow_new_family=False
+            )
+            if pick.get("family") is None:
+                # No existing family could be offered, so there is nothing to
+                # widen into. Say so honestly rather than silently mutating
+                # into a different action.
+                return {"action": "new_family", "family": None, "strategy": None,
+                        "is_new": True, "elite": None, "lineage_id": None,
+                        "rationale": ("no existing family was available to widen "
+                                      "into; opening a new mechanism instead")}
             pick["action"] = "widen"
             pick["lineage_id"] = None
             pick["elite"] = None  # a new chain, not a refinement of the elite
@@ -1063,7 +1104,8 @@ class SearchArchive:
                 self._newfam_losses += 1
 
     def select_niche(
-        self, budget_remaining: int, budget_total: int, force_new_family: bool = False
+        self, budget_remaining: int, budget_total: int, force_new_family: bool = False,
+        allow_new_family: bool = True,
     ) -> Dict[str, Any]:
         """Pick which niche the next proposal should be conditioned on.
 
@@ -1233,10 +1275,16 @@ class SearchArchive:
                      None)
                 )
 
-        # "Propose a new family" always competes too, with a neutral q=0.5
-        # (same as an unscored niche) and zero visits (maximal exploration
-        # bonus).
-        candidates.append((None, puct(None, 0), None))
+        # "Propose a new family" competes too, with a neutral q=0.5 (same as an
+        # unscored niche) and zero visits (maximal exploration bonus) -- unless
+        # the caller has already ruled that move out. select_action's `widen`
+        # arm does exactly that: it has decided this is not a new-family move,
+        # sometimes because the budget reserve forbids one, and an unconditional
+        # option here silently overrode that decision.
+        if allow_new_family:
+            candidates.append((None, puct(None, 0), None))
+        if not candidates:
+            return {"family": None, "strategy": None, "is_new": False, "elite": None}
 
         best_key, _best_score, best_niche = max(candidates, key=lambda c: c[1])
         if best_key is None:
