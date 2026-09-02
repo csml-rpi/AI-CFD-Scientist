@@ -17,6 +17,7 @@ implement `bind_tools`; `deep_agent.py` refuses one that does not).
 # API-billed
 export CFD_SCIENTIST_LLM_PROVIDER=gemini    CFD_SCIENTIST_MODEL=gemini-3.7-flash   # + GOOGLE_GENAI_USE_VERTEXAI=true
 export CFD_SCIENTIST_LLM_PROVIDER=bedrock   CFD_SCIENTIST_MODEL=us.anthropic.claude-sonnet-4-6
+export CFD_SCIENTIST_LLM_PROVIDER=glm       CFD_SCIENTIST_MODEL=zai-org/glm-5.2-maas  # Vertex MaaS, ADC auth
 
 # subscription-billed, no API key — uses the local CLI's own OAuth cache
 export CFD_SCIENTIST_LLM_PROVIDER=claude-code   CFD_SCIENTIST_MODEL=claude-sonnet-4-6   # ~/.claude, via claude-agent-sdk
@@ -31,6 +32,17 @@ downgraded: `openai-codex` takes none/minimal/low/medium/high/xhigh,
 `CFD_SCIENTIST_MODEL=codex` resolves to whatever `~/.codex/config.toml` sets, so
 it tracks the Codex CLI rather than pinning a name. Sign in with `claude` /
 `codex login`; an expired token is reported up front, not as an HTTP 401.
+
+`glm` (alias `vertex-openai`) reaches any Vertex MaaS model served on the
+OpenAI-compatible `/endpoints/openapi` route, so the model id is the fully
+qualified publisher form (`zai-org/glm-5.2-maas`) and a bare name is refused up
+front rather than 404-ing mid-study. It authenticates with Application Default
+Credentials, not an API key: `gcloud auth application-default login` once, and
+`GOOGLE_CLOUD_PROJECT` only if you want a project other than the ADC default.
+A Vertex bearer token lives 60 minutes and a study runs for hours, so the token
+is refreshed per request from the credentials object — the same mechanism
+`ChatGoogleGenerativeAI` uses, which is why Gemini never hit this either.
+Native tool calling, including parallel calls.
 
 Both subscription providers use native tool calling (Claude via an in-process
 SDK MCP server, Codex via Responses `tools`), so neither depends on parsing

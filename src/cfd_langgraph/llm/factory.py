@@ -1107,6 +1107,39 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
 
+        if provider in {"vertex-openai", "glm"}:
+            # Vertex serves third-party MaaS models through an OpenAI-shaped
+            # route, so ChatOpenAI drives them unmodified. Auth is ADC with
+            # automatic refresh -- see vertex_openai for why that matters over
+            # a multi-hour study.
+            from .vertex_openai import create_vertex_openai_chat_model
+
+            if effort:
+                # The endpoint accepts `reasoning_effort` and ignores it:
+                # measured output tokens went 2922 / 2374 / 1163 for
+                # none / low / high on one prompt -- non-monotonic, and with
+                # no reasoning-token accounting in output_token_details. So
+                # honouring the request is not possible, and accepting it
+                # silently would show up only on the bill.
+                raise ValueError(
+                    f"CFD_SCIENTIST_EFFORT={effort!r} is not supported by provider "
+                    f"{provider!r}. The Vertex OpenAI-compatible route accepts the field "
+                    "but does not act on it. Unset CFD_SCIENTIST_EFFORT for this provider."
+                )
+            if "/" not in m:
+                raise ValueError(
+                    f"CFD_SCIENTIST_MODEL={m!r} is not a Vertex MaaS publisher model id. "
+                    "These are fully qualified, e.g. 'zai-org/glm-5.2-maas'. Passing a bare "
+                    "name would 404 at request time, several minutes into a study."
+                )
+            return create_vertex_openai_chat_model(
+                m,
+                temperature,
+                project_id=os.environ.get("GOOGLE_CLOUD_PROJECT", ""),
+                location=os.environ.get("GOOGLE_CLOUD_LOCATION", ""),
+                callbacks=[TOKEN_STATS_HANDLER],
+            )
+
     # Back-compat inference from model string.
     if (
         m.startswith("arn:aws:bedrock")
