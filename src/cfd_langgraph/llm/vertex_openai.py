@@ -102,3 +102,38 @@ def create_vertex_openai_chat_model(
         http_client=httpx.Client(auth=auth, timeout=timeout),
         callbacks=callbacks or [],
     )
+
+def create_vertex_endpoint_chat_model(
+    model: str,
+    temperature: float = 0.0,
+    *,
+    base_url: str = "",
+    callbacks: Optional[list] = None,
+    timeout: int = 600,
+) -> Any:
+    """A ChatOpenAI bound to a self-hosted Vertex endpoint, with ADC auth.
+
+    The MaaS route above is a shared publisher endpoint whose URL can be derived
+    from the project alone. A model you deploy yourself cannot: it lives behind a
+    per-endpoint dedicated host, so the caller supplies the whole base URL and
+    this only attaches the same refreshing credential. Everything in the module
+    docstring about the 60-minute token applies here identically -- a
+    self-hosted endpoint is reached with the same bearer.
+    """
+    from langchain_openai import ChatOpenAI
+
+    base = (base_url or "").strip().rstrip("/")
+    if not base:
+        raise ValueError(
+            "A self-hosted Vertex endpoint needs its full base URL, e.g. "
+            "https://<endpoint-id>.<region>-<project-number>.prediction.vertexai.goog"
+            "/v1/projects/<project>/locations/<region>/endpoints/<endpoint-id>"
+        )
+    return ChatOpenAI(
+        model=model,
+        temperature=temperature,
+        base_url=base,
+        api_key="vertex-adc",
+        http_client=httpx.Client(auth=_ADCBearer(), timeout=timeout),
+        callbacks=callbacks or [],
+    )

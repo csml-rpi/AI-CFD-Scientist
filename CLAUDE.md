@@ -33,16 +33,20 @@ downgraded: `openai-codex` takes none/minimal/low/medium/high/xhigh,
 it tracks the Codex CLI rather than pinning a name. Sign in with `claude` /
 `codex login`; an expired token is reported up front, not as an HTTP 401.
 
-`glm` (alias `vertex-openai`) reaches any Vertex MaaS model served on the
-OpenAI-compatible `/endpoints/openapi` route, so the model id is the fully
-qualified publisher form (`zai-org/glm-5.2-maas`) and a bare name is refused up
-front rather than 404-ing mid-study. It authenticates with Application Default
-Credentials, not an API key: `gcloud auth application-default login` once, and
-`GOOGLE_CLOUD_PROJECT` only if you want a project other than the ADC default.
-A Vertex bearer token lives 60 minutes and a study runs for hours, so the token
-is refreshed per request from the credentials object — the same mechanism
-`ChatGoogleGenerativeAI` uses, which is why Gemini never hit this either.
-Native tool calling, including parallel calls.
+`glm` (alias `vertex-openai`) reaches third-party Vertex MaaS models. The id is
+the fully qualified publisher form (`zai-org/glm-5.2-maas`); a bare name is
+refused up front rather than 404-ing mid-study. It runs through the same
+`ChatGoogleGenerativeAI` client as Gemini — Vertex serves these models on both
+the OpenAI-compatible route and Gemini's own `:generateContent`, and the Gemini
+client is the one that already holds a google.auth credentials object (so
+access-token expiry is handled inside the library over a multi-hour study) and
+already carries the thought-signature/tool_calls fixes multi-turn tool calling
+needs. Vertex mode, project and location are passed explicitly, so no
+`GOOGLE_GENAI_USE_VERTEXAI` is required. Auth is Application Default
+Credentials, not an API key: `gcloud auth application-default login` once, plus
+`GOOGLE_CLOUD_PROJECT` only to override the ADC default. Native tool calling,
+including parallel calls. `CFD_SCIENTIST_EFFORT` is refused: the endpoint
+accepts `reasoning_effort` and ignores it.
 
 Both subscription providers use native tool calling (Claude via an in-process
 SDK MCP server, Codex via Responses `tools`), so neither depends on parsing

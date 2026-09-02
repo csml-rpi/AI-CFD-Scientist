@@ -1107,12 +1107,49 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
 
+        if provider == "vertex-endpoint":
+            # A model YOU deployed on Vertex, not a MaaS publisher model. The
+            # Gemini route (ChatGoogleGenerativeAI) cannot reach it: that speaks
+            # :generateContent to a publisher path, while a self-hosted endpoint
+            # serves whatever its container serves -- for a vLLM deployment, the
+            # OpenAI routes. Endpoint URL comes from the environment rather than
+            # being derived, because a dedicated endpoint's host embeds its own
+            # id and project number and nothing else can reconstruct it.
+            from .vertex_openai import create_vertex_endpoint_chat_model
+
+            base_url = (os.environ.get("CFD_SCIENTIST_VERTEX_ENDPOINT_URL") or "").strip()
+            if not base_url:
+                raise ValueError(
+                    "provider 'vertex-endpoint' needs CFD_SCIENTIST_VERTEX_ENDPOINT_URL "
+                    "set to the endpoint's base URL (everything before /chat/completions)."
+                )
+            return create_vertex_endpoint_chat_model(
+                m, temperature, base_url=base_url, callbacks=[TOKEN_STATS_HANDLER]
+            )
+
         if provider in {"vertex-openai", "glm"}:
-            # Vertex serves third-party MaaS models through an OpenAI-shaped
-            # route, so ChatOpenAI drives them unmodified. Auth is ADC with
-            # automatic refresh -- see vertex_openai for why that matters over
-            # a multi-hour study.
-            from .vertex_openai import create_vertex_openai_chat_model
+            # Third-party Vertex MaaS models (GLM and friends) go through the
+            # SAME client as Gemini.
+            #
+            # Vertex exposes these on two routes -- an OpenAI-compatible
+            # /endpoints/openapi/chat/completions, and Gemini's own
+            # :generateContent -- and both serve both model families. That is
+            # worth stating because it is not obvious: `zai-org/glm-5.2-maas`
+            # answers :generateContent, and `google/gemini-*` answers the
+            # OpenAI route. Verified directly against both endpoints.
+            #
+            # Given the choice, this takes the Gemini client, because it is
+            # the one that already solves the problems: it holds a google.auth
+            # CREDENTIALS object, so access-token expiry is handled inside the
+            # library rather than by anything here (a Vertex bearer lives 60
+            # minutes and a study runs for hours), and GeminiChatModel below
+            # carries the thought-signature and tool_calls preservation fixes
+            # that multi-turn tool-calling agents on this transport need. The
+            # OpenAI route would need all of that rebuilt to reach parity.
+            #
+            # Tool calling, including parallel tool calls, verified on this
+            # path with the model bound to real tools.
+            from langchain_google_genai import ChatGoogleGenerativeAI
 
             if effort:
                 # The endpoint accepts `reasoning_effort` and ignores it:
@@ -1123,8 +1160,8 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                 # silently would show up only on the bill.
                 raise ValueError(
                     f"CFD_SCIENTIST_EFFORT={effort!r} is not supported by provider "
-                    f"{provider!r}. The Vertex OpenAI-compatible route accepts the field "
-                    "but does not act on it. Unset CFD_SCIENTIST_EFFORT for this provider."
+                    f"{provider!r}. The endpoint accepts the field but does not act on "
+                    "it. Unset CFD_SCIENTIST_EFFORT for this provider."
                 )
             if "/" not in m:
                 raise ValueError(
@@ -1132,13 +1169,27 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     "These are fully qualified, e.g. 'zai-org/glm-5.2-maas'. Passing a bare "
                     "name would 404 at request time, several minutes into a study."
                 )
-            return create_vertex_openai_chat_model(
-                m,
-                temperature,
-                project_id=os.environ.get("GOOGLE_CLOUD_PROJECT", ""),
-                location=os.environ.get("GOOGLE_CLOUD_LOCATION", ""),
-                callbacks=[TOKEN_STATS_HANDLER],
+            # Passed explicitly rather than through GOOGLE_GENAI_USE_VERTEXAI /
+            # GOOGLE_CLOUD_LOCATION: these models exist ONLY on Vertex, so
+            # depending on the caller's environment just adds a way to get a
+            # 404 several minutes in, and mutating os.environ here would
+            # silently re-point any later Gemini call in the same process.
+            project = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+            if not project:
+                import google.auth
+
+                _, project = google.auth.default(
+                    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                )
+            inner = ChatGoogleGenerativeAI(
+                model=m,
+                temperature=temperature,
+                vertexai=True,
+                project=project,
+                location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
             )
+            return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
+                                   callbacks=[TOKEN_STATS_HANDLER])
 
     # Back-compat inference from model string.
     if (

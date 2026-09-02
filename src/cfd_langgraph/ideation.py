@@ -289,6 +289,25 @@ def _fetch_literature(settings: Settings, research_topic: str, verbose: bool = T
     return lit_items
 
 
+def _judged_too_similar(judgement: str, similarity, threshold: float) -> bool:
+    """Whether the novelty judge rejected this idea.
+
+    The judge returns a verdict AND a self-reported similarity. The verdict
+    decides; the number is a fallback for when there is no verdict to read,
+    because it scores "same research area" rather than "same idea" and a study
+    pinned to one case has a similarity floor set by its own topic.
+
+    This lives in one place because it was written in two -- the retry loop's
+    accept test and the `passed` flag recorded for the pipeline -- and fixing
+    only the first produced candidates logged as "Idea accepted
+    (judgement=novel)" and then rejected downstream with "Failed novelty gate
+    before critique ran". Three of three, on runs/ideation_probe8.
+    """
+    if judgement == "too_similar":
+        return True
+    return not judgement and similarity is not None and similarity >= threshold
+
+
 def _generate_one_idea(
     llm: Any,
     ideation_prompts: Dict[str, Any],
@@ -308,6 +327,30 @@ def _generate_one_idea(
     system_prompt = str(ideation_prompts["initial_idea_prompt"]).replace(
         "{max_experiments}", str(settings.ideation_max_experiments)
     )
+    if case_context:
+        # The base prompt asks for "an impactful CFD research idea" and "a
+        # non-overlapping set of experiments" -- i.e. a study design. Given a
+        # fixed case that is the wrong deliverable, and saying so only in the
+        # user turn does not survive: measured on runs/ideation_probe, with the
+        # fixed-case block moved to character 0 of the user prompt, 3 of 4
+        # candidates still came back with pimpleFoam/IDDES/3D and 0 of 4 passed
+        # critique. The same run at effort=none produced 4 of 4 3D LES ideas, so
+        # it is not a reasoning-depth problem either -- the model is answering
+        # the question the system prompt asked. Redefining the deliverable has
+        # to happen here, in the same turn that sets the task.
+        system_prompt = (
+            "THIS STUDY RUNS ON A FIXED CASE. You are not designing a simulation "
+            "campaign. The setup given below under FIXED CASE SETUP is already "
+            "decided, and nothing you propose changes it.\n\n"
+            "Propose variation ONLY in what the research topic asks to be varied. "
+            "Whatever that is, your experiments are variants of it evaluated by "
+            "re-running the one existing case — not different simulations. An "
+            "idea that re-specifies any part of the fixed setup is off-topic by "
+            "construction and will be rejected, however strong it would be as an "
+            "independent study.\n\n"
+            "Use the prior studies for the mechanisms they identify, expressed "
+            "within what the topic varies; they are not study designs to copy.\n\n"
+        ) + system_prompt
     previous_ideas = previous_ideas or []
     user_prompt = ideation_prompts.get(
         "literature_aware_user_prompt",
@@ -323,13 +366,33 @@ def _generate_one_idea(
         # real run: every candidate was a setup-sensitivity study (confinement,
         # spanwise size, grid-scheme interaction), half of them at Re_H=10595
         # when the starter case is Re_H=5600.
-        user_prompt += (
-            "\n\nFIXED CASE SETUP — this study runs on an existing case. Geometry, "
+        #
+        # It leads the prompt rather than trailing it. Appended last it sat
+        # behind the literature block -- 807 characters of constraint after
+        # 11,544 characters of papers on run ph_codex_20260902_1402, 20,354 on
+        # oed_20260822_1626_codex_high -- and lost. Measured pass rate fell with
+        # the size of that block: 20/25 with no literature, 37/61 at ten papers,
+        # 14/32 at twenty.
+        #
+        # The field list is the other half. The required schema asks for
+        # `solver`, `topology` and `dimensions`, so a model with no instruction
+        # to the contrary invents them, and the critic then rejects the idea for
+        # exactly those fields: 45 of 64 rejections across every run cite a
+        # setup violation (mesh 33, LES 33, dimension 31, solver 30, 3D 27).
+        # Three consecutive rounds scored 0 of 5 this way. Naming the fields as
+        # copied removes the choice instead of forbidding its consequences.
+        user_prompt = (
+            "FIXED CASE SETUP — this study runs on an existing case. Geometry, "
             "mesh, boundary conditions, solver, numerics and flow parameters below are "
             "GIVEN and must not be changed or re-proposed. Your hypothesis is about what "
             "to CHANGE IN THE MODEL relative to this case, evaluated on this case:\n"
             f"{case_context}\n"
-        )
+            "\nThe schema's `solver`, `topology`, `dimensions` and `controls` fields "
+            "DESCRIBE this fixed case — copy them from above. They are not choices to "
+            "make. The only field your hypothesis decides is `parameters`: the model "
+            "change itself. Read the prior studies below for mechanisms you can express "
+            "as such a change, not for a study design to adopt.\n\n"
+        ) + user_prompt
     if previous_ideas:
         prior_summaries = [
             _idea_distinguishing_text(x)[:1200] for x in previous_ideas[-8:]
@@ -401,9 +464,18 @@ def _generate_one_idea(
                 default=0.0,
             )
 
-        too_similar = (
-            novelty_val is not None and novelty_val >= threshold
-        ) or novelty_judgement == "too_similar"
+        # The judge returns BOTH a verdict and a self-reported similarity, and
+        # the number used to be able to veto the verdict. It should not: the
+        # number scores "same research area", not "same idea", and on a study
+        # pinned to one case that floor is set by the topic itself. Measured
+        # across probes 5 and 6, every one of six rejected candidates carried
+        # judgement "novel" -- four were discarded on the number alone, one at
+        # exactly the threshold, with reasons like "none listed introduces ...
+        # the application and calibration setting overlap strongly". That is a
+        # correct similarity and an irrelevant one. The number now decides only
+        # when there is no verdict to read; the failed-closed path still sets
+        # judgement itself, and the within-batch duplicate check is unaffected.
+        too_similar = _judged_too_similar(novelty_judgement, novelty_val, threshold)
         too_similar_to_batch = max_candidate_similarity >= candidate_similarity_threshold
         invalid_count = (
             count_val is None
@@ -413,13 +485,13 @@ def _generate_one_idea(
 
         if not too_similar and not too_similar_to_batch and not invalid_count and not idea_json.get("parse_error"):
             if verbose:
-                print("[Ideation] Idea accepted (novelty=%.3f, count=%s)" % (
-                    novelty_val or 0, count_val), flush=True)
+                print("[Ideation] Idea accepted (similarity=%.3f/%.2f, judgement=%s, count=%s)" % (
+                    novelty_val or 0, threshold, novelty_judgement or "-", count_val), flush=True)
             break
 
         if verbose and (too_similar or too_similar_to_batch or invalid_count):
-            print("[Ideation] Retry %d/%d: too_similar=%s duplicate_candidate=%s invalid_experiment_count=%s" % (
-                attempt + 1, retries, too_similar, too_similar_to_batch, invalid_count), flush=True)
+            print("[Ideation] Attempt %d/%d rejected: too_similar=%s duplicate_candidate=%s invalid_experiment_count=%s" % (
+                attempt + 1, retries + 1, too_similar, too_similar_to_batch, invalid_count), flush=True)
 
         if attempt < retries:
             retry_tpl = ideation_prompts.get(
@@ -448,8 +520,7 @@ def _generate_one_idea(
             "judgement": novelty_judgement,
             "threshold": threshold,
             "passed": (
-                (novelty_val is None or novelty_val < threshold)
-                and novelty_judgement != "too_similar"
+                not _judged_too_similar(novelty_judgement, novelty_val, threshold)
                 and max_candidate_similarity < candidate_similarity_threshold
             ),
             "max_similarity_to_batch": max_candidate_similarity,
