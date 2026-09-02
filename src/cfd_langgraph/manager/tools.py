@@ -490,7 +490,7 @@ def _approved_hypothesis_directions(out_dir: Path) -> List[Dict[str, str]]:
 
 def _oed_candidate_fingerprint(
     family: str, action_type: str, hypothesis: str, parameters: Optional[Dict[str, Any]] = None,
-    strategy: str = "",
+    strategy: str = "", parent_iteration: Any = None,
 ) -> str:
     """Identity of a candidate by what it actually *does*, not what it is called.
 
@@ -517,13 +517,30 @@ def _oed_candidate_fingerprint(
     params = parameters if isinstance(parameters, dict) else {}
     param_key = ";".join(f"{k}={float(params[k]):g}" for k in sorted(params))
 
+    # The PARENT is part of a coefficient experiment's identity. The same
+    # coefficient value applied to two different compiled models is two
+    # different physics experiments -- Ccr=1.2 on a curvature-corrected SST is
+    # not Ccr=1.2 on a stress-limited one -- and without this they fingerprint
+    # identically and the second is discarded as "an identical proposal".
+    #
+    # Keyed on the parent's ITERATION NUMBER, which both call sites can name
+    # identically. An earlier attempt keyed on a directory basename and broke
+    # the guard in both directions at once: the history side fell back to the
+    # record's own case_dir while the proposal side used the parent's, and
+    # oed_run_experiment_candidate names every experiment's case dir the
+    # literal string "case" -- so an identical repeat did not match (key
+    # "case" vs "case_sst_curv") while two genuinely different parents both
+    # collapsed to "case". An iteration number has no such ambiguity and does
+    # not change when a case is copied.
+    parent_key = "" if parent_iteration is None else str(parent_iteration).strip()
+
     if action_key == "experiment" and param_key:
         # A coefficient experiment IS its coefficients. Ignoring the prose here
         # is the whole point: seven candidates that all set c_cd = 1.0 were
         # described seven different ways, from a full paragraph down to
         # "SA-Cross-Diffusion with c_cd=1.0", and every one was paid for.
         # Exact, free, and cannot be wrong — so no model call for this case.
-        return "|".join([family_key, action_key, strategy_key, param_key])
+        return "|".join([family_key, action_key, strategy_key, parent_key, param_key])
 
     # Anything else has no exact identity to compare, and normalising the prose
     # was never going to give it one. `_llm_duplicate_of` reads the two
@@ -626,6 +643,17 @@ def _set_model_coefficients(case_dir: Path, parameters: Dict[str, float]) -> Dic
     return written
 
 
+# Coefficient names read from a runtime dictionary, in any of the forms
+# OpenFOAM models use: lookupOrAddToDict("n", ...), lookupOrDefault<T>("n", ...),
+# getOrDefault<T>/get<T>("n", ...), and readScalar/readLabel(dict.lookup("n")).
+_COEFF_LOOKUP_RE = re.compile(
+    r'(?:lookupOrAddToDict|(?:lookupOrDefault|getOrDefault|get)\s*<[^>]*>)'
+    r'\s*\(\s*\n?\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+    r'|\b(?:readScalar|readLabel)\s*\(\s*\w+(?:_|\(\))?\.lookup'
+    r'\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+)
+
+
 def _runtime_coefficients(case_dir: Path) -> List[str]:
     """Coefficient names a compiled model exposes through its coeffDict.
 
@@ -648,11 +676,31 @@ def _runtime_coefficients(case_dir: Path) -> List[str]:
             text = source.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        for match in re.finditer(
-            r'lookupOrAddToDict\s*\(\s*\n?\s*"([A-Za-z_][A-Za-z0-9_]*)"', text
-        ):
-            name = match.group(1)
-            if name not in names:
+        # Every idiom OpenFOAM offers for reading a named coefficient out of a
+        # dictionary, not just the one the first model happened to use.
+        #
+        # Matching `lookupOrAddToDict` alone missed the other two forms that
+        # appear in this study's own candidates: `lookupOrDefault<scalar>` (4
+        # occurrences) and `readScalar(coeffs.lookup(...))` (6). Measured over
+        # the 55 recorded candidates, three reported NO tunable coefficients
+        # while actually exposing cInner/cOuter, cW, and cXG/rXG -- and those
+        # are exactly the coefficients each modification introduces, the ones
+        # worth refining. It stayed invisible because a model derived from
+        # kOmegaSST still reports the inherited stock names (alphaK1, beta1,
+        # a1, b1), so the function looked like it was working.
+        #
+        # The cost of the miss is the thing this function exists to prevent:
+        # the DEEPEN prompt falls back to "use action_type=code_mod", so
+        # nudging one coefficient pays a full rebuild and compile-failure risk
+        # instead of a no-build rerun.
+        #
+        # Lexical extraction of literal identifiers is what a regex is for --
+        # there is no judgement here, and the result is checked against a real
+        # corpus below -- but anything that needs a decision about a candidate
+        # belongs in a model call, not a pattern.
+        for match in re.finditer(_COEFF_LOOKUP_RE, text):
+            name = match.group(1) or match.group(2)
+            if name and name not in names:
                 names.append(name)
     return names
 
@@ -3884,6 +3932,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
         picks: List[Dict[str, Any]] = []
         picked_lineages: set = set()
+        # Set when the last-scraps branch finds no elite it could re-run.
+        endgame_exhausted = False
         for _ in range(min(max(1, num_candidates), budget_remaining)):
             # Keyed to the measured cheap-candidate cost, not to a literal 1.
             # Costs step in units of ~32-97, so `== 1` was never reached and
@@ -3893,11 +3943,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 and budget_remaining < _expected_candidate_cost(history, "code_mod")
                 and budget_remaining >= _expected_candidate_cost(history, "experiment")
             ):
+                # An experiment re-runs a compiled model with different
+                # coefficients, so the elite must actually EXPOSE some. A
+                # directory check alone nominates elites with no
+                # `lookupOrAddToDict` names at all -- notably any elite that
+                # was itself an experiment, which has no customModels/ tree --
+                # for which an experiment is impossible by construction, and
+                # the candidate is then dropped downstream for empty
+                # `parameters`.
                 reusable = [
                     (key, niche)
                     for key, niche in archive.niches.items()
                     if isinstance(niche.get("elite_history_entry"), dict)
                     and Path(str(niche["elite_history_entry"].get("case_dir", ""))).is_dir()
+                    and _runtime_coefficients(
+                        Path(str(niche["elite_history_entry"].get("case_dir", "")))
+                    )
                 ]
                 if reusable:
                     key, niche = min(
@@ -3918,6 +3979,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         "action": "deepen",
                     }
                 else:
+                    # Nothing left that an experiment could re-run: the budget
+                    # only stretches to a coefficient change, and no compiled
+                    # elite exposes a coefficient to change. That is a real end
+                    # of the search, and it must be reported as one --
+                    # `force_new_families` is NOT a way out, because this `if`
+                    # is evaluated before that `elif` and so re-enters here on
+                    # every retry. Advertising it produced an endless loop
+                    # paying a proposer call per round.
+                    endgame_exhausted = True
                     break
             elif force_new_families:
                 sel = archive.select_niche(
@@ -4091,6 +4161,32 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 # instructions, and the second is the one that produced the
                 # only depth-2 lineage in the last study.
                 trace = sel.get("score_trace") or []
+                if sel.get("experiment_only"):
+                    # Must come BEFORE the deepen branch. Labelling this pick
+                    # `action="deepen"` (so replay charges the arms for it) made
+                    # it fall into that branch, which ends in `continue` and so
+                    # skipped the experiment_only sentence further down -- the
+                    # sentence became unreachable. The deepen text then told the
+                    # proposer "Use action_type=code_mod", while the caller
+                    # force-sets action="experiment" and requires non-empty
+                    # finite `parameters`; a proposal written as a code_mod has
+                    # no reason to supply any, so the candidate was dropped and
+                    # the batch came back empty. This is the last-scraps branch,
+                    # so an empty batch here ends the study.
+                    elite = sel.get("elite") or {}
+                    coeffs = _runtime_coefficients(Path(str(elite.get("case_dir", ""))))
+                    niche_lines.append(
+                        f"{i}. Re-run the existing compiled model in family "
+                        f"'{sel.get('family')}' with different coefficients. "
+                        f"There is only enough budget left for one coefficient "
+                        f"change, so this MUST be action_type=experiment: no "
+                        f"rebuild, no new C++. Set model_name_to_reuse and "
+                        f"base_case_dir from that elite and give concrete "
+                        f"numeric `parameters`."
+                        + (f" Tunable coefficients it exposes: {', '.join(coeffs)}."
+                           if coeffs else "")
+                    )
+                    continue
                 if sel.get("action") == "deepen":
                     # Emitted for EVERY deepen, including a depth-0 root.
                     #
@@ -4108,24 +4204,44 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     # the round.
                     steps = " -> ".join(f"{v:.6g}" for v in trace) or "n/a"
                     # "Continue in the same direction" is wrong advice after a
-                    # step that went backwards. The trace is now the path from
-                    # the root to the current best, so its last entry IS the
-                    # model being handed over, and the sign of the last step
-                    # says which instruction is correct.
-                    _dir = str(sel.get("direction") or "min").strip().lower()
-                    improving = None
-                    if len(trace) > 1:
+                    # step that went backwards -- but the TRACE cannot detect
+                    # that. The trace is the path from the root to the tip, and
+                    # the tip is by definition the chain's best member, so the
+                    # last step on it is always an improvement: measured over
+                    # 1500 draws on the real archive, 59 deepen picks reported
+                    # "improved" and 0 reported "regressed". This branch was
+                    # dead, and every ordinary regression was being reported to
+                    # the proposer as "continue in the same direction".
+                    #
+                    # A regression makes a SIBLING of the tip, not a next step,
+                    # so the evidence lives off the path. `stalled` counts the
+                    # scored attempts made since the tip was set; if there are
+                    # any, the last thing this chain tried did not work.
+                    stalled = int(sel.get("stalled") or 0)
+                    if stalled:
+                        improving = False
+                    elif len(trace) > 1:
+                        _dir = str(sel.get("direction") or "min").strip().lower()
                         delta = trace[-1] - trace[-2]
                         improving = delta < 0 if _dir != "max" else delta > 0
+                    else:
+                        improving = None
                     if improving is True:
                         started = (
                             f"Its refinement path so far: {steps} — the last step improved, "
                             f"so continue in the same direction"
                         )
                     elif improving is False:
+                        _last = sel.get("last_attempt_score")
                         started = (
-                            f"Its refinement path so far: {steps} — the last step made it "
-                            f"WORSE, so do not repeat that change; make a different single "
+                            f"Its refinement path so far: {steps} — but "
+                            + (
+                                f"the {stalled} attempt(s) since then did NOT beat it"
+                                + (f" (most recent scored {_last:.6g})"
+                                   if isinstance(_last, (int, float)) else "")
+                                if stalled else "the last step made it WORSE"
+                            )
+                            + ", so do not repeat that change; make a different single "
                             f"change from the same parent"
                         )
                     else:
@@ -4202,7 +4318,13 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "model — put those steps in `plan`. The candidate agent has a shell, can "
                 "read any file listed above, and can import the libraries listed above.\n\n"
             )
-            + f"{archive.render_summary(baseline_score=baseline.get('value'), baseline_direction=baseline.get('direction', 'min'))}\n\n"
+            # Via the shared helper, which also passes baseline_per_case. This
+            # call site open-coded the summary and omitted it, so the proposer's
+            # per-case difficulty block carried no baseline deltas -- it could
+            # see which case scored worst in absolute terms but not which case
+            # the model was actually losing ground on, which is the question the
+            # block exists to answer.
+            + f"{_render_archive_summary(archive, disc_dir)}\n\n"
             + (
                 f"Families already evaluated in this study (do NOT propose these as new): "
                 f"{', '.join(known_families)}\n\n" if known_families else "\n"
@@ -4234,8 +4356,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             + "\n".join(niche_lines)
         )
         try:
-            batch = foam_llm.with_structured_output(_OEDCandidateBatch).invoke(prompt)
-            raw_candidates = [c.model_dump() for c in batch.candidates]
+            if not picks:
+                # Nothing was selected, so the prompt reads "Propose exactly 0
+                # candidate modifications". Asking the model that wastes a call
+                # per manager retry and can only come back empty.
+                raw_candidates = []
+            else:
+                batch = foam_llm.with_structured_output(_OEDCandidateBatch).invoke(prompt)
+                raw_candidates = [c.model_dump() for c in batch.candidates]
         except Exception as exc:
             # A malformed structured-output response is a transient proposer
             # failure, not a reason to hand the manager a raw traceback with
@@ -4266,6 +4394,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         seen_variants.discard("")
         # What has already been *evaluated*, by content. Budget is the scarce
         # resource here, and paying twice for the same hypothesis buys nothing.
+        # Which recorded iteration a compiled case belongs to. An experiment's
+        # real parent is the case it is actually re-run from, and the proposer
+        # supplies that as `base_case_dir` -- which takes precedence over the
+        # selection's elite when the two disagree. Deriving parent_iteration
+        # from the selection alone therefore let a candidate be built on one
+        # model and recorded as a child of another, and parent_iteration is the
+        # single field the lineage reconstruction, the deepen-vs-parent bar and
+        # the experiment fingerprint all trust.
+        iteration_by_case: Dict[str, int] = {}
+        for h in history:
+            if not isinstance(h, dict):
+                continue
+            cdir = str(h.get("case_dir") or "").strip()
+            try:
+                it = int(h.get("iteration"))
+            except (TypeError, ValueError):
+                continue
+            if cdir:
+                try:
+                    iteration_by_case[str(Path(cdir).resolve())] = it
+                except (OSError, ValueError):
+                    iteration_by_case[cdir] = it
+
+        def _resolved_parent(cand: Dict[str, Any], elite_entry: Dict[str, Any]) -> Any:
+            """The iteration this candidate is really built from."""
+            base = str(cand.get("base_case_dir") or "").strip()
+            if base:
+                try:
+                    hit = iteration_by_case.get(str(Path(base).resolve()))
+                except (OSError, ValueError):
+                    hit = iteration_by_case.get(base)
+                if hit is not None:
+                    return hit
+            return (elite_entry or {}).get("iteration")
+
         seen_fingerprints: set[str] = {
             _oed_candidate_fingerprint(
                 str(h.get("family") or ""),
@@ -4273,6 +4436,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 str(h.get("model_description") or ""),
                 h.get("parameters") if isinstance(h.get("parameters"), dict) else None,
                 strategy=str(h.get("strategy") or ""),
+                parent_iteration=h.get("parent_iteration"),
             )
             for h in history
             if isinstance(h, dict) and h.get("action_type") in {"code_mod", "experiment"}
@@ -4354,6 +4518,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 str(candidate.get("hypothesis") or ""),
                 candidate.get("parameters") if isinstance(candidate.get("parameters"), dict) else None,
                 strategy=str(candidate.get("strategy") or ""),
+                parent_iteration=_resolved_parent(candidate, elite),
             )
             repeats = None
             if fingerprint in seen_fingerprints:
@@ -4395,7 +4560,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # Recorded here, where it is actually known, rather than asked of
             # the subagent later — a candidate's parent is a fact about the
             # selection, not something to be re-typed through two prompts.
-            candidate["parent_iteration"] = (elite or {}).get("iteration")
+            # From the case actually being built on, not just the selection --
+            # see `_resolved_parent`. `base_case_dir` was normalised just above
+            # for an experiment, so this reads the resolved path.
+            candidate["parent_iteration"] = _resolved_parent(candidate, elite)
             # From this candidate's own `selection` -- the same pick that set
             # parent_iteration just above -- so it stays correct however many
             # candidates the loop skips. Recorded so record_candidate_results
@@ -4458,13 +4626,21 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # treat it as finished, and the manager looped, paying a proposer
             # call per round and never reaching the paper stage.
             cheapest = _expected_candidate_cost(history, "experiment")
-            affordable = budget_remaining >= cheapest
+            # An exhausted endgame is not "affordable": the remaining budget
+            # cannot fund a rebuild, and there is no compiled elite left whose
+            # coefficients an experiment could vary.
+            affordable = budget_remaining >= cheapest and not endgame_exhausted
             guidance = (
                 "Call this tool again with force_new_families=True — that requires every "
                 "niche to be a family the archive has never seen, which is what breaks the "
                 "loop. Do NOT treat this as the search being finished: "
                 f"budget_remaining={budget_remaining} of {total_budget}."
                 if affordable else
+                f"budget_remaining={budget_remaining} of {total_budget} can only fund a "
+                f"coefficient experiment ({cheapest} units), and no compiled model in the "
+                f"archive exposes a coefficient to vary, so the search really is finished. "
+                "force_new_families will NOT help — a new family needs a full rebuild."
+                if endgame_exhausted else
                 f"budget_remaining={budget_remaining} is below the {cheapest} units the "
                 f"cheapest candidate has been costing in this study, "
                 "so the search really is finished."
@@ -4524,12 +4700,37 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # below: a repair-only record has no case_dir, so it fails to resolve
         # inside the candidate and is reported missing rather than recorded.
         swept: List[str] = []
+        # Auto-swept candidates held back because a repair is still in flight.
+        deferred: List[str] = []
         requested = {str(Path(c).expanduser().resolve()) for c in candidate_dirs}
+        def _repair_in_flight(rec: Any) -> bool:
+            """A null-scored candidate that still has repair attempts left.
+
+            Its record is complete and its case_dir resolves, so it passes
+            every guard the sweep applies -- and sweeping it freezes it into
+            history as FAILED/score:null. Once recorded it can never be
+            corrected, because the already_recorded check below used to skip it
+            outright, so the repaired result was written to disk and silently
+            dropped. That is how the best model in a study can end up filed as
+            a failure: the real run has iteration 29 (elite_sst_sas025) sitting
+            in history as FAILED with repair_attempts 1 and a repair_log.
+            """
+            if not isinstance(rec, dict) or rec.get("score") is not None:
+                return False
+            return int(rec.get("repair_attempts", 0) or 0) < _OED_REPAIR_ATTEMPTS
+
         for record_path in sorted(disc_dir.glob("cand_*/candidate_record.json")):
             found = str(record_path.parent.resolve())
-            if found not in requested and found not in already_recorded:
-                swept.append(found)
+            if found in requested or found in already_recorded:
+                continue
+            # Only auto-swept dirs are held back. If the manager passes one
+            # explicitly it means that candidate really is finished.
+            if _repair_in_flight(_read_json(record_path)):
+                deferred.append(found)
+                continue
+            swept.append(found)
         candidate_dirs = list(candidate_dirs) + swept
+        repaired: List[str] = []
 
         missing: List[str] = []
         for cdir in candidate_dirs:
@@ -4538,12 +4739,36 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 missing.append(str(candidate_path))
                 continue
             resolved_cdir = str(candidate_path)
-            if resolved_cdir in already_recorded:
-                continue
             record_path = candidate_path / "candidate_record.json"
             record = _read_json(record_path)
             if not record:
-                missing.append(resolved_cdir)
+                if resolved_cdir not in already_recorded:
+                    missing.append(resolved_cdir)
+                continue
+            if resolved_cdir in already_recorded:
+                # Already in history -- but the record on disk may have moved on
+                # since, which is exactly what a successful repair does. Skipping
+                # unconditionally meant a repaired candidate kept its stale
+                # FAILED/null entry forever, while the arms had already been
+                # charged a loss for it and its extra solver runs went unbilled.
+                prior = next(
+                    (h for h in history
+                     if isinstance(h, dict) and str(h.get("candidate_dir", "")) == resolved_cdir),
+                    None,
+                )
+                if prior is None or prior.get("score") == record.get("score"):
+                    continue
+                if prior.get("score") is not None:
+                    # Only a null -> scored correction is applied. Overwriting a
+                    # score that already existed would let a late rewrite silently
+                    # restate a result the search has already acted on.
+                    continue
+                keep_iter = prior.get("iteration")
+                prior.clear()
+                prior.update(record)
+                prior["iteration"] = keep_iter
+                prior["candidate_dir"] = resolved_cdir
+                repaired.append(resolved_cdir)
                 continue
             try:
                 Path(str(record.get("case_dir", ""))).resolve().relative_to(candidate_path)
@@ -4760,6 +4985,13 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # explicitly so a recovered result is visible rather than silently
             # appearing in the archive summary.
             "recovered_unrecorded_candidates": swept,
+            # Held back because a repair is still in flight -- call again once
+            # the repair has run, and they will be recorded with their real
+            # score instead of frozen as FAILED.
+            "deferred_pending_repair": deferred,
+            # Already in history as null-scored, now corrected in place from a
+            # repair that succeeded after they were first recorded.
+            "repaired_since_recorded": repaired,
             "history_path": str(history_path),
             "case_ids_to_interpret": promoted_case_ids,
         }
@@ -5760,6 +5992,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "error": "Coefficient names must be identifiers and values must be finite numbers.",
                 "invalid_parameters": invalid_parameters,
             }
+        # The parent must actually READ every coefficient being set.
+        #
+        # The `remaining` guard further down cannot catch this: when a name is
+        # absent from the coeffs dictionary `_set_model_coefficients` appends
+        # it and reports it written, which is correct for a coefficient the
+        # model reads through lookupOrAddToDict with a default (it legitimately
+        # may not be in the dict yet) but indistinguishable from a name the
+        # model never reads at all. So `remaining` empties either way and the
+        # refusal is unreachable.
+        #
+        # A misnamed coefficient -- C_bradshaw for bBradshaw, the underscore
+        # variant this file has already seen with C_cr for Ccr -- then writes a
+        # key OpenFOAM ignores, and the case runs to convergence bit-identical
+        # to its parent. That costs a full evaluation, and it is worse than
+        # wasted: `no_op` compares against the BASELINE, not the parent, so the
+        # clone enters history with the parent's score and is booked as a
+        # non-improving refinement, charging a real `stalled` against a chain
+        # that did nothing wrong.
+        #
+        # Only enforced when the parent exposes something. `_runtime_coefficients`
+        # returns [] for a case with no customModels tree, and refusing there
+        # would block legitimate work on a parent this cannot introspect.
+        exposed = set(_runtime_coefficients(src))
+        unknown = sorted(k for k in parameters if k not in exposed)
+        if exposed and unknown:
+            return {
+                "ok": False,
+                "error": (
+                    "These coefficient names are not read by the compiled parent model, so "
+                    "setting them would rerun an unchanged clone of it at full cost. Use one "
+                    "of the names the model actually exposes, or make this a code_mod."
+                ),
+                "unknown_parameters": unknown,
+                "exposed_coefficients": sorted(exposed),
+            }
         case_dir = candidate_dir / "case"
         if case_dir.exists():
             shutil.rmtree(case_dir)
@@ -6307,8 +6574,21 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # Same provenance rule as family: the proposal decided it, so history
         # records what was actually chosen rather than re-deriving a label
         # from prose that may describe the physics but not the method.
-        strategy_label = normalize_strategy(
-            proposal.get("strategy") or proposal.get("plan") or model_description,
+        #
+        # Taken verbatim when present. oed_propose_candidates already ran
+        # normalize_strategy on this candidate with use_llm=True and stored the
+        # answer -- its comment says "the model call is paid once here and the
+        # answer is stored; replay never re-asks" -- so re-deriving it here
+        # asked twice and could disagree with itself. normalize_strategy
+        # degrades silently to a keyword table when the model call fails, and
+        # the table gets exactly the case the LLM was added for wrong: a
+        # solver_fit plan reads as analytic. The elite would then land in a
+        # different (family, strategy) cell from the one select_action picked
+        # and paid for, and history's label would no longer match the
+        # fingerprint a re-proposal carries, so an identical repeat escapes
+        # dedup. Only re-derived for a record with no proposal on file.
+        strategy_label = proposal.get("strategy") or normalize_strategy(
+            proposal.get("plan") or model_description,
             plan=proposal.get("plan") or "",
             hypothesis=model_description,
             use_llm=True,
@@ -6410,6 +6690,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 + ("  [repairable]" if diagnosis.get("repairable") else "  [not repairable]"),
                 flush=True,
             )
+        # Carry forward the fields that belong to the CANDIDATE rather than to
+        # this evaluation of it. `record` is built fresh every call, so a
+        # re-score after a repair wrote a brand-new document over the top and
+        # reset the repair counter to zero -- and the prescribed workflow is
+        # repair -> oed_note_repair_attempt -> re-run -> oed_score_candidate,
+        # so the counter was destroyed on every cycle. Measured: after two
+        # attempts (cap reached, remaining 0), one re-score put it back to
+        # "attempt 1, remaining 1", making the two-attempt cap unenforceable
+        # and letting the search grind one broken closure indefinitely at ~48
+        # solver runs a go. oed_extend_candidate avoids this by keeping its
+        # counter in a separate file; these fields never got the same
+        # treatment.
+        _prior = _read_json(candidate_path / "candidate_record.json") or {}
+        for _carry in ("repair_attempts", "repair_log", "extensions_used"):
+            if _carry in _prior and _carry not in record:
+                record[_carry] = _prior[_carry]
         _write_json(candidate_path / "candidate_record.json", record)
         return {"ok": True, "candidate_dir": str(candidate_path), **record}
 

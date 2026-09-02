@@ -1581,6 +1581,479 @@ def test_select_niche_can_actually_hand_over_an_elite() -> None:
           (SearchArchive().strategy_transfer, SearchArchive().strategy_prior_visits))
 
 
+def test_dedup_tolerance_clears_solver_reproducibility() -> None:
+    """Two builds of the same closure do not return bit-identical scores.
+
+    The dedup added earlier used a 1e-9 relative tolerance, which only ever
+    collapsed the no-op candidates that returned the baseline number
+    bit-for-bit. On the real archive (closure_20260826_codex) iterations
+    44/52/39 are the same b1=0.90 Bradshaw limiter implemented three times,
+    spread by 2.2e-6 relative -- 2200x that tolerance -- and took 52% of ALL
+    deepen mass between them.
+
+    The previous version of this test built its duplicates at EXACTLY 0.100, so
+    it tested the mechanism and never the constant, and passed throughout.
+    """
+    # Same model, three builds, differing at the 7th significant figure --
+    # gentler than the 2.2e-6 the real archive shows.
+    clones = [_ch(1, "F", 0.0739291), _ch(2, "F", 0.0739292), _ch(3, "F", 0.0739293)]
+    distinct = [_ch(4, "G", 0.0921980), _ch(5, "H", 0.0928690)]
+    share = _deepen_share(clones + distinct)
+    offered = set(share)
+
+    check("round-off clones collapse to a single representative",
+          len(offered & {1, 2, 3}) == 1, f"offered {sorted(offered & {1, 2, 3})}")
+
+    # The right comparison is not an absolute cap -- this model IS the best in
+    # a three-model archive, so its representative legitimately takes most of
+    # deepen. What must not happen is the GROUP drawing more than one copy of
+    # the model would, which is what three independent samples bought.
+    clone_mass = sum(v for k, v in share.items() if k in {1, 2, 3})
+    solo_mass = sum(v for k, v in _deepen_share(clones[:1] + distinct).items()
+                    if k in {1, 2, 3})
+    solo_offered = set(_deepen_share(clones[:1] + distinct))
+    check("three copies offer the allocator no more choices than one copy does",
+          len(offered) == len(solo_offered),
+          f"{len(offered)} lineages offered with three copies, "
+          f"{len(solo_offered)} with one")
+    check("and they draw no more mass between them",
+          abs(clone_mass - solo_mass) < 0.10,
+          f"{clone_mass:.0%} with three copies vs {solo_mass:.0%} with one")
+
+    # The other half: genuinely distinct models must NOT be merged. These two
+    # differ by 6.2e-4 relative, the tightest real pair in the archive.
+    check("genuinely distinct models stay separate lineages",
+          {4, 5} <= offered or len(offered) >= 3,
+          f"offered {sorted(offered)}")
+
+    a = SearchArchive()
+    a.replay(clones + distinct, baseline_direction="min")
+    rel_clone = abs(0.0739291 - 0.0739293) / 0.0739293
+    rel_distinct = abs(0.0921980 - 0.0928690) / 0.0928690
+    check("the tolerance sits between reproducibility noise and real spacing",
+          rel_clone < a._duplicate_rtol < rel_distinct,
+          f"clone {rel_clone:.2e} < rtol {a._duplicate_rtol:.0e} < distinct {rel_distinct:.2e}")
+
+
+def test_a_stalled_chain_stops_being_bought() -> None:
+    """A chain whose refinements keep failing to beat its tip must decay.
+
+    Reading momentum off the root->tip path removed a 3.9x gain inflation, but
+    the tip is by definition the chain's best member -- so a refinement that
+    scored and lost is a SIBLING and never appears on the path. `lost` stayed
+    0, `gained` kept its old value, and `failures` counts only SCORELESS
+    attempts, so a chain that had burned five consecutive refinements looked
+    identical to one that had just improved.
+
+    Chain A improved once, then missed five times. Chain B improved once. Chain
+    C is a fresh root at a comparable score. A took 87% of deepen before this.
+    """
+    hist = [_ch(1, "A", 0.110), _ch(2, "A", 0.090, 1)]
+    # Five refinements of A's tip, every one worse -- so all five are siblings.
+    for it, v in zip(range(3, 8), (0.098, 0.101, 0.0955, 0.112, 0.0999)):
+        hist.append(_ch(it, "A", v, 2))
+    hist += [_ch(10, "B", 0.110), _ch(11, "B", 0.091, 10), _ch(20, "C", 0.092)]
+
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+    lin = a.lineages()
+
+    check("the stalled attempts are counted", lin[1]["stalled"] == 5, lin[1]["stalled"])
+    check("a clean chain has no stall", lin[10]["stalled"] == 0, lin[10]["stalled"])
+    check("the tip is still the best member, not the last attempt",
+          lin[1]["tip"]["iteration"] == 2, lin[1]["tip"]["iteration"])
+    check("the last ATTEMPT is known to have regressed",
+          lin[1]["last_attempt_regressed"] is True)
+    check("a chain that has not stalled reports no regression",
+          lin[10]["last_attempt_regressed"] is False)
+
+    share = _deepen_share(hist)
+    # Same archive with the five misses deleted, i.e. what the allocator saw
+    # before the stall signal existed.
+    unstalled = _deepen_share([c for c in hist if c["iteration"] not in range(3, 8)])
+    check("the stalled chain no longer monopolises deepen",
+          share.get(1, 0) < 0.30,
+          f"{share.get(1, 0):.0%} of deepen, vs {unstalled.get(1, 0):.0%} "
+          f"when its five misses are hidden")
+    check("the healthy chain overtakes it",
+          share.get(10, 0) > share.get(1, 0),
+          f"stalled {share.get(1, 0):.0%} vs healthy {share.get(10, 0):.0%}")
+    check("hiding the misses really does flip the order (else this proves nothing)",
+          unstalled.get(1, 0) > unstalled.get(10, 0),
+          f"{unstalled.get(1, 0):.0%} vs {unstalled.get(10, 0):.0%}")
+
+
+def test_select_niche_quality_survives_a_diverged_outlier() -> None:
+    """select_niche must rank, not min-max, for the reason select_action does.
+
+    A closure that destabilises the solver returns an enormous error. Under
+    min-max that one outlier sets `hi`, every real niche compresses toward 1.0,
+    and the visit-count exploration bonus decides instead. select_action was
+    fixed for this; select_niche -- the entire `widen` arm -- was not, and no
+    test here ever called it with an outlier.
+
+    This asserts on what select_niche actually PICKS. An earlier version of
+    this test recomputed the percentile rank inline and compared it to itself,
+    so it passed with the min-max code still in place.
+    """
+    # A is decisively the best mechanism and has been visited three times;
+    # B is clearly worse and fresh, so only the exploration bonus favours it.
+    base = [_ch(1, "A", 0.090), _ch(2, "A", 0.092, 1), _ch(3, "A", 0.091, 2),
+            _ch(4, "B", 0.110)]
+
+    def pick(hist):
+        a = SearchArchive()
+        a.replay(hist, baseline_direction="min")
+        # allow_new_family=False so this is the widen decision, not an escape
+        # into an untried mechanism.
+        return a.select_niche(budget_remaining=500, budget_total=1000,
+                              allow_new_family=False)["family"]
+
+    clean = pick(base)
+    # One diverged candidate in a third family: the solver blew up and the
+    # metric came back three orders of magnitude high.
+    outlier = pick(base + [_ch(5, "D", 55.0)])
+
+    check("without an outlier, widen goes to the better mechanism",
+          clean == "A", f"picked {clean}")
+    check("one diverged candidate does not flip the widen decision",
+          outlier == "A", f"picked {outlier} once a candidate diverged")
+
+
+def test_the_endgame_pick_asks_for_an_experiment() -> None:
+    """The last-scraps branch must emit experiment instructions, not code_mod.
+
+    Labelling that pick `action="deepen"` (so replay charges the arms for it)
+    made it fall into the deepen prompt branch, which ends in `continue` and so
+    skipped the experiment_only sentence entirely. The deepen text says "use
+    action_type=code_mod", while the caller force-sets action="experiment" and
+    then requires non-empty finite `parameters` -- which a proposal written as
+    a code_mod has no reason to supply, so the candidate was dropped and this
+    branch returned an empty batch. It is the last-scraps branch, so an empty
+    batch there ends the study.
+    """
+    import ast
+    src = Path(__file__).resolve().parents[1] / "src/cfd_langgraph/manager/tools.py"
+    text = src.read_text(encoding="utf-8")
+    fn = next(n for n in ast.walk(ast.parse(text))
+              if isinstance(n, ast.FunctionDef) and "propose_candidates" in n.name)
+
+    # Only the branches that BUILD PROMPT TEXT. `experiment_only` is also
+    # tested later where the candidate is normalised, and ast.walk is not in
+    # source order, so match on the body rather than taking the first hit.
+    prompt_ifs = [
+        n for n in ast.walk(fn)
+        if isinstance(n, ast.If)
+        and "niche_lines.append" in (ast.get_source_segment(text, n) or "")
+    ]
+
+    def branch(token):
+        hits = [n for n in prompt_ifs if token in ast.dump(n.test)]
+        return min(hits, key=lambda n: n.lineno) if hits else None
+
+    exp = branch("experiment_only")
+    deep = branch("deepen")
+    check("the experiment_only prompt branch exists", exp is not None)
+    check("the deepen prompt branch still exists", deep is not None)
+    check("experiment_only is checked BEFORE deepen",
+          exp is not None and deep is not None and exp.lineno < deep.lineno,
+          f"experiment_only at {exp and exp.lineno}, deepen at {deep and deep.lineno}")
+
+    # And that the branch actually reached asks for an experiment. Read the
+    # STRING LITERALS, not the source text: the comments in this branch
+    # explain the bug and quote both action types, so matching on raw source
+    # reports whatever the comment says rather than what the prompt says.
+    emitted = " ".join(
+        n.value for n in ast.walk(exp)
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+    )
+    check("the endgame text asks for action_type=experiment",
+          "action_type=experiment" in emitted)
+    check("the endgame text does not tell the proposer to rebuild",
+          "action_type=code_mod" not in emitted, emitted[:120])
+    check("the endgame branch does not fall through into deepen",
+          any(isinstance(n, ast.Continue) for n in ast.walk(exp)))
+
+
+def test_the_tip_survives_a_lineage_spanning_two_cells() -> None:
+    """`tip` must come from the uncapped chain record, not the capped cells.
+
+    "The cap never drops the best member" holds only WITHIN one cell, and a
+    lineage stops being confined to one cell as soon as a refinement is
+    reclassified -- which the DEEPEN prompt actively causes by steering toward
+    action_type=experiment, which normalize_strategy bins as `sweep`. The
+    parent then sits in a crowded `analytic` cell and can be evicted while its
+    worse child sits safely in `sweep`.
+    """
+    hist = [
+        _ch(1, "F", 0.100),                       # root, analytic
+        _ch(2, "F", 0.080, 1),                    # the true best, analytic
+        _ch(3, "F", 0.090, 2, strat="sweep"),     # reclassified refinement
+        # Three unrelated candidates crowd the analytic cell (population 3).
+        _ch(4, "F", 0.050), _ch(5, "F", 0.060), _ch(6, "F", 0.070),
+    ]
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+    lin = a.lineages()[1]
+
+    survivors = [m["iteration"] for m in a.niches[("F", "analytic")]["population"]]
+    check("iteration 2 really was evicted from its cell (else this proves nothing)",
+          2 not in survivors, f"population {survivors}")
+    check("the tip is still the chain's best member",
+          lin["tip"]["iteration"] == 2, f"tip is iteration {lin['tip']['iteration']}")
+    check("the tip carries a history_entry the proposer can mutate",
+          isinstance(lin["tip"].get("history_entry"), dict)
+          and lin["tip"]["history_entry"].get("variant_name") == "v2",
+          str(lin["tip"].get("history_entry"))[:80])
+    check("best_norm_score is not understated",
+          abs(lin["best_norm_score"] - 0.080) < 1e-12, lin["best_norm_score"])
+    check("the trace does not show a regression that never happened",
+          lin["score_trace"] == [0.100, 0.080], lin["score_trace"])
+
+
+def test_excluding_a_lineage_does_not_promote_its_twin() -> None:
+    """Batch de-correlation must exclude the whole duplicate group.
+
+    The exclusion runs before the `_duplicate_rtol` dedup, so removing a
+    representative simply handed its slot to the near-identical
+    re-implementation the dedup exists to hide. Measured on the real archive:
+    excluding lineage 39 made lineage 44 selectable, and the two differ by
+    1.6e-7 relative -- three orders inside the tolerance. 18% of four-candidate
+    batches came back holding two deepen picks the archive itself calls the
+    same model, at ~48 solver runs each. Nothing downstream catches it.
+    """
+    import random
+    # Three builds of one model plus two genuinely distinct ones.
+    hist = [_ch(1, "F", 0.073929), _ch(2, "F", 0.0739292), _ch(3, "F", 0.0739294),
+            _ch(4, "G", 0.092198), _ch(5, "H", 0.092869)]
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+
+    def offered(excl):
+        seen = set()
+        for seed in range(400):
+            d = a.select_action(500, 1000, rng=random.Random(seed), exclude_lineages=excl)
+            if d["action"] == "deepen":
+                seen.add(d["lineage_id"])
+        return seen
+
+    rep = next(iter(offered(set()) & {1, 2, 3}))
+    after = offered({rep})
+    check("excluding the representative does not offer its twins",
+          not (after & {1, 2, 3}), f"still offered {sorted(after & {1, 2, 3})}")
+    check("but genuinely distinct lineages are still available",
+          after & {4, 5}, f"offered {sorted(after)}")
+
+    # And the batch-level symptom is gone.
+    bad = 0
+    for seed in range(600):
+        rng = random.Random(seed); excl = set(); picks = []
+        for _ in range(4):
+            d = a.select_action(500, 1000, rng=rng, exclude_lineages=excl)
+            if d["action"] == "deepen" and d["lineage_id"] is not None:
+                picks.append(d["lineage_id"]); excl.add(d["lineage_id"])
+        if any(a._same_model(a.lineages()[x]["best_norm_score"],
+                             a.lineages()[y]["best_norm_score"])
+               for i, x in enumerate(picks) for y in picks[i + 1:]):
+            bad += 1
+    check("no batch proposes two picks the archive calls the same model",
+          bad == 0, f"{bad}/600 batches")
+
+
+def test_one_lucky_step_cannot_capture_the_whole_budget() -> None:
+    """A step's credit must not be scaled by the objective's distance from zero.
+
+    `denom = abs(prev)` is only valid for a ratio-scale metric. The metric
+    proposer may author correlation, r2, iou, skill or accuracy (baseline_setup
+    lists them), and all of those sit near or cross zero for a poor closure. One
+    ordinary refinement of IoU 0.02 -> 0.45 was credited a relative gain of
+    21.5 -- 1290 pseudo-counts against a _lineage_prior of 3.0 -- so alpha
+    swamped beta, the draw was ~1.0 deterministically, and 98.2% of every
+    decision went to the WORST lineage in the archive. `gained` is a property of
+    the whole path, so the lock was permanent.
+    """
+    import random
+    from collections import Counter
+
+    def iou(i, fam, v, parent=None):
+        d = {"action_type": "code_mod", "variant_name": f"v{i}", "family": fam,
+             "strategy": "analytic", "iteration": i,
+             "score": {"metric": "recirculation_region_iou", "value": v, "direction": "max"}}
+        if parent is not None:
+            d["parent_iteration"] = parent
+        return d
+
+    # Lineage 1 climbs from near zero but is still the WORST model in the archive.
+    hist = [iou(1, "A", 0.02), iou(2, "A", 0.45, 1),
+            iou(3, "B", 0.85), iou(4, "C", 0.83), iou(5, "D", 0.82)]
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="max")
+    c = Counter()
+    for seed in range(1500):
+        d = a.select_action(500, 1000, rng=random.Random(seed))
+        c[(d["action"], d.get("lineage_id"))] += 1
+    worst = c[("deepen", 1)] / 1500.0
+    check("the worst lineage does not capture the archive",
+          worst < 0.25, f"{worst:.1%} of all decisions (was 98.2%)")
+    check("the better lineages remain reachable",
+          c[("deepen", 3)] + c[("widen", None)] + c[("new_family", None)] > 0.5 * 1500,
+          f"{(c[('deepen', 3)] + c[('widen', None)] + c[('new_family', None)]) / 1500:.0%}")
+
+    # The clamp must not flatten every good step into one value -- if it did,
+    # two chains with very different momentum would be indistinguishable.
+    fast = _deepen_share([_ch(1, "A", 0.1000), _ch(2, "A", 0.0800, 1),
+                          _ch(10, "B", 0.1000), _ch(11, "B", 0.0995, 10)])
+    check("a fast chain still outranks a crawling one after clamping",
+          fast.get(1, 0) > fast.get(10, 0) + 0.20,
+          f"fast {fast.get(1, 0):.2f} vs slow {fast.get(10, 0):.2f}")
+
+
+def test_a_scoreless_build_is_charged_once_and_still_bites() -> None:
+    """Failures were charged through two channels at ~2.5x the stated weight.
+
+    `buildable` shrank the quality prior (lowering alpha and raising beta at
+    once) AND `_failure_weight * failures` was added to beta. Charging once at
+    weight 1.0 made the penalty far too weak -- a chain that was the best model
+    with momentum kept 96% of refinements through six failed builds. The weight
+    now says what it costs.
+    """
+    a = SearchArchive()
+    check("the failure weight is stated, not implied by two channels",
+          a._failure_weight > 1.0, f"_failure_weight={a._failure_weight}")
+    check("a scored miss is weighed separately from a build that will not compile",
+          a._stall_weight < a._failure_weight,
+          f"stall={a._stall_weight} failure={a._failure_weight}")
+
+    base = [_ch(1, "A", 0.1000), _ch(2, "A", 0.0985, 1), _ch(3, "A", 0.0970, 2),
+            _ch(10, "B", 0.0971)]
+    clean = _deepen_share(base).get(1, 0.0)
+    six = _deepen_share(base + [_chfail(20 + k, "A", 3) for k in range(6)]).get(1, 0.0)
+    check("six failed builds still substantially reduce a chain's share",
+          six < clean - 0.15, f"clean {clean:.2f} -> six failures {six:.2f}")
+
+
+def test_an_exhausted_batch_still_respects_the_new_family_reserve() -> None:
+    """`if not lineages` returned new_family with no budget check.
+
+    Every other path checks `budget_remaining >= new_family_reserve` before
+    opening a mechanism, because a new family cannot be developed on scraps.
+    This path skipped it, and it is reachable whenever a batch has already
+    excluded every lineage -- common early on, when num_candidates exceeds the
+    number of lineages. The rationale also claimed the archive was empty.
+    """
+    import random
+    a = SearchArchive()
+    a.replay([_ch(1, "A", 0.10), _ch(2, "B", 0.11)], baseline_direction="min")
+    # Every lineage excluded, and almost no budget left.
+    d = a.select_action(3, 4000, rng=random.Random(0), exclude_lineages={1, 2})
+    check("it does not claim an empty archive when the archive has entries",
+          "archive is empty" not in d["rationale"], d["rationale"])
+    check("and it flags that there is no budget for a new mechanism",
+          d.get("budget_exhausted") is True, str(d))
+
+    plenty = a.select_action(3000, 4000, rng=random.Random(0), exclude_lineages={1, 2})
+    check("with budget available it is not flagged",
+          not plenty.get("budget_exhausted"), str(plenty))
+
+
+def test_a_refinement_is_judged_against_its_own_parent() -> None:
+    """`deepen` is credited for beating ITS PARENT, not the archive best.
+
+    A refinement's job is to improve the chain it is refining. select_action's
+    own design note says a chain improving 1.7% per step deserves another pull
+    "even while it trails a flat chain that is already better" -- and scoring
+    every refinement against the archive best charged exactly that chain a loss
+    on every step of a winning streak.
+
+    Measured on the real run: all 5 refinements beat their parent, only 3 were
+    credited. Constructed below: a chain that improved on its parent five times
+    running, under a separate unbeatable elite, taught the deepen arm nothing
+    but losses and fell to ~1% of decisions while `widen` took ~49% sitting at
+    its untouched coin-flip prior.
+    """
+    import random
+    from collections import Counter
+
+    hist = [{"action_type": "code_mod", "variant_name": "elite", "family": "A",
+             "strategy": "analytic", "iteration": 1,
+             "score": {"metric": "m", "value": 0.090, "direction": "min"},
+             "search_action": "new_family"}]
+    v = 0.1261
+    for i in range(2, 7):  # five steps, under the exploration floor of 8
+        v = round(v * 0.97, 6)
+        hist.append({"action_type": "code_mod", "variant_name": f"r{i}", "family": "B",
+                     "strategy": "analytic", "iteration": i, "parent_iteration": i - 1,
+                     "score": {"metric": "m", "value": v, "direction": "min"},
+                     "search_action": "deepen", "lineage_id": 2})
+    a = SearchArchive()
+    a.replay(hist, baseline_direction="min")
+
+    check("the chain never reaches the archive best (else this proves nothing)",
+          v > 0.090, f"chain reached {v}, elite is 0.090")
+    check("a winning streak teaches the deepen arm wins, not losses",
+          a._deepen_wins > a._deepen_losses,
+          f"{a._deepen_wins} wins / {a._deepen_losses} losses")
+
+    c = Counter()
+    for seed in range(1500):
+        c[a.select_action(500, 1000, rng=random.Random(seed))["action"]] += 1
+    deepen = c["deepen"] / 1500.0
+    check("and the streak keeps being refined",
+          deepen > 0.30, f"deepen {deepen:.3f} of decisions (was 0.013)")
+
+
+def test_momentum_survives_a_diverged_candidate() -> None:
+    """The gain denominator's floor must be outlier-proof.
+
+    Flooring with the min-max range put back the exact sensitivity that
+    percentile-rank `_quality` was introduced to remove: a closure that
+    destabilises the solver returns an enormous error and is still recorded
+    with a score. On the real archive the min-max spread is 0.237 against
+    typical scores of 0.113, so the floor was ALWAYS active and halved every
+    chain's momentum -- a 1.7% refinement earned 0.47 pseudo-counts where
+    _gain_weight = 60 is calibrated for ~1.0.
+    """
+    a = SearchArchive()
+    # Five lineages: the opening of a campaign, where one diverged closure is a
+    # fifth of the archive. This is the case the IQR cannot survive.
+    clean = [0.090, 0.095, 0.100, 0.105, 0.110]
+    check("the robust scale reflects the bulk of the archive",
+          0.001 < a._robust_scale(clean) < 0.05, f"{a._robust_scale(clean):.4f}")
+    check("one diverged candidate barely moves it",
+          a._robust_scale(clean + [5.0]) < 2 * a._robust_scale(clean),
+          f"{a._robust_scale(clean):.4f} -> {a._robust_scale(clean + [5.0]):.4f}")
+    check("nor does an astronomically diverged one",
+          a._robust_scale(clean + [5.2e52]) < 0.05,
+          f"{a._robust_scale(clean + [5.2e52]):.4g}")
+    check("a young archive degrades to a usable scale, not a crash",
+          a._robust_scale([0.09, 0.11]) > 0 and a._robust_scale([0.1]) == 0.0)
+    check("all-tied lineages give no scale rather than a spurious one",
+          a._robust_scale([0.1, 0.1, 0.1, 0.1]) == 0.0)
+
+    # Behaviour, on the case the whole momentum channel exists for: lineage 1
+    # is MOVING but TRAILS, lineage 10 is flat and already BETTER. The design
+    # note says the moving chain "deserves another pull even while it trails a
+    # flat chain that is already better", and momentum is the only thing that
+    # can express that -- quality alone ranks it last.
+    #
+    # The two chains must not end on the same score, or the duplicate check
+    # merges them and the fixture measures nothing. They must also differ by
+    # more than a comparison of RATIOS can hide: an outlier suppresses both
+    # chains' momentum equally, so a ratio between two deepen shares is
+    # unchanged by it, and an earlier version of this check passed with the
+    # fix reverted for exactly that reason.
+    base = [_ch(1, "A", 0.1400), _ch(2, "A", 0.1200, 1), _ch(3, "A", 0.1000, 2),
+            _ch(10, "B", 0.0992), _ch(11, "B", 0.0991, 10), _ch(12, "B", 0.0990, 11)]
+    clean = _deepen_share(base)
+    check("the moving chain earns a real share despite trailing",
+          clean.get(1, 0) > 0.15, f"{clean.get(1, 0):.3f} of deepen")
+    outlier = _deepen_share(base + [_ch(20, "D", 5.0)])
+    check("and one diverged candidate does not erase its momentum",
+          outlier.get(1, 0) > 0.30,
+          f"{clean.get(1, 0):.3f} -> {outlier.get(1, 0):.3f} with a diverged "
+          f"candidate (min-max floor gave 0.109)")
+
+
 def main() -> int:
     test_classify_degrades_gracefully()
     test_update_tracks_elite_per_family()
@@ -1643,6 +2116,17 @@ def main() -> int:
     test_allocation_follows_the_evidence()
     test_deepen_does_not_win_by_arithmetic()
     test_replay_relearns_the_arms()
+    test_dedup_tolerance_clears_solver_reproducibility()
+    test_a_stalled_chain_stops_being_bought()
+    test_select_niche_quality_survives_a_diverged_outlier()
+    test_the_endgame_pick_asks_for_an_experiment()
+    test_the_tip_survives_a_lineage_spanning_two_cells()
+    test_excluding_a_lineage_does_not_promote_its_twin()
+    test_one_lucky_step_cannot_capture_the_whole_budget()
+    test_a_scoreless_build_is_charged_once_and_still_bites()
+    test_an_exhausted_batch_still_respects_the_new_family_reserve()
+    test_a_refinement_is_judged_against_its_own_parent()
+    test_momentum_survives_a_diverged_candidate()
 
     print(f"\n{'ALL PASS' if FAILURES == 0 else f'{FAILURES} FAILURE(S)'}")
     return 1 if FAILURES else 0

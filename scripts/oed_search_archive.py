@@ -28,6 +28,7 @@ enough to pay for itself here.
 from __future__ import annotations
 
 import math
+import statistics
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -250,6 +251,20 @@ class SearchArchive:
         self,
         exploration_c: float = 0.3,
         stale_halflife: int = 3,
+        # A CORRECTNESS INVARIANT, not a tuning knob. The learned arms starve
+        # exploration on their own -- widen and new_family are judged against
+        # the archive best, so their measured win rate decays as the archive
+        # improves (to ~0.02 by the last fifth of a campaign) while deepen is
+        # judged against its own parent and stays around 0.68. That asymmetry
+        # is deliberate and load-bearing for depth, but it means nothing in the
+        # bandit stops the search circling known physics.
+        #
+        # Measured over 200 synthetic 80-evaluation campaigns, setting this to
+        # 0 took families opened from 11.0 to 7.3, the chance of ever opening
+        # the true best family from 95% to 60%, and the final score down by
+        # 0.0082 (95% CI [0.0013, 0.0152] -- significant). The hard floor is
+        # the only thing that prevents it. Do not set it to 0 to "let the
+        # bandit decide".
         exploration_floor: int = 8,
         # The values this class's own comments below argue for, and which were
         # never applied: at 1.0/0 an empty strategy cell carries the family's
@@ -332,10 +347,38 @@ class SearchArchive:
         # failed to compile is not as promising as one that did not fail, and
         # without this it looked identical: same depth, same trace, same gain.
         self._chain_failures: Dict[int, int] = {}
-        # A scoreless attempt weighs like one failed trial. Calibrated against
-        # the gain scale: at _gain_weight 60 a typical 1.7% refinement earns
-        # about one pseudo-count, so one failure costing one is symmetric.
-        self._failure_weight = 1.0
+        # A scoreless attempt -- a build that would not compile or a run that
+        # produced no number -- charged ONCE, here.
+        #
+        # It used to be charged through two channels at the same time: this
+        # pseudo-count, plus a `buildable` factor that shrank the quality prior
+        # (which lowers alpha and raises beta together). The effective cost was
+        # ~2.5 trials per failure while this comment claimed one. Removing the
+        # second channel and leaving the weight at 1.0 made the penalty far too
+        # weak to matter -- a chain that was the best model AND had momentum
+        # kept 96% of refinements through six consecutive failed builds,
+        # because nothing else in alpha depends on whether the thing compiles.
+        #
+        # So: one channel, and the weight says what it actually is. 2.5
+        # reproduces the behaviour the two-channel form had (six failures take
+        # a chain from 1.00 to 0.67 of refinements, against 0.76 before) while
+        # being a single number someone can reason about. The real archive's
+        # action mix is unchanged at every weight tried, 1.0 through 6.0.
+        self._failure_weight = 2.5
+        # A refinement that BUILT and SCORED but did not beat the tip is weaker
+        # evidence than one that would not compile -- it still produced a usable
+        # data point and told the search something. Separate constant so raising
+        # the failure weight does not silently retune the stall penalty, which
+        # was calibrated at 1.0 (a five-miss chain drops 86% -> 11%).
+        self._stall_weight = 1.0
+        # Relative tolerance for treating two lineages as the same model.
+        # Sits between measured solver reproducibility (2.2e-6 relative across
+        # three builds of one closure) and the nearest genuinely distinct pair
+        # in the same archive (6.2e-4). See the dedup block in select_action.
+        self._duplicate_rtol = 5e-5
+        # Most one refinement step may contribute, in relative-gain units.
+        # At _gain_weight 60 this is 6 pseudo-counts, twice _lineage_prior.
+        self._max_step_gain = 0.10
         self._lineage_prior = 3.0
         # Applied to RELATIVE gains, so a chain improving ~1.7% per step earns
         # about one pseudo-count per step -- enough to compete with the score
@@ -438,6 +481,63 @@ class SearchArchive:
                 return depth
             cur = nxt
 
+    @staticmethod
+    def _robust_scale(values: List[float]) -> float:
+        """Outlier-proof spread of the archive's lineage scores.
+
+        Median absolute deviation, not the interquartile range. Both are
+        immune to an outlier on a large archive, but the IQR's breakdown point
+        is 25% and a campaign spends its opening on an archive of three or four
+        lineages, where a single diverged closure IS a quarter of the sample.
+        Measured on five lineages spanning 0.090-0.110: one diverged candidate
+        at 5.0 took the IQR from 0.015 to 1.239, and one at 5.2e52 (a real
+        recorded value in this study) took it to 1.3e52 -- the same failure the
+        min-max range had. MAD moved 0.0050 to 0.0075. On the real 39-lineage
+        archive the two agree, so nothing is given up for the robustness.
+
+        Falls back to the IQR only when MAD is zero, which means more than half
+        the lineages are tied on the same score; then to 0.0, which is safe --
+        the caller floors with it, so the denominator reverts to the score's
+        own magnitude.
+        """
+        if len(values) >= 2:
+            median = statistics.median(values)
+            mad = statistics.median([abs(v - median) for v in values])
+            if mad > 0:
+                return mad
+        if len(values) >= 4:
+            q1, _, q3 = statistics.quantiles(values, n=4)
+            if q3 - q1 > 0:
+                return q3 - q1
+        return 0.0
+
+    def _same_model(self, a: float, b: float) -> bool:
+        """Whether two tip scores are the same model to within solver noise.
+
+        Single definition on purpose: the dedup and the batch exclusion used to
+        express this separately, and the exclusion running first is what let a
+        twin be promoted into a slot the dedup had just closed.
+        """
+        return abs(a - b) <= self._duplicate_rtol * max(abs(a), abs(b), 1e-30)
+
+    def _duplicate_group(
+        self, lineages: Dict[int, Dict[str, Any]], root: int
+    ) -> set:
+        """Roots whose tip score is within `_duplicate_rtol` of `root`'s.
+
+        The same equivalence the dedup in select_action uses, factored out so
+        the batch exclusion and the dedup cannot disagree about what "the same
+        model" means.
+        """
+        base = lineages.get(root)
+        if base is None:
+            return set()
+        b = base["best_norm_score"]
+        return {
+            other for other, lin in lineages.items()
+            if self._same_model(b, lin["best_norm_score"])
+        }
+
     def lineages(self) -> Dict[int, Dict[str, Any]]:
         """Every chain in the archive, with the trace the allocator needs.
 
@@ -486,12 +586,43 @@ class SearchArchive:
         out: Dict[int, Dict[str, Any]] = {}
         for root, members in chains.items():
             members = sorted(members, key=lambda m: m["iteration"])
-            # The cap never drops the best member (the population is sorted
-            # best-first before truncation), so the tip is always present.
-            tip = min(members, key=lambda m: m["norm_score"])
             all_scored = sorted(
                 self._chain_scores.get(root, []), key=lambda m: m["iteration"]
             ) or members
+            # The tip comes from the UNCAPPED record, not from the surviving
+            # population members.
+            #
+            # "The cap never drops the best member" is true only WITHIN one
+            # cell, and a lineage stops being confined to one cell as soon as a
+            # refinement is reclassified -- which the DEEPEN prompt actively
+            # causes, since it steers refinements toward
+            # `action_type=experiment` and normalize_strategy bins those as
+            # `sweep`. The parent then sits in a crowded `analytic` cell where
+            # it can be evicted by three unrelated candidates while the child
+            # sits safely in `sweep`.
+            #
+            # Reproduced on a 1->2->3 chain split across two cells: the true
+            # best (iteration 2 at 0.080) was evicted, so `deepen` handed the
+            # proposer iteration 3 at 0.090 -- the WORSE model -- reported
+            # best_norm_score 0.09 (understating the chain's quality
+            # percentile) and a score_trace showing a regression that never
+            # happened.
+            best_rec = min(all_scored, key=lambda m: m["norm_score"])
+            tip = next(
+                (m for m in members if m["iteration"] == best_rec["iteration"]), None
+            )
+            if tip is None:
+                # Evicted from its cell. Rebuild it from the iteration index,
+                # exactly as the no-surviving-member fallback above does.
+                entry = self._by_iteration.get(best_rec["iteration"]) or {}
+                tip = {
+                    "norm_score": best_rec["norm_score"],
+                    "score": best_rec["score"],
+                    "iteration": best_rec["iteration"],
+                    "history_entry": entry,
+                    "lineage_id": root,
+                    "depth": self._depth_of(entry),
+                }
             # A lineage is a TREE, not a sequence.
             #
             # `deepen` hands back the lineage's BEST member, so when a
@@ -526,6 +657,29 @@ class SearchArchive:
             last_gain = 0.0
             if len(history) >= 2:
                 last_gain = history[-2]["norm_score"] - history[-1]["norm_score"]
+            # Scored attempts made AFTER the current best was found.
+            #
+            # Reading momentum off the root->tip path fixed a 3.9x gain
+            # inflation, but it also deleted the only evidence that a chain has
+            # stopped paying. The tip is by definition the chain's best member,
+            # so a refinement that scored but failed to beat it is a sibling
+            # and never appears on the path: `lost` stays 0, `gained` keeps the
+            # value it earned several evaluations ago, and `failures` counts
+            # only SCORELESS attempts. A chain that burned five consecutive
+            # refinements without improving looked identical to one that had
+            # just improved -- and took 87% of deepen on the strength of a gain
+            # made six evaluations back, at ~48 solver runs a refinement.
+            #
+            # Every attempt later than the tip is by construction one that
+            # failed to beat it, so this is the count of consecutive
+            # non-improving refinements. `select_niche` has `stale_visits` for
+            # exactly this at the niche level; the deepen arm had nothing.
+            stalled = sum(1 for m in all_scored if m["iteration"] > tip["iteration"])
+            # The most recent scored attempt, tip or sibling. The proposer
+            # needs this rather than the path delta, which ends at the tip and
+            # therefore reports "improved" for every ordinary regression.
+            last_attempt = max(all_scored, key=lambda m: m["iteration"])
+            last_attempt_regressed = last_attempt["norm_score"] > tip["norm_score"]
             out[root] = {
                 "root_iteration": root,
                 "members": members,
@@ -535,6 +689,9 @@ class SearchArchive:
                 "all_scored": all_scored,
                 "score_trace": trace,
                 "failures": self._chain_failures.get(root, 0),
+                "stalled": stalled,
+                "last_attempt_regressed": last_attempt_regressed,
+                "last_attempt_score": last_attempt["score"],
                 # Length of the actual refinement path, not the max recorded
                 # depth over a star of siblings.
                 "depth": max(0, len(history) - 1),
@@ -632,11 +789,46 @@ class SearchArchive:
                     self.record_action_outcome(action, False)
                 else:
                     norm = self._normalize(value, direction)
+                    # What counts as a win depends on which question the arm
+                    # was answering.
+                    #
+                    # `widen` and `new_family` are bids to find a better model
+                    # than the study has, so the archive best is the right bar.
+                    # `deepen` is not: a refinement's job is to beat ITS OWN
+                    # PARENT, and this method's own design note says a chain
+                    # improving 1.7% per step deserves another pull "even while
+                    # it trails a flat chain that is already better". Scoring it
+                    # against the archive best charged that chain a loss on
+                    # every step of a winning streak.
+                    #
+                    # Measured on the real run: all 5 refinements beat their
+                    # parent, only 3 were credited. Constructed: a chain that
+                    # improved on its parent nine times running, under a
+                    # separate unbeatable elite, taught the deepen arm 0 wins
+                    # and 9 losses -- it fell to 10.8% of decisions while
+                    # `widen` took 77.6% sitting at its untouched coin-flip
+                    # prior. Crediting against the parent puts it at 97.6%.
+                    bar = prior_best
+                    if action == "deepen":
+                        parent_entry = self._by_iteration.get(
+                            h.get("parent_iteration")
+                        ) or {}
+                        parent_score = parent_entry.get("score")
+                        if isinstance(parent_score, dict):
+                            try:
+                                parent_val = float(parent_score.get("value"))
+                            except (TypeError, ValueError):
+                                parent_val = None
+                            if parent_val is not None:
+                                pd = str(parent_score.get("direction", "")).strip().lower()
+                                bar = self._normalize(
+                                    parent_val, pd if pd in ("min", "max") else direction
+                                )
                     # An empty archive has no incumbent to beat, so the first
                     # scored candidate would otherwise always register a win
                     # against inf. It is a baseline, not evidence about the arm.
-                    if prior_best is not None:
-                        self.record_action_outcome(action, norm < prior_best)
+                    if bar is not None:
+                        self.record_action_outcome(action, norm < bar)
             prior_best = min(
                 (n["elite_norm_score"] for n in self.niches.values()
                  if n["elite_norm_score"] is not None),
@@ -851,14 +1043,43 @@ class SearchArchive:
         # visit bump the caller does between picks cannot prevent it, because
         # the deepen path never reads `visits`.
         if exclude_lineages:
+            # Exclude the whole DUPLICATE GROUP, not just the root that was
+            # picked. Excluding one lineage otherwise promotes its own twin:
+            # the batch de-correlation runs before the `_duplicate_rtol` dedup,
+            # so removing the representative simply hands the survivor slot to
+            # the near-identical re-implementation the dedup exists to hide.
+            #
+            # Measured on the real archive: excluding lineage 39 made lineage
+            # 44 selectable, and 44 and 39 differ by 1.6e-7 relative -- three
+            # orders inside the tolerance. 18% of four-candidate batches came
+            # back holding two deepen picks the archive itself calls the same
+            # model, at ~48 solver runs each. Nothing downstream catches it:
+            # the prose fingerprint is exact-match, the family guard only
+            # covers `is_new` picks, and the LLM duplicate check compares
+            # against history rather than against a sibling in the same batch.
+            excluded = set(exclude_lineages)
+            for root in list(excluded):
+                excluded |= self._duplicate_group(lineages, root)
             lineages = {
-                root: lin for root, lin in lineages.items()
-                if root not in set(exclude_lineages)
+                root: lin for root, lin in lineages.items() if root not in excluded
             }
         if not lineages:
+            # No lineage left to refine. That is NOT the same as an empty
+            # archive -- the usual cause is a batch that has already excluded
+            # every lineage there is -- and it must still respect the
+            # new-family budget reserve, which every other path checks.
+            reserve = max(4, int(0.10 * max(1, budget_total)))
+            exhausted = bool(self.niches) and budget_remaining < reserve
             return {"action": "new_family", "family": None, "strategy": None,
                     "is_new": True, "elite": None, "lineage_id": None,
-                    "rationale": "archive is empty; nothing to refine yet"}
+                    "budget_exhausted": exhausted,
+                    "rationale": (
+                        "no lineage left to refine in this batch"
+                        if self.niches else "archive is empty; nothing to refine yet"
+                    ) + (
+                        f"; only {budget_remaining} of a {reserve} reserve remains for a "
+                        f"new mechanism" if exhausted else ""
+                    )}
 
         # Sampled value of deepening each lineage. Beta over "did the last step
         # improve", so a chain with a run of gains is pulled more often, and a
@@ -908,9 +1129,37 @@ class SearchArchive:
         # one: `(hi - lo) or 1.0` then handed 0.0 to EVERY lineage, so the
         # allocator refused to deepen 90% of the time -- which is the state of
         # every campaign for its first few rounds, exactly when the one chain
-        # it has is the only thing worth refining. select_niche already guards
-        # this (`if span <= 0: return 0.5`); select_action did not.
+        # it has is the only thing worth refining. `select_niche` now ranks the
+        # same way -- it had only the tie guard, which covers the degenerate
+        # half of this and not the diverged-outlier half.
         norms = sorted(l["best_norm_score"] for l in lineages.values())
+        # Origin-independent scale for one refinement step, used to floor the
+        # relative-gain denominator below.
+        #
+        # A ROBUST scale, not the min-max range. min-max is set by the two
+        # extremes, and this file already replaced min-max with percentile
+        # rank in `_quality` and `normalized_q` for exactly that reason: in CFD
+        # the extremes are not rare, because a closure that destabilises the
+        # solver returns an enormous error and still gets recorded with a
+        # score. Using the full range as the floor put that sensitivity
+        # straight back into the momentum channel.
+        #
+        # It was not hypothetical or confined to a bad archive. On the real run
+        # the min-max spread is 0.237 against typical scores of 0.113, so the
+        # floor was ALWAYS the active denominator -- the comment claiming Cf
+        # RMSE was unaffected was simply wrong -- and it halved every chain's
+        # momentum: a 1.7% refinement earned 0.47 pseudo-counts where
+        # _gain_weight = 60 is calibrated for about 1.0. Against
+        # _failure_weight 2.5 that let one failed build outweigh five good
+        # refinement steps. One diverged candidate at 5.0 took the same step to
+        # 0.02 pseudo-counts; one at 5.2e52 (a real recorded value in this
+        # study) to 4.6e-54, deleting the channel outright.
+        #
+        # `_robust_scale` restores the intended calibration (about one
+        # pseudo-count for a 1.7% step) and is unmoved by outliers, while still
+        # floating the denominator off zero for a metric that lives near the
+        # origin -- which is what the floor is for.
+        archive_spread = self._robust_scale(norms)
 
         def _quality(norm: float) -> float:
             if len(norms) < 2 or norms[0] == norms[-1]:
@@ -934,12 +1183,31 @@ class SearchArchive:
         # Grouped on the tip score to a relative tolerance, keeping the deepest
         # member as the representative -- if the same model was reached twice,
         # the chain that got further is the one worth continuing.
+        #
+        # The TOLERANCE has to clear solver reproducibility, and 1e-9 does not
+        # come close. Two builds of the same closure do not return bit-identical
+        # numbers: mesh ordering, linear-solver tolerances and the iteration the
+        # run converges on all move the last digits. Measured on
+        # closure_20260826_codex, iterations 44/52/39 are the same b1=0.90
+        # Bradshaw limiter implemented three times and spread by 2.2e-6
+        # relative -- so at 1e-9 they stayed three separate lineages and took
+        # 52% of ALL deepen mass between them. Only the no-op candidates, which
+        # returned the baseline number bit-for-bit, ever collapsed.
+        #
+        # Relative to the score's own magnitude, not to `max(1.0, ...)`: the
+        # latter silently becomes an ABSOLUTE tolerance for any objective
+        # below 1.0, which is every objective we run.
+        #
+        # The band is wide and measured. Clones differ by 2.2e-6 relative; the
+        # nearest genuinely distinct pair in the same archive differs by
+        # 6.2e-4. 5e-5 sits between them with ~23x margin below and ~12x above.
+        # Too tight and clones split the vote; too loose and two real models
+        # merge, and the loser is never offered for refinement again.
         deduped: List[Dict[str, Any]] = []
         for lin in sorted(lineages.values(), key=lambda l: (-l["depth"], l["root_iteration"])):
             twin = next(
                 (d for d in deduped
-                 if abs(d["best_norm_score"] - lin["best_norm_score"])
-                 <= 1e-9 * max(1.0, abs(lin["best_norm_score"]))),
+                 if self._same_model(d["best_norm_score"], lin["best_norm_score"])),
                 None,
             )
             if twin is None:
@@ -967,8 +1235,46 @@ class SearchArchive:
             for i in range(1, len(history)):
                 prev = history[i - 1]["norm_score"]
                 cur = history[i]["norm_score"]
-                denom = abs(prev) or 1.0
-                rel.append((prev - cur) / denom)
+                # Scale a STEP by something that does not depend on where the
+                # objective's zero happens to sit.
+                #
+                # `abs(prev)` alone is only valid for a ratio-scale metric. The
+                # metric proposer is allowed to author correlation, r2, iou,
+                # skill, accuracy and friends (baseline_setup.py lists them,
+                # with `recirculation_region_iou` as a named example), and every
+                # one of those sits near or crosses zero for a poor closure. A
+                # single ordinary refinement of IoU 0.02 -> 0.45 then scores a
+                # relative gain of 21.5, worth 1290 pseudo-counts against a
+                # _lineage_prior of 3.0 -- alpha swamps beta, the draw is ~1.0
+                # deterministically, and measured over 2000 draws 98.2% of every
+                # decision went to the WORST lineage in the archive. Because
+                # `gained` is a property of the whole path, the lock is
+                # permanent: neither `stalled` nor `failures`, both weight 1.0,
+                # can move it.
+                #
+                # The archive's own spread is the origin-independent scale, so
+                # floor the denominator with it. Cf RMSE (~0.07, ratio-scale,
+                # spread ~0.04) is unaffected -- abs(prev) dominates there,
+                # which is the case the relative form was introduced for.
+                denom = max(abs(prev), archive_spread)
+                if denom <= 0:
+                    denom = 1.0
+                # Cap what ONE step can be worth. The floor above stops the
+                # denominator collapsing, but a step of a full archive-spread
+                # still bought 60 pseudo-counts against a prior of 3.0 and left
+                # the worst lineage taking 68% of decisions. _gain_weight's own
+                # calibration says a step should be "enough to compete with the
+                # score prior after two good steps, not enough to override it on
+                # one", so the cap is set to make one exceptional step worth
+                # about twice the prior (0.10 * 60 = 6 pseudo-counts).
+                #
+                # This does not touch normal operation: on the real archive the
+                # action mix is identical at caps of 1.0, 0.25, 0.10 and 0.05
+                # (54/22/24), because Cf RMSE refinements gain ~1.7% and never
+                # come near it. It only bites the near-zero metric case, where
+                # the worst lineage's share drops 68% -> 7%.
+                rel.append(max(-self._max_step_gain,
+                               min(self._max_step_gain, (prev - cur) / denom)))
             gained = sum(max(0.0, g) for g in rel)
             lost = sum(max(0.0, -g) for g in rel)
 
@@ -1002,8 +1308,19 @@ class SearchArchive:
             # understates once a chain has branched.
             scored_n = len(lin.get("all_scored") or lin.get("history") or lin["members"])
             failures = lin.get("failures", 0)
-            buildable = scored_n / float(scored_n + failures) if scored_n else 0.0
-            effective_quality = quality * buildable
+            # A failure is EVIDENCE, and it is charged once, below, as a
+            # pseudo-count in beta. It used to be charged twice: `buildable`
+            # also shrank the quality prior, which lowers alpha and raises beta
+            # by _lineage_prior * (1 - effective_quality) at the same time.
+            # At q=1 with one scored attempt, one failed build took the
+            # posterior mean from 0.800 to 0.417 -- versus 0.667 for the single
+            # pseudo-count the _failure_weight comment describes. One scoreless
+            # build was weighing like ~2.5 failed trials, so two of them buried
+            # a chain that a single bad compile should barely have moved.
+            #
+            # A chain that has never produced a score at all is the one case
+            # where there is no evidence to weigh, so it keeps a zero prior.
+            effective_quality = quality if scored_n else 0.0
 
             alpha = 1.0 + self._lineage_prior * effective_quality + self._gain_weight * gained
             # Failures are counted in PSEUDO-COUNTS, not in relative-gain
@@ -1016,6 +1333,11 @@ class SearchArchive:
                 + self._lineage_prior * (1.0 - effective_quality)
                 + self._gain_weight * lost
                 + self._failure_weight * failures
+                # A refinement that built and scored but did not beat the tip
+                # is evidence against the chain in exactly the way a failed
+                # build is: it consumed a full evaluation and returned nothing
+                # the search can use. Same weight, for the same reason.
+                + self._stall_weight * lin.get("stalled", 0)
             )
             sample = rng.betavariate(alpha, beta)
             if best is None or sample > best[0]:
@@ -1084,10 +1406,19 @@ class SearchArchive:
                 "is_new": False,
                 "depth": lin["depth"],
                 "score_trace": lin["score_trace"],
+                # The path ends at the tip, so its last step is ALWAYS an
+                # improvement and the trace alone can never tell the proposer
+                # that its previous attempt went backwards. These three carry
+                # the sibling evidence the path drops.
+                "last_attempt_regressed": lin.get("last_attempt_regressed", False),
+                "last_attempt_score": lin.get("last_attempt_score"),
+                "stalled": lin.get("stalled", 0),
                 "rationale": (
                     f"lineage rooted at iteration {lin['root_iteration']} is at depth "
                     f"{lin['depth']} with trace {[round(x, 6) for x in lin['score_trace']]}; "
                     f"refining its best member"
+                    + (f"; {lin['stalled']} attempt(s) since it last improved"
+                       if lin.get("stalled") else "")
                 ),
             }
         if chosen == "widen":
@@ -1204,17 +1535,42 @@ class SearchArchive:
         # because 0.001 vs 0.01 is invisible next to an O(1) bonus. Min-max
         # normalize across the niches actually being compared instead, so
         # q sits in [0, 1] (1 = best niche seen) and can actually compete.
-        scored_values = [n["elite_norm_score"] for n in self.niches.values() if n["elite_norm_score"] is not None]
-        lo = min(scored_values) if scored_values else 0.0
-        hi = max(scored_values) if scored_values else 0.0
-        span = hi - lo
+        scored_values = sorted(
+            n["elite_norm_score"] for n in self.niches.values()
+            if n["elite_norm_score"] is not None
+        )
 
         def normalized_q(norm_q: Optional[float]) -> float:
-            if norm_q is None or span <= 0:
+            """Percentile rank among scored niches, 1 = best.
+
+            Rank, not min-max, for the same reason select_action uses rank:
+            min-max is set by the WORST niche, and in CFD the worst is
+            routinely a closure that destabilised the solver and returned an
+            enormous error. One such outlier compresses every real niche toward
+            1.0 and the decision falls to whatever tiebreak comes next.
+
+            Measured on a two-family archive — A decisively best at 0.090 with
+            3 visits, B mediocre at 0.110 with 1 — one diverged candidate moved
+            q from {A: 1.000, B: 0.000} to {A: 1.000, B: 0.996}, and the
+            visit-count exploration gap (~0.09) then chose B over A. It flattens
+            `transferred_q` at the same time, so which of a family's untried
+            strategy cells get offered goes arbitrary too.
+
+            select_action was fixed for this; select_niche was not — and
+            select_niche is the entire `widen` arm.
+            """
+            if (
+                norm_q is None
+                or len(scored_values) < 2
+                or scored_values[0] == scored_values[-1]
+            ):
                 # No signal yet, or every scored niche is tied — neutral,
                 # same footing as a new, never-tried family.
                 return 0.5
-            return 1.0 - (norm_q - lo) / span
+            # Lower norm_score is better for both objective directions.
+            worse = sum(1 for v in scored_values if v > norm_q)
+            ties = sum(1 for v in scored_values if v == norm_q)
+            return (worse + 0.5 * max(0, ties - 1)) / (len(scored_values) - 1)
 
         def stale_penalty(stale_visits: int) -> float:
             """Damp q for a family that keeps being visited without improving.

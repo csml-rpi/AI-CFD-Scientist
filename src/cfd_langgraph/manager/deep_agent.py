@@ -104,10 +104,13 @@ selected case and cannot invent a separate baseline requirement:
      not by a fixed schedule.
 
      When it says DEEPEN, it hands you that lineage's score trace and asks for a
-     refinement. Treat that as the instruction it is: continue the chain in the same
-     direction and change ONE thing, so the next step is attributable. Do not restart the
+     refinement. Change ONE thing, so the next step is attributable, and do not restart the
      mechanism from scratch — a chain that is still improving is the most reliable move
      the search has, and it cannot get deeper if every visit rebuilds from the elite.
+     Whether to continue in the same direction is decided per candidate, not here: each
+     DEEPEN line says either that the last step improved (continue) or that the attempts
+     since then did not beat it (try a different single change from the same parent).
+     Follow the line you were given rather than a general rule.
   c. Launch every returned candidate as a `task` call with subagent_type="oed-candidate-runner"
      — a single message with one task call per candidate, concurrently, same as launching
      cases in step 7. Give each one its full candidate spec from step b, including its
