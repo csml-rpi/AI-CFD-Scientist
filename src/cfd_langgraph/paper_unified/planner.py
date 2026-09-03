@@ -43,7 +43,7 @@ Return ONLY valid JSON.
 
 
 def plan_paper_stage(model: str, planner_input: str) -> Dict[str, Any]:
-    llm = create_langchain_llm(model=model, temperature=0.15)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     msgs = [
         SystemMessage(content=PLANNER_SYSTEM),
         HumanMessage(content=planner_input[:120_000]),

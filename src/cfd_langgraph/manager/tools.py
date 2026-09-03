@@ -2143,7 +2143,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         forced_max_concurrency=settings.max_parallel_cases,
     )
     bundle = KnowledgeBundle(settings.knowledge_bundle_dir)
-    foam_llm = create_langchain_llm(model=settings.model, temperature=0.15)
+    foam_llm = create_langchain_llm(model=settings.model, temperature=0.0)
     state_lock = threading.Lock()
 
     def _now() -> str:
@@ -2947,37 +2947,45 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # requirement, and an open-ended-discovery run replaces per-case
         # launches with the search loop entirely. Publishing zero, by contrast,
         # stops the study dead.
+        # Every requirement is published, including ones the validator never
+        # signed off. It used to exclude them, and hard-fail the stage when
+        # none passed -- which makes the study's survival depend on a verdict
+        # measured to be unreliable: on the approved hypothesis of
+        # runs/ph_codex_20260902_1806 the validator returned 13 issues and then
+        # "valid" on IDENTICAL text, with its issue count going 10 -> 4 -> 13
+        # across rounds. With one approved hypothesis there is one requirement,
+        # so a single unlucky verdict ended the whole run.
+        #
+        # The repair loop still runs its full four rounds, so what is published
+        # is the best text the loop could produce. `requirement_valid` records
+        # the honest verdict for anything downstream that wants it.
         valid = [r for r in out if r.get("requirement_valid")]
         invalid = [r for r in out if not r.get("requirement_valid")]
         draft_path = out_dir / "requirements_draft.json"
         if invalid:
             _write_json(draft_path, out)
-        if not valid:
-            return {
-                "error": "Every generated requirement failed validation; nothing runnable was published.",
-                "invalid_case_ids": [r["case_id"] for r in invalid],
-                "draft_path": str(draft_path),
-            }
         req_path = out_dir / "requirements.json"
-        _write_json(req_path, valid)
+        _write_json(req_path, out)
         _write_checkpoint(
             "requirements_done",
-            {"path": str(req_path), "num_requirements": len(valid), "num_excluded": len(invalid)},
+            {"path": str(req_path), "num_requirements": len(out), "num_unvalidated": len(invalid)},
         )
         _update_study_state(current_stage="requirements")
-        result: Dict[str, Any] = {"num_requirements": len(valid), "path": str(req_path)}
+        result: Dict[str, Any] = {"num_requirements": len(out), "path": str(req_path)}
         if invalid:
             print(
-                f"  [requirements] published {len(valid)}/{len(out)}; excluded "
+                f"  [requirements] published {len(out)}/{len(out)}; "
+                f"{len(invalid)} did not pass validation and were published anyway: "
                 f"{', '.join(r['case_id'] for r in invalid)}",
                 flush=True,
             )
-            result["excluded_case_ids"] = [r["case_id"] for r in invalid]
-            result["excluded_reason"] = (
-                "These failed validation twice and were left out of requirements.json. "
-                "The published requirements are complete and runnable; do NOT regenerate "
-                "requirements to recover them — regenerating rewords every "
-                "user_requirement_text and invalidates any mesh gate already run."
+            result["unvalidated_case_ids"] = [r["case_id"] for r in invalid]
+            result["unvalidated_reason"] = (
+                "These exhausted the repair loop without a passing verdict and were "
+                "published as-is, because the validator is not reliable enough to drop "
+                "work on. Do NOT regenerate requirements to 'fix' them — regenerating "
+                "rewords every user_requirement_text and invalidates any mesh gate "
+                "already run."
             )
             result["draft_path"] = str(draft_path)
         return result

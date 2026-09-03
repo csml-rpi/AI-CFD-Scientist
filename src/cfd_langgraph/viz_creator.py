@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from cfd_langgraph.llm.factory import create_langchain_llm
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 
 
 VIZ_MAX_RETRIES = 10
@@ -157,7 +157,7 @@ def viz_creator(
 
     marker_foam = _ensure_marker_foam(foam_output_dir)
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
 
     script_system = (_PAPER_PYVISTA_ONLY_SYSTEM + "\n\n" + _REFERENCE_DATA_RULE) if paper_pyvista_only else (
         "You write PyVista+matplotlib Python scripts to visualize OpenFOAM cases.\n"
@@ -414,7 +414,7 @@ def viz_creator(
         try:
             viz_resp = llm.invoke(viz_msgs)
             raw = getattr(viz_resp, "content", str(viz_resp))
-            parsed = json.loads(strip_json_fences(raw))
+            parsed = json.loads(extract_json_object(raw))
             viz_ok = bool(parsed.get("viz_acceptable", False))
             reason = str(parsed.get("reason", ""))
         except Exception as e:

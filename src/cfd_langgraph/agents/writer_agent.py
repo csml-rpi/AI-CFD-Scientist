@@ -19,7 +19,7 @@ from cfd_langgraph.agents.paper_reviewer_agent import PaperReviewerAgent
 from cfd_langgraph.paper_utils import compile_tex_to_pdf, extract_pdflatex_errors
 
 _COMPILE_ERR_TAIL_CHARS = 14_000
-from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences, strip_latex_fences
 from cfd_langgraph.refchecker_integration import run_refchecker_on_tex
 
 
@@ -86,7 +86,7 @@ class WriterAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
         self.prompts = prompt_loader.section("WriterAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.2)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
         self.lit_agent = LiteratureSurveyAgent(model=model)
         self.reviewer = PaperReviewerAgent(model=model, prompt_loader=prompt_loader)
 
@@ -121,7 +121,7 @@ class WriterAgent:
                 ("human", usr_t),
             ]
         )
-        chain = prompt | create_langchain_llm(self.model, temperature=0.1)
+        chain = prompt | create_langchain_llm(self.model, temperature=0.0)
 
         collected: List[Dict[str, Any]] = []
         for r in range(1, max(1, total_rounds) + 1):
@@ -133,7 +133,7 @@ class WriterAgent:
                 }
             ).content
             try:
-                parsed = json.loads(strip_json_fences(raw))
+                parsed = json.loads(extract_json_object(raw))
             except Exception:
                 continue
             cites = parsed.get("citations", []) if isinstance(parsed, dict) else []

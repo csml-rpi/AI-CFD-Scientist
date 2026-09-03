@@ -218,7 +218,7 @@ def build_manager(
     checkpoint connection cleanly.
     """
     out_dir = Path(out_dir)
-    model = create_langchain_llm(model=settings.model, temperature=0.2)
+    model = create_langchain_llm(model=settings.model, temperature=0.0)
     _require_tool_calling_support(model, settings)
 
     built = build_manager_tools(settings, out_dir)

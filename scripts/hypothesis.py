@@ -70,7 +70,7 @@ def run_literature_aware_ideation(
     """
     from cfd_langgraph.ideation import build_literature_context, load_prompts, _normalize_to_experiments_schema
     from cfd_langgraph.llm.factory import create_langchain_llm
-    from cfd_langgraph.utils import strip_json_fences
+    from cfd_langgraph.utils import extract_json_object, strip_json_fences
 
     prompts = load_prompts(settings.prompts_path)
     ideation_prompts = prompts["IdeationAgent"]
@@ -133,11 +133,11 @@ def run_literature_aware_ideation(
             f"{mesh_gate_ctx}\n"
         )
 
-    llm = create_langchain_llm(model=settings.model, temperature=0.2)
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
     resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
     try:
-        idea_json = json.loads(strip_json_fences(content))
+        idea_json = json.loads(extract_json_object(content))
     except Exception as exc:
         raise ValueError(f"Ideation JSON parse failed: {exc}") from exc
     if not isinstance(idea_json, dict):

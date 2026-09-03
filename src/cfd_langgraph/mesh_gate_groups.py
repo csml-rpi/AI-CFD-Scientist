@@ -114,7 +114,7 @@ def plan_mesh_refinement_groups_llm(
         "Respond with the structured MeshGateGroupPlan only."
     )
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     try:
         structured = llm.with_structured_output(MeshGateGroupPlan)
         out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])

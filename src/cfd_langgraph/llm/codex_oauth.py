@@ -384,7 +384,21 @@ class CodexResponsesWrapper:
     # connection to be dropped by anything between here and the backend.
     _RETRYABLE_STATUS = (429, 500, 502, 503, 504, 522, 524)
 
-    _MAX_ATTEMPTS = 4
+    # Six attempts over ~7 minutes, not four over fifteen seconds. The old
+    # 2/4/8s ladder was built for a one-off blip and gave up long before any
+    # real fault cleared. Measured across one evening on this account: HTTP 429
+    # rate limiting on the validate call fired immediately after a generate
+    # call, "servers are currently overloaded", a read timeout, three empty
+    # assistant turns, and a response.failed with an OpenAI request id -- none
+    # of which resolve inside fifteen seconds, and every one of them killed a
+    # study stage that had already spent minutes of work.
+    #
+    # A rate-limit window in particular is tens of seconds wide, so the ladder
+    # has to reach into minutes. The cost is a slower failure when something is
+    # genuinely broken; the benefit is not throwing away a stage because a
+    # provider hiccuped for half a minute.
+    _MAX_ATTEMPTS = 6
+    _BACKOFF_SECONDS = (5, 15, 45, 120, 240)
 
     def invoke(
         self,
@@ -447,7 +461,9 @@ class CodexResponsesWrapper:
                     raise
                 last_error = exc
             if attempt < self._MAX_ATTEMPTS:
-                delay = 2 ** attempt
+                delay = self._BACKOFF_SECONDS[
+                    min(attempt - 1, len(self._BACKOFF_SECONDS) - 1)
+                ]
                 print(
                     f"[codex] {type(last_error).__name__} on attempt {attempt}/{self._MAX_ATTEMPTS} "
                     f"({str(last_error)[:80]}); retrying in {delay}s",

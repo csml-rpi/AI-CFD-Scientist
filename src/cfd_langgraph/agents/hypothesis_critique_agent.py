@@ -8,7 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from cfd_langgraph.ideation import build_literature_context
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 
 
 class HypothesisCritiqueAgent:
@@ -23,7 +23,7 @@ class HypothesisCritiqueAgent:
 
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.prompts = prompt_loader.section("IdeationCritiqueAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.15)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
 
     def critique(
         self,
@@ -65,7 +65,7 @@ class HypothesisCritiqueAgent:
         ).content
 
         try:
-            parsed = json.loads(strip_json_fences(raw))
+            parsed = json.loads(extract_json_object(raw))
             if not isinstance(parsed, dict):
                 raise ValueError("not dict")
         except Exception:

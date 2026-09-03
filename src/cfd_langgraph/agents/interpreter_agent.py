@@ -30,7 +30,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 from cfd_langgraph.viz_creator import viz_creator
 
 VIZ_MAX_RETRIES = 10
@@ -81,7 +81,7 @@ class ResultsInterpreterAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
         self.prompts = prompt_loader.section("ResultsInterpreterAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.1)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
 
     @staticmethod
     def _extract_output_dir(experiment_result: Dict[str, Any]) -> Optional[Path]:
@@ -479,7 +479,7 @@ class ResultsInterpreterAgent:
         chain = prompt | self.llm
         content = chain.invoke({"user_requirement": user_req, "solver_log": solver_log_tail}).content
         try:
-            parsed = json.loads(strip_json_fences(content))
+            parsed = json.loads(extract_json_object(content))
         except Exception:
             parsed = {"raw": content, "parse_error": True}
         rc = experiment_results.get("returncode")
@@ -626,7 +626,7 @@ class ResultsInterpreterAgent:
             print("[Interpreter] Invoking vision LLM for interpretation...", flush=True)
         content = self._invoke_vision_llm(user_req, image_paths, system_interp, user_interp)
         try:
-            parsed = json.loads(strip_json_fences(content))
+            parsed = json.loads(extract_json_object(content))
         except Exception:
             parsed = {"raw": content, "parse_error": True}
 

@@ -27,7 +27,7 @@ class LiteratureSurveyAgent:
 
     def __init__(self, model: str):
         self.model = model
-        self.llm = create_langchain_llm(model=model, temperature=0.1)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
         self.s2_api_key = os.environ.get("S2_API_KEY")
         self.brave_api_key = os.environ.get("BRAVE_SEARCH_API_KEY")
 

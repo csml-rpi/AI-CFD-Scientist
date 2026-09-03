@@ -321,7 +321,7 @@ def _llm_pyvista_batch_qoi(
         marker = _ensure_foam_marker(cp.resolve())
         foam_markers[str(cp.resolve())] = str(marker)
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
 
     system_prompt = (
         "You write a single self-contained Python script for PyVista-based OpenFOAM QoI extraction.\n"

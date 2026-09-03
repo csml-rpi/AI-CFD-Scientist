@@ -425,7 +425,7 @@ class CFDIntroductionAgent:
             {"role": "user", "content": user_prompt}
         ]
         
-        materials_methods = self.openai_client.generate_text(messages, max_tokens=1200, temperature=0.5)
+        materials_methods = self.openai_client.generate_text(messages, max_tokens=1200, temperature=0.0)
         
         if materials_methods:
             return materials_methods

@@ -49,7 +49,7 @@ class PromptEvolver:
     ):
         self.bundle = bundle
         self.min_validation_studies = min_validation_studies
-        self.llm = create_langchain_llm(model=model, temperature=0.4)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
 
     def is_active(self) -> bool:
         return self.bundle.is_bootstrapped(self.min_validation_studies)

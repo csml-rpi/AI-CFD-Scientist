@@ -13,7 +13,7 @@ class IdeationAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
         self.prompts = prompt_loader.section("IdeationAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.65)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
 
     def generate_candidates(self, num_calls: int = 1) -> List[Dict[str, Any]]:
         system = "You are an experienced AI researcher in Computational Fluid Dynamics (CFD)."

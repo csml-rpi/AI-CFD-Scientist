@@ -7,7 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 
 
 class HypothesisRankAgent:
@@ -24,7 +24,7 @@ class HypothesisRankAgent:
 
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.prompts = prompt_loader.section("IdeationRankAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.1)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
 
     def rank(self, candidates: List[Dict[str, Any]], research_topic: str = "") -> List[Dict[str, Any]]:
         if len(candidates) <= 1:
@@ -50,7 +50,7 @@ class HypothesisRankAgent:
         raw = (prompt | self.llm).invoke(payload).content
 
         try:
-            parsed = json.loads(strip_json_fences(raw))
+            parsed = json.loads(extract_json_object(raw))
             order = parsed.get("ranking", []) if isinstance(parsed, dict) else []
         except Exception:
             order = []

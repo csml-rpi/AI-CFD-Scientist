@@ -20,7 +20,7 @@ from cfd_langgraph.foam.runner import FoamAgentRunner
 from cfd_langgraph.ideation import run_ideation
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 
 
 class WorkflowState(TypedDict, total=False):
@@ -401,7 +401,7 @@ class CFDWorkflow:
         resp = llm.invoke(prompt.format_messages(payload=json.dumps(user, ensure_ascii=False)) )
         raw = getattr(resp, "content", str(resp))
         try:
-            parsed = json.loads(strip_json_fences(raw))
+            parsed = json.loads(extract_json_object(raw))
         except Exception:
             if verbose:
                 print(f"[rerun] LLM selection parse failed; raw={raw[:2000]}", flush=True)
@@ -455,7 +455,7 @@ class CFDWorkflow:
         resp = llm.invoke(prompt.format_messages(working=working_bundle, failing=failing_bundle))
         raw = getattr(resp, "content", str(resp))
         try:
-            parsed = json.loads(strip_json_fences(raw))
+            parsed = json.loads(extract_json_object(raw))
             diff_report = parsed.get("diff_report")
             if isinstance(diff_report, str) and diff_report.strip():
                 return diff_report.strip()
@@ -559,7 +559,7 @@ class CFDWorkflow:
             try:
                 resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=content)])
                 raw = getattr(resp, "content", str(resp))
-                parsed = json.loads(strip_json_fences(raw))
+                parsed = json.loads(extract_json_object(raw))
                 keep_idx = parsed.get("keep_indices", [])
                 if not isinstance(keep_idx, list):
                     keep_idx = []

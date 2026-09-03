@@ -914,7 +914,7 @@ def _llm_decide_next_action(
     from cfd_langgraph.llm.factory import create_langchain_llm  # type: ignore
     from cfd_langgraph.utils import strip_json_fences  # type: ignore
 
-    llm = create_langchain_llm(model=get_settings().model, temperature=0.3)
+    llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
 
     fp = starter_understanding.get("flow_parameters", {}) or {}
     ref = starter_understanding.get("reference_data", {}) or {}
@@ -2225,7 +2225,7 @@ def _revise_runtime_snippet_with_llm(
         f"Captured log tail (last ~3500 chars):\n{error_context or '(empty)'}\n\n"
         f"Original snippet spec (JSON):\n{json.dumps(spec, indent=2, default=str)[:8000]}\n"
     )
-    llm = create_langchain_llm(model=get_settings().model, temperature=0.1)
+    llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
     try:
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
         text = getattr(raw, "content", str(raw))

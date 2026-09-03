@@ -1123,7 +1123,7 @@ class CFDResearchPaperGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        introduction = self.openai_client.generate_text(messages, max_tokens=target_length*5, temperature=0.6)
+        introduction = self.openai_client.generate_text(messages, max_tokens=target_length*5, temperature=0.0)
         
         if introduction:
             return introduction
@@ -1161,7 +1161,7 @@ class CFDResearchPaperGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        literature_review = self.openai_client.generate_text(messages, max_tokens=2500, temperature=0.5)
+        literature_review = self.openai_client.generate_text(messages, max_tokens=2500, temperature=0.0)
         
         if literature_review:
             return literature_review
@@ -1209,7 +1209,7 @@ class CFDResearchPaperGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        materials_methods = self.openai_client.generate_text(messages, max_tokens=3000, temperature=0.4)
+        materials_methods = self.openai_client.generate_text(messages, max_tokens=3000, temperature=0.0)
         
         if materials_methods:
             return materials_methods
@@ -1261,7 +1261,7 @@ class CFDResearchPaperGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        results_discussion = self.openai_client.generate_text(messages, max_tokens=3500, temperature=0.4)
+        results_discussion = self.openai_client.generate_text(messages, max_tokens=3500, temperature=0.0)
         
         if results_discussion:
             return results_discussion
@@ -1300,7 +1300,7 @@ class CFDResearchPaperGenerator:
             {"role": "user", "content": user_prompt}
         ]
         
-        conclusion = self.openai_client.generate_text(messages, max_tokens=1500, temperature=0.5)
+        conclusion = self.openai_client.generate_text(messages, max_tokens=1500, temperature=0.0)
         
         if conclusion:
             return conclusion

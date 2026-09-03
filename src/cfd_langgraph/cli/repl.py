@@ -4,6 +4,7 @@ import argparse
 import json
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -352,6 +353,15 @@ def _stream_until_interrupt_or_done(
     print("\nDone (or waiting on the next stage). Check the out-dir for artifacts.")
 
 
+# How many times a failed step is retried on its own before the session goes
+# idle and waits for a person. Four in a row, on a minute-scale ladder, covers
+# every transient fault measured so far without letting a genuinely broken
+# study spin.
+_AUTO_RETRY_ATTEMPTS = 4
+_AUTO_RETRY_DELAYS = (60, 120, 240, 480)
+_AUTO_RETRY_MESSAGE = "retry that step"
+
+
 def _drive_study(
     graph: Any,
     payload: Any,
@@ -367,6 +377,7 @@ def _drive_study(
     something, or push the search further. Each follow-up is a new turn on the
     same thread ID, so the whole checkpointed history is still there.
     """
+    auto_retries_left = _AUTO_RETRY_ATTEMPTS
     while True:
         try:
             _stream_until_interrupt_or_done(graph, payload, config, out_dir, ask)
@@ -378,18 +389,57 @@ def _drive_study(
             # restart the process; measured on a real run, a single dropped
             # HTTPS stream after 587s of a `generate_case_requirements` turn
             # killed everything. The checkpoint survives either way, so stay
-            # up and let the user decide: type to retry, or /quit.
+            # up.
             print(f"\n✗ that step failed: {type(exc).__name__}: {exc}", flush=True)
+
+            # Staying up is not the same as continuing, and this used to
+            # conflate them: it printed "type an instruction to continue" and
+            # then blocked on stdin. Overnight there is nobody to type, so a
+            # provider blip that clears in a minute cost the entire night
+            # instead -- observed repeatedly on one evening of 429s, empty
+            # assistant turns, a read timeout and a response.failed, each of
+            # which left a study idle for hours with its checkpoint intact and
+            # nothing driving it.
+            #
+            # The per-call ladders in codex_oauth and factory sit INSIDE one
+            # model call. This is a level above them: once a call has spent its
+            # own retries and the exception propagates, nothing tried again.
+            # Retry the step itself, on a slower ladder, then hand back to the
+            # human -- so an unattended run rides out a transient fault while a
+            # genuinely broken study still stops rather than spinning.
+            if auto_retries_left > 0:
+                attempt = _AUTO_RETRY_ATTEMPTS - auto_retries_left + 1
+                delay = _AUTO_RETRY_DELAYS[
+                    min(attempt - 1, len(_AUTO_RETRY_DELAYS) - 1)
+                ]
+                auto_retries_left -= 1
+                print(
+                    f"  auto-retrying that step in {delay}s "
+                    f"(attempt {attempt}/{_AUTO_RETRY_ATTEMPTS}); "
+                    f"nothing completed is lost. Type anything, or /quit, to take over.",
+                    flush=True,
+                )
+                BOARD.note(f"retrying in {delay}s")
+                time.sleep(delay)
+                BOARD.note("")
+                payload = {"messages": [{"role": "user", "content": _AUTO_RETRY_MESSAGE}]}
+                continue
             print(
-                "  Nothing completed is lost. Type an instruction to continue "
+                "  auto-retries exhausted. Type an instruction to continue "
                 "(e.g. 'retry that step'), or /quit to stop.",
                 flush=True,
             )
+        else:
+            # A turn that got through resets the budget, so a long study is
+            # not capped at four recoveries for its whole life -- only at four
+            # in a row, which is what distinguishes a blip from a wall.
+            auto_retries_left = _AUTO_RETRY_ATTEMPTS
         BOARD.note("idle")
         text = next_message()
         if not text:
             return
         BOARD.note("")
+        auto_retries_left = _AUTO_RETRY_ATTEMPTS
         payload = {"messages": [{"role": "user", "content": text}]}
 
 

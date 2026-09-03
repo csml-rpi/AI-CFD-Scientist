@@ -903,7 +903,7 @@ def run_agent_loop(
         return ("\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n"
                 + keep)
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     started = time.time()
     final_payload: Dict[str, Any] = {}
     aborted_reason = ""

@@ -12,7 +12,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from .config import Settings
 from .llm.factory import create_langchain_llm
 from .literature import LiteratureClient
-from .utils import strip_json_fences
+from .utils import extract_json_object, strip_json_fences
 
 
 def load_prompts(prompts_path: Path) -> Dict[str, Any]:
@@ -133,7 +133,7 @@ def novelty_score_llm(
     )
     resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
     content = resp.content if isinstance(resp.content, str) else str(resp.content)
-    parsed = json.loads(strip_json_fences(content))
+    parsed = json.loads(extract_json_object(content))
     if not isinstance(parsed, dict):
         raise ValueError("novelty evaluator did not return a JSON object")
     value = float(parsed.get("max_similarity_to_prior"))
@@ -426,7 +426,7 @@ def _generate_one_idea(
         last_raw = content
 
         try:
-            idea_json = json.loads(strip_json_fences(content))
+            idea_json = json.loads(extract_json_object(content))
         except Exception:
             idea_json = {"raw_output": content, "parse_error": True}
             novelty_val = 1.0
@@ -550,7 +550,7 @@ def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) 
 
     lit_items = _fetch_literature(settings, research_topic, verbose=verbose)
     literature_context = build_literature_context(lit_items)
-    llm = create_langchain_llm(model=settings.model, temperature=0.2)
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
 
     result = _generate_one_idea(
         llm, ideation_prompts, research_topic, literature_context, lit_items, settings, verbose=verbose
@@ -595,9 +595,14 @@ def run_ideation_batch(
             "Literature-grounded hypothesis generation requires a non-empty literature set."
         )
     literature_context = build_literature_context(lit_items)
-    # Slightly hotter than the single-idea path: candidates should differ
-    # from each other, not just from the literature.
-    llm = create_langchain_llm(model=settings.model, temperature=0.55)
+    # Was 0.55, on the reasoning that candidates should differ from each other
+    # and not just from the literature. Now 0.0 like every other call site: a
+    # study is only reproducible if its verdicts are, and the measured cost of
+    # sampling was a validator that returned 13 issues and then "valid" on
+    # identical text. Diversity between candidates comes from the prompt
+    # instead -- each generation is shown the ones already proposed in this
+    # batch and told to differ from them.
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
 
     candidates: List[Dict[str, Any]] = []
     prior_ideas: List[Dict[str, Any]] = []

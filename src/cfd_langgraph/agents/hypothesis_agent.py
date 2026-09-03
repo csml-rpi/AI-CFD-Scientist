@@ -1,21 +1,33 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Dict, List
 from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
+
+
+# How many times to re-ask the validator when its reply will not parse.
+_VALIDATOR_PARSE_ATTEMPTS = 3
 
 
 class HypothesisAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
         self.prompts = prompt_loader.section("HypothesisAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.3)
-        # Keep validator non-deterministic (LLM semantic QA), but lower-temp than generator.
-        self.validator_llm = create_langchain_llm(model=model, temperature=0.2)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
+        # Temperature 0.0, not 0.2. This is a QA checker, and sampling bought
+        # nothing but disagreement with itself: measured on the approved
+        # hypothesis of runs/ph_codex_20260902_1806, the validator read one
+        # requirement and returned 13 specific issues, then read the IDENTICAL
+        # text and returned valid. Across three rounds its issue count went
+        # 10 -> 4 -> 13 while the text only grew by 161 characters between the
+        # last two. A verdict that unstable makes the repair loop argue with
+        # noise at ~100s a call.
+        self.validator_llm = create_langchain_llm(model=model, temperature=0.0)
 
     def generate_user_requirement(
         self,
@@ -118,29 +130,66 @@ class HypothesisAgent:
         )
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", user)])
         chain = prompt | self.validator_llm
-        raw = chain.invoke({"req": req}).content
 
-        try:
-            parsed = json.loads(strip_json_fences(raw))
-            if not isinstance(parsed, dict):
-                raise ValueError("not dict")
-            parsed.setdefault("valid", False)
-            parsed.setdefault("issues", [])
-            parsed.setdefault("repair_guidance", [])
-            if verbose:
-                print("[Hypothesis] Validation: valid=%s" % parsed.get("valid", False), flush=True)
-            return parsed
-        except Exception as e:
-            if verbose:
-                print("[Hypothesis] Validation parse error: %s" % e, flush=True)
-            return {
-                "valid": False,
-                "issues": ["Validator response was not parseable JSON."],
-                "repair_guidance": [
-                    "Return one complete executable requirement paragraph with solver, time controls, and boundary conditions. Do not include visualization instructions."
-                ],
-                "raw": raw,
-            }
+        # An unreadable reply is not a verdict, and it used to be recorded as
+        # one: any parse failure returned valid=False with the invented issue
+        # "Validator response was not parseable JSON" plus generic repair
+        # guidance. The repair agent then rewrote a requirement nobody had
+        # found a defect in, at ~200s a round, and the rewrite grew the text so
+        # every later validate ran slower. Measured live on
+        # runs/ph_codex_20260902_1806: "Validation parse error: Expecting value:
+        # line 1 column 1 (char 0)" -- an EMPTY body -- charged to the
+        # requirement as a failure. `raw` was captured and never printed, so
+        # nothing in the log distinguished a real rejection from an unread one.
+        #
+        # Retry the call instead. Empty and truncated bodies from the provider
+        # were transient every time we measured them, and _retry_empty_turn
+        # cannot catch these: it fires only when a turn has neither text nor
+        # tool calls, while an empty *string* is a perfectly well-formed reply.
+        last_err = None
+        raw = ""
+        for attempt in range(1, _VALIDATOR_PARSE_ATTEMPTS + 1):
+            raw = chain.invoke({"req": req}).content
+            try:
+                parsed = json.loads(extract_json_object(raw))
+                if not isinstance(parsed, dict):
+                    raise ValueError("not a JSON object")
+                parsed.setdefault("valid", False)
+                parsed.setdefault("issues", [])
+                parsed.setdefault("repair_guidance", [])
+                if verbose:
+                    print("[Hypothesis] Validation: valid=%s" % parsed.get("valid", False), flush=True)
+                return parsed
+            except Exception as e:
+                last_err = e
+                # Always surfaced, verbose or not: this is the difference
+                # between "your requirement is wrong" and "we could not read
+                # the answer", and it was invisible.
+                print(
+                    "[Hypothesis] validator reply unparseable on attempt "
+                    "%d/%d (%s); raw=%r"
+                    % (attempt, _VALIDATOR_PARSE_ATTEMPTS, e, (raw or "")[:200]),
+                    flush=True,
+                )
+                if attempt < _VALIDATOR_PARSE_ATTEMPTS:
+                    time.sleep(2 ** attempt)
+
+        # Still unreadable. Report it as what it is rather than as a defect in
+        # the requirement, and give the repair step nothing to act on -- there
+        # is no finding to repair.
+        print(
+            "[Hypothesis] validator gave no readable verdict after %d attempts; "
+            "treating as unvalidated, not as a defect" % _VALIDATOR_PARSE_ATTEMPTS,
+            flush=True,
+        )
+        return {
+            "valid": False,
+            "parse_failed": True,
+            "issues": [],
+            "repair_guidance": [],
+            "raw": raw,
+            "parse_error": str(last_err),
+        }
 
     def repair_requirement(
         self,
@@ -277,6 +326,14 @@ class HypothesisAgent:
                     "valid": True,
                     "history": history,
                 }
+            if verdict.get("parse_failed"):
+                # No readable verdict means no finding, and repairing against
+                # no finding is a ~200s rewrite of text nobody objected to --
+                # which also grows it and slows every later validate. Go round
+                # again and try to get a verdict instead.
+                if verbose:
+                    print("[Hypothesis] no verdict to act on; re-validating without repair", flush=True)
+                continue
             if verbose:
                 print("[Hypothesis] Repairing requirement...", flush=True)
             req = self.repair_requirement(

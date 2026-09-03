@@ -221,7 +221,12 @@ def _lc_messages_to_dicts(messages: Any) -> List[dict]:
     return out
 
 
-_EMPTY_TURN_ATTEMPTS = 4
+# Same reasoning as the transport-level ladder in codex_oauth: an empty turn
+# arrived three times in a row on the evening this account was also seeing 429s
+# and "servers are overloaded", and a 2/4/8s ladder gives up before any of that
+# clears.
+_EMPTY_TURN_ATTEMPTS = 5
+_EMPTY_TURN_BACKOFF = (5, 15, 45, 120)
 
 
 def _retry_empty_turn(produce, provider: str):
@@ -250,7 +255,9 @@ def _retry_empty_turn(produce, provider: str):
             return text, tool_calls
         last_text, last_calls = text, tool_calls
         if attempt < _EMPTY_TURN_ATTEMPTS:
-            delay = 2 ** attempt
+            delay = _EMPTY_TURN_BACKOFF[
+                min(attempt - 1, len(_EMPTY_TURN_BACKOFF) - 1)
+            ]
             print(
                 f"[{provider}] empty assistant turn (no text, no tool calls) on attempt "
                 f"{attempt}/{_EMPTY_TURN_ATTEMPTS}; retrying in {delay}s",
@@ -1103,7 +1110,48 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
 
         if provider in {"gemini", "google"}:
             from langchain_google_genai import ChatGoogleGenerativeAI
-            inner = ChatGoogleGenerativeAI(model=m, temperature=temperature)
+
+            # Two different backends answer to "gemini": Google AI Studio,
+            # keyed by GOOGLE_API_KEY, and Vertex, keyed by Application
+            # Default Credentials. This used to hardcode the first, so a
+            # machine with working ADC and no API key got
+            # "API key not valid. Please pass a valid API key." for a model
+            # that Vertex serves perfectly well -- measured on
+            # gemini-3.8-flash, which answers :generateContent on Vertex but
+            # 400s on the AI Studio route.
+            #
+            # Pick by what the environment actually has rather than by a
+            # separate provider name: an explicit API key wins, otherwise fall
+            # back to Vertex if a project can be resolved. A study on a GCP box
+            # then needs no extra configuration, and one with a key keeps its
+            # existing behaviour untouched.
+            api_key = (
+                os.environ.get("GOOGLE_API_KEY")
+                or os.environ.get("GEMINI_API_KEY")
+                or ""
+            ).strip()
+            project = ""
+            if not api_key:
+                project = (os.environ.get("GOOGLE_CLOUD_PROJECT") or "").strip()
+                if not project:
+                    try:
+                        import google.auth
+
+                        _, project = google.auth.default(
+                            scopes=["https://www.googleapis.com/auth/cloud-platform"]
+                        )
+                    except Exception:
+                        project = ""
+            if project:
+                inner = ChatGoogleGenerativeAI(
+                    model=m,
+                    temperature=temperature,
+                    vertexai=True,
+                    project=project,
+                    location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
+                )
+            else:
+                inner = ChatGoogleGenerativeAI(model=m, temperature=temperature)
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
 
