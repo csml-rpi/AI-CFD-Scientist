@@ -468,13 +468,17 @@ def test_an_exhausted_endgame_says_so_instead_of_looping() -> None:
           detail=ast.get_source_segment(text, affordable.value) if affordable else "no assign")
 
     # The proposer must not be asked for zero candidates.
+    # Either spelling counts: the call went through `structured_output(...)`
+    # once schema-mismatch salvage was added, and this test is about the
+    # `picks` guard around the paid call, not about how it is spelled.
+    _PROPOSER_CALL = ("with_structured_output", "structured_output(")
     invoke = next((n for n in ast.walk(fn) if isinstance(n, ast.Call)
-                   and "with_structured_output" in (ast.get_source_segment(text, n) or "")), None)
+                   and any(m in (ast.get_source_segment(text, n) or "") for m in _PROPOSER_CALL)), None)
     guarded = False
     for node in ast.walk(fn):
         if isinstance(node, ast.If) and "picks" in ast.dump(node.test):
             seg = ast.get_source_segment(text, node) or ""
-            if "with_structured_output" in seg:
+            if any(m in seg for m in _PROPOSER_CALL):
                 guarded = True
     check("and no proposer call is paid for an empty batch",
           invoke is not None and guarded, detail="LLM invoked without a picks guard")

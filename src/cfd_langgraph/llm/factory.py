@@ -1009,6 +1009,29 @@ def _bedrock_read_timeout() -> int:
     return int(os.environ.get("BEDROCK_READ_TIMEOUT", "300"))
 
 
+# Vertex (Gemini and the third-party MaaS models on the same route) is built
+# below through ChatGoogleGenerativeAI, which defaults to no timeout at all --
+# unlike the Bedrock branch directly above, which has always pinned one. A
+# request Vertex never answers therefore blocks the calling thread forever.
+#
+# That is not hypothetical. On ph_glm_20260902_2340 a candidate agent issued a
+# call at turn 25 and sat in a socket wait for twenty minutes with 15 seconds
+# of CPU burned across a 43-minute lifetime. It happened to be that group's
+# calibration case, which CaseCoordinator runs exclusively, so the study's two
+# other candidates never wrote a byte: one hung HTTP read held everything.
+#
+# The bound is generous because these are genuine long generations -- a
+# code-mod turn emitting a full OpenFOAM model class is minutes of tokens, not
+# seconds -- so this is set to catch a dead connection, not to police slowness.
+# With max_retries the client then retries rather than the study stopping.
+def _vertex_timeout() -> float:
+    return float(os.environ.get("CFD_SCIENTIST_VERTEX_TIMEOUT", "900"))
+
+
+def _vertex_max_retries() -> int:
+    return int(os.environ.get("CFD_SCIENTIST_VERTEX_MAX_RETRIES", "3"))
+
+
 # The union across providers. Each backend accepts a subset and is checked
 # where it is built, because the sets genuinely differ: the ChatGPT/Codex
 # Responses API answered with its own list — none, minimal, low, medium, high,
@@ -1149,9 +1172,16 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     vertexai=True,
                     project=project,
                     location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
+                    timeout=_vertex_timeout(),
+                    max_retries=_vertex_max_retries(),
                 )
             else:
-                inner = ChatGoogleGenerativeAI(model=m, temperature=temperature)
+                inner = ChatGoogleGenerativeAI(
+                    model=m,
+                    temperature=temperature,
+                    timeout=_vertex_timeout(),
+                    max_retries=_vertex_max_retries(),
+                )
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
 
@@ -1235,6 +1265,8 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                 vertexai=True,
                 project=project,
                 location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
+                timeout=_vertex_timeout(),
+                max_retries=_vertex_max_retries(),
             )
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
@@ -1282,7 +1314,12 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
         return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
     if "gemini" in m:
         from langchain_google_genai import ChatGoogleGenerativeAI
-        inner = ChatGoogleGenerativeAI(model=m, temperature=temperature)
+        inner = ChatGoogleGenerativeAI(
+            model=m,
+            temperature=temperature,
+            timeout=_vertex_timeout(),
+            max_retries=_vertex_max_retries(),
+        )
         return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                callbacks=[TOKEN_STATS_HANDLER])
     raise ValueError(f"Unsupported model: {model}")

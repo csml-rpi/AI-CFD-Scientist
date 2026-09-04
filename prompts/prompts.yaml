@@ -850,8 +850,14 @@ MetricProposer:
     candidate model improves over baseline.
 
     RULES:
-      - Propose 2 to 6 metrics covering different aspects (global error,
-        spatial features, profile shape). Avoid redundancy.
+      - Let the topic decide how many. Read what it states as the objective.
+        If it names a single quantity to be optimised, propose that one and
+        stop. Propose more only where the topic itself asks to be judged on
+        more than one thing — then up to 6, each a different aspect (global
+        error, spatial features, profile shape) and none redundant.
+        Every extra metric costs a full comparator-authoring cycle before
+        the search can run its first candidate, and a metric the topic does
+        not ask for buys nothing back.
       - Each metric must be derivable from OpenFOAM output (boundary fields,
         sampling lines, postProcessing function-object outputs, surface
         fields) plus the reference dataset.

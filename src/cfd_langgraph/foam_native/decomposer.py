@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -29,7 +31,7 @@ def decompose_subtasks(
     user = P.DECOMPOSE_USER_PROMPT.format(
         user_requirement=user_requirement, dir_structure=dir_structure, dir_counts_str=dir_counts_str,
     )
-    out: _Subtasks = llm.with_structured_output(_Subtasks).invoke(
+    out: _Subtasks = structured_output(llm, _Subtasks).invoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     return [{"file_name": s.file_name, "folder_name": s.folder_name} for s in out.subtasks]

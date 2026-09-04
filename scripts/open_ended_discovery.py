@@ -41,6 +41,36 @@ from oed_search_archive import SearchArchive
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Suffixes that make a declared reference file a program rather than data. A
+# study may name its authoritative comparator among its reference files -- that
+# is useful, it is what the authored comparator is written from -- but it can
+# never be the thing a comparator is pointed at with --reference.
+_CODE_SUFFIXES = {".py", ".sh", ".pyc", ".ipynb"}
+
+
+def _reference_data_file(ref_files, fallback=None):
+    """The first declared reference file that is DATA, not a program.
+
+    Every comparator is invoked as `--reference <this>` and reads it as a
+    table. Taking ref_files[0] blindly hands over whatever happens to be
+    listed first, and a study that declares its authoritative scorer among
+    its reference files puts a .py there: the comparator then parses Python
+    source as CSV, crashes, and the harness concludes the comparator is
+    broken. Measured on ph_codex_20260902_1806 -- the starter's own scorer,
+    which reproduces the study's stated baseline exactly, was discovered and
+    thrown away on this alone, and a replacement authored in its place.
+
+    Falls back to the old behaviour when every declared file is a program,
+    so a study that declares nothing else is no worse off than before.
+    """
+    data = [f for f in (ref_files or []) if Path(f).suffix.lower() not in _CODE_SUFFIXES]
+    if data:
+        return data[0]
+    if ref_files:
+        return ref_files[0]
+    return fallback
+
+
 def _bootstrap(repo_root: Path) -> None:
     foam_src = repo_root / "Foam-Agent" / "src"
     lang_src = repo_root / "src"
@@ -299,7 +329,23 @@ def _resolve_objective_contract(
     contract_path = disc_dir / "objective_contract.json"
     existing = _read_json(contract_path, {})
     if isinstance(existing, dict) and existing.get("version") == 1:
-        return existing
+        # Only a contract that actually resolved something is worth keeping.
+        # An empty one gets written whenever setup runs before
+        # read_starter_folder's record is complete -- and because the cache
+        # key was the version number alone, that emptiness then survived every
+        # later attempt in the run, however good the starter understanding had
+        # since become. Downstream, `if ... and ref_files:` silently skips
+        # computing the baseline vector, so baseline_score stays null and the
+        # search can never gate. Both ph_glm_20260902_2340 and
+        # ph_gemini38_20260902_2349 died exactly there, hours apart, on
+        # contracts stamped with the fingerprint of an empty topic and an
+        # empty file list.
+        #
+        # Re-derive instead. If the starter understanding still declares
+        # nothing, the rebuild writes the same empty contract and nothing is
+        # lost but a few milliseconds.
+        if existing.get("reference_files"):
+            return existing
 
     ref_info = starter_understanding.get("reference_data", {}) if isinstance(starter_understanding, dict) else {}
     quantities = [str(q).strip() for q in (ref_info.get("quantities", []) or []) if str(q).strip()]
@@ -314,6 +360,19 @@ def _resolve_objective_contract(
     ref_search_roots: List[Path] = []
     if starter_dir and starter_dir.is_dir():
         ref_search_roots.append(starter_dir.resolve())
+        # The starter folder a study is pointed at is usually one case inside a
+        # bundle, with the shared reference data a sibling of it -- and a
+        # declared path is then written relative to the bundle, not the case.
+        # Without this root, "reference_data/ref.csv" resolves under the case
+        # and under the repo, misses at both, and the contract comes out with
+        # no reference files at all: no baseline vector, baseline_score null,
+        # search unable to gate. Observed on ph_glm_20260902_2340, which
+        # declared exactly that path while ph_codex_20260902_1806 happened to
+        # declare absolute ones and worked. The comparator search below
+        # already walks this parent; the reference lookup did not.
+        parent = starter_dir.resolve().parent
+        if parent.is_dir() and parent not in ref_search_roots:
+            ref_search_roots.append(parent)
     ref_search_roots.append(repo_root.resolve())
 
     ref_files_abs: List[str] = []
@@ -3487,7 +3546,7 @@ def run_open_ended_discovery(
                 try:
                     bv = _oedx.compute_metric_vector(
                         case_dir=base_case_p_fast, bound_comparators=bound_fast,
-                        reference_file=ref_files_fast[0],
+                        reference_file=_reference_data_file(ref_files_fast),
                         baseline_final_time=baseline_final_time,
                         metric_specs=_ms_metrics,
                     )
@@ -3620,7 +3679,18 @@ def run_open_ended_discovery(
                 # function's own docstring says it must not walk the repo; the
                 # caller was adding it back. With no starter-local comparator,
                 # finding nothing and authoring one is the correct outcome.
-                ref_for_self = ref_files[0] if ref_files else (starter_dir or repo_root) / "reference.csv"
+                # Every comparator is self-tested by being run with this as
+                # its --reference, so it has to be the reference DATA. Taking
+                # ref_files[0] blindly handed it whatever came first, and a
+                # study that legitimately declares its authoritative scorer
+                # among its reference files puts a .py there: the comparator
+                # then tried to read Python source as CSV, crashed, was judged
+                # broken, and a replacement was authored. Measured on
+                # ph_codex_20260902_1806, where the starter's own scorer --
+                # which reproduces the study's stated baseline exactly -- was
+                # discovered and rejected on this alone, twice over two nights.
+                ref_for_self = _reference_data_file(
+                    ref_files, (starter_dir or repo_root) / "reference.csv")
                 bound = _oedx.resolve_metric_comparators(
                     metrics=specs, search_roots=search_roots,
                     reference_file=ref_for_self, flow_params=starter_understanding.get("flow_parameters", {}) or {},
@@ -3656,7 +3726,7 @@ def run_open_ended_discovery(
                 if base_case_p and base_case_p.is_dir() and ref_files:
                     bv = _oedx.compute_metric_vector(
                         case_dir=base_case_p, bound_comparators=bound,
-                        reference_file=ref_files[0],
+                        reference_file=_reference_data_file(ref_files),
                         baseline_final_time=baseline_final_time,
                         metric_specs=specs,
                     )
@@ -3883,7 +3953,7 @@ def run_open_ended_discovery(
             if ext_state["multi_metric"] and bound and ref_files:
                 try:
                     mv = _oedx.compute_metric_vector(
-                        case_dir=cp, bound_comparators=bound, reference_file=ref_files[0],
+                        case_dir=cp, bound_comparators=bound, reference_file=_reference_data_file(ref_files),
                         baseline_final_time=baseline_final_time,
                         metric_specs=specs,
                     )
@@ -4000,7 +4070,7 @@ def run_open_ended_discovery(
                     try:
                         mv = _oedx.compute_metric_vector(
                             case_dir=cp, bound_comparators=bound,
-                            reference_file=fref[0],
+                            reference_file=_reference_data_file(fref),
                             baseline_final_time=baseline_final_time,
                             metric_specs=specs,
                         )

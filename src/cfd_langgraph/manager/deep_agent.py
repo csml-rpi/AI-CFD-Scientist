@@ -93,6 +93,19 @@ mesh gate driven by one of those approved requirement texts. Then replace the no
 case-launch/interpret steps 7-8 with this loop; the search needs the mesh gate's locked
 selected case and cannot invent a separate baseline requirement:
 
+  a0. The baseline must be a case that has actually been solved: the comparators read
+     real fields off a real mesh, and a directory that merely looks like a case scores
+     nan on every metric. If the case you intend to use has no time directory past 0,
+     call `oed_prepare_baseline(baseline_case_dir)` first and use the `case_dir` it
+     returns. Read the case before you do — if it has no Allrun, that tool asks you for
+     one rather than guessing, and what it needs (the application in controlDict, how
+     the mesh is made, which utilities the setup runs) is only visible in the files.
+     If the case is already solved, that tool says so and changes nothing.
+
+     Never stand in a case's place with a proxy, marker or staging directory, and never
+     point `starter_dir` at a folder this study created. Neither works — the baseline is
+     checked for real solved fields — and both cost hours before the failure surfaces.
+
   a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's selected_level>,
      total_budget=<in SOLVER RUNS, not candidates: a code-mod candidate costs roughly 50 runs on a multi-case benchmark and ~2 on a single-case one, so budget for the number of candidates you want times that — e.g. 2000-4000 for a 40-80 candidate campaign>)` once. It resolves reference data and
      authors the scored comparators every candidate will be judged against, and computes
@@ -161,6 +174,17 @@ selected case and cannot invent a separate baseline requirement:
      oed_score_candidate call already wrote the real result to disk — you're just telling
      this tool where to find them, not re-typing scores). It returns budget_used,
      proceed_count, is_saturated, and the updated archive summary.
+
+     Each candidate record carries a `run_window`: the start and end time the case was
+     actually run over, its latest solved time, and the time its score was taken at. A
+     candidate agent chooses for itself whether to solve cold from t=0 or restart from
+     the starter's converged field, and either can be the right call for a given
+     closure — nothing here decides that for it. But when `scored_field_is_inherited`
+     is true, the score was read from a field the candidate was handed rather than one
+     it computed, and it will sit at the baseline value no matter what the modification
+     does. Read that flag before you believe a "no effect" result, and decide what the
+     candidate needs — re-scoring at its own final time, a cold re-run for parity with
+     how the baseline was solved, or nothing.
   e. Repeat b-d until budget_used reaches the total you set, or is_saturated is true and
      proceed_count is at least 1 (the search has plateaued and you already have a working
      result — stopping earlier than that discards budget for nothing, stopping much later

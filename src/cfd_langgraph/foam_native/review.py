@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -67,7 +69,7 @@ def plan_rewrite(
         foamfiles_xml=foamfiles_xml, error_logs=error_logs,
         review_analysis=review_analysis, user_requirement=user_requirement,
     )
-    out: _RewritePlan = llm.with_structured_output(_RewritePlan).invoke(
+    out: _RewritePlan = structured_output(llm, _RewritePlan).invoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     return [{"file": t.file, "changes": t.changes} for t in out.target_files]

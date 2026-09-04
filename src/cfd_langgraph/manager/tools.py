@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field
 
 from cfd_langgraph.config import Settings, get_settings
+from cfd_langgraph.utils import structured_output
 from cfd_langgraph.hypothesis_pipeline import run_propose_critique_rank
 from cfd_langgraph.knowledge_bundle import KnowledgeBundle
 from cfd_langgraph.llm.factory import create_langchain_llm
@@ -186,7 +187,7 @@ def _llm_duplicate_of(
     if not prior:
         return None
     try:
-        verdict = llm.with_structured_output(_OEDDuplicateVerdict).invoke(
+        verdict = structured_output(llm, _OEDDuplicateVerdict).invoke(
             "You are preventing wasted compute in a scientific search. Each evaluation below "
             "already ran and cost real budget.\n\n"
             "Is the PROPOSED experiment the same experiment as any of them — the same change to "
@@ -220,6 +221,12 @@ _LIT_MIN_PAPERS = 10
 # agent, no compile — so a case that has not reached End in an hour is stuck
 # rather than slow.
 _OED_EVAL_CASE_TIMEOUT_S = 3600
+
+# A baseline solve is the same order of work as one evaluation case — the
+# starter's own periodic-hill case reaches its end time in minutes — but it
+# runs once per study and blocks everything after it, so the fence is looser
+# than the per-candidate one rather than tighter.
+_OED_BASELINE_RUN_TIMEOUT_S = 7200
 
 # How many timed-out evaluation cases before a candidate is abandoned. Two, not
 # one: a single slow case can be the heaviest in the set rather than a verdict
@@ -813,7 +820,7 @@ def _diagnose_null_score(candidate_path: Path, execution_doc: Dict[str, Any],
         from cfd_langgraph.llm.factory import create_langchain_llm
 
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        verdict = llm.with_structured_output(_NullScoreDiagnosis).invoke(
+        verdict = structured_output(llm, _NullScoreDiagnosis).invoke(
             "A candidate model in an automated CFD closure search produced no score.\n"
             "Diagnose it from the evidence below, the way an engineer reading the run "
             "would: what failed, was it the tooling or the model, and is it worth "
@@ -1051,7 +1058,7 @@ def _diagnose_unclean_finish(candidate_path: Path, execution_doc: Dict[str, Any]
         from cfd_langgraph.llm.factory import create_langchain_llm
 
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        verdict = llm.with_structured_output(_UncleanFinishDiagnosis).invoke(
+        verdict = structured_output(llm, _UncleanFinishDiagnosis).invoke(
             "A build agent in an automated CFD closure search stopped before finishing "
             "cleanly. Decide what should happen to its work.\n\n"
             "The question is NOT primarily whether it failed. It is whether what is on "
@@ -1366,6 +1373,120 @@ def _latest_solved_time(case_dir: Path) -> Optional[str]:
     if best is None:
         return None
     return f"{best:g}"
+
+
+def _read_head(path: Path, limit: int) -> str:
+    """The first ``limit`` characters of a file, or "" if it cannot be read."""
+    try:
+        return path.read_text(errors="replace")[:limit]
+    except OSError:
+        return ""
+
+
+def _stream_text(stream: Any) -> str:
+    """A TimeoutExpired's captured stream as text — it may be bytes or None."""
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", errors="replace")
+    return str(stream)
+
+
+_CODE_REFERENCE_SUFFIXES = {".py", ".sh", ".pyc", ".ipynb"}
+
+
+def _reference_data_file(ref_files: List[Path]) -> Optional[Path]:
+    """The first declared reference that is DATA rather than a program.
+
+    Comparators are invoked as ``--reference <this>`` and read it as a table.
+    A study may legitimately declare its authoritative scorer among its
+    reference files -- and when that .py is listed first, taking ref_files[0]
+    hands Python source to something expecting CSV. The same mistake in
+    open_ended_discovery.py made every discovered comparator look broken.
+    """
+    for path in ref_files or []:
+        if path.suffix.lower() not in _CODE_REFERENCE_SUFFIXES:
+            return path
+    return ref_files[0] if ref_files else None
+
+
+def _run_window(case_dir: Path) -> Dict[str, Any]:
+    """When this case was told to start and stop, and what it actually wrote.
+
+    A candidate agent decides for itself how to reach a settled state, and
+    both choices it makes are legitimate: solve cold from t=0 like the
+    baseline did, or restart from the already-converged starter field and run
+    on. Nothing in the pipeline should pick for it -- which state a given
+    closure needs, and from where, is a judgement about that closure.
+
+    What the pipeline must not do is hide the choice. Scoring pins to the
+    baseline's final time, and for a case restarted from that same time the
+    pinned directory holds the field the case was *given*, not the one it
+    produced: on ph_codex_20260902_1806, sa_apg_destruction restarted at 5000,
+    ran to 10000, and scored 0.0042971252419934 against a baseline of
+    0.0042971252419270 -- agreement to thirteen places, because it was being
+    compared with itself. Its own result at 10000 was 0.004102, a 4.5%
+    improvement, and the best number in the study.
+
+    So report the window and let the reader draw the conclusion. When
+    ``scored_at_time`` is at or below ``run_start_time`` the scored field
+    predates anything this candidate computed, and ``scored_field_is_inherited``
+    says so outright.
+    """
+    control = case_dir / "system" / "controlDict"
+    window: Dict[str, Any] = {
+        "run_start_time": None,
+        "run_end_time": None,
+        "latest_solved_time": _latest_solved_time(case_dir),
+    }
+    try:
+        text = control.read_text(errors="replace")
+    except OSError:
+        return window
+    for key, field in (("startTime", "run_start_time"), ("endTime", "run_end_time")):
+        # controlDict is a fixed OpenFOAM dictionary, not model output: this
+        # reads a known keyword from a known file, it does not interpret prose.
+        for line in text.splitlines():
+            parts = line.strip().rstrip(";").split()
+            if len(parts) == 2 and parts[0] == key:
+                try:
+                    window[field] = float(parts[1])
+                except ValueError:
+                    pass
+                break
+    return window
+
+
+def _baseline_case_shape(case_dir: Path) -> Dict[str, Any]:
+    """What a directory actually holds, reported as facts and nothing more.
+
+    A legitimate baseline arrives in either of two shapes and the difference
+    is not something this can decide for the caller: a case the starter ships
+    already solved to its end time, or the files to run one and nothing else.
+    The second has no ``constant/polyMesh`` — blockMesh has not executed yet —
+    so requiring a mesh here would reject a perfectly good baseline. The
+    structural test is only "could this be run at all": a controlDict, a
+    constant directory, and initial fields. An empty proxy directory fails all
+    three, which is the case this exists to catch.
+    """
+    initial = [name for name in ("0", "0.orig") if (case_dir / name).is_dir()]
+    missing: List[str] = []
+    if not (case_dir / "system" / "controlDict").is_file():
+        missing.append("system/controlDict")
+    if not (case_dir / "constant").is_dir():
+        missing.append("constant/")
+    if not initial:
+        missing.append("0/ or 0.orig/")
+    return {
+        "path": str(case_dir),
+        "is_openfoam_case": not missing,
+        "missing": missing,
+        "initial_field_dirs": initial,
+        "has_mesh": (case_dir / "constant" / "polyMesh" / "points").is_file(),
+        "has_allrun": (case_dir / "Allrun").is_file(),
+        "latest_solved_time": _latest_solved_time(case_dir),
+        "stale_logs": sorted(path.name for path in case_dir.glob("log.*") if path.is_file()),
+    }
 
 
 class _EvalProc:
@@ -1711,7 +1832,7 @@ def _literature_query(topic: str, llm: Any) -> Tuple[str, str]:
     if not text:
         return "", ""
     try:
-        decided = llm.with_structured_output(_SearchQuery).invoke(
+        decided = structured_output(llm, _SearchQuery).invoke(
             "Turn this research objective into a literature search query.\n\n"
             "Keep the physics: the flow, the model, the phenomenon, the method. "
             "Drop everything that is specific to how this particular study is run "
@@ -1884,7 +2005,7 @@ def _study_metrics(out_dir: Path, llm: Any) -> List[Dict[str, Any]]:
     prompt = base_prompt
     for attempt in range(1, 4):
         try:
-            decided = llm.with_structured_output(_StudyMetrics).invoke(prompt)
+            decided = structured_output(llm, _StudyMetrics).invoke(prompt)
         except Exception as exc:
             print(f"[study] could not decide the study metric ({type(exc).__name__}: {exc})", flush=True)
             return []
@@ -3542,6 +3663,158 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
     def _oed_disc_dir() -> Path:
         return out_dir / "open_ended_discovery"
 
+    def oed_prepare_baseline(
+        baseline_case_dir: str, allrun_script: str = "", force_rerun: bool = False,
+    ) -> dict:
+        """Get a baseline case into the state OED setup needs — actually
+        solved, real fields on a real mesh — without touching the supplied
+        starter folder.
+
+        Call this before oed_setup_search when the baseline you mean to use
+        has no time directory past 0. A starter ships either shape and only
+        reading it tells you which: a case already solved to its end time, or
+        the files to run one and nothing else.
+
+        Two decisions are left to you on purpose, because a rule cannot make
+        them well:
+
+        * **Whether it needs running.** If the case is already solved this
+          reports that and stops. Pass ``force_rerun=True`` only after reading
+          the case and judging the existing result unusable.
+        * **What the Allrun should contain.** An Allrun already in the case is
+          used exactly as it stands. If there is none, read the case — the
+          application in system/controlDict, whether the mesh comes from
+          blockMesh or is supplied, which utilities the setup needs, whether
+          it decomposes — and pass the script you want as ``allrun_script``.
+          Nothing is inferred on your behalf.
+
+        One thing is handled for you, because getting it wrong fails silently
+        rather than loudly: a leftover ``log.blockMesh`` makes OpenFOAM's
+        runApplication print "already run" and exit 0, so the step is skipped,
+        the run is scored a success, and the numbers come from the previous
+        attempt. Those logs — with ``processor*/`` and ``postProcessing/``,
+        which break decomposePar and poison scoring the same way — are cleared
+        before every run.
+
+        The case is copied to ``<out_dir>/baseline_case`` and solved there, so
+        the starter stays exactly as supplied. Hand the returned ``case_dir``
+        to oed_setup_search as its baseline_case_dir.
+        """
+        source = Path(baseline_case_dir).expanduser()
+        if not source.is_absolute():
+            source = _REPO_ROOT / source
+        source = source.resolve()
+        if not source.is_dir():
+            return {"ok": False, "error": f"baseline_case_dir does not exist: {source}"}
+
+        shape = _baseline_case_shape(source)
+        if not shape["is_openfoam_case"]:
+            return {
+                "ok": False,
+                "error": (
+                    "baseline_case_dir is not an OpenFOAM case — missing "
+                    + ", ".join(shape["missing"])
+                ),
+                "baseline_case_shape": shape,
+            }
+        if shape["latest_solved_time"] and not force_rerun:
+            return {
+                "ok": True,
+                "already_solved": True,
+                "case_dir": str(source),
+                "latest_solved_time": shape["latest_solved_time"],
+                "note": (
+                    "Already solved to this time; nothing was copied or run. Use this "
+                    "case_dir as-is. Pass force_rerun=True only if you have read the case "
+                    "and judged the existing result unusable."
+                ),
+                "baseline_case_shape": shape,
+            }
+
+        target = (out_dir / "baseline_case").resolve()
+        if target.exists():
+            shutil.rmtree(target, ignore_errors=True)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(source, target, symlinks=True)
+        _write_json(target / ".oed_baseline_provenance.json", {
+            "source_case_dir": str(source),
+            "prepared_at": datetime.now(timezone.utc).isoformat(),
+            "reason": (
+                "baseline had no solved time directory; solved out-of-place so the "
+                "supplied starter is left untouched"
+            ),
+        })
+
+        if allrun_script.strip():
+            script = allrun_script if allrun_script.lstrip().startswith("#!") else "#!/bin/sh\n" + allrun_script
+            allrun_path = target / "Allrun"
+            allrun_path.write_text(script)
+            allrun_path.chmod(0o755)
+            allrun_origin = "authored"
+        elif (target / "Allrun").is_file():
+            (target / "Allrun").chmod(0o755)
+            allrun_origin = "existing"
+        else:
+            # Returned rather than guessed: what the run needs is a reading of
+            # this particular case, and the caller is the one that can read it.
+            listing = sorted(
+                str(path.relative_to(target))
+                for path in target.rglob("*")
+                if path.is_file() and ".oed_baseline_provenance" not in path.name
+            )
+            return {
+                "ok": False,
+                "needs_allrun": True,
+                "error": (
+                    "This case has no Allrun and none was supplied. Read the files below, "
+                    "decide what the run needs, and call again with allrun_script set."
+                ),
+                "case_dir": str(target),
+                "case_listing": listing[:300],
+                "control_dict": _read_head(target / "system" / "controlDict", 4000),
+                "baseline_case_shape": shape,
+            }
+
+        # See _clean_stale_run_artifacts' own docstring for why each of the
+        # three artifact kinds it removes has to go before a run, not after.
+        foam_native.loop._clean_stale_run_artifacts(target)
+
+        env = resolve_openfoam_env(settings.openfoam_path)
+        started = time.monotonic()
+        try:
+            proc = subprocess.run(
+                ["./Allrun"], cwd=str(target), env=env,
+                capture_output=True, text=True, timeout=_OED_BASELINE_RUN_TIMEOUT_S,
+            )
+            returncode, timed_out = proc.returncode, False
+            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        except subprocess.TimeoutExpired as exc:
+            returncode, timed_out = -1, True
+            output = _stream_text(exc.stdout) + "\n" + _stream_text(exc.stderr)
+        elapsed = int(time.monotonic() - started)
+        (target / "Allrun.out").write_text(output)
+
+        after = _baseline_case_shape(target)
+        # ``ok`` is the one structural fact — solved fields exist — and not a
+        # verdict on the run. Everything needed to judge the run itself is
+        # returned alongside it, because a nonzero return code with a written
+        # end time and a clean exit with none are both real outcomes that mean
+        # different things.
+        return {
+            "ok": bool(after["latest_solved_time"]) and returncode == 0 and not timed_out,
+            "case_dir": str(target),
+            "source_case_dir": str(source),
+            "allrun_origin": allrun_origin,
+            "allrun_returncode": returncode,
+            "timed_out": timed_out,
+            "elapsed_s": elapsed,
+            "latest_solved_time": after["latest_solved_time"],
+            "has_mesh": after["has_mesh"],
+            "log_files": sorted(path.name for path in target.glob("log.*") if path.is_file()),
+            "allrun_tail": output[-4000:],
+            "baseline_case_shape": after,
+        }
+
     def oed_setup_search(
         topic: str, baseline_case_dir: str = "", total_budget: int = 2000,
         starter_dir: str = "", evaluation_cases: Optional[List[str]] = None,
@@ -3625,7 +3898,17 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # Allowed only for a case inside the starter folder, which is
             # supplied input this study did not produce — so the escape hatch
             # cannot be used to bless a mesh the study refined itself.
-            starter_root = starter_dir or (_read_json(out_dir / "starter_understanding.json") or {}).get("starter_dir", "")
+            # Deliberately NOT ``starter_dir or ...``. This check decides
+            # whether baseline_case_dir is supplied input the study did not
+            # create, and taking the answer from an argument the caller passes
+            # lets the caller nominate its own scratch folder as the trusted
+            # source — which is exactly what happened on run
+            # ph_codex_20260902_1806: starter_dir was set to
+            # runs/<study>/setup_staging, a proxy case was written inside it,
+            # and the provenance check waved it through. The trust root comes
+            # from read_starter_folder's record of the folder the study was
+            # actually given, and from nowhere else.
+            starter_root = (_read_json(out_dir / "starter_understanding.json") or {}).get("starter_dir", "")
             starter_resolved = None
             if starter_root:
                 candidate_root = Path(str(starter_root)).expanduser()
@@ -3636,6 +3919,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 starter_resolved
                 and (baseline_path == starter_resolved or starter_resolved in baseline_path.parents)
             )
+            # An unsolved starter case has to be run before it can be
+            # scored, and running it in place would edit supplied input, so
+            # oed_prepare_baseline solves a copy under out_dir instead. That
+            # copy carries the same prescribed mesh, so accept it when its
+            # provenance names a source inside the starter root. Writing that
+            # provenance file by hand buys nothing — the solved-fields check
+            # below still has to pass, and passing it requires a real case to
+            # have really run.
+            if not inside_starter and baseline_path == (out_dir / "baseline_case").resolve():
+                provenance = _read_json(baseline_path / ".oed_baseline_provenance.json") or {}
+                source_dir = Path(str(provenance.get("source_case_dir", ""))).expanduser()
+                if starter_resolved and str(source_dir):
+                    source_dir = source_dir.resolve()
+                    inside_starter = (
+                        source_dir == starter_resolved or starter_resolved in source_dir.parents
+                    )
             if not prescribed_reason:
                 return {
                     "ok": False,
@@ -3665,6 +3964,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 f"baseline={baseline_path} reason={prescribed_reason[:160]}",
                 flush=True,
             )
+        # Existing as a directory was, until now, the whole of what
+        # baseline_case_dir had to prove — and on run ph_codex_20260902_1806
+        # that was enough for a manager to point setup at a folder holding a
+        # zero-byte case.foam and a text note where the wallShearStress field
+        # belongs. Every comparator then self-tested against it: five metrics,
+        # ten authoring attempts each, every one nan, no baseline score, and
+        # after fifteen hours not one candidate. The comparators read real
+        # fields off a real mesh through pyvista, so that is what the baseline
+        # has to be.
+        baseline_shape = _baseline_case_shape(baseline_path)
+        if not baseline_shape["is_openfoam_case"]:
+            return {
+                "ok": False,
+                "error": (
+                    "baseline_case_dir is not an OpenFOAM case — missing "
+                    + ", ".join(baseline_shape["missing"])
+                    + ". Point this at the real case; a staging or proxy directory "
+                    "cannot be scored no matter what it is named."
+                ),
+                "baseline_case_dir": str(baseline_path),
+                "baseline_case_shape": baseline_shape,
+            }
+        if not baseline_shape["latest_solved_time"]:
+            return {
+                "ok": False,
+                "error": (
+                    "baseline_case_dir is a real case but has never been solved: no time "
+                    "directory past 0, so there are no fields to score and no mesh for the "
+                    "comparators to read. Run it first with oed_prepare_baseline, then call "
+                    "this again with the case_dir that returns."
+                ),
+                "baseline_case_dir": str(baseline_path),
+                "baseline_case_shape": baseline_shape,
+            }
+
         # Resolved before anything is measured: the baseline has to be taken
         # over these same cases, and an invalid case is cheapest to reject now.
         declared_cases_resolved: List[Path] = []
@@ -3774,7 +4108,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         mv_one = _oedx.compute_metric_vector(
                             case_dir=case,
                             bound_comparators=bound,
-                            reference_file=ref_files[0],
+                            reference_file=_reference_data_file(ref_files),
                             metric_specs=specs,
                         )
                         if index == 0:
@@ -4370,7 +4704,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 # per manager retry and can only come back empty.
                 raw_candidates = []
             else:
-                batch = foam_llm.with_structured_output(_OEDCandidateBatch).invoke(prompt)
+                batch = structured_output(foam_llm, _OEDCandidateBatch).invoke(prompt)
                 raw_candidates = [c.model_dump() for c in batch.candidates]
         except Exception as exc:
             # A malformed structured-output response is a transient proposer
@@ -4978,6 +5312,26 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 {**artifact, "bridge_signature": "cfd-open-discovery:bridge:v1"},
             )
             _update_study_state(mode="open_discovery", current_stage="open_ended_discovery")
+
+        # The verdict, on disk. It was previously computed here and returned to
+        # the manager and nowhere else, so nothing outside this call could tell
+        # a study that had finished from one that had merely stopped. On
+        # ph_gemini38_20260902_2349 the manager read search_complete=false,
+        # budget 95 of 3000, is_saturated=false -- and wrote a closing summary
+        # anyway, leaving the session idle at 3% of budget with its best result
+        # at -1.71% against a -30% target. From outside, that looked exactly
+        # like a completed study. Persisting it lets the CLI tell the two
+        # apart; see _search_incomplete in cli/repl.py.
+        _write_json(disc_dir / "search_status.json", {
+            "search_complete": search_complete,
+            "budget_used": budget_used,
+            "budget_total": total_budget,
+            "is_saturated": saturated,
+            "proceed_count": proceed_count,
+            "has_winner": has_winner,
+            "budget_exhausted": budget_exhausted,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
 
         return {
             "budget_used": budget_used,
@@ -6233,6 +6587,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         candidate_dir: str, case_dir: str, action_type: str, variant_name: str,
         model_description: str, target_family: str = "",
         case_dirs: Optional[List[str]] = None,
+        score_at_time: Optional[float] = None,
     ) -> dict:
         """Score one finished OED candidate against the study's baseline and
         write candidate_record.json into candidate_dir — the exact file
@@ -6240,6 +6595,23 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         needs to be retyped or transcribed anywhere. Call this right after
         oed_run_code_mod_candidate or oed_run_experiment_candidate finishes,
         then just report the candidate_dir back in your final message.
+
+        ``score_at_time`` scores the case at a time you choose instead of the
+        study's baseline final time. Leave it unset and nothing changes.
+
+        Reach for it when a record's ``run_window`` reports
+        ``scored_field_is_inherited``. A candidate agent may restart from the
+        starter's converged field rather than solving cold, and the score is
+        otherwise pinned to the baseline's final time — which in that case is
+        the field the candidate was handed, not the one it produced, so the
+        result reads as exactly baseline whatever the closure does. Passing the
+        case's own latest solved time scores what it actually computed.
+
+        Whether that number is the fair one is yours to judge, not this tool's:
+        a warm-started candidate and a cold-solved baseline are not the same
+        protocol, and for some closures that matters and for others it does
+        not. This only makes the number reachable. Re-running cold remains the
+        stricter option and is still available.
 
         ``case_dirs`` scores a candidate on a SET of cases instead of one:
         pass the list oed_run_evaluation_cases returned, and the candidate's
@@ -6458,8 +6830,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     mv_one = _oedx.compute_metric_vector(
                         case_dir=path,
                         bound_comparators=bound,
-                        reference_file=ref_files[0],
+                        reference_file=_reference_data_file(ref_files),
                         metric_specs=specs,
+                        # None keeps the per-spec baseline_final_time that has
+                        # always applied; a value overrides it for this call
+                        # only, and is never written back to the specs.
+                        baseline_final_time=score_at_time,
                     )
                     if path == scored_paths[0]:
                         mv = mv_one
@@ -6665,6 +7041,50 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # evaluation cases all succeeded and decided the outcome instead.
             "evaluation_rescue": evaluation_rescue,
         }
+        # How this case was run, and whether the number above came from it.
+        # Reported, never acted on: cold-start versus restart is the candidate
+        # agent's call and depends on the closure, but a score taken from a
+        # field the candidate inherited rather than computed is not a result,
+        # and until now nothing said which had happened. See _run_window.
+        _window = _run_window(case_path)
+        _scored_at = None
+        if isinstance(metric_vector, dict):
+            _times = metric_vector.get("times_used") or {}
+            if isinstance(_times, dict) and _times:
+                _scored_at = _times.get(metric_name, next(iter(_times.values())))
+        if _scored_at is None:
+            # Unknown rather than assumed. Naming the baseline's time here
+            # would report a time this score may not have come from, which is
+            # the exact confusion this field exists to remove.
+            _scored_at = None
+        _window["scored_at_time"] = _scored_at
+        _window["warm_started"] = bool(
+            _window["run_start_time"] is not None and _window["run_start_time"] > 0
+        )
+        try:
+            _window["scored_field_is_inherited"] = bool(
+                _window["warm_started"]
+                and _scored_at is not None
+                and float(_scored_at) <= float(_window["run_start_time"])
+            )
+        except (TypeError, ValueError):
+            _window["scored_field_is_inherited"] = False
+        if _window["scored_field_is_inherited"]:
+            _window["note"] = (
+                f"This candidate restarted from t={_window['run_start_time']:g} and ran to "
+                f"t={_window['latest_solved_time']}, but the score above was taken at "
+                f"t={_scored_at:g} -- a field it inherited from the starter rather than one "
+                f"it computed. Its own result is at its latest solved time. Re-score there, "
+                f"or re-run the candidate cold from t=0 to match how the baseline was solved, "
+                f"before concluding this modification does nothing."
+            )
+            print(
+                f"[oed] {candidate_path.name}: scored at t={_scored_at:g} but the case ran "
+                f"{_window['run_start_time']:g} -> {_window['latest_solved_time']}; "
+                f"the scored field was inherited, not computed by this candidate.",
+                flush=True,
+            )
+        record["run_window"] = _window
         # A null score always carries a reason.
         #
         # It used to be recorded as bare FAILED with score=None, which is a
@@ -6736,6 +7156,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             interpret_case,
             analyze_all_cases,
             write_paper,
+            oed_prepare_baseline,
             oed_setup_search,
             oed_propose_candidates,
             oed_record_candidate_results,

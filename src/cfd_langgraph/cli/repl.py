@@ -13,6 +13,7 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from cfd_langgraph.config import Settings, get_settings
+from cfd_langgraph.utils import structured_output
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.manager import build_manager
 from cfd_langgraph.cli import ui
@@ -338,7 +339,26 @@ def _stream_until_interrupt_or_done(
     graph: Any, payload: Any, config: Dict[str, Any], out_dir: Path, ask: Asker
 ) -> None:
     pending = _pending_interrupts(graph, config)
-    if not pending:
+    if pending and payload is not None:
+        # The message would otherwise be thrown away. A paused graph cannot be
+        # driven by a fresh input -- it has to be resumed through its pending
+        # interrupts -- and this branch used to just skip the stream call,
+        # taking the payload with it. Silently: the session printed nothing,
+        # the interrupt prompt appeared as if the user had said nothing, and
+        # answering "continue" carried on the plan the message existed to
+        # redirect. Observed on ph_codex_20260902_1806, where an instruction to
+        # stop rebuilding setup_staging vanished and the manager went straight
+        # back to rebuilding setup_staging.
+        #
+        # Write it into the thread's own message channel instead. The pending
+        # calls still resolve first -- they are already in flight and their
+        # results are owed to the model -- but the instruction is sitting in
+        # the history when the model next speaks, which is the whole point of
+        # having typed it.
+        graph.update_state(config, payload)
+        print("  (your message was added to the thread; it takes effect after "
+              "the paused call above resolves)", flush=True)
+    elif not pending:
         for chunk in graph.stream(payload, config=config, stream_mode="updates"):
             _print_update_chunk(chunk)
         pending = _pending_interrupts(graph, config)
@@ -362,6 +382,108 @@ _AUTO_RETRY_DELAYS = (60, 120, 240, 480)
 _AUTO_RETRY_MESSAGE = "retry that step"
 
 
+# How many times in a row the session will restart a search that says it is
+# not finished. Bounded because the point is to survive a manager that stops
+# early, not to argue with one that has genuinely run out of things to try:
+# five nudges that all end the same way is itself the answer.
+_AUTO_CONTINUE_ATTEMPTS = 5
+_AUTO_CONTINUE_MESSAGE = (
+    "You stopped, but the search is not complete. Do not re-run setup and do not "
+    "re-do earlier stages. Call oed_propose_candidates for the next round and "
+    "carry on the loop until the stop conditions actually hold."
+)
+
+
+def _search_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """The search's own verdict when it says it is unfinished, else None.
+
+    oed_record_candidate_results decides `search_complete` from budget and
+    saturation and writes it to search_status.json. This only reads it back.
+    Nothing here judges whether a study should continue -- the study already
+    said, and a manager that stops anyway is contradicting its own tool.
+
+    Returns None when the file is absent, which is every non-open-discovery
+    run and any search that has not recorded a round yet. Those keep the old
+    behaviour of going idle, because for them there is no computed verdict to
+    honour and "finished" is a judgement rather than a fact.
+    """
+    status = None
+    try:
+        raw = (out_dir / "open_ended_discovery" / "search_status.json").read_text()
+        status = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(status, dict) or status.get("search_complete") is not False:
+        return None
+    return status
+
+
+_STAGE_ORDER = (
+    ("routing_done", "routing"),
+    ("literature_done", "literature"),
+    ("hypothesis_done", "hypotheses"),
+    ("requirements_done", "case requirements"),
+    ("metric_setup_done", "metric setup"),
+)
+
+
+def _resume_summary(out_dir: Path) -> List[str]:
+    """Where this study stands, for someone who has just sat down at it.
+
+    Deliberately read off the artifacts on disk rather than the conversation:
+    after a crash or an overnight stall the thread's last words are about
+    whatever failed, while the files say what actually finished.
+    """
+    lines = ["", "  Resuming — nothing runs until you say so.", ""]
+    state = {}
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        pass
+    if state.get("topic"):
+        lines.append(f"  topic         {str(state['topic'])[:96]}")
+    if state.get("current_stage"):
+        lines.append(f"  last stage    {state['current_stage']}")
+
+    done = [
+        label for name, label in _STAGE_ORDER
+        if (out_dir / "checkpoints" / f"{name}.json").is_file()
+    ]
+    lines.append(f"  completed     {', '.join(done) if done else '(nothing checkpointed)'}")
+
+    artifacts = [
+        name for name in (
+            "lit.json", "starter_understanding.json", "requirements.json",
+            "hypotheses_approved.json", "study_metrics.json", "analysis.json",
+        )
+        if (out_dir / name).is_file()
+    ]
+    lines.append(f"  on disk       {', '.join(artifacts) if artifacts else '(none)'}")
+
+    discovery = out_dir / "open_ended_discovery"
+    if discovery.is_dir():
+        history = discovery / "history.json"
+        count = 0
+        try:
+            entries = json.loads(history.read_text())
+            count = len(entries) if isinstance(entries, list) else 0
+        except (OSError, ValueError):
+            pass
+        lines.append(f"  search        {count} candidate(s) recorded")
+
+    cases = out_dir / "cases"
+    if cases.is_dir():
+        lines.append(f"  cases         {len([d for d in cases.iterdir() if d.is_dir()])}")
+
+    lines += [
+        "",
+        "  Tell it which stage to pick up and what to read. Type 'continue' to",
+        "  let it carry on from the checkpoint on its own, or /quit to stop.",
+        "",
+    ]
+    return lines
+
+
 def _drive_study(
     graph: Any,
     payload: Any,
@@ -378,7 +500,33 @@ def _drive_study(
     same thread ID, so the whole checkpointed history is still there.
     """
     auto_retries_left = _AUTO_RETRY_ATTEMPTS
+    auto_continues_left = _AUTO_CONTINUE_ATTEMPTS
     while True:
+        if payload is None:
+            # A resume reaches here with no payload, and handing LangGraph a
+            # None input does not mean "wait for me" -- it means "continue from
+            # the checkpoint". So the manager woke up mid-thought and started
+            # working immediately, before the person who typed `resume` could
+            # say what they wanted done. Measured on run ph_codex_20260902_1806:
+            # 47 tool calls of source-code reading in the first 2m23s, while the
+            # instruction meant to redirect it sat unsent in the input box, and
+            # 24 more after it landed because the model was already committed to
+            # a line of enquiry.
+            #
+            # A resume is a person sitting down at a study, and what they need
+            # first is to see where it stands and say where to go next. So show
+            # that and block. Continuing from the checkpoint untouched is still
+            # one word away -- "continue" -- it is just no longer the default
+            # that happens before anyone can object.
+            for line in _resume_summary(out_dir):
+                print(line, flush=True)
+            BOARD.note("idle")
+            text = next_message()
+            if not text:
+                return
+            BOARD.note("")
+            payload = {"messages": [{"role": "user", "content": text}]}
+            continue
         try:
             _stream_until_interrupt_or_done(graph, payload, config, out_dir, ask)
         except SystemExit:
@@ -434,12 +582,34 @@ def _drive_study(
             # not capped at four recoveries for its whole life -- only at four
             # in a row, which is what distinguishes a blip from a wall.
             auto_retries_left = _AUTO_RETRY_ATTEMPTS
+        # A turn that ends cleanly is not the same as a study that is finished,
+        # and this used to treat them identically -- park, and wait for a human
+        # who is asleep. An open-ended search publishes its own verdict, so
+        # when that verdict says unfinished, say so and carry on rather than
+        # accepting a stop the search itself contradicts.
+        status = _search_incomplete(out_dir)
+        if status is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
+            print(
+                f"\n  the search reports search_complete=false "
+                f"(budget {status.get('budget_used')}/{status.get('budget_total')}, "
+                f"saturated={status.get('is_saturated')}) — continuing it "
+                f"[{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. Type anything, or /quit, to take over.",
+                flush=True,
+            )
+            payload = {"messages": [{"role": "user", "content": _AUTO_CONTINUE_MESSAGE}]}
+            continue
+
         BOARD.note("idle")
         text = next_message()
         if not text:
             return
         BOARD.note("")
         auto_retries_left = _AUTO_RETRY_ATTEMPTS
+        # A person taking over resets the nudge budget: the next stop after
+        # their instruction is a fresh one, not a continuation of the streak.
+        auto_continues_left = _AUTO_CONTINUE_ATTEMPTS
         payload = {"messages": [{"role": "user", "content": text}]}
 
 
@@ -474,7 +644,7 @@ def _llm_extract_hints(topic: str, settings: Settings) -> _PromptHints:
     """
     try:
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        return llm.with_structured_output(_PromptHints).invoke(
+        return structured_output(llm, _PromptHints).invoke(
             "Find any output/working-directory path and any starter/base-case folder path "
             f"mentioned in this text. Return null for whichever isn't mentioned.\n\nText:\n{topic}"
         )

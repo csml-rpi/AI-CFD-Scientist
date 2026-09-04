@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 import json
 import re
 from pathlib import Path
@@ -116,7 +118,7 @@ def plan_mesh_refinement_groups_llm(
 
     llm = create_langchain_llm(model=model, temperature=0.0)
     try:
-        structured = llm.with_structured_output(MeshGateGroupPlan)
+        structured = structured_output(llm, MeshGateGroupPlan)
         out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])
         if isinstance(out, MeshGateGroupPlan) and out.groups:
             return out
@@ -377,7 +379,7 @@ def llm_mesh_gate_pair_convergence(
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        structured = llm.with_structured_output(_MeshGatePairDecision)
+        structured = structured_output(llm, _MeshGatePairDecision)
         out: _MeshGatePairDecision = structured.invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         )

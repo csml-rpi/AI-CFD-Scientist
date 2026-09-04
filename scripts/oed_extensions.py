@@ -858,8 +858,13 @@ def propose_metric_set(
             "enumerate the QUANTITATIVE METRICS that should be tracked to judge "
             "whether a candidate model improves over baseline.\n\n"
             "RULES:\n"
-            "- Propose 2 to 6 metrics covering different aspects (global error, "
-            "spatial features, profile shape). Avoid redundancy.\n"
+            "- Let the topic decide how many. Read what it states as the "
+            "objective. If it names a single quantity to be optimised, propose "
+            "that one and stop. Propose more only where the topic itself asks to "
+            "be judged on more than one thing — then up to 6, each a different "
+            "aspect (global error, spatial features, profile shape) and none "
+            "redundant. Every extra metric costs a full comparator-authoring "
+            "cycle before the search can run its first candidate.\n"
             "- Each metric must be derivable from OpenFOAM output (boundary "
             "fields, sampling lines, postProcessing function-object outputs, "
             "surface fields) plus the reference dataset.\n"
@@ -1566,18 +1571,25 @@ def author_comparator(
         return None
 
 
-def _comparator_supports_baseline_time(comparator: Path, timeout_s: int = 10) -> bool:
-    """Probe `--help` to detect `--baseline-time` support. Comparators shipped
-    by older starters may not accept the flag; we then run without it."""
+def _comparator_supports_flag(comparator: Path, flag: str, timeout_s: int = 10) -> bool:
+    """Probe `--help` to detect support for one flag. Comparators shipped by a
+    starter are hand-written and predate any of these conventions, so every
+    flag is offered rather than assumed."""
     try:
         res = subprocess.run(
             [sys.executable, str(comparator), "--help"],
             capture_output=True, text=True, timeout=timeout_s,
         )
         blob = (res.stdout or "") + "\n" + (res.stderr or "")
-        return "--baseline-time" in blob
+        return flag in blob
     except Exception:
         return False
+
+
+def _comparator_supports_baseline_time(comparator: Path, timeout_s: int = 10) -> bool:
+    """Probe `--help` to detect `--baseline-time` support. Comparators shipped
+    by older starters may not accept the flag; we then run without it."""
+    return _comparator_supports_flag(comparator, "--baseline-time", timeout_s)
 
 
 def _run_comparator_with_optional_baseline_time(
@@ -1587,12 +1599,25 @@ def _run_comparator_with_optional_baseline_time(
     reference_file: Path,
     baseline_time: Optional[float],
     timeout_s: int,
+    metric_name: str = "",
 ) -> "subprocess.CompletedProcess[str]":
     """Run a comparator, forwarding --baseline-time when supported. On any
     error invoking with the flag, retry without it (back-compat)."""
     base_cmd = [sys.executable, str(comparator),
                 "--case", str(case_dir),
                 "--reference", str(reference_file)]
+    # Every reader here scans for `METRIC <metric_name>:`, and the name is
+    # whatever the metric proposer coined this run -- so a comparator the
+    # starter shipped cannot possibly know it, and its output never matches
+    # however correct the number is. Measured on ph_codex_20260902_1806: the
+    # starter's own compare_exactmatch_cf.py, which produces the study's
+    # stated baseline exactly, was discovered, run, judged unusable, and a
+    # replacement authored that came out 1% adrift. Tell the script what to
+    # call the number and it can answer. Offered only to comparators whose
+    # --help advertises the flag, so hand-written ones that predate it are
+    # invoked exactly as before.
+    if metric_name and _comparator_supports_flag(comparator, "--metric-name"):
+        base_cmd += ["--metric-name", metric_name]
     if baseline_time is not None and _comparator_supports_baseline_time(comparator):
         try:
             return subprocess.run(
@@ -1631,7 +1656,7 @@ def selftest_comparator(
     try:
         res = _run_comparator_with_optional_baseline_time(
             comparator=comparator, case_dir=case_dir, reference_file=reference_file,
-            baseline_time=baseline_time, timeout_s=timeout_s,
+            baseline_time=baseline_time, timeout_s=timeout_s, metric_name=metric_name,
         )
     except subprocess.TimeoutExpired:
         return False, "timeout", None
@@ -1841,7 +1866,7 @@ def _selftest_comparator_full(
     try:
         res = _run_comparator_with_optional_baseline_time(
             comparator=comparator, case_dir=case_dir, reference_file=reference_file,
-            baseline_time=baseline_time, timeout_s=timeout_s,
+            baseline_time=baseline_time, timeout_s=timeout_s, metric_name=metric_name,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "value": None, "reason": "timeout",
@@ -2825,7 +2850,7 @@ def compute_metric_vector(
         try:
             res = _run_comparator_with_optional_baseline_time(
                 comparator=sp, case_dir=case_dir, reference_file=reference_file,
-                baseline_time=bt, timeout_s=timeout_s,
+                baseline_time=bt, timeout_s=timeout_s, metric_name=name,
             )
         except Exception as exc:
             errors[name] = f"exec: {exc}"
@@ -2864,7 +2889,25 @@ def compute_metric_vector(
             metrics[name] = float(val_s)
         except Exception:
             errors[name] = f"unparseable: {val_s}"
-    return {"metrics": metrics, "raw_outputs": raw_outputs, "errors": errors}
+    # Which time directory each number actually came from. Parsed here anyway
+    # for the wrong-time checks; it was then dropped, so a caller holding a
+    # score had no way to tell whether it described the case's own result or a
+    # field the case had merely been handed. Returning it costs nothing and is
+    # the difference between a number and a number you can trust.
+    times_used: Dict[str, float] = {}
+    for name, blob in raw_outputs.items():
+        tu = _TIME_USED_RE.search(blob or "")
+        if tu:
+            try:
+                times_used[name] = float(tu.group(1))
+            except ValueError:
+                pass
+    return {
+        "metrics": metrics,
+        "raw_outputs": raw_outputs,
+        "errors": errors,
+        "times_used": times_used,
+    }
 
 
 def render_metric_vector_for_prompt(
