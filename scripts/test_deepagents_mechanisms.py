@@ -29,7 +29,6 @@ from cfd_langgraph.config import get_settings  # noqa: E402
 from cfd_langgraph.ideation import candidate_similarity, normalize_literature_records  # noqa: E402
 from cfd_langgraph.manager import tools as manager_tools_module  # noqa: E402
 from cfd_langgraph.manager.tools import (  # noqa: E402
-    _extract_target_improvement_pct,
     _improvement_pct,
     _run_succeeded,
     build_manager_tools,
@@ -198,8 +197,18 @@ def test_novelty_evaluator_fails_closed() -> None:
 def test_score_and_status_helpers() -> None:
     check("native status-only success is normalized", _run_succeeded({"status": "success"}))
     check("explicit failed success flag is not overridden", not _run_succeeded({"status": "failed", "success": False}))
-    check("topic improvement target is extracted", _extract_target_improvement_pct("targeting >=30% improvement") == 30.0)
-    check("beat-baseline phrasing extracts its percentage target", _extract_target_improvement_pct("beats the baseline Cf error by 25%") == 25.0)
+    # The pattern-matching extractor these exercised is gone: it returned 0 --
+    # "no threshold at all" -- whenever it misread the phrasing, and a 0%
+    # threshold makes any candidate that is not strictly worse a success.
+    # Reading the target is now the model's job (_llm_target_improvement_pct),
+    # so what is worth asserting here is that nothing pattern-matches it.
+    import inspect as _inspect
+    from cfd_langgraph.manager import tools as _tools
+    _src = _inspect.getsource(_tools._llm_target_improvement_pct)
+    check("the improvement target is read by the model, not by a pattern",
+          "re.search" not in _src and "re.match" not in _src)
+    check("and a failed read is reported rather than silently becoming 0%",
+          "WARNING" in _src)
     check("min-direction improvement is positive when error drops", abs(_improvement_pct(0.7, 1.0, "min") - 30.0) < 1e-9)
     check("max-direction improvement is positive when score rises", abs(_improvement_pct(1.3, 1.0, "max") - 30.0) < 1e-9)
     profile = ResourceProfile(wall_clock_s=1.0, peak_used_mem_mb=100.0, avg_cpu_percent=50.0, logical_cores=8)
@@ -1213,7 +1222,22 @@ def test_promotion_does_not_require_an_interpretation_that_cannot_run() -> None:
     )
     check(
         "saturation can complete the search without an interpreter verdict",
-        "saturated and (proceed_count > 0 or bool(improving))" in source,
+        "and (proceed_count > 0 or bool(improving))" in source,
+    )
+    # PROCEED is stamped by oed_score_candidate from the measured score against
+    # the study's target, never by interpret_case, so counting it cannot
+    # recreate the promotion/interpretation deadlock above.
+    check(
+        "PROCEED is a scoring verdict, not an interpretation one",
+        'status = "PROCEED" if target_met else "REVISE"' in source,
+    )
+    # A stated target that no candidate has reached must not be closed out by
+    # saturation while budget remains: ph_codex_20260902_1806 declared itself
+    # complete three times (-4.53%, -7.77%, -25.83%) against a 30% target, and
+    # improved substantially every time it was pushed to continue.
+    check(
+        "an unmet stated target blocks saturation-completion",
+        "target_declared_and_unmet" in source,
     )
     check("only the best are promoted", "promotable = sorted(improving, key=_score_of)[:_OED_MAX_PROMOTED]" in source)
 

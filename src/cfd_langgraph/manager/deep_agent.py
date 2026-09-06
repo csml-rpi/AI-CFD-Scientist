@@ -7,7 +7,10 @@ from typing import Any, Tuple
 from deepagents import FilesystemPermission, create_deep_agent
 
 from cfd_langgraph.config import Settings
-from cfd_langgraph.llm.caching import build_caching_middleware
+from cfd_langgraph.llm.caching import (
+    build_caching_middleware,
+    build_context_middleware,
+)
 from cfd_langgraph.llm.factory import create_langchain_llm
 
 from .control import DENY_BUILTIN_FILESYSTEM_TOOLS, build_interrupt_on
@@ -287,7 +290,14 @@ def build_manager(
         # block across every turn of this run — see llm/caching.py for which
         # providers this actually applies to. No-op (empty list) on providers
         # without a wired middleware, e.g. Gemini/Vertex.
-        middleware=build_caching_middleware(model),
+        middleware=build_caching_middleware(model)
+        # Every tool group, not just the manager's own. A name absent from
+        # the list is not exempt and would be cleared, so passing the union
+        # means a result that somehow reaches this conversation from a
+        # subagent tool is protected rather than silently discarded.
+        + build_context_middleware(
+            model, manager_tools + case_runner_tools + oed_candidate_tools
+        ),
         # Every manager tool is watched for a Ctrl-C-requested pause (see
         # control.py) — cost-free until GLOBAL_INTERRUPT is actually set, and
         # the pause always lands *before* a tool runs, never mid-call, so

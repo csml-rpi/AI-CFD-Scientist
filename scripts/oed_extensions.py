@@ -3340,22 +3340,25 @@ def render_diversity_constraint(
         target = f" (current best family: {current_best_family})" if current_best_family else ""
         return (
             f"\nSEARCH MODE: CLOSE-REFINEMENT{target}.\n"
-            "Propose a small, parameter-level or structural-tweak modification of "
-            "the current best direction. Explore nearby variants of the same "
-            "model family. Goal: incremental improvement.\n"
+            "Propose a modification of the current best direction that stays "
+            "inside its family. Prefer a structural change at the point where "
+            "that model actually loses to the reference over a parameter nudge; "
+            "a coefficient change is worth making when the form is right and "
+            "only a magnitude is off. Goal: incremental improvement.\n"
         )
     seen = ", ".join(families_seen_list) if families_seen_list else "(none yet)"
     return (
         f"\nSEARCH MODE: FAR-FROM-BASELINE.\n"
         f"Families ALREADY explored (do NOT repeat these): {seen}\n"
         "Propose a candidate from a DIFFERENT model family or that touches a "
-        "different equation than any explored above. Acceptable directions "
-        "include: a different turbulence model class entirely (k-ω SST, "
-        "transition models, RSM components), a different equation in the same "
-        "model (production source vs destruction vs diffusion), a fundamentally "
-        "different functional form (anisotropic stress limiter, non-equilibrium "
-        "correction, Reynolds-stress augmentation). Justify the structural "
-        "novelty in your rationale. Goal: escape local optima.\n"
+        "different equation than any explored above. Distance can come from "
+        "any of: a different established model class than the one being "
+        "modified, a different term or equation within the same model, or a "
+        "fundamentally different functional form for the same effect. What "
+        "counts as a family here is set by the research topic and by what the "
+        "archive already lists above, not by any fixed taxonomy — read those "
+        "and go somewhere they do not reach. Justify the structural novelty in "
+        "your rationale. Goal: escape local optima.\n"
     )
 
 
@@ -3384,9 +3387,9 @@ def llm_classify_family(model_description: str, model_class: str = "") -> Option
                     "EQUATION TERM it touches.\n"
                     "Reply with STRICT JSON only: "
                     '{"family": "<short-label>", "equation_touched": "<term>"}.\n'
-                    "The family names the specific mechanism, using its established "
-                    "name where one exists (SA-RC, SA-QCR2000, Kato-Launder, "
-                    "Wray-Agarwal, k-omega-SST, ...). Two modifications share a family "
+                    "The family names the specific mechanism. Give it the name "
+                    "you would use for that mechanism, short enough to be a "
+                    "label. Two modifications share a family "
                     "only if they alter the same mechanism in the same way — the label "
                     "is used to tell approaches apart, so an over-broad one hides real "
                     "differences. equation_touched is one of: production, destruction, "

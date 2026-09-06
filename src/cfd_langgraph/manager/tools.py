@@ -654,11 +654,64 @@ def _set_model_coefficients(case_dir: Path, parameters: Dict[str, float]) -> Dic
 # OpenFOAM models use: lookupOrAddToDict("n", ...), lookupOrDefault<T>("n", ...),
 # getOrDefault<T>/get<T>("n", ...), and readScalar/readLabel(dict.lookup("n")).
 _COEFF_LOOKUP_RE = re.compile(
+    # lookupOrAddToDict("x", ...) / lookupOrDefault<T>("x", ...) / get<T>("x")
     r'(?:lookupOrAddToDict|(?:lookupOrDefault|getOrDefault|get)\s*<[^>]*>)'
     r'\s*\(\s*\n?\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+    # readScalar(coeffs.lookup("x")) / readLabel(coeffs_.lookup("x"))
     r'|\b(?:readScalar|readLabel)\s*\(\s*\w+(?:_|\(\))?\.lookup'
     r'\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+    # coeffDict().template lookup<scalar>("x") -- the templated read. Missed
+    # gemini's best model, which exposes C_esb exactly this way and was
+    # reported as having no tunable coefficient at all, so DEEPEN was told to
+    # rebuild rather than offered the no-build rerun this function exists to
+    # find.
+    r'|\.\s*(?:template\s+)?lookup\s*<[^>]*>\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
+    # coeffDict().found("x") / coeffDict_.found("x") -- how a model offers an
+    # alias or an optional coefficient; if it asks whether the dictionary
+    # carries the name, the name is settable from the dictionary.
+    r'|\bcoeffDict(?:_|\(\))?\s*\.\s*found\s*\(\s*"([A-Za-z_][A-Za-z0-9_]*)"'
 )
+
+
+def _refinement_track_record(history: List[Dict[str, Any]]) -> str:
+    """How refinements have actually gone in THIS study, as a sentence.
+
+    The DEEPEN instruction used to push straight at the elite's runtime
+    coefficients -- "changing one ALONE needs no recompile" -- and then ask for
+    one change without restarting the mechanism. Read as written that is a
+    parameter nudge, and a parameter nudge around an already-good point mostly
+    goes downhill: measured across ph_codex_20260902_1806,
+    ph_glm_20260902_2340 and ph_gemini38_20260902_2349, deepen beat its own
+    parent 0 times in 18, some of it badly (a parent at -0.38% refined to
+    +48%). The allocator did eventually learn and route around the arm, which
+    is the system working -- but it spent about a fifth of the budget learning
+    it, three times over, in three separate studies.
+
+    Rather than assert any of that in the prompt, report what this study has
+    seen. A run with no refinements yet gets no claim either way.
+    """
+    by_iteration = {e.get("iteration"): e for e in history if isinstance(e, dict)}
+
+    def _value(entry: Optional[Dict[str, Any]]) -> Optional[float]:
+        score = (entry or {}).get("score")
+        value = score.get("value") if isinstance(score, dict) else None
+        return value if isinstance(value, (int, float)) else None
+
+    tried = beat = 0
+    for entry in history:
+        if not isinstance(entry, dict) or entry.get("search_action") != "deepen":
+            continue
+        child, parent = _value(entry), _value(by_iteration.get(entry.get("parent_iteration")))
+        if child is None or parent is None:
+            continue
+        tried += 1
+        beat += int(child < parent) if str(entry.get("baseline_direction", "min")) != "max" else int(child > parent)
+    if tried < 3:
+        return ""
+    return (
+        f"In this study {beat} of {tried} refinements have beaten the parent they "
+        f"refined. Weigh that when you decide how large a change to make."
+    )
 
 
 def _runtime_coefficients(case_dir: Path) -> List[str]:
@@ -706,7 +759,7 @@ def _runtime_coefficients(case_dir: Path) -> List[str]:
         # corpus below -- but anything that needs a decision about a candidate
         # belongs in a model call, not a pattern.
         for match in re.finditer(_COEFF_LOOKUP_RE, text):
-            name = match.group(1) or match.group(2)
+            name = next((g for g in match.groups() if g), None)
             if name and name not in names:
                 names.append(name)
     return names
@@ -1138,85 +1191,75 @@ def _diagnose_unclean_finish(candidate_path: Path, execution_doc: Dict[str, Any]
         }
 
 
-def _extract_target_improvement_pct(topic: str) -> float:
-    """Best-effort extraction of an explicit improvement target.
-
-    Returns zero when the topic only asks to beat baseline without naming a
-    margin.  This is intentionally conservative: an arbitrary percentage is
-    never invented.
-    """
-    text = str(topic or "")
-    # A period is allowed through the gap ONLY as a decimal point (followed by
-    # a digit), so an intervening baseline value does not look like the end of
-    # a sentence. Without this, the natural phrasing "beating the baseline
-    # (Cf RMSE 0.004297) by at least 10%" extracted 0% — the decimal point in
-    # the quoted baseline broke the match, leaving the search with no success
-    # threshold at all.
-    gap = r"(?:[^.%\n]|\.(?=\d))"
-    # "by 10%", "by at least 10%", "by more than 10%", "by over 10%", "by >=10%".
-    qual = r"(?:at\s+least\s+|more\s+than\s+|greater\s+than\s+|over\s+|>=\s*|≥\s*|about\s+|around\s+)?"
-    patterns = [
-        rf"(?:beat(?:s|ing)?|outperform(?:s|ing)?)(?:{gap}){{0,80}}?\bby\s*{qual}(\d+(?:\.\d+)?)\s*%",
-        r"(?:target(?:ing)?|at\s+least|>=|≥|by)\s*(\d+(?:\.\d+)?)\s*%\s*(?:improvement|better|reduction)",
-        rf"(?:improv(?:e|ement)|reduc(?:e|tion))(?:{gap}){{0,40}}?{qual}(\d+(?:\.\d+)?)\s*%",
-        r"(\d+(?:\.\d+)?)\s*%\s*(?:improvement|better|reduction)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            try:
-                return max(0.0, float(match.group(1)))
-            except Exception:
-                pass
-    return 0.0
+# Attempts allowed when reading the study's stated improvement target. The
+# answer decides what counts as success, so a transient provider failure
+# must not silently become "no target".
+_TARGET_EXTRACTION_ATTEMPTS = 3
 
 
 def _llm_target_improvement_pct(topic: str, settings: Any) -> float:
     """The success threshold the study's own prompt asks for.
 
-    Read by the model, not by pattern matching. A regex has to anticipate the
-    phrasing, and it silently returns 0 — "no threshold at all" — when it
-    guesses wrong: the natural sentence "beating the unmodified baseline
-    (Cf RMSE 0.004297) by at least 10%" defeated it, because the decimal point
-    in the quoted baseline looked like the end of a sentence. Silence is the
-    worst failure mode here, since a 0% threshold makes any candidate that is
-    not strictly worse count as a success.
+    Read by the model, and only by the model. The pattern-matching fallback
+    that used to sit behind this is gone: it had to anticipate the phrasing,
+    and when it guessed wrong it returned 0 -- "no threshold at all" -- in
+    silence. The natural sentence "beating the unmodified baseline (Cf RMSE
+    0.004297) by at least 10%" defeated it, because the decimal point in the
+    quoted baseline looked like the end of a sentence, and "maximise heat
+    transfer by at least 12%" defeated it too. A wrong 0 here is the worst
+    answer available, since a 0% threshold makes any candidate that is not
+    strictly worse count as a success.
 
-    ``_extract_target_improvement_pct`` remains the fallback for when the model
-    is unavailable or answers unusably.
+    Returns 0.0 for a topic that asks to beat baseline without naming a
+    margin, which is a real answer. It also returns 0.0 when the model cannot
+    be reached after retrying -- there is no better guess to make -- but says
+    so loudly rather than letting a failed call look like a topic with no
+    target.
     """
     from cfd_langgraph.llm.factory import create_langchain_llm
+    from cfd_langgraph.utils import extract_json_object
 
-    fallback = _extract_target_improvement_pct(topic)
-    try:
-        llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        reply = llm.invoke([
-            (
-                "system",
-                "Read a research topic and report the minimum improvement over "
-                "baseline it demands, as a percentage.\n"
-                "Reply with STRICT JSON only: {\"target_improvement_pct\": <number or null>}.\n"
-                "Use null when the topic asks to beat baseline without naming a "
-                "margin. Never invent a margin. A number quoted as the baseline "
-                "VALUE is not a target. Percentages of anything other than the "
-                "improvement over baseline are not the target either.",
-            ),
-            ("user", f"TOPIC:\n{topic}"),
-        ])
-        text = getattr(reply, "content", "")
-        if isinstance(text, list):
-            text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
-        match = re.search(r"\{.*\}", str(text), re.S)
-        if match:
-            value = json.loads(match.group(0)).get("target_improvement_pct")
+    system = (
+        "Read a research topic and report the minimum improvement over "
+        "baseline it demands, as a percentage.\n"
+        'Reply with STRICT JSON only: {"target_improvement_pct": <number or null>}.\n'
+        "Use null when the topic asks to beat baseline without naming a "
+        "margin. Never invent a margin. A number quoted as the baseline "
+        "VALUE is not a target. Percentages of anything other than the "
+        "improvement over baseline are not the target either."
+    )
+    last_error: Optional[Exception] = None
+    for attempt in range(_TARGET_EXTRACTION_ATTEMPTS):
+        try:
+            llm = create_langchain_llm(model=settings.model, temperature=0.0)
+            reply = llm.invoke([("system", system), ("user", f"TOPIC:\n{topic}")])
+            text = getattr(reply, "content", "")
+            if isinstance(text, list):
+                text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
+            # Brace-matched rather than pattern-matched, so a reply that wraps
+            # the object in prose or nests one inside it still parses.
+            value = json.loads(extract_json_object(str(text))).get("target_improvement_pct")
             if value is None:
-                return fallback
+                return 0.0
             parsed = float(value)
             if 0.0 <= parsed <= 100.0:
                 return parsed
-    except Exception as exc:
-        print(f"[oed] improvement-target extraction fell back to pattern matching: {exc}")
-    return fallback
+            last_error = ValueError(f"out-of-range target {parsed}")
+        except Exception as exc:  # noqa: BLE001 - any provider or parse error
+            last_error = exc
+        print(
+            f"[oed] improvement-target extraction attempt "
+            f"{attempt + 1}/{_TARGET_EXTRACTION_ATTEMPTS} failed: {last_error}",
+            flush=True,
+        )
+    print(
+        "[oed] WARNING: could not read this study's improvement target from its "
+        "topic. Treating it as 'beat baseline, no stated margin'. If the topic "
+        "does name a target, success will be judged against 0% until this is "
+        "re-read.",
+        flush=True,
+    )
+    return 0.0
 
 
 def _improvement_pct(value: float, baseline: float, direction: str) -> float:
@@ -4426,6 +4469,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 + f"] {description[:180]}"
                 + (f"  -> {value}" if value is not None else "  -> failed")
             )
+        # Measured here, not asserted in the prompt: how this study's own
+        # refinements have gone. Empty until there are enough to mean anything.
+        refinement_record = _refinement_track_record(history)
         niche_lines = []
         for i, sel in enumerate(picks, 1):
             if sel.get("is_new"):
@@ -4600,15 +4646,36 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                            if sel.get("depth") else "")
                         + f". {started}. The model to change: {formula or '(not recorded)'}. "
                         + (
-                            f"It exposes these coefficients at runtime: {', '.join(coeffs)} — "
-                            f"changing one ALONE needs no recompile, so use "
-                            f"action_type=experiment with parameters and "
-                            f"base_case_dir={elite.get('case_dir', '')}. "
+                            f"Its solved case is at {elite.get('case_dir', '')} — read it. "
+                            "You have a shell and python3 with pyvista and numpy: open the "
+                            "case, read the fields, compare them against the reference this "
+                            "study scores on, and find out WHERE this model loses before you "
+                            "decide what to change. The score is one number over a whole "
+                            "field; the error is not spread evenly through it, and which "
+                            "part of it is bad is the thing that tells you what to fix. Look "
+                            "at what the model's own terms are doing wherever that turns out "
+                            "to be. "
+                            if elite.get("case_dir") else ""
+                        )
+                        + "Then improve the MECHANISM at the place it fails. A different "
+                        "formulation of the same idea, a term that is missing where the "
+                        "error is, a limiter that is binding where it should not, a "
+                        "dependence that is wrong in that region — a structural change you "
+                        "can name a reason for. Keep the idea, rebuild the part of it that "
+                        "is not working. "
+                        + (
+                            f"It also exposes these coefficients at runtime: {', '.join(coeffs)}. "
+                            "A coefficient-only change is cheap (action_type=experiment with "
+                            f"parameters and base_case_dir={elite.get('case_dir', '')}, no "
+                            "recompile) and worth doing when the diagnosis says the form is "
+                            "right and only a magnitude is off — but not as a substitute for "
+                            "looking. "
                             if coeffs else
                             "Use action_type=code_mod. "
                         )
-                        + "Change ONE thing so the next step is attributable, and do not "
-                        "restart the mechanism from scratch."
+                        + "Change one thing at a time so the next step is attributable, and "
+                        "do not restart the mechanism from scratch. "
+                        + refinement_record
                     )
                     continue
                 niche_lines.append(
@@ -5167,7 +5234,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 return False
 
         improving = [h for h in real_evals if _beats_baseline(h)]
-        search_complete = budget_exhausted or (saturated and (proceed_count > 0 or bool(improving)))
+
+        # Saturation is not the same as success, and treating it as such let a
+        # study close itself having missed the objective it was given.
+        #
+        # `proceed_count` counts candidates that actually MET the target (see
+        # `status = "PROCEED" if target_met else "REVISE"`), while `improving`
+        # counts anything merely better than baseline. The old rule accepted
+        # either, so one candidate a hair above baseline was enough to call a
+        # saturated search finished. Measured on ph_codex_20260902_1806, which
+        # asks for 30%: it declared itself complete at -4.53% with 95 of 256
+        # budget spent, again at -7.77%, and again at -25.83% with 1366 of
+        # 3000 spent. Each time it was pushed to continue it improved
+        # substantially, so saturation was wrong on every occasion it fired.
+        #
+        # Saturation still ends a study that has no stated target -- there is
+        # then nothing to be short of -- and a met target still ends one
+        # normally. Budget exhaustion always ends one. Only "gave up early on
+        # a target it was given" changes, and that is the case where the
+        # remaining budget is the whole point.
+        target_pct = float(config.get("target_improvement_pct", 0.0) or 0.0)
+        target_declared_and_unmet = target_pct > 0.0 and proceed_count == 0
+        search_complete = budget_exhausted or (
+            saturated
+            and (proceed_count > 0 or bool(improving))
+            and not target_declared_and_unmet
+        )
+        if saturated and target_declared_and_unmet and not budget_exhausted:
+            print(
+                f"[oed] archive saturated, but this study asks for "
+                f"{target_pct:g}% and no candidate has reached it "
+                f"({budget_used}/{total_budget} budget used). Not treating "
+                f"saturation as completion; propose from families the archive "
+                f"has not reached.",
+                flush=True,
+            )
         has_winner = proceed_count > 0 or bool(improving)
 
         promoted_case_ids: List[str] = []

@@ -5,7 +5,10 @@ from typing import Any, Dict, List
 
 from deepagents import SubAgent
 
-from cfd_langgraph.llm.caching import build_caching_middleware
+from cfd_langgraph.llm.caching import (
+    build_caching_middleware,
+    build_context_middleware,
+)
 
 from .control import DENY_BUILTIN_FILESYSTEM_TOOLS, build_interrupt_on
 
@@ -72,7 +75,7 @@ def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> S
         system_prompt=_build_case_runner_prompt(out_dir),
         tools=tools,
         model=model,
-        middleware=build_caching_middleware(model),
+        middleware=build_caching_middleware(model) + build_context_middleware(model, tools),
         # Same Ctrl-C-driven pause coverage as the manager (see control.py) —
         # matters here even more, since one case can be a dozen-plus
         # sequential tool calls (write each file, then review/rewrite rounds).
@@ -200,7 +203,7 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
         system_prompt=_build_oed_candidate_runner_prompt(out_dir),
         tools=tools,
         model=model,
-        middleware=build_caching_middleware(model),
+        middleware=build_caching_middleware(model) + build_context_middleware(model, tools),
         interrupt_on=build_interrupt_on(tools),
         permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
     )
