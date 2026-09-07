@@ -3799,15 +3799,37 @@ def run_open_ended_discovery(
         # oed_record_candidate_results), so this script's own while-loop
         # below is only reached when it's run standalone (e.g. via
         # orchestrator_run.py), not from that path.
-        _write_json(disc_dir / "baseline_score.json", {
-            "value": baseline_score_value, "direction": baseline_direction,
+        # Deliberately NOT baseline_score.json. That filename means one thing
+        # downstream -- a baseline verified over the same cases candidates are
+        # scored on -- and this stage cannot produce that: it has only the
+        # single baseline case, never the declared evaluation set, which
+        # oed_setup_search scores separately right after this returns.
+        #
+        # Writing the single-case number under that name left a file that
+        # looked authoritative whenever the caller then failed. Measured on
+        # runs/closure_20260906_codex: this stage wrote 0.0208 (CBFS alone),
+        # oed_setup_search hit its "no verified comparator and baseline"
+        # guard and returned without overwriting it, and a two-key
+        # {value, direction} file sat where the seven-key verified one
+        # belongs -- against a true 32-case mean of 0.1136, a factor of five.
+        # The manager then spent 563 grep calls over 90 minutes reading this
+        # source trying to work out why it was blocked.
+        #
+        # Now baseline_score.json exists only when it has been verified, so
+        # every reader of it is safe by construction rather than by
+        # remembering to check a flag.
+        _write_json(disc_dir / "baseline_score_setup_stage.json", {
+            "value": baseline_score_value,
+            "direction": baseline_direction,
+            "verified": False,
+            "measured_over": "the single baseline case, not the evaluation set",
         })
         return {
             "status": "setup_complete",
             "disc_dir": str(disc_dir),
             "objective_contract_path": str(disc_dir / "objective_contract.json"),
             "bound_comparators_path": str(disc_dir / "bound_comparators.json"),
-            "baseline_score_path": str(disc_dir / "baseline_score.json"),
+            "baseline_score_path": str(disc_dir / "baseline_score_setup_stage.json"),
             "ext_state_path": str(disc_dir / "ext_state.json"),
             "baseline_score": baseline_score_value,
             "baseline_direction": baseline_direction,

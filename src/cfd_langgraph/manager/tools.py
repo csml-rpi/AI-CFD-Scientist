@@ -3533,9 +3533,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             timeout=1200,
         )
         decision_path = case_dir / "decision.json"
+        # 20 minutes was set when this call could only fail: every attempt
+        # died on a provider 400 at 8-10 minutes (see codex_oauth's
+        # _content_parts) and nothing ever ran to completion, so the cap was
+        # never tested against real work. A working interpretation is a
+        # vision loop -- up to VIZ_MAX_RETRIES=10 rounds of regenerating
+        # figures and asking the model whether they cover what it needs, each
+        # round allowed 600s on its own -- and it does not fit in 20 minutes.
+        # Measured on case_oed_001: still on retry 1 at 1100s, having already
+        # produced a substantive critique of the first figure set.
+        #
+        # A cap that stops a working interpretation halfway is worse than no
+        # cap: it costs the full runtime and returns nothing. One hour is
+        # generous against the observed loop and still bounds a hang.
         interp_proc = _run_script(
             ["scripts/interpret.py", "--case", str(case_dir), "--figs", str(figs_dir), "--output", str(decision_path)],
-            timeout=1200,
+            timeout=3600,
         )
         decision = _read_json(decision_path) or {}
         if interp_proc.returncode == 0 and decision.get("status") in {"PROCEED", "REVISE", "RERUN"}:
@@ -3546,7 +3559,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 if isinstance(decisions, dict):
                     decisions[case_id] = decision
                     _write_json(bridge_path, bridge)
-        return {
+        result = {
             "case_id": case_id,
             "viz_ok": viz_proc.returncode == 0,
             "interpret_ok": interp_proc.returncode == 0,
@@ -3554,6 +3567,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "reason": decision.get("reason"),
             "path": str(decision_path),
         }
+        # A failed subprocess said why on stderr, and this used to drop it,
+        # reporting only interpret_ok=false with status and reason both null
+        # -- and still handing back a `path` to a file it never wrote.
+        # Measured on ph_codex_20260902_1806: all nine promoted cases failed
+        # this way, each after 8-10 minutes, and the cause was one line
+        # ("TokenRetrievalError: Token has expired") that never reached the
+        # caller. With nothing to act on, the manager spent 40 minutes and
+        # 111 grep calls reading this repository instead of refreshing a
+        # credential. Pass the tail through; an expired token, a missing
+        # figure and a crashed interpreter are different problems.
+        if viz_proc.returncode != 0:
+            result["viz_error"] = (viz_proc.stderr or "")[-2000:]
+        if interp_proc.returncode != 0:
+            result["interpret_error"] = (interp_proc.stderr or "")[-2000:]
+            result["path"] = None
+        return result
 
     def analyze_all_cases(case_ids: List[str], metrics: str = "Cd,Cl,y_plus") -> dict:
         """Cross-case QoI comparison and discussion, across every finished case."""
@@ -5086,6 +5115,60 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             str(h.get("candidate_dir", "")) for h in history if isinstance(h, dict) and h.get("candidate_dir")
         }
 
+        def _score_value(rec: Any) -> Optional[float]:
+            score = rec.get("score") if isinstance(rec, dict) else None
+            if not isinstance(score, dict):
+                return None
+            value = score.get("value")
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            return float(value)
+
+        # `already_recorded` keys on the candidate directory, so a finished
+        # case copied into a second `cand_*` wrapper under a new variant name
+        # enters history twice. Measured on ph_gemini38_20260902_2349:
+        # `sa_enstrophy_core_suppression` (iteration 45) reappeared as
+        # `sa_enstrophy_elite_proceed` (72), and `sa_sls_sensor` (38) as
+        # `sa_sls_elite_proceed` (73). Each duplicate charged its cost to the
+        # budget a second time, gave its family a second archive visit it had
+        # not earned, and -- because both carried a PROCEED stamp from an
+        # earlier, lower target -- closed the search 2386 solver runs early.
+        #
+        # The tell is that the resubmitted case directory is still named after
+        # the candidate it was built for, not after the one submitting it. A
+        # bit-identical score is required as well: scores alone are not an
+        # identity (across these two studies 16 groups of records share one to
+        # every digit -- refits that settle on the parent's coefficients, and
+        # near-baseline modifications that change nothing measurable), and a
+        # case rebuilt under the same name with different coefficients scores
+        # differently and must still be recorded.
+        recorded_by_variant: Dict[str, Dict[str, Any]] = {}
+        for _h in history:
+            if not isinstance(_h, dict):
+                continue
+            _name = str(_h.get("variant_name") or "")
+            if _name and _name not in recorded_by_variant:
+                recorded_by_variant[_name] = _h
+
+        def _resubmitted_case_of(rec: Any) -> Optional[Dict[str, Any]]:
+            if not isinstance(rec, dict):
+                return None
+            case_dir = str(rec.get("case_dir") or "")
+            if not case_dir:
+                return None
+            built_for = Path(case_dir.rstrip("/")).name
+            mine = str(rec.get("variant_name") or "")
+            if not built_for or built_for == mine:
+                return None
+            prior = recorded_by_variant.get(built_for)
+            if prior is None:
+                return None
+            mine_score, prior_score = _score_value(rec), _score_value(prior)
+            if mine_score is None or prior_score is None or mine_score != prior_score:
+                return None
+            return prior
+
+
         # Every finished candidate on disk, not only the ones the manager
         # remembered to pass.
         #
@@ -5140,6 +5223,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             swept.append(found)
         candidate_dirs = list(candidate_dirs) + swept
         repaired: List[str] = []
+        duplicates: List[Dict[str, Any]] = []
 
         missing: List[str] = []
         for cdir in candidate_dirs:
@@ -5184,11 +5268,31 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             except (ValueError, OSError):
                 missing.append(resolved_cdir)
                 continue
+            prior_same = _resubmitted_case_of(record)
+            if prior_same is not None:
+                duplicates.append({
+                    "candidate_dir": resolved_cdir,
+                    "variant_name": str(record.get("variant_name", "")),
+                    "already_recorded_as_iteration": prior_same.get("iteration"),
+                    "already_recorded_as_variant": str(prior_same.get("variant_name", "")),
+                    "score": _score_value(record),
+                })
+                print(
+                    f"[oed] {record.get('variant_name')!r} submits the case built "
+                    f"for {prior_same.get('variant_name')!r} (iteration "
+                    f"{prior_same.get('iteration')}) with an identical score. "
+                    f"Not recording it twice.",
+                    flush=True,
+                )
+                continue
             record["iteration"] = next_iter
             record["candidate_dir"] = resolved_cdir
             next_iter += 1
             history.append(record)
             already_recorded.add(resolved_cdir)
+            name = str(record.get("variant_name") or "")
+            if name:
+                recorded_by_variant.setdefault(name, record)
         _write_json(history_path, history)
 
         config = _read_json(disc_dir / "search_config.json") or {}
@@ -5220,7 +5324,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # acceptable — instead of being a precondition for itself. A candidate
         # that is worse than baseline is still never promoted, and a study
         # where nothing beat baseline still ends with nothing to write up.
-        baseline_value = (_read_json(disc_dir / "baseline_score.json") or {}).get("value")
+        # Only a verified baseline may decide what "beats baseline" means.
+        # An unverified one is either a partial artifact from a setup that did
+        # not finish, or a number measured over a different case set -- and
+        # either way comparing 32-case candidate means against it is arithmetic
+        # rather than evidence. With no verified baseline nothing counts as
+        # improving, so nothing is promoted and the study says so, which is the
+        # honest outcome; oed_setup_search has to complete first.
+        baseline_doc = _read_json(disc_dir / "baseline_score.json") or {}
+        baseline_value = baseline_doc.get("value") if baseline_doc.get("verified") else None
+        if baseline_doc and not baseline_doc.get("verified"):
+            print(
+                "[oed] baseline_score.json is not marked verified, so no candidate "
+                "can be judged against it. Re-run oed_setup_search to completion "
+                "before reading anything into these results.",
+                flush=True,
+            )
         direction = str(config.get("baseline_direction", "min")).strip().lower()
 
         def _beats_baseline(entry: Dict[str, Any]) -> bool:
@@ -5238,12 +5357,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # Saturation is not the same as success, and treating it as such let a
         # study close itself having missed the objective it was given.
         #
-        # `proceed_count` counts candidates that actually MET the target (see
-        # `status = "PROCEED" if target_met else "REVISE"`), while `improving`
-        # counts anything merely better than baseline. The old rule accepted
-        # either, so one candidate a hair above baseline was enough to call a
-        # saturated search finished. Measured on ph_codex_20260902_1806, which
-        # asks for 30%: it declared itself complete at -4.53% with 95 of 256
+        # `target_reached` re-measures each candidate's improvement against the
+        # target in force now, while `improving` counts anything merely better
+        # than baseline. The old rule accepted either, so one candidate a hair
+        # above baseline was enough to call a saturated search finished.
+        # Measured on ph_codex_20260902_1806, which asks for 30%: it
+        # declared itself complete at -4.53% with 95 of 256
         # budget spent, again at -7.77%, and again at -25.83% with 1366 of
         # 3000 spent. Each time it was pushed to continue it improved
         # substantially, so saturation was wrong on every occasion it fired.
@@ -5254,10 +5373,26 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # a target it was given" changes, and that is the case where the
         # remaining budget is the whole point.
         target_pct = float(config.get("target_improvement_pct", 0.0) or 0.0)
-        target_declared_and_unmet = target_pct > 0.0 and proceed_count == 0
+        # Re-measure against the target this study is running under NOW, rather
+        # than trusting each candidate's `status`/`target_met` stamp. Those are
+        # written by oed_score_candidate at the moment that candidate was
+        # scored, against whatever target search_config.json held then, and
+        # they are never revised. Measured on ph_gemini38_20260902_2349: two
+        # result files written Sep 4 under a 5% target (+6.56% and +6.11%,
+        # both stamped PROCEED) were re-submitted a day later, after the target
+        # had been raised to 30%. proceed_count went to 2, this guard stood
+        # down, and the study closed itself at 614 of 3000 budget having
+        # reached 6.56% of a 30% goal. An improvement number is comparable
+        # across targets; a PROCEED stamp is not.
+        target_reached = any(
+            isinstance(h.get("improvement_pct"), (int, float))
+            and float(h["improvement_pct"]) >= target_pct
+            for h in real_evals
+        )
+        target_declared_and_unmet = target_pct > 0.0 and not target_reached
         search_complete = budget_exhausted or (
             saturated
-            and (proceed_count > 0 or bool(improving))
+            and (target_reached or bool(improving))
             and not target_declared_and_unmet
         )
         if saturated and target_declared_and_unmet and not budget_exhausted:
@@ -5269,7 +5404,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 f"has not reached.",
                 flush=True,
             )
-        has_winner = proceed_count > 0 or bool(improving)
+        has_winner = target_reached or bool(improving)
 
         promoted_case_ids: List[str] = []
         if search_complete and has_winner:
@@ -5455,6 +5590,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # Already in history as null-scored, now corrected in place from a
             # repair that succeeded after they were first recorded.
             "repaired_since_recorded": repaired,
+            # Not recorded because their score is bit-identical to a candidate
+            # already in history -- the same solve resubmitted under a second
+            # variant name. Reported rather than dropped silently, so a real
+            # collision would be visible instead of looking like a lost result.
+            "duplicate_solves_skipped": duplicates,
             "history_path": str(history_path),
             "case_ids_to_interpret": promoted_case_ids,
         }

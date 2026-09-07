@@ -293,11 +293,58 @@ class CodexResponsesWrapper:
         return _StructuredWrapper()
 
     @staticmethod
+    def _content_parts(content: Any) -> List[Dict[str, Any]]:
+        """Translate one message's content into Responses API parts.
+
+        A LangChain message's content is either a string or a list of typed
+        blocks -- text plus images, which is how any vision call is expressed.
+        This used to wrap whatever it was found in a single input_text part,
+        so a list went into a field the API requires to be a string:
+
+            HTTP 400 ... Invalid type for 'input[1].content[0].text':
+            expected a string, but got an array instead.
+
+        Measured on ph_codex_20260902_1806: the results interpreter shows the
+        model its diagnostic figures, so every one of its calls is multimodal.
+        All nine promoted cases failed here, each after eight to ten minutes
+        of figure generation that then had nowhere to go, and the study could
+        not reach its write-up. Nothing about the images was wrong -- they
+        were never validly encoded into the request.
+        """
+        if not isinstance(content, list):
+            return [{"type": "input_text", "text": "" if content is None else str(content)}]
+        parts: List[Dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, str):
+                if block:
+                    parts.append({"type": "input_text", "text": block})
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in {"text", "input_text", "output_text"}:
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    parts.append({"type": "input_text", "text": text})
+            elif btype in {"image_url", "input_image"}:
+                # LangChain nests the URL under image_url.url; the Responses
+                # API takes it flat. Both shapes appear depending on who built
+                # the message, so accept either rather than assuming one.
+                raw = block.get("image_url")
+                url = raw.get("url") if isinstance(raw, dict) else raw
+                if isinstance(url, str) and url:
+                    parts.append({"type": "input_image", "image_url": url})
+        # A message with no renderable part is still a turn the API must see
+        # in the right position, so keep it rather than dropping it and
+        # silently shifting the conversation.
+        return parts or [{"type": "input_text", "text": ""}]
+
+    @staticmethod
     def _to_responses_input(messages: Any) -> List[Dict[str, Any]]:
         return [
             {
                 "role": m.get("role"),
-                "content": [{"type": "input_text", "text": m.get("content", "")}],
+                "content": CodexResponsesWrapper._content_parts(m.get("content", "")),
             }
             for m in messages
         ]
