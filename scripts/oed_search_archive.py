@@ -1792,13 +1792,42 @@ class SearchArchive:
                 totals.setdefault(case, []).append(value)
         means = {c: sum(v) / len(v) for c, v in totals.items()}
         worse_is = (lambda a, b: a > b) if baseline_direction != "max" else (lambda a, b: a < b)
-        ranked = sorted(means.items(), key=lambda kv: kv[1], reverse=baseline_direction != "max")
+
+        # Ranked by how far each case has moved AGAINST its own baseline, not
+        # by raw error. Sorting on raw error ranks by how hard a case is, which
+        # is a property of the problem the search cannot change, and it hides
+        # any low-error case the search is actively damaging.
+        #
+        # Measured on closure_20260906_codex: averaged over 24 scored elites,
+        # all five duct cases had been pushed WORSE than stock (AR_1_Ret_180
+        # 0.1073 -> 0.1119, and the same for the other four), while the six
+        # cases this block named were the hardest hills, every one of them
+        # improving by 0.031 to 0.041. The ducts never appeared, because 0.11
+        # is a smaller number than 0.16 -- so the one duct-relevant signal in
+        # the loop pointed away from the ducts, and the study spent a day
+        # buying mean gains with duct regressions. On the graded test set
+        # ducts are 3 of 8; here they are 5 of 32.
+        #
+        # The delta was already computed and printed on every line. Only the
+        # sort key was wrong.
+        def _regression(item):
+            case, value = item
+            base = (baseline_per_case or {}).get(case)
+            if not isinstance(base, (int, float)):
+                # No baseline for this case: fall back to raw error so it still
+                # ranks somewhere sensible rather than silently sorting first.
+                return (0, value if baseline_direction != "max" else -value)
+            delta = value - base
+            return (1, delta if baseline_direction != "max" else -delta)
+
+        ranked = sorted(means.items(), key=_regression, reverse=True)
 
         lines = [
             "PER-CASE DIFFICULTY (mean over the %d elite(s) that recorded per-case scores)."
             % len(per_case_sets),
-            "  This is where the score is actually being lost. A mechanism that only",
-            "  helps cases already near baseline cannot move the overall mean much.",
+            "  Ranked by movement against baseline, worst first: a case listed here",
+            "  as worse than baseline is one the search is actively damaging, and it",
+            "  costs the objective regardless of how small its absolute error looks.",
         ]
         for case, value in ranked[:worst_n]:
             base = (baseline_per_case or {}).get(case)

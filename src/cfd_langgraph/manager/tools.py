@@ -7009,6 +7009,34 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         declared_cases = _evaluation_cases(disc_dir)
         scored_paths: List[Path] = [case_path]
         multi_case = False
+        if declared_cases and not case_dirs:
+            # Both coverage guards below live inside `if case_dirs` / `if
+            # multi_case`, so omitting case_dirs entirely skipped every check
+            # and scored the candidate's own single case against a mean
+            # baseline. Measured on closure_20260906_codex, which declares 32
+            # cases: qcr2000_cq_010 and wall_echo_scale_15 were recorded at
+            # +84.37% and +85.15% with cost 1, evaluation_cases_scored null and
+            # no per-case scores. Their "score" 0.017758713958434088 is
+            # bit-identical to CBFS alone from a sibling candidate -- one case
+            # divided by a 32-case baseline of 0.1136. Both entered the archive
+            # as the best results in the study, four times better than anything
+            # the benchmark's public leaderboard has ever recorded.
+            #
+            # A missing case_dirs is not a request to score one case; in a
+            # multi-case study it is an incomplete evaluation, and the honest
+            # answer is to refuse it rather than to return a number that cannot
+            # mean what it appears to mean.
+            return {
+                "ok": False,
+                "error": (
+                    f"This study declares {len(declared_cases)} evaluation cases, so a "
+                    "candidate must be scored over all of them. No case_dirs were given, "
+                    "which would score this candidate's own case alone and compare it "
+                    "against a mean baseline. Run oed_run_evaluation_cases first and pass "
+                    "the case_dirs it returns."
+                ),
+                "declared": [c.name for c in declared_cases],
+            }
         if case_dirs:
             resolved = [Path(str(c)).expanduser().resolve() for c in case_dirs]
             missing_dirs = [str(c) for c in resolved if not c.is_dir()]
