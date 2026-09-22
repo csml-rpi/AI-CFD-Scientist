@@ -6,6 +6,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from ..llm.caching import cacheable_human_message
 from . import prompts as P
+from cfd_langgraph.llm.reply import reply_text
 
 
 def _strip_code_fences(text: str) -> str:
@@ -42,10 +43,10 @@ def write_file_initial(
         user_requirement=user_requirement, tutorial_reference=tutorial_reference,
         written_files_ctx=written_files_ctx, file_name=file_name, folder_name=folder_name,
     ).partition(P.WRITE_CACHE_SPLIT_MARKER)
-    raw = llm.invoke([
+    raw = reply_text(llm.invoke([
         SystemMessage(content=system),
         cacheable_human_message(llm, stable, P.WRITE_CACHE_SPLIT_MARKER + tail),
-    ]).content
+    ]))
     return _strip_code_fences(raw)
 
 
@@ -66,5 +67,5 @@ def edit_file(
         file_name=file_name, folder_name=folder_name,
         changes=changes, current_content=current_content, written_files_ctx=written_files_ctx,
     )
-    raw = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]).content
+    raw = reply_text(llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]))
     return _strip_code_fences(raw)

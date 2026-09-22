@@ -6,8 +6,10 @@ from typing import Any, Dict, List
 from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.llm.retry import call_with_retry
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 class HypothesisRankAgent:
@@ -47,7 +49,7 @@ class HypothesisRankAgent:
             ),
         }
         prompt = ChatPromptTemplate.from_messages([("system", sys_t), ("human", usr_t)])
-        raw = (prompt | self.llm).invoke(payload).content
+        raw = reply_text(call_with_retry(lambda: (prompt | self.llm).invoke(payload), "hypothesis ranking"))
 
         try:
             parsed = json.loads(extract_json_object(raw))

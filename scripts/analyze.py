@@ -252,7 +252,8 @@ def _extract_from_wall_shear(case_dir: Path) -> Dict[str, Any]:
 
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-        txt = strip_json_fences(str(getattr(raw, "content", raw)).strip())
+        from cfd_langgraph.llm.reply import reply_text
+        txt = strip_json_fences(reply_text(raw).strip())
         result = json.loads(txt)
         return {k: float(v) for k, v in result.items() if isinstance(v, (int, float))}
     except Exception:
@@ -315,6 +316,15 @@ def _llm_pyvista_batch_qoi(
     script_path = work_dir / "qoi_batch_script.py"
     case_strs = [str(p.resolve()) for p in case_paths]
     out_json_path_str = str(out_json.resolve())
+    # The script is executed with cwd=work_dir (see the doubled-path note
+    # above), so a repo-relative path written into a metric definition — which
+    # is how every study names its reference data, e.g.
+    # "starter_lid_driven_cavity/reference_data/ghia1982_u_vertical_centreline.csv"
+    # — cannot be opened as written. Handing the root over explicitly is what
+    # lets the script join it. Measured on qwen_27b_nothink cavity r1/r3/r4:
+    # all three died with "Reference data not found" while the file was on
+    # disk the whole time, one directory join away.
+    repo_root_str = str(Path(__file__).resolve().parent.parent)
 
     foam_markers: Dict[str, str] = {}
     for cp in case_paths:
@@ -338,9 +348,21 @@ def _llm_pyvista_batch_qoi(
         "quantity from the loaded data — not from OpenFOAM's postProcessing/ text files and not from "
         "log files; you do not need them.\n"
         "You MAY read files the metric definition below explicitly names — a reference/DNS data file, "
-        "or a case dictionary such as constant/transportProperties for a constant. Read those with "
+        "or a case dictionary holding a constant. Read those with "
         "numpy/pathlib. What you must not do is invent a value for a constant the definition tells "
         "you where to find.\n"
+        "RESOLVE EVERY NAMED FILE AGAINST REPO_ROOT. A metric definition names data files the way the "
+        "study writes them — repo-relative, e.g. `starter_x/reference_data/ref.csv`. This script does "
+        "NOT run from the repository root, so opening that path as written raises FileNotFoundError and "
+        "the metric is lost. Build it as `REPO_ROOT / <path as written>` whenever the path is not "
+        "already absolute. If it is still missing, try the same relative path under each case directory "
+        "and its parents before giving up, and if you do give up put the ABSOLUTE paths you tried into "
+        "'<metric>__why_null' — 'reference data not found' without a path is not a usable report.\n"
+        "A case dictionary named by the definition may also sit under a different name than the one the "
+        "definition uses, because OpenFOAM renamed several of them between versions — transport and "
+        "thermophysical properties are the common ones, and a case written for one version names them the "
+        "other way. List `constant/` and match by content rather than by the exact filename, and only "
+        "conclude a constant is absent after looking at what is actually there.\n"
         "\n"
         "WHAT THE READER GIVES YOU. reader.read() returns a MultiBlock, typically with an 'internalMesh' "
         "block and a 'boundary' block:\n"
@@ -358,11 +380,23 @@ def _llm_pyvista_batch_qoi(
         "for a metric cannot proceed on a different one. Derive them from the fields above, including "
         "standard definitions, for example a skin-friction coefficient from wall shear stress and the "
         "case's reference velocity (Cf = -2 * wallShearStress_x / Ub**2, with Ub read from the case's "
-        "constant/transportProperties or its documented value). Emit a scalar per case: a summary "
+        "own dictionaries or its documented value — never assumed to be 1). Emit a scalar per case: a summary "
         "(mean/RMS/extremum) of a profile is fine, but it must be that metric, computed from that field.\n"
         "Return null for a requested metric ONLY if the underlying field genuinely does not exist in the "
         "case. In that case also add a key '<metric>__why_null' with a one-line reason naming what you "
         "looked for and which patches/fields you found — a bare null with no explanation is a defect.\n"
+        "DISTINGUISH THE FAILURE MODES in '<metric>__why_null'. 'Reference data not found' must mean the "
+        "FILE is absent, and must list the absolute paths tried. If the file opened but you could not "
+        "locate a column or row inside it, say so and LIST THE COLUMN NAMES THE FILE ACTUALLY HAS — "
+        "reporting a present file as missing sends the reader hunting for the wrong bug.\n"
+        "READ THE REFERENCE TABLE'S HEADER BEFORE ASSUMING ITS SHAPE. A reference table often carries one "
+        "column per flow condition, with the condition encoded in the column name, rather than one column "
+        "per quantity: the coordinate column plus several value columns that differ only by the condition "
+        "they were measured at. Inspect the header, then select the column matching THIS case's own "
+        "condition — read that condition from the case itself (its dictionaries and the metric definition), "
+        "not from the column order. Never assume a bare quantity name exists as a column, and never take "
+        "the first value column because it parsed. If the definition spans several conditions, emit the "
+        "metric for the condition this case was run at.\n"
         "\n"
         "- Also report `mesh_n_cells` and `mesh_n_points` for every case.\n"
         "- read() and combine MultiBlock meshes when needed (mesh.combine() or first non-empty block).\n"
@@ -397,6 +431,7 @@ def _llm_pyvista_batch_qoi(
             f"CASE_DIRS = {case_strs!r}\n"
             f"FOAM_MARKERS = {foam_markers!r}\n"
             f"REQUESTED_METRIC_NAMES = {metrics!r}\n"
+            f"REPO_ROOT = pathlib.Path({repo_root_str!r})\n"
             f"{hint_block}"
             f"OUT_JSON = pathlib.Path({out_json_path_str!r})\n\n"
             "Start from `import json, pathlib`, `import numpy as np`, `import pyvista as pv`.\n"
@@ -409,7 +444,8 @@ def _llm_pyvista_batch_qoi(
             resp = llm.invoke(
                 [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
             )
-            script_text = getattr(resp, "content", str(resp))
+            from cfd_langgraph.llm.reply import reply_text
+            script_text = reply_text(resp)
         except Exception as e:
             last_err = f"LLM invoke failed: {e}"
             time.sleep(min(2.0, 0.5 * attempt))

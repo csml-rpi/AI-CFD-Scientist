@@ -13,6 +13,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 VIZ_MAX_RETRIES = 10
@@ -359,7 +360,7 @@ def viz_creator(
         ]
         try:
             resp = llm.invoke(script_msgs)
-            script_text = getattr(resp, "content", str(resp))
+            script_text = reply_text(resp)
         except Exception as e:
             last_error = f"LLM error while generating script: {e}"
             _log(f"LLM error: {e}")
@@ -413,7 +414,7 @@ def viz_creator(
         ]
         try:
             viz_resp = llm.invoke(viz_msgs)
-            raw = getattr(viz_resp, "content", str(viz_resp))
+            raw = reply_text(viz_resp)
             parsed = json.loads(extract_json_object(raw))
             viz_ok = bool(parsed.get("viz_acceptable", False))
             reason = str(parsed.get("reason", ""))

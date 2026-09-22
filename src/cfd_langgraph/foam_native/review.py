@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..llm.caching import cacheable_human_message
 from . import prompts as P
+from cfd_langgraph.llm.reply import reply_text
 
 
 def review_errors(
@@ -38,10 +39,10 @@ def review_errors(
         user_requirement=user_requirement,
         history_text=history_text,
     ).partition(P.REVIEW_CACHE_SPLIT_MARKER)
-    raw = llm.invoke([
+    raw = reply_text(llm.invoke([
         SystemMessage(content=system),
         cacheable_human_message(llm, stable, P.REVIEW_CACHE_SPLIT_MARKER + tail),
-    ]).content
+    ]))
     return (raw or "").strip()
 
 

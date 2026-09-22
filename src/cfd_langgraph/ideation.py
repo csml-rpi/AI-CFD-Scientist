@@ -11,8 +11,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import Settings
 from .llm.factory import create_langchain_llm
+from .llm.retry import call_with_retry, is_transient_error
 from .literature import LiteratureClient
 from .utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 def load_prompts(prompts_path: Path) -> Dict[str, Any]:
@@ -131,8 +133,13 @@ def novelty_score_llm(
         f"{json.dumps(idea_json, ensure_ascii=False)}\n\n"
         "Evaluate novelty now."
     )
-    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    # Retried here because the caller fails closed: a novelty check that raises
+    # marks the idea "too similar", so a provider blip would reject a good idea.
+    resp = call_with_retry(
+        lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
+        "novelty check",
+    )
+    content = reply_text(resp)
     parsed = json.loads(extract_json_object(content))
     if not isinstance(parsed, dict):
         raise ValueError("novelty evaluator did not return a JSON object")
@@ -308,6 +315,29 @@ def _judged_too_similar(judgement: str, similarity, threshold: float) -> bool:
     return not judgement and similarity is not None and similarity >= threshold
 
 
+# How a fitted-model study's idea is framed. It replaces the simulation-study
+# framing instead of adding to it: given the CFD study schema and the fixed-case
+# brief, ideas for a surrogate task came back with `solver: OpenFOAM 10`, a CFL
+# and an end time, and the reviewer rejected each as "a CFD study, not the
+# surrogate task" -- 0 of 2-3 ideas in four rounds on
+# experiments_for_paper/qwen_27b_nothink/palmo, 1 of 3 for Codex and gpt-oss on
+# the same task, 0 of 3 for Maverick.
+_FITTED_MODEL_STUDY_BRIEF = (
+    "THIS IS A FITTED-MODEL STUDY. Nothing is simulated. The task supplies data, a "
+    "fixed split between what may be trained on and what is held back for scoring, and "
+    "a scorer that decides success. The deliverable is a model fitted on the permitted "
+    "data and judged by that scorer.\n\n"
+    "Propose ONE modelling idea: the model family or method, its inputs and any features "
+    "derived from them, what it is fitted on (permitted data only), how it is validated "
+    "without the held-back data, and why the prior studies suggest it can beat the "
+    "reference.\n\n"
+    "The schema below was written for simulation studies, and its simulation fields do "
+    "not apply here: set `solver`, `target_CFL`, `topology`, `dimensions` and `controls` "
+    "to null. Each experiment is one model variant, with its defining choices under "
+    "`parameters`.\n\n"
+)
+
+
 def _generate_one_idea(
     llm: Any,
     ideation_prompts: Dict[str, Any],
@@ -319,6 +349,7 @@ def _generate_one_idea(
     previous_ideas: Optional[List[Dict[str, Any]]] = None,
     candidate_similarity_threshold: float = 0.92,
     case_context: str = "",
+    study_mode: str = "",
 ) -> Dict[str, Any]:
     """One novelty-checked idea, with retries. Extracted from ``run_ideation``'s
     original loop body so both a single idea and a batch of candidates
@@ -327,7 +358,10 @@ def _generate_one_idea(
     system_prompt = str(ideation_prompts["initial_idea_prompt"]).replace(
         "{max_experiments}", str(settings.ideation_max_experiments)
     )
-    if case_context:
+    fitted_model_study = str(study_mode or "").strip().lower() == "surrogate"
+    if fitted_model_study:
+        system_prompt = _FITTED_MODEL_STUDY_BRIEF + system_prompt
+    elif case_context:
         # The base prompt asks for "an impactful CFD research idea" and "a
         # non-overlapping set of experiments" -- i.e. a study design. Given a
         # fixed case that is the wrong deliverable, and saying so only in the
@@ -360,7 +394,12 @@ def _generate_one_idea(
         literature_context=literature_context,
         max_experiments=settings.ideation_max_experiments,
     )
-    if case_context:
+    if case_context and fitted_model_study:
+        user_prompt = (
+            "THE TASK'S DATA AND SCORING — given, not to be changed:\n"
+            f"{case_context}\n\n"
+        ) + user_prompt
+    elif case_context:
         # Without this the ideator has no idea a concrete case already exists,
         # and proposes studies of a *different* configuration — observed on a
         # real run: every candidate was a setup-sensitivity study (confinement,
@@ -419,10 +458,13 @@ def _generate_one_idea(
     idea_json: Dict[str, Any] = {}
 
     for attempt in range(retries + 1):
-        resp = llm.invoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        resp = call_with_retry(
+            lambda: llm.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            ),
+            "idea generation",
         )
-        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        content = reply_text(resp)
         last_raw = content
 
         try:
@@ -570,6 +612,7 @@ def run_ideation_batch(
     literature_items: Optional[List[Dict[str, Any]]] = None,
     require_literature: bool = False,
     case_context: str = "",
+    study_mode: str = "",
 ) -> Dict[str, Any]:
     """Propose step of the propose -> critique -> rank hypothesis pipeline.
 
@@ -607,11 +650,24 @@ def run_ideation_batch(
     candidates: List[Dict[str, Any]] = []
     prior_ideas: List[Dict[str, Any]] = []
     for i in range(max(1, num_candidates)):
-        one = _generate_one_idea(
-            llm, ideation_prompts, research_topic, literature_context, lit_items,
-            settings, verbose=verbose, previous_ideas=prior_ideas,
-            case_context=case_context,
-        )
+        try:
+            one = _generate_one_idea(
+                llm, ideation_prompts, research_topic, literature_context, lit_items,
+                settings, verbose=verbose, previous_ideas=prior_ideas,
+                case_context=case_context, study_mode=study_mode,
+            )
+        except Exception as exc:
+            # Its calls have already spent their retries. Keep the ideas this
+            # batch finished instead of unwinding all of them; with none
+            # finished there is nothing to keep, so the failure goes up.
+            if not candidates or not is_transient_error(exc):
+                raise
+            print(
+                f"[Ideation] Idea {i + 1} failed after retries ({type(exc).__name__}); "
+                f"keeping the {len(candidates)} finished idea(s).",
+                flush=True,
+            )
+            break
         one["candidate_id"] = f"cand_{i + 1:02d}"
         candidates.append(one)
         if isinstance(one.get("idea"), dict) and not one["idea"].get("parse_error"):

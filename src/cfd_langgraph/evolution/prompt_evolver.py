@@ -7,6 +7,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from cfd_langgraph.knowledge_bundle import KnowledgeBundle
 from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.llm.reply import reply_text
 
 
 def _now_iso() -> str:
@@ -78,9 +79,9 @@ class PromptEvolver:
             f"Recent lessons from completed, audited studies:\n{lessons_text or '(none yet)'}\n\n"
             "Propose the improved prompt."
         )
-        candidate = self.llm.invoke(
+        candidate = reply_text(self.llm.invoke(
             [SystemMessage(content=system), HumanMessage(content=user)]
-        ).content.strip()
+        )).strip()
 
         if not candidate or candidate == current_prompt:
             return None

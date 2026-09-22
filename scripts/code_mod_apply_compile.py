@@ -858,7 +858,8 @@ def _llm_compile_review_fix(
             HumanMessage(content=json.dumps(base_prompt, indent=2)[:42000]),
         ]
     )
-    req_txt = getattr(req_raw, "content", "") if req_raw else ""
+    from cfd_langgraph.llm.reply import reply_text
+    req_txt = reply_text(req_raw)
     req_clean = strip_json_fences(req_txt if isinstance(req_txt, str) else str(req_txt))
     s, e = req_clean.find("{"), req_clean.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -992,7 +993,8 @@ def _llm_compile_review_fix(
             HumanMessage(content=json.dumps(fix_prompt, indent=2)[:60000]),
         ]
     )
-    fix_txt = getattr(fix_raw, "content", "") if fix_raw else ""
+    from cfd_langgraph.llm.reply import reply_text
+    fix_txt = reply_text(fix_raw)
     fix_clean = strip_json_fences(fix_txt if isinstance(fix_txt, str) else str(fix_txt))
     s2, e2 = fix_clean.find("{"), fix_clean.rfind("}")
     if s2 != -1 and e2 != -1 and e2 > s2:
@@ -1221,7 +1223,8 @@ def _llm_openfoam_custom_files_bundle(
                 )
             )
         resp = llm.invoke(messages)
-        raw = getattr(resp, "content", "") if resp else ""
+        from cfd_langgraph.llm.reply import reply_text
+        raw = reply_text(resp)
         print(f"[CODEMOD-DEBUG] LLM raw response length: {len(raw)}", flush=True)
         print(f"[CODEMOD-DEBUG] LLM raw response (first 500 chars): {raw[:500]!r}", flush=True)
         txt = strip_json_fences(raw if isinstance(raw, str) else str(raw))
@@ -1254,7 +1257,8 @@ def _llm_openfoam_custom_files_bundle(
                         )
                     )
                     resp2 = llm.invoke(messages)
-                    raw2 = getattr(resp2, "content", "") if resp2 else ""
+                    from cfd_langgraph.llm.reply import reply_text
+                    raw2 = reply_text(resp2)
                     txt2 = strip_json_fences(raw2 if isinstance(raw2, str) else str(raw2))
                     s2, e2 = txt2.find("{"), txt2.rfind("}")
                     if s2 != -1 and e2 != -1 and e2 > s2:

@@ -8,6 +8,7 @@ import requests
 from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.llm.reply import reply_text
 
 # Retry on 429 (rate limit) or timeout; max 4 attempts, exponential backoff
 S2_RETRY_ATTEMPTS = 4
@@ -110,7 +111,7 @@ class LiteratureSurveyAgent:
             ),
         ])
         chain = prompt | self.llm
-        synthesis = chain.invoke({"idea": idea_text, "s2": s2, "web": web}).content
+        synthesis = reply_text(chain.invoke({"idea": idea_text, "s2": s2, "web": web}))
 
         return {
             "idea": idea_text,

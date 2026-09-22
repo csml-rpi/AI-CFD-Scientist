@@ -21,6 +21,7 @@ from cfd_langgraph.ideation import run_ideation
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 class WorkflowState(TypedDict, total=False):
@@ -399,7 +400,7 @@ class CFDWorkflow:
         }
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", "{payload}")])
         resp = llm.invoke(prompt.format_messages(payload=json.dumps(user, ensure_ascii=False)) )
-        raw = getattr(resp, "content", str(resp))
+        raw = reply_text(resp)
         try:
             parsed = json.loads(extract_json_object(raw))
         except Exception:
@@ -438,9 +439,11 @@ class CFDWorkflow:
             "Output ONLY valid JSON."
         )
         human = (
-            "Return JSON with schema {"
+            # A prompt template: literal braces are doubled, or the schema
+            # itself is read as a {placeholder} and formatting raises KeyError.
+            "Return JSON with schema {{"
             "\"diff_report\": string"
-            "}. "
+            "}}. "
             "The diff_report must include: "
             "1) FILE PATHS that differ; "
             "2) For each differing file, show a unified-diff-like block (use '+'/'-' lines when possible); "
@@ -453,7 +456,7 @@ class CFDWorkflow:
         # Use ChatPromptTemplate for consistent formatting with other calls.
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", human)])
         resp = llm.invoke(prompt.format_messages(working=working_bundle, failing=failing_bundle))
-        raw = getattr(resp, "content", str(resp))
+        raw = reply_text(resp)
         try:
             parsed = json.loads(extract_json_object(raw))
             diff_report = parsed.get("diff_report")
@@ -558,7 +561,7 @@ class CFDWorkflow:
 
             try:
                 resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=content)])
-                raw = getattr(resp, "content", str(resp))
+                raw = reply_text(resp)
                 parsed = json.loads(extract_json_object(raw))
                 keep_idx = parsed.get("keep_indices", [])
                 if not isinstance(keep_idx, list):

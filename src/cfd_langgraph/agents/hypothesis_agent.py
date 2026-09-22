@@ -8,6 +8,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 # How many times to re-ask the validator when its reply will not parse.
@@ -89,7 +90,7 @@ class HypothesisAgent:
             ]
         )
         chain = prompt | self.llm
-        out = chain.invoke(payload).content.strip()
+        out = reply_text(chain.invoke(payload)).strip()
         if verbose:
             print("[Hypothesis] Requirement generated (%d chars)" % len(out), flush=True)
         return out
@@ -149,7 +150,7 @@ class HypothesisAgent:
         last_err = None
         raw = ""
         for attempt in range(1, _VALIDATOR_PARSE_ATTEMPTS + 1):
-            raw = chain.invoke({"req": req}).content
+            raw = reply_text(chain.invoke({"req": req}))
             try:
                 parsed = json.loads(extract_json_object(raw))
                 if not isinstance(parsed, dict):
@@ -220,7 +221,7 @@ class HypothesisAgent:
         )
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", user)])
         chain = prompt | self.validator_llm
-        return chain.invoke(
+        return reply_text(chain.invoke(
             {
                 "req": req,
                 "run_topic": run_topic or "",
@@ -230,7 +231,7 @@ class HypothesisAgent:
                 "issues": "\n".join(f"- {i}" for i in issues),
                 "guidance": "\n".join(f"- {g}" for g in guidance),
             }
-        ).content.strip()
+        )).strip()
 
     def _strip_visualization_mentions(self, req: str) -> str:
         """Remove visualization instructions without touching anything else.
@@ -260,7 +261,7 @@ class HypothesisAgent:
                 "Return only the resulting text.\n\n"
                 f"TEXT:\n{text}"
             )
-            out = getattr(cleaned, "content", cleaned)
+            out = reply_text(cleaned)
             out = out if isinstance(out, str) else str(out)
             # A model that returns something drastically shorter has summarised
             # rather than filtered; keep the original over a lossy rewrite.

@@ -352,7 +352,8 @@ def _llm_starter_study_brief(
         "before literature search. Be concrete, avoid vague language, and do not invent facts."
     )
     raw = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=human_content)])
-    content = getattr(raw, "content", "") if raw else ""
+    from cfd_langgraph.llm.reply import reply_text
+    content = reply_text(raw)
     cleaned = strip_json_fences(content if isinstance(content, str) else str(content))
     s, e = cleaned.find("{"), cleaned.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -437,7 +438,8 @@ def _llm_infer_understanding_and_plan(
         f"Available modules (must only use these ids):\n{json.dumps(available_modules, indent=2)}\n"
     )
     raw = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)])
-    content = getattr(raw, "content", "") if raw else ""
+    from cfd_langgraph.llm.reply import reply_text
+    content = reply_text(raw)
     cleaned = strip_json_fences(content if isinstance(content, str) else str(content))
     s, e = cleaned.find("{"), cleaned.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -495,7 +497,8 @@ def _validate_and_revise_module_plan(
         "Return full corrected JSON with same top-level keys."
     )
     raw = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)])
-    content = getattr(raw, "content", "") if raw else ""
+    from cfd_langgraph.llm.reply import reply_text
+    content = reply_text(raw)
     cleaned = strip_json_fences(content if isinstance(content, str) else str(content))
     s, e = cleaned.find("{"), cleaned.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -700,7 +703,8 @@ def _infer_starter_case_context(repo_root: Path, starter_dir: Optional[Path] = N
         from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         raw = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        txt = str(getattr(raw, "content", raw)).strip()
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw).strip()
         # Strip optional markdown fences.
         if txt.startswith("```"):
             txt = txt.split("```")[1].lstrip("json").strip()
@@ -853,7 +857,8 @@ def _llm_classify_topic_mode(
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)[:42000]),
             ]
         )
-        txt = str(getattr(raw, "content", raw))
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw)
         clean = strip_json_fences(txt)
         s, e = clean.find("{"), clean.rfind("}")
         if s != -1 and e != -1 and e > s:
@@ -920,7 +925,8 @@ def _llm_decide_open_discovery(
                 HumanMessage(content=json.dumps(payload, ensure_ascii=False)[:40000]),
             ]
         )
-        txt = str(getattr(raw, "content", raw))
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw)
         clean = strip_json_fences(txt)
         s, e = clean.find("{"), clean.rfind("}")
         if s != -1 and e != -1 and e > s:
@@ -1036,7 +1042,8 @@ def _generate_open_discovery_hypotheses(
             "- Do not return markdown; JSON only."
         )
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=json.dumps(prompt_obj, ensure_ascii=False)[:42000])])
-        txt = str(getattr(raw, "content", raw))
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw)
         clean = strip_json_fences(txt)
         s, e = clean.find("{"), clean.rfind("}")
         if s != -1 and e != -1 and e > s:
@@ -2658,7 +2665,8 @@ def _llm_decide_analysis_metrics(
     )
     try:
         out = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        raw = strip_json_fences(str(getattr(out, "content", out)).strip())
+        from cfd_langgraph.llm.reply import reply_text
+        raw = strip_json_fences(reply_text(out).strip())
         payload = json.loads(raw)
         metrics = payload.get("metrics", []) if isinstance(payload, dict) else []
         metrics = [str(m).strip() for m in metrics if str(m).strip()]
@@ -2915,7 +2923,8 @@ def _llm_plan_analysis_stage(
     )
     try:
         out = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        raw = strip_json_fences(str(getattr(out, "content", out)).strip())
+        from cfd_langgraph.llm.reply import reply_text
+        raw = strip_json_fences(reply_text(out).strip())
         payload = json.loads(raw)
         if isinstance(payload, dict):
             metrics = [str(m).strip() for m in payload.get("metrics", []) if str(m).strip()]
@@ -2998,7 +3007,8 @@ def _mesh_gate_plan_experiments(
     try:
         from langchain_core.messages import HumanMessage as _HM, SystemMessage as _SM
         resp = llm.invoke([_SM(content=system_prompt), _HM(content=user_prompt)])
-        raw_text = getattr(resp, "content", str(resp))
+        from cfd_langgraph.llm.reply import reply_text
+        raw_text = reply_text(resp)
         parsed = json.loads(re.search(r"\{.*\}", raw_text, re.DOTALL).group(0))  # type: ignore[union-attr]
         exps = parsed.get("experiments", [])
         if not exps:
@@ -4221,7 +4231,8 @@ def _llm_canonical_baseline_requirement(
         f"Produce the canonical baseline requirement now."
     )
     resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)])
-    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    from cfd_langgraph.llm.reply import reply_text
+    content = reply_text(resp)
     return str(content).strip()
 
 

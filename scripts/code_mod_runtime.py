@@ -136,17 +136,42 @@ def _slug(s: str, n: int = 32) -> str:
 
 
 def _copy_case(src: Path, dst: Path) -> None:
-    """Copy a case dir, skipping bulky postProcessing/log artifacts."""
+    """Copy a case dir, skipping a previous solve's outputs.
+
+    The base case handed here is frequently one that has already been solved,
+    so its non-zero time directories must not travel with it. Every QoI
+    extractor in this repo reads the copy with PyVista at ``max(time_values)``;
+    a leftover time directory from the base case's own solve wins that pick and,
+    once the mesh differs, its ``internalField`` length no longer matches
+    ``nCells`` and the reader loads no fields at all. Time 0 is the initial
+    condition and stays.
+    """
     if dst.exists():
         shutil.rmtree(dst)
+    src_root = Path(src).resolve()
 
     def ignore(directory: str, names: List[str]) -> List[str]:
         skip = []
+        try:
+            at_root = Path(directory).resolve() == src_root
+        except OSError:
+            at_root = False
         for n in names:
-            if n in {"postProcessing", "processor*"}:
+            # `"processor*"` was a literal set member here and so never matched
+            # a real `processor0`/`processor1` directory; decomposed leftovers
+            # travelled into every copy and made decomposePar abort on rerun.
+            if n == "postProcessing" or n.startswith("processor"):
                 skip.append(n)
+                continue
             if n.startswith("log.") or n in {"Allrun.out", "Allrun.err"}:
                 skip.append(n)
+                continue
+            if at_root and n not in {"constant", "system"} and (Path(directory) / n).is_dir():
+                try:
+                    if float(n) != 0.0:
+                        skip.append(n)
+                except ValueError:
+                    pass
         return skip
 
     shutil.copytree(str(src), str(dst), ignore=ignore, dirs_exist_ok=False)

@@ -283,7 +283,8 @@ def _call_llm(messages: List[Any]) -> str:
     settings = get_settings()
     llm = create_langchain_llm(model=settings.model, temperature=0.0, effort="low")
     resp = llm.invoke(messages)
-    return str(getattr(resp, "content", "") or "")
+    from cfd_langgraph.llm.reply import reply_text
+    return reply_text(resp)
 
 
 def _parse_round_response(raw: str) -> Dict[str, Any]:

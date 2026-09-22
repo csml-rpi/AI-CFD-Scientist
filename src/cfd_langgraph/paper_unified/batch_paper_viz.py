@@ -18,6 +18,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
 from cfd_langgraph.viz_creator import _PAPER_PYVISTA_ONLY_SYSTEM, _images_to_blocks
+from cfd_langgraph.llm.reply import reply_text
 
 SCRIPT_GEN_SYSTEM = (
     _PAPER_PYVISTA_ONLY_SYSTEM
@@ -230,7 +231,7 @@ def _check_one_image(
     ]
     try:
         r = llm.invoke(msgs)
-        raw = getattr(r, "content", str(r))
+        raw = reply_text(r)
     except Exception as e:
         return True, f"VLM check error, accepting: {e}"
     try:
@@ -295,7 +296,7 @@ def run_batch_paper_viz_loop(
         msgs = [SystemMessage(content=SCRIPT_GEN_SYSTEM), HumanMessage(content=user)]
         try:
             resp = llm.invoke(msgs)
-            script_text = getattr(resp, "content", str(resp))
+            script_text = reply_text(resp)
         except Exception as e:
             meta["failures_log"].append({"attempt": attempt, "phase": "llm", "error": str(e)})
             if verbose:
@@ -378,7 +379,7 @@ def analyze_figures_for_paper(
     )
     try:
         out = llm.invoke([HumanMessage(content=user)])
-        return getattr(out, "content", str(out))[:24_000]
+        return reply_text(out)[:24_000]
     except Exception as e:
         if verbose:
             print(f"[batch_paper_viz] image analysis LLM failed: {e}")

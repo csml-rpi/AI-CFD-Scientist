@@ -197,7 +197,8 @@ def classify_starter_scripts(
 
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)])
-        raw_response = resp.content if hasattr(resp, "content") else str(resp)
+        from cfd_langgraph.llm.reply import reply_text
+        raw_response = reply_text(resp)
         cleaned = strip_json_fences(raw_response)
         m = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not m:

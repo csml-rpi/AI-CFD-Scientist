@@ -9,6 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 PLANNER_SYSTEM = """You are the planning head for a CFD journal manuscript tied to an automated experiment run.
@@ -49,7 +50,7 @@ def plan_paper_stage(model: str, planner_input: str) -> Dict[str, Any]:
         HumanMessage(content=planner_input[:120_000]),
     ]
     resp = llm.invoke(msgs)
-    raw = getattr(resp, "content", str(resp))
+    raw = reply_text(resp)
     raw = strip_json_fences(raw if isinstance(raw, str) else str(raw))
     try:
         data = json.loads(raw)

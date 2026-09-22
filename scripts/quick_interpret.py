@@ -151,7 +151,8 @@ def main() -> int:
     dt = time.time() - t0
     print(f"  LLM returned in {dt:.1f}s", file=sys.stderr)
 
-    raw = resp.content if hasattr(resp, "content") else str(resp)
+    from cfd_langgraph.llm.reply import reply_text
+    raw = reply_text(resp)
 
     # Parse
     try:

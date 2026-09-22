@@ -90,9 +90,22 @@ IdeationCritiqueAgent:
        produce a meaningful, interpretable result, or is something physically incoherent
        (e.g. a Reynolds number/turbulence-model/geometry combination that doesn't make
        sense together, a parameter sweep outside any regime where the claim is testable)?
-    2) IMPLEMENTABILITY: does the idea contain enough concrete detail (geometry,
-       boundary conditions, solver, parameters) to be executed, without inventing
-       details that would have to be guessed?
+    2) IMPLEMENTABILITY: could a competent implementer start building this without
+       guessing what it is? The idea must name the method, model or change it proposes
+       and its key ingredients, and say how its result will be judged (which quantity
+       or metric decides whether it worked).
+
+       Judge the idea, not a build plan. Details that are normally settled while
+       building and testing are NOT missing and are NEVER a reason to reject: network
+       sizes, activations, normalisation, optimiser and schedule, loss weights, basis
+       or mode counts, interpolation and discretisation choices, tolerances, the exact
+       value of a coefficient that will be calibrated, the internal equations of an
+       auxiliary component. A reviewer who demands the full equations of every
+       component rejects every idea. Reject for vagueness only when it is unclear WHAT
+       would be built or HOW it would be judged: "use machine learning to improve
+       accuracy" is vague; "fit a Gaussian-process correction on top of the baseline
+       predictor, trained only on the training data and scored by the study's scorer"
+       is buildable even though its kernel and hyper-parameters are not written out.
 
        CRITICAL — read before judging any custom model. This workflow compiles
        NEW OpenFOAM turbulence-model classes from source as a first-class

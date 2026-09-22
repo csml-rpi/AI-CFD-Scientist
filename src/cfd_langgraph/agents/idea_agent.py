@@ -7,6 +7,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 class IdeationAgent:
@@ -29,7 +30,7 @@ class IdeationAgent:
 
         out: List[Dict[str, Any]] = []
         for _ in range(num_calls):
-            txt = strip_json_fences(chain.invoke({"task": user}).content)
+            txt = strip_json_fences(reply_text(chain.invoke({"task": user})))
             s, e = txt.find("{"), txt.rfind("}")
             if s != -1 and e != -1 and e > s:
                 txt = txt[s : e + 1]

@@ -351,6 +351,33 @@ def _resolve_objective_contract(
     quantities = [str(q).strip() for q in (ref_info.get("quantities", []) or []) if str(q).strip()]
     declared_files = [str(f).strip() for f in (ref_info.get("files", []) or []) if str(f).strip()]
 
+    # The model records which files are reference data in TWO places: the
+    # reference_data.files list, and file_classifications, where each path is
+    # labelled base_case / formula_spec / reference_data / literature / other.
+    # Reading only the first meant a model that filled in the classification
+    # but left the list null contributed nothing, and the contract came out
+    # with no reference files at all -- no baseline vector, baseline_score
+    # null, setup refused. Measured on gpt-6-astra against
+    # starter_oed_turbulence: it read 24 files, labelled both
+    # reference_data/compare_exactmatch_cf.py and
+    # reference_data/reference_exactmatch_cf.csv as "reference_data", described
+    # the CSV's columns correctly in prose, and still wrote "files": null.
+    #
+    # This is not a disk scan and it guesses nothing: the classification is the
+    # model's own judgement about the same files, in the same document, and it
+    # is only consulted when the explicit list is empty.
+    if not declared_files:
+        classifications = (
+            starter_understanding.get("file_classifications")
+            if isinstance(starter_understanding, dict) else None
+        )
+        if isinstance(classifications, dict):
+            declared_files = [
+                str(path).strip()
+                for path, label in classifications.items()
+                if str(label).strip().lower() == "reference_data" and str(path).strip()
+            ]
+
     # Reference-file lookup may use repo_root for declared paths that are
     # explicitly listed (those are user-asserted and safe). Comparator-script
     # auto-detection is restricted to the starter dir below to avoid
@@ -913,7 +940,8 @@ def _llm_refine_code_mod_spec(
         )
 
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-        txt = strip_json_fences(str(getattr(raw, "content", raw)).strip())
+        from cfd_langgraph.llm.reply import reply_text
+        txt = strip_json_fences(reply_text(raw).strip())
         s, e = txt.find("{"), txt.rfind("}")
         if s != -1 and e != -1 and e > s:
             txt = txt[s : e + 1]
@@ -1341,7 +1369,8 @@ def _llm_decide_next_action(
         user_msg = user_msg + "\n\n--- EXTENSIONS CONTEXT ---\n" + extension_context
 
     raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-    txt = str(getattr(raw, "content", raw)).strip()
+    from cfd_langgraph.llm.reply import reply_text
+    txt = reply_text(raw).strip()
     cleaned = strip_json_fences(txt)
     s, e = cleaned.find("{"), cleaned.rfind("}")
     if s != -1 and e != -1 and e > s:
@@ -1707,7 +1736,8 @@ def _compute_cf_metrics(
 
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-        script_code = str(getattr(raw, "content", raw)).strip()
+        from cfd_langgraph.llm.reply import reply_text
+        script_code = reply_text(raw).strip()
         if script_code.startswith("```"):
             script_code = "\n".join(script_code.split("\n")[1:])
             script_code = script_code.rsplit("```", 1)[0]
@@ -2287,7 +2317,8 @@ def _revise_runtime_snippet_with_llm(
     llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
     try:
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-        text = getattr(raw, "content", str(raw))
+        from cfd_langgraph.llm.reply import reply_text
+        text = reply_text(raw)
         text = strip_json_fences(text or "")
         patch = json.loads(text)
     except Exception:
@@ -3202,8 +3233,18 @@ def _latest_case_time(case_dir: Path) -> Optional[float]:
         return None
 
 
+def _read_text_or_empty(path: str) -> str:
+    """Source of a script named by path, or "" if it cannot be read."""
+    try:
+        p = Path(str(path)).expanduser()
+        return p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else ""
+    except Exception:
+        return ""
+
+
 def _comparator_exemplar_text(
-    *, search_roots: List[Path], metrics: List[Dict[str, Any]], fallback: str = ""
+    *, search_roots: List[Path], metrics: List[Dict[str, Any]], fallback: str = "",
+    cache_dirs: Optional[List[Path]] = None,
 ) -> str:
     """Source of the study's own comparator, to author a new one from.
 
@@ -3219,7 +3260,8 @@ def _comparator_exemplar_text(
     except Exception:
         return fallback
     try:
-        found = discover_existing_comparators(search_roots=search_roots, metrics=metrics)
+        found = discover_existing_comparators(
+            search_roots=search_roots, metrics=metrics, cache_dirs=cache_dirs)
     except Exception:
         return fallback
     for path in found.values():
@@ -3432,11 +3474,21 @@ def run_open_ended_discovery(
                 flush=True,
             )
         else:
-            print(
-                "[OED-EXT][phase1] WARNING: could not determine the baseline case's final time; "
-                "comparators cannot be pinned and will refuse to score",
-                flush=True,
-            )
+            try:
+                _mode_for_warning = str(
+                    (json.loads((run_dir / "study_mode.json").read_text(encoding="utf-8")) or {}).get("mode", "")
+                ).strip().lower()
+            except Exception:
+                _mode_for_warning = ""
+            # A surrogate study has no time directories by design -- its
+            # scorer reads prediction files -- so there is nothing to pin, and
+            # the warning would point at a problem that does not exist.
+            if _mode_for_warning != "surrogate":
+                print(
+                    "[OED-EXT][phase1] WARNING: could not determine the baseline case's final time; "
+                    "comparators cannot be pinned and will refuse to score",
+                    flush=True,
+                )
     disc_dir = run_dir / "open_ended_discovery"
     disc_dir.mkdir(parents=True, exist_ok=True)
     objective_contract = _resolve_objective_contract(
@@ -3496,7 +3548,127 @@ def run_open_ended_discovery(
     # below remains the FALLBACK when metric_setup is unavailable / failed.
     _metric_setup_specs_path = run_dir / "metric_specs.json"
     _metric_setup_used = False
-    if _oedx is not None and ext_state["multi_metric"] and _metric_setup_specs_path.is_file():
+
+    # A study whose candidates are fitted models (study_mode.json, decided from
+    # the starter folder by scripts/study_mode.py) has no OpenFOAM output for
+    # the metric proposer below to read and no mesh for a field comparator to
+    # read it from, and both of those paths are written around exactly that.
+    # Its starter ships a scorer that turns prediction files into numbers, so
+    # scoring is set up around that scorer instead (scripts/surrogate_setup.py).
+    # Once this branch is taken it never falls through to the field-comparator
+    # path: authoring pyvista readers against a directory of CSV predictions
+    # can only fail, slowly, and would hide the real cause.
+    _study_mode_name = ""
+    try:
+        _study_mode_name = str(
+            (json.loads((run_dir / "study_mode.json").read_text(encoding="utf-8")) or {}).get("mode", "")
+        ).strip().lower()
+    except Exception:
+        _study_mode_name = ""
+    if _oedx is not None and _study_mode_name == "surrogate":
+        _metric_setup_used = True
+        ext_state["multi_metric"] = True
+        try:
+            import surrogate_setup as _sur  # type: ignore
+
+            _sur_base_path = ""
+            if isinstance(baseline_metrics, dict):
+                _sur_base_path = str(baseline_metrics.get("baseline_case_dir", "") or "")
+            if not _sur_base_path:
+                _sur_base_path = str(base_case_dir or "")
+            _sur_base = Path(_sur_base_path).expanduser().resolve() if _sur_base_path else None
+            _sur_starter = Path(str(starter_dir)).expanduser().resolve() if starter_dir else _sur_base
+            # Which stage of surrogate setup failed, and why, for the setup tool to
+            # report. Its error used to blame the metric proposer for every empty
+            # binding, and malmo_qwen38max_openrouter_20260912 re-ran setup three
+            # times (~45 min each) to fix a proposer that had worked.
+            (disc_dir / "surrogate_setup_status.json").unlink(missing_ok=True)
+            _sur_scorer = str(objective_contract.get("comparator_script", "") or "").strip()
+            _sur_refs = [Path(p) for p in (objective_contract.get("reference_files") or []) if Path(p).is_file()]
+            # The adapter may ignore --reference (the scorer knows its own truth
+            # data), but the contract passes one, so it is always a real path.
+            _sur_ref = _reference_data_file(_sur_refs) if _sur_refs else (_sur_starter or _sur_base)
+            if not _sur_scorer or not Path(_sur_scorer).is_file():
+                print("[OED-SURROGATE] the objective contract names no scorer script, so there is "
+                      "nothing to score predictions with; setup cannot bind a comparator.", flush=True)
+                _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "scorer", "ok": False,
+                    "detail": "The objective contract names no scorer script, so predictions cannot be scored."})
+            elif _sur_base is None or not _sur_base.is_dir():
+                print(f"[OED-SURROGATE] baseline result directory not found: {_sur_base_path!r}", flush=True)
+                _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "baseline", "ok": False,
+                    "detail": f"The baseline result directory was not found: {_sur_base_path!r}."})
+            else:
+                specs = _sur.propose_surrogate_metrics(
+                    topic=topic, starter_dir=_sur_starter, scorer_path=Path(_sur_scorer),
+                    baseline_dir=_sur_base,
+                )
+                if specs:
+                    for s in specs:
+                        s["baseline_final_time"] = None
+                    _write_json(disc_dir / "metric_specs.json", specs)
+                    ext_state["metric_specs"] = specs
+                    bound = _sur.bind_surrogate_comparators(
+                        topic=topic, specs=specs, scorer_path=Path(_sur_scorer),
+                        starter_dir=_sur_starter, baseline_dir=_sur_base,
+                        out_dir=disc_dir / "authored_comparators", reference_file=Path(_sur_ref),
+                    )
+                    _primary = next((s["name"] for s in specs if s.get("primary")), specs[0]["name"])
+                    if not (bound.get(_primary) or {}).get("selftest_ok"):
+                        # Binding the secondaries alone would let the first of
+                        # them silently become "the" score, since every reader
+                        # takes the first finite metric. No binding is honest.
+                        print(f"[OED-SURROGATE] the primary metric {_primary!r} never passed its "
+                              f"self-test; binding nothing rather than scoring on a secondary.",
+                              flush=True)
+                        bound = {}
+                    _write_json(disc_dir / "bound_comparators.json", bound)
+                    ext_state["bound_comparators"] = bound
+                    _attempt_doc = _read_json(
+                        disc_dir / "authored_comparators" / "surrogate_adapter_attempt_log.json", {}
+                    ) or {}
+                    _attempt_lines = []
+                    for _a in (_attempt_doc.get("attempts") or []):
+                        if not _a.get("authoring_ok"):
+                            _attempt_lines.append(
+                                f"attempt {_a.get('attempt')}: writing the scoring wrapper failed -- {str(_a.get('error'))[:300]}"
+                            )
+                        else:
+                            _st = (_a.get("selftest") or {}).get(_primary) or {}
+                            _attempt_lines.append(
+                                f"attempt {_a.get('attempt')}: wrapper written; self-test of {_primary} "
+                                f"{'passed' if _st.get('ok') else 'failed -- ' + str(_st.get('reason'))[:300]}"
+                            )
+                    _write_json(disc_dir / "surrogate_setup_status.json", {
+                        "stage": "done" if bound else "scoring_wrapper",
+                        "ok": bool(bound),
+                        "detail": (
+                            f"{len(specs)} metrics proposed (primary {_primary}); scoring wrapper bound."
+                            if bound else
+                            f"The metric proposer worked ({len(specs)} metrics, primary {_primary}), but no "
+                            f"scoring wrapper passed its self-test for the primary metric."
+                        ),
+                        "adapter_attempts": _attempt_lines,
+                    })
+                    if bound:
+                        bv = _oedx.compute_metric_vector(
+                            case_dir=_sur_base, bound_comparators=bound,
+                            reference_file=Path(_sur_ref), baseline_final_time=None,
+                            metric_specs=specs,
+                        )
+                        _write_json(disc_dir / "baseline_metric_vector.json", bv)
+                        ext_state["baseline_metric_vector"] = bv
+                        print(f"[OED-SURROGATE] baseline metric vector: {bv.get('metrics', {})}", flush=True)
+                else:
+                    print("[OED-SURROGATE] no usable metrics were proposed.", flush=True)
+                    _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "metric_proposal", "ok": False,
+                        "detail": "The metric proposer returned no usable metric for this objective."})
+        except Exception as exc:
+            print(f"[OED-SURROGATE] setup failed: {type(exc).__name__}: {exc}", flush=True)
+            _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "exception", "ok": False,
+                "detail": f"Surrogate setup raised {type(exc).__name__}: {str(exc)[:500]}"})
+
+    if (_oedx is not None and ext_state["multi_metric"] and _metric_setup_specs_path.is_file()
+            and not _metric_setup_used):
         try:
             _ms_doc = json.loads(_metric_setup_specs_path.read_text(encoding="utf-8"))
         except Exception:
@@ -3664,8 +3836,16 @@ def run_open_ended_discovery(
                 search_roots: List[Path] = []
                 if starter_dir and starter_dir.is_dir():
                     search_roots.append(starter_dir.resolve())
-                    if starter_dir.resolve().parent.is_dir():
-                        search_roots.append(starter_dir.resolve().parent)
+                    # starter_dir.parent is the repo root. The comment below
+                    # says this must not be searched, and an earlier fix
+                    # removed the explicit repo_root while leaving this alias
+                    # in, which put it straight back: measured, discovery then
+                    # returns scripts/test_deepagents_mechanisms.py (score 89)
+                    # or a stray scripts/tools.before_multicase.py over
+                    # reference_data/compare_exactmatch_cf.py (score 42),
+                    # because raw keyword counts favour whichever file is
+                    # largest. Reference DATA may come from anywhere; the
+                    # script that reads it lives with the starter.
                 for _rf in ref_files:
                     _rfp = Path(_rf).parent
                     if _rfp.is_dir() and _rfp.resolve() not in search_roots:
@@ -3693,6 +3873,12 @@ def run_open_ended_discovery(
                     ref_files, (starter_dir or repo_root) / "reference.csv")
                 bound = _oedx.resolve_metric_comparators(
                     metrics=specs, search_roots=search_roots,
+                    # The contract's own comparator, and the run dir where
+                    # the classification cache actually lives.
+                    locked_comparator=(
+                        Path(str(objective_contract.get("comparator_script") or "")).expanduser()
+                        if objective_contract.get("comparator_script") else None),
+                    cache_dirs=[run_dir],
                     reference_file=ref_for_self, flow_params=starter_understanding.get("flow_parameters", {}) or {},
                     baseline_case_dir=base_case_p, out_dir=disc_dir / "authored_comparators",
                     sample_pp_tree=sample_pp_tree, sample_pp_data=sample_pp_data,
@@ -3714,7 +3900,12 @@ def run_open_ended_discovery(
                     exemplar_text=_comparator_exemplar_text(
                         search_roots=search_roots,
                         metrics=specs,
-                        fallback=objective_contract.get("comparator_script") or "",
+                        cache_dirs=[run_dir],
+                        # The contract stores a PATH; this parameter is the
+                        # exemplar SOURCE. Passing the path handed the author
+                        # LLM a bare filename as its worked example.
+                        fallback=_read_text_or_empty(
+                            objective_contract.get("comparator_script") or ""),
                     ),
                     baseline_final_time=baseline_final_time,
                     topic=topic,

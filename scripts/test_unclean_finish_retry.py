@@ -229,8 +229,10 @@ if patched:
 
     r = extend(str(cand), 600, "8 of 12 iterations done at ~90s each, ~600s remain")
     check("a justified extension runs", r.get("ok") is True, r)
-    check("the grant is the prior duration plus the extension, not the extension alone",
-          calls and calls[-1]["timeout_s"] == 2249 + 600, calls[-1] if calls else None)
+    # The continuation is a new process whose clock starts at launch, and its
+    # brief says "counted from now", so it gets the extension alone.
+    check("the grant is the extension, counted from the continuation's start",
+          calls and calls[-1]["timeout_s"] == 600, calls[-1] if calls else None)
     check("the continuation is told what the previous attempt did",
           "51 turns" in calls[-1]["prior_attempt"] and "timeout after 2249s" in calls[-1]["prior_attempt"])
     check("the continuation carries the rationale it was granted on",
@@ -638,8 +640,8 @@ try:
 
     r = by["oed_extend_candidate"](str(cand), 600, "4 of 12 iterations left at ~150s each")
     check("the extension runs", r.get("ok") is True, r)
-    check("the grant is prior duration + extension", launches[-1]["timeout"] == 2249 + 600,
-          launches[-1]["timeout"])
+    check("the grant is the extension, counted from the continuation's start",
+          launches[-1]["timeout"] == 600, launches[-1]["timeout"])
     check("the continuation is told what the previous attempt did",
           "51 turns" in launches[-1]["prior"] and "timeout after 2249s" in launches[-1]["prior"])
     check("a clean finish clears the standing verdict",

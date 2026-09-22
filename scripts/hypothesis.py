@@ -135,7 +135,8 @@ def run_literature_aware_ideation(
 
     llm = create_langchain_llm(model=settings.model, temperature=0.0)
     resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-    content = resp.content if isinstance(resp.content, str) else str(resp.content)
+    from cfd_langgraph.llm.reply import reply_text
+    content = reply_text(resp)
     try:
         idea_json = json.loads(extract_json_object(content))
     except Exception as exc:

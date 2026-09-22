@@ -138,7 +138,8 @@ def llm_classify_baseline_need(topic: str, repo_root: Path) -> Dict[str, Any]:
     try:
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         raw = llm.invoke([SystemMessage(content=sys_msg), HumanMessage(content=user_msg)])
-        text = strip_json_fences(str(getattr(raw, "content", raw)).strip())
+        from cfd_langgraph.llm.reply import reply_text
+        text = strip_json_fences(reply_text(raw).strip())
         s, e = text.find("{"), text.rfind("}")
         if s != -1 and e > s:
             text = text[s:e + 1]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+from cfd_langgraph.llm.reply import reply_text
 
 
 class MeshPhysicsGroup(BaseModel):
@@ -127,7 +128,7 @@ def plan_mesh_refinement_groups_llm(
 
     try:
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-        raw = getattr(resp, "content", str(resp))
+        raw = reply_text(resp)
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             data = json.loads(m.group(0))

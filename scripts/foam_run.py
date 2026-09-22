@@ -206,6 +206,18 @@ def _prepare_output_dir_for_case_copy(out: Path) -> None:
         d = out / sub
         if d.is_dir():
             shutil.rmtree(d)
+    # Non-zero time directories from whatever was solved here before. Left in
+    # place they outlive the case they belong to: the incoming baseline brings
+    # its own mesh, and a QoI extractor taking max(time_values) then reads a
+    # time whose field length no longer matches nCells, so no fields load.
+    for d in list(out.iterdir()) if out.is_dir() else []:
+        if not d.is_dir() or d.is_symlink() or d.name.startswith("processor"):
+            continue
+        try:
+            if float(d.name) != 0.0:
+                shutil.rmtree(d, ignore_errors=True)
+        except ValueError:
+            continue
     for name in ("Allrun", "Allclean", "Allpost"):
         f = out / name
         if f.is_file():
@@ -1835,7 +1847,8 @@ def main() -> int:
                 "Reply with ONLY the field name, nothing else."
             )
             raw = llm_service.invoke(user_requirement, sys_p, pydantic_obj=None)
-            field = str(getattr(raw, "content", raw)).strip().split()[0]
+            from cfd_langgraph.llm.reply import reply_text
+            field = reply_text(raw).strip().split()[0]
             return field if field else "U"
         except Exception:
             return "U"

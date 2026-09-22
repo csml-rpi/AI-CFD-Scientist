@@ -10,6 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.prompts.loader import PromptLoader
 from cfd_langgraph.utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 class PaperReviewerAgent:
@@ -77,7 +78,7 @@ class PaperReviewerAgent:
             "reference_report": reference_report or "",
             "tex_content": tex_for_review,
         })
-        raw = getattr(out, "content", str(out))
+        raw = reply_text(out)
 
         try:
             parsed = json.loads(extract_json_object(raw))

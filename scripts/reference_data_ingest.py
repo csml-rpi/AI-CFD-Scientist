@@ -311,7 +311,8 @@ def _llm_interpret_reference_data(
 
         llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
         raw_resp = llm.invoke([SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)])
-        txt = str(getattr(raw_resp, "content", raw_resp)).strip()
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw_resp).strip()
         if txt.startswith("```"):
             txt = txt.split("```")[1].lstrip("json").strip()
             txt = txt.rsplit("```", 1)[0].strip()

@@ -256,7 +256,7 @@ def test_study_wide_concurrency_and_exclusive_calibration() -> None:
     peak = 0
     original_benchmark = coordinator_module.benchmark_case
 
-    def fake_benchmark(fn):
+    def fake_benchmark(fn, **_kwargs):
         return fn(), ResourceProfile(0.04, 256.0, 25.0, 4)
 
     try:

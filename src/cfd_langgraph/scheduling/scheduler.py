@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Any, Callable, Optional, TypeVar
@@ -12,6 +13,22 @@ from .resource_probe import ResourceProfile
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+def usable_cores() -> int:
+    """CPUs this process may actually run on.
+
+    ``psutil.cpu_count()`` reports every CPU in the machine and ignores the process's
+    CPU affinity, so under ``taskset``, a cgroup cpuset or a container limit it
+    overstates the cores available -- on a 128-CPU host pinned to 16, by 8x -- and the
+    scheduler then launches eight times too many concurrent solver jobs onto the 16 it
+    has. ``sched_getaffinity`` is the set the kernel will actually schedule this
+    process on. Unpinned, it is every CPU, so nothing changes for an unrestricted run.
+    """
+    try:
+        return len(os.sched_getaffinity(0)) or 1
+    except (AttributeError, OSError):  # not available on this platform
+        return psutil.cpu_count(logical=True) or 1
 
 
 def compute_max_concurrency(
@@ -30,7 +47,7 @@ def compute_max_concurrency(
     resource request. See the design doc's "Running many things at once"
     section for the studies this follows.
     """
-    cores_available = psutil.cpu_count(logical=True) or 1
+    cores_available = usable_cores()
     mem_available_mb = psutil.virtual_memory().available / (1024 * 1024)
 
     if not profile.measured:
