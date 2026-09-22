@@ -13,8 +13,14 @@ from cfd_langgraph.llm.caching import (
 )
 from cfd_langgraph.llm.factory import create_langchain_llm
 
-from .control import DENY_BUILTIN_FILESYSTEM_TOOLS, build_interrupt_on
+from .control import (
+    DENY_BUILTIN_FILESYSTEM_TOOLS,
+    build_hide_builtin_filesystem_tools_middleware,
+    build_interrupt_on,
+)
 from .subagents import build_case_runner_subagent, build_oed_candidate_runner_subagent
+
+_MANAGER_GRAPH_NAME = "cfd-scientist-manager"
 from .tools import build_manager_tools
 
 
@@ -40,9 +46,10 @@ the relevant case (e.g. {out_dir}/cases/<case_id>/customModels/), matching how t
 existing code-mod protocol in this repo already works — never inside the OpenFOAM
 installation itself.
 
-You have real filesystem read access: `list_directory`, `directory_tree`, `find_files`,
-`read_text_file`, and `grep_files` may inspect any real path, including a starter or
-OpenFOAM source tree. Writable tools (`make_directory`, `write_text_file`,
+You have real filesystem read access: `list_directory`, `directory_tree` and
+`read_text_file` may inspect any real path, including a starter or OpenFOAM source tree;
+`find_files` and `grep_files` search this study's output directory, its starter folder, the
+repository and the OpenFOAM installation. Writable tools (`make_directory`, `write_text_file`,
 `edit_text_file`) are enforced in code to stay under {out_dir}; they also reject
 protected workflow-owned files such as candidate_record.json, state/checkpoints, and
 audit_passed.json. Use `directory_tree` to see structure at a glance. You are not
@@ -54,8 +61,13 @@ write_paper both pick up automatically once written.
 
 Sequence for a standard study:
 0. If the user gave a starter/base-case folder path, call `read_starter_folder` on it first.
-1. Call `fetch_literature` with the research topic — writes lit.json.
-2. Call `propose_and_rank_hypotheses` with the research topic.
+1. Call `fetch_literature` with the research topic — writes lit.json. If it finds no
+   papers, call it again with a different phrasing of the same research question. Once
+   it reports `literature_skipped`, go on to step 2 without literature and do not call
+   it again.
+2. Call `propose_and_rank_hypotheses` with the research topic. If none of its ideas passes
+   review it says so and gives the attempt number: call it again. After its final attempt the
+   last set of ideas is kept for approval, with their review issues attached.
 3. Read the ranked list it wrote and decide which candidate_ids you'd propose to run.
 4. Call `advance_with_approved_hypotheses` with those candidate_ids. This call requires
    human approval before it executes — a person may approve it as-is, edit which
@@ -89,6 +101,52 @@ Sequence for a standard study:
     reviewer loop.
 11. Call `run_audit_and_record` to run the stage-gate audit and, if it passes, record
     this study into the knowledge bundle.
+
+If `read_starter_folder` reports `study_mode: "surrogate"`, this study's candidates are
+models FITTED to data the starter folder supplies — not modifications to a solver — and
+several steps above do not apply. The search itself is unchanged: the same archive, the same
+DEEPEN / WIDEN / NEW FAMILY choice, the same oed-candidate-runner, the same recording and
+stopping rules. Only these differ:
+  - Do steps 0-4 as normal. SKIP step 5 (`generate_case_requirements`) and step 6
+    (`run_mesh_gate`): there is no simulation case and no mesh to converge. Do not call
+    `oed_prepare_baseline` either.
+  - For `oed_setup_search`, `baseline_case_dir` is the reference result the starter itself
+    supplies — the directory holding the predictions that reproduce the task's stated
+    baseline numbers. It must be inside the starter folder. `prescribed_mesh_reason` and
+    `evaluation_cases` do not apply; leave them out.
+  - `total_budget` is counted in candidates: every candidate costs one unit.
+  - Every candidate is `action_type="code_mod"`. `oed_run_experiment_candidate` refuses in a
+    surrogate study; a hyper-parameter change is a code_mod whose `plan` says what changes.
+  - When the search completes, do NOT call `interpret_case` or `analyze_all_cases` — they
+    read simulation fields a fitted model does not produce. `write_paper` does not support
+    surrogate studies yet. Report the best candidate — its candidate_dir, its score against
+    the baseline, and where its predictions and model code are — and stop.
+
+If `read_starter_folder` reports `study_mode: "implementation"`, the task already fixes
+what to build — a numerical scheme, a solver, a model or method from a paper — and asks
+for it to be implemented, run on the verification cases the task defines, and checked
+against the task's own scorer or acceptance criteria. There is no search, no hypothesis
+step and no mesh-independence study: the task supplies its cases. Do this instead:
+  1. After `read_starter_folder`, call `fetch_literature` only if the task folder does not
+     already supply the papers it is based on.
+  2. Call `impl_run(topic)` once. It hands the whole implementation to one build agent
+     working in {out_dir}/implementation/: it reads the task brief, writes and builds the
+     code, runs the task's cases and scorer, writes the report the task asks for, and
+     records how the scorer is run on its results. It returns when the agent finishes or
+     its time runs out.
+  3. Call `impl_verify()`. The framework re-runs the task's scorer itself on what the agent
+     produced and judges the result against the task's acceptance criteria — including
+     whether the numbers really come from the implementation and whether the task's rules
+     were kept.
+  4. If the verdict is not passed, or the agent stopped before finishing, call
+     `impl_continue(extra_seconds, guidance)` with what to fix — normally the verdict's
+     next_steps — and then `impl_verify()` again. `impl_status()` shows where the study
+     stands at any time.
+  5. Finish by reporting the verdict: every criterion with its evidence, whether the
+     results come from the implementation, any rule problems, and where the code and the
+     report are. Do not call propose_and_rank_hypotheses, generate_case_requirements,
+     run_mesh_gate, the oed_* tools, interpret_case, analyze_all_cases or write_paper in
+     this kind of study.
 
 For an open-ended discovery topic — "find a novel model/modification that beats
 baseline by X%" — still do steps 0-6, including `generate_case_requirements` and a
@@ -141,7 +199,8 @@ selected case and cannot invent a separate baseline requirement:
      real run: six candidates across five different mechanisms all came back at
      0.1136009392817217 against a baseline of 0.11360099048446087 — bit-identical, every
      one recorded as a genuine evaluation, and the archive concluded from them that
-     fitting does not work. It had never been tried.
+     fitting does not work. It had never been tried. A fitted model stopped part-way does
+     the same with prediction files from an early trial, or for only some of its seeds.
      - If `model_is_complete` is false, the candidate must NOT be scored as it stands.
      - verdict=complete → score it normally. verdict=repair → `oed_apply_repair`.
        verdict=extend → `oed_extend_candidate` with its own extra_seconds_needed.
@@ -177,6 +236,13 @@ selected case and cannot invent a separate baseline requirement:
      oed_score_candidate call already wrote the real result to disk — you're just telling
      this tool where to find them, not re-typing scores). It returns budget_used,
      proceed_count, is_saturated, and the updated archive summary.
+
+     Scoring always goes through the oed-candidate-runner. If a candidate has no score on
+     disk — it is listed in `missing_candidate_records`, or a restart interrupted it — call
+     `oed_candidate_status(candidate_dir)` and follow its next_step: a build that finished is
+     scored by launching the oed-candidate-runner with a task to score that existing
+     candidate_dir. Never re-propose it under the same variant_name to get it scored; an
+     existing variant_name is never rebuilt.
 
      Each candidate record carries a `run_window`: the start and end time the case was
      actually run over, its latest solved time, and the time its score was taken at. A
@@ -245,7 +311,8 @@ def build_manager(
     checkpoint connection cleanly.
     """
     out_dir = Path(out_dir)
-    model = create_langchain_llm(model=settings.model, temperature=0.0)
+    model = create_langchain_llm(model=settings.model, temperature=0.0, agent="manager",
+                                 agent_graph=_MANAGER_GRAPH_NAME)
     _require_tool_calling_support(model, settings)
 
     built = build_manager_tools(settings, out_dir)
@@ -253,8 +320,23 @@ def build_manager(
     case_runner_tools = built["case_runner_tools"]
     oed_candidate_tools = built["oed_candidate_tools"]
 
-    case_runner = build_case_runner_subagent(case_runner_tools, model, out_dir)
-    oed_candidate_runner = build_oed_candidate_runner_subagent(oed_candidate_tools, model, out_dir)
+    # A separate client per subagent, solely so token usage is attributed to
+    # the role that spent it. Same provider, same model, same settings — only
+    # the callback handler's label differs, and prompt caching is keyed on
+    # request content server-side, so nothing is lost by not sharing the
+    # instance. Without this the manager graph and both subagents all report
+    # as one "manager" line, which cannot distinguish a manager that reasons
+    # too much from subagents that do.
+    case_runner_model = create_langchain_llm(
+        model=settings.model, temperature=0.0, agent="case-runner"
+    )
+    oed_candidate_model = create_langchain_llm(
+        model=settings.model, temperature=0.0, agent="oed-candidate-runner"
+    )
+    case_runner = build_case_runner_subagent(case_runner_tools, case_runner_model, out_dir)
+    oed_candidate_runner = build_oed_candidate_runner_subagent(
+        oed_candidate_tools, oed_candidate_model, out_dir
+    )
 
     stack = contextlib.ExitStack()
     checkpointer: Any
@@ -290,7 +372,10 @@ def build_manager(
         # block across every turn of this run — see llm/caching.py for which
         # providers this actually applies to. No-op (empty list) on providers
         # without a wired middleware, e.g. Gemini/Vertex.
-        middleware=build_caching_middleware(model)
+        # Denied built-in file tools are hidden from the model, not merely
+        # refused (see control.py).
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model)
         # Every tool group, not just the manager's own. A name absent from
         # the list is not exempt and would be cleared, so passing the union
         # means a result that somehow reaches this conversation from a
@@ -321,6 +406,6 @@ def build_manager(
             },
         ),
         checkpointer=checkpointer,
-        name="cfd-scientist-manager",
+        name=_MANAGER_GRAPH_NAME,
     )
     return graph, stack

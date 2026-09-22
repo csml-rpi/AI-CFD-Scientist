@@ -19,6 +19,7 @@ already does, and reimplementing it is how the Codex path got it wrong.
 """
 from __future__ import annotations
 
+import json
 import threading
 from typing import Any, Optional
 
@@ -29,6 +30,79 @@ from typing import Any, Optional
 import httpx
 
 DEFAULT_LOCATION = "global"
+
+
+def _raw_predict_url(url: httpx.URL, stream: bool) -> Optional[httpx.URL]:
+    """The ``:rawPredict`` address matching a self-hosted endpoint's chat URL, or None.
+
+    Only ``.../endpoints/<id>/chat/completions`` has one. The shared MaaS route,
+    ``.../endpoints/openapi/chat/completions``, is served as it is.
+    """
+    suffix = "/chat/completions"
+    path = url.path
+    if not path.endswith(suffix):
+        return None
+    endpoint_path = path[: -len(suffix)]
+    parent, _, endpoint_id = endpoint_path.rpartition("/")
+    if not parent.endswith("/endpoints") or not endpoint_id or endpoint_id == "openapi":
+        return None
+    verb = "streamRawPredict" if stream else "rawPredict"
+    return url.copy_with(path=f"{endpoint_path}:{verb}")
+
+
+def _is_stream(request: httpx.Request) -> bool:
+    try:
+        return json.loads(request.read() or b"{}").get("stream") is True
+    except (ValueError, AttributeError):
+        return False
+
+
+def _retarget(request: httpx.Request, url: httpx.URL) -> httpx.Request:
+    return httpx.Request(request.method, url, headers=request.headers,
+                         content=request.read(), extensions=request.extensions)
+
+
+class _RawPredictFallback(httpx.BaseTransport):
+    """Sends a self-hosted endpoint's chat requests to ``:rawPredict`` when it
+    does not serve ``/chat/completions``.
+
+    Vertex answers ``/chat/completions`` on a dedicated endpoint only for some
+    deployments. A model uploaded with its own container -- the route left when
+    Model Garden's deploy is refused at its quota pre-check -- is reachable only
+    through ``:rawPredict``, which passes the body unchanged to the container's
+    predict route. With that route set to the server's own OpenAI chat path,
+    request and reply are exactly what ChatOpenAI sends and parses. Measured on
+    qwen38-27b-fp8-chat (endpoint 191566261639970816): ``/chat/completions``
+    returned 404 UNIMPLEMENTED, while ``:rawPredict`` returned a parsed
+    get_weather call and, given the tool result, a final answer.
+
+    A request first goes where ChatOpenAI addressed it. Only a 404 there sends
+    it to ``:rawPredict``, and once that answers, later requests go there
+    directly, so a deployment that serves ``/chat/completions`` is never touched.
+    """
+
+    def __init__(self, inner: httpx.BaseTransport) -> None:
+        self._inner = inner
+        self._raw_predict = False
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        raw_url = _raw_predict_url(request.url, _is_stream(request))
+        if raw_url is None:
+            return self._inner.handle_request(request)
+        if self._raw_predict:
+            return self._inner.handle_request(_retarget(request, raw_url))
+        response = self._inner.handle_request(request)
+        if response.status_code != 404:
+            return response
+        response.read()
+        response.close()
+        retry = self._inner.handle_request(_retarget(request, raw_url))
+        if retry.status_code != 404:
+            self._raw_predict = True
+        return retry
+
+    def close(self) -> None:
+        self._inner.close()
 
 
 class _ADCBearer(httpx.Auth):
@@ -99,8 +173,13 @@ def create_vertex_openai_chat_model(
         # requires the argument, and leaving it unset makes it read
         # OPENAI_API_KEY, which would be the wrong credential entirely.
         api_key="vertex-adc",
+        # See create_vertex_endpoint_chat_model: without this the SDK sends
+        # timeout=None per request and the httpx value is ignored.
+        timeout=timeout,
         http_client=httpx.Client(auth=auth, timeout=timeout),
         callbacks=callbacks or [],
+        # See create_vertex_endpoint_chat_model.
+        stream_usage=True,
     )
 
 def create_vertex_endpoint_chat_model(
@@ -110,8 +189,13 @@ def create_vertex_endpoint_chat_model(
     base_url: str = "",
     callbacks: Optional[list] = None,
     timeout: int = 600,
+    max_retries: Optional[int] = None,
+    extra_body: Optional[dict] = None,
 ) -> Any:
     """A ChatOpenAI bound to a self-hosted Vertex endpoint, with ADC auth.
+
+    ``extra_body`` is merged into every request, e.g. the chat template's
+    thinking switch.
 
     The MaaS route above is a shared publisher endpoint whose URL can be derived
     from the project alone. A model you deploy yourself cannot: it lives behind a
@@ -129,11 +213,46 @@ def create_vertex_endpoint_chat_model(
             "https://<endpoint-id>.<region>-<project-number>.prediction.vertexai.goog"
             "/v1/projects/<project>/locations/<region>/endpoints/<endpoint-id>"
         )
-    return ChatOpenAI(
+    class _RepairingChatOpenAI(ChatOpenAI):
+        """ChatOpenAI that recovers a tool call the model wrote as prose.
+
+        Same repair as the Gemini/MaaS path in factory.py, applied here
+        because this route hands back a plain ChatOpenAI with no wrapper of
+        its own -- and it is the route llama-4-maverick runs on, the model
+        measured narrating [oed_prepare_baseline(...)] and
+        [interpret_case(...)] as message text and ending the study each time.
+        """
+
+        def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+            result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            try:
+                from cfd_langgraph.llm.factory import _repair_narrated_tool_calls
+                from langchain_core.outputs import ChatResult
+
+                fixed = _repair_narrated_tool_calls(self, list(result.generations), kwargs)
+                return ChatResult(generations=fixed, llm_output=result.llm_output)
+            except Exception:
+                return result
+
+    return _RepairingChatOpenAI(
         model=model,
         temperature=temperature,
         base_url=base,
         api_key="vertex-adc",
-        http_client=httpx.Client(auth=_ADCBearer(), timeout=timeout),
+        # The openai SDK sends its own per-request timeout, which overrides the
+        # httpx client's. Left unset, ChatOpenAI passes None — no timeout at
+        # all — so CFD_SCIENTIST_VERTEX_TIMEOUT=60 never applied and a llama
+        # call sat 9+ minutes on a silent socket (malmo_llama_20260911).
+        timeout=timeout,
+        http_client=httpx.Client(auth=_ADCBearer(), timeout=timeout,
+                                 transport=_RawPredictFallback(httpx.HTTPTransport())),
         callbacks=callbacks or [],
+        # ChatOpenAI asks for usage on a streamed reply only when talking to
+        # api.openai.com. Everywhere else a stream ends with no token counts,
+        # and every _llm_invoke call streams (for its heartbeat): study_mode,
+        # metric_setup, surrogate_setup, run_validity, OED. On the Qwen studies
+        # each of those calls was logged as zero tokens.
+        stream_usage=True,
+        **({"max_retries": max_retries} if max_retries is not None else {}),
+        **({"extra_body": extra_body} if extra_body else {}),
     )

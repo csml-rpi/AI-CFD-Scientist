@@ -210,11 +210,28 @@ class CodexResponsesWrapper:
     """
 
     class _Resp:
-        def __init__(self, content: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> None:
+        def __init__(
+            self,
+            content: str,
+            tool_calls: Optional[List[Dict[str, Any]]] = None,
+            usage: Optional[Dict[str, Any]] = None,
+            response_id: Optional[str] = None,
+        ) -> None:
             self.content = content
+            # The provider's id for this response: lets a logged row be matched to
+            # exactly one billed response, and a duplicate be recognised as one.
+            self.response_id: Optional[str] = response_id
             # Native Responses `function_call` items, already decoded. Empty for
             # a plain text answer, so callers can treat this uniformly.
             self.tool_calls: List[Dict[str, Any]] = tool_calls or []
+            # The provider's own token accounting for this response, exactly as the
+            # Responses API reports it: input_tokens, input_tokens_details.cached_tokens,
+            # output_tokens, output_tokens_details.reasoning_tokens, total_tokens.
+            # None when the response carried none. Before this was kept, every Codex
+            # call's tokens were a tokenizer estimate of the message text, which leaves
+            # out the tool schemas, reasoning and caching the provider bills -- and was
+            # then logged as "provider_usage", so the estimate looked authoritative.
+            self.usage: Optional[Dict[str, Any]] = usage if isinstance(usage, dict) else None
 
     def __init__(
         self,
@@ -506,6 +523,17 @@ class CodexResponsesWrapper:
                     continue
                 if status not in self._RETRYABLE_STATUS:
                     raise
+                from .retry import ProviderQuotaExhausted, describe_wait, provider_quota_reset_s
+
+                reset_s = provider_quota_reset_s(exc)
+                if reset_s is not None:
+                    # A usage limit that resets in hours or days: the five
+                    # retries below would only spend ~7 minutes proving it.
+                    raise ProviderQuotaExhausted(
+                        "Codex usage limit reached; the provider accepts requests again "
+                        f"in {describe_wait(reset_s)}.",
+                        reset_s=reset_s,
+                    ) from exc
                 last_error = exc
             if attempt < self._MAX_ATTEMPTS:
                 delay = self._BACKOFF_SECONDS[
@@ -576,10 +604,17 @@ class CodexResponsesWrapper:
 
         if not self._stream:
             body = resp.json()
-            return self._Resp(self._extract_output_text(body), self._extract_tool_calls(body))
+            return self._Resp(
+                self._extract_output_text(body),
+                self._extract_tool_calls(body),
+                usage=body.get("usage") if isinstance(body, dict) else None,
+                response_id=body.get("id") if isinstance(body, dict) else None,
+            )
 
         chunks: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
+        usage: Optional[Dict[str, Any]] = None
+        response_id: Optional[str] = None
         try:
             for event in self._iter_sse_text(resp):
                 try:
@@ -614,6 +649,9 @@ class CodexResponsesWrapper:
                     if kind in {"response.completed", "response.incomplete", "response.failed"}:
                         body = parsed.get("response")
                         if isinstance(body, dict):
+                            # The terminal event is where the provider reports usage.
+                            usage = body.get("usage") or usage
+                            response_id = body.get("id") or response_id
                             if not chunks:
                                 text = self._extract_output_text(body)
                                 if text:
@@ -641,7 +679,7 @@ class CodexResponsesWrapper:
                     chunks.append(fallback)
         finally:
             resp.close()
-        return self._Resp("".join(chunks).strip(), tool_calls)
+        return self._Resp("".join(chunks).strip(), tool_calls, usage=usage, response_id=response_id)
 
     @staticmethod
     def _decode_function_call(item: Dict[str, Any]) -> Dict[str, Any]:

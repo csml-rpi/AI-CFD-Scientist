@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
@@ -15,6 +16,7 @@ from pydantic import BaseModel, Field
 from cfd_langgraph.config import Settings, get_settings
 from cfd_langgraph.utils import structured_output
 from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.llm import token_usage_logger
 from cfd_langgraph.manager import build_manager
 from cfd_langgraph.cli import ui
 from cfd_langgraph.cli.activity import BOARD, STEERING_QUEUE
@@ -394,6 +396,93 @@ _AUTO_CONTINUE_MESSAGE = (
 )
 
 
+_AUTO_SETUP_MESSAGE = (
+    "You stopped before the study was set up, and no tool call was made in that "
+    "turn. Do not describe what you would do next — issue the next tool call now. "
+    "If a step failed, retry it or diagnose it with a tool; do not narrate the plan "
+    "and stop."
+)
+
+
+def _setup_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """True when a study stopped before it could possibly be finished.
+
+    ``_search_incomplete`` below only speaks once the search has recorded a
+    round, because before that there is no search_status.json to read. That
+    left the whole of setup -- starter reading, literature, hypotheses,
+    comparator authoring, baseline scoring -- with no auto-continue at all, and
+    a model that ends a turn with prose and no tool call parks the study there.
+    LangGraph reads "no tool calls" as the agent choosing to stop, so nothing
+    downstream can tell that apart from a finished study.
+
+    Measured on the four-model comparison: llama-4-maverick and gemma-4 each
+    idled inside eleven minutes this way -- gemma immediately after writing a
+    valid objective contract, so it was not blocked on anything, it simply
+    stopped. gpt-5.6-sol did not do it once in 28 hours on the same code. The
+    weaker the model, the more often a turn comes back as narration instead of
+    a call, and an unattended overnight study is exactly where that costs most.
+
+    search_config.json is the milestone: setup writes it last, and until it
+    exists the study definitionally has not finished. Once it exists this stops
+    firing and _search_incomplete takes over, so the two never overlap.
+    """
+    # An implementation study has no search to set up; whether it is done is
+    # its own status file's call (see _implementation_incomplete).
+    if _study_mode_of(out_dir) == "implementation":
+        return None
+    disc = out_dir / "open_ended_discovery"
+    if (disc / "search_config.json").is_file():
+        return None
+    state = {}
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "running":
+        return None
+    return {"stage": state.get("current_stage") or "setup"}
+
+
+def _study_mode_of(out_dir: Path) -> str:
+    try:
+        doc = json.loads((out_dir / "study_mode.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    return str((doc or {}).get("mode") or "").strip().lower() if isinstance(doc, dict) else ""
+
+
+_AUTO_IMPLEMENTATION_MESSAGE = (
+    "The implementation study is not finished. Call impl_status and carry on with the step "
+    "it names -- impl_run, impl_verify or impl_continue -- until impl_verify accepts the work "
+    "or the continuations are used up, then report the verdict."
+)
+
+
+def _implementation_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """For an implementation study, whether it has reached its own end.
+
+    Done means implementation/status.json says complete: accepted by
+    impl_verify, or checked with every continuation used. Anything short of
+    that while the study is marked running is a pause, not an end -- the same
+    distinction _setup_incomplete and _search_incomplete draw for the other
+    kinds of study."""
+    if _study_mode_of(out_dir) != "implementation":
+        return None
+    try:
+        status = json.loads((out_dir / "implementation" / "status.json").read_text())
+    except (OSError, ValueError):
+        status = {}
+    if isinstance(status, dict) and status.get("complete"):
+        return None
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "running":
+        return None
+    return {"stage": "implementation"}
+
+
 def _search_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
     """The search's own verdict when it says it is unfinished, else None.
 
@@ -539,6 +628,22 @@ def _drive_study(
             # killed everything. The checkpoint survives either way, so stay
             # up.
             print(f"\n✗ that step failed: {type(exc).__name__}: {exc}", flush=True)
+            from cfd_langgraph.llm.retry import describe_wait, provider_quota_reset_s
+
+            # A usage limit that resets in hours or days is a wall, not a blip.
+            # Retrying the step, or nudging the search to carry on, only spends
+            # those hours hitting it again -- on 2026-09-13 both codex studies
+            # did exactly that against a limit 5.4 days from resetting.
+            quota_wait = provider_quota_reset_s(exc)
+            if quota_wait is not None:
+                print(
+                    "  the model provider's usage limit is used up; it accepts requests "
+                    f"again in {describe_wait(quota_wait)}. Not retrying, and nothing "
+                    "completed is lost: resume this study after that, or /quit.",
+                    flush=True,
+                )
+                auto_retries_left = 0
+                auto_continues_left = 0
 
             # Staying up is not the same as continuing, and this used to
             # conflate them: it printed "type an instruction to continue" and
@@ -572,11 +677,12 @@ def _drive_study(
                 BOARD.note("")
                 payload = {"messages": [{"role": "user", "content": _AUTO_RETRY_MESSAGE}]}
                 continue
-            print(
-                "  auto-retries exhausted. Type an instruction to continue "
-                "(e.g. 'retry that step'), or /quit to stop.",
-                flush=True,
-            )
+            if quota_wait is None:
+                print(
+                    "  auto-retries exhausted. Type an instruction to continue "
+                    "(e.g. 'retry that step'), or /quit to stop.",
+                    flush=True,
+                )
         else:
             # A turn that got through resets the budget, so a long study is
             # not capped at four recoveries for its whole life -- only at four
@@ -599,6 +705,33 @@ def _drive_study(
                 flush=True,
             )
             payload = {"messages": [{"role": "user", "content": _AUTO_CONTINUE_MESSAGE}]}
+            continue
+
+        # Same reasoning one stage earlier: a study that has not finished setup
+        # cannot be finished, whatever the turn looked like.
+        pre = _setup_incomplete(out_dir)
+        if pre is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
+            print(
+                f"\n  the study stopped during {pre.get('stage')} with setup "
+                f"unfinished — continuing it [{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. "
+                "Type anything, or /quit, to take over.",
+                flush=True,
+            )
+            payload = {"messages": [{"role": "user", "content": _AUTO_SETUP_MESSAGE}]}
+            continue
+
+        impl = _implementation_incomplete(out_dir)
+        if impl is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
+            print(
+                f"\n  the implementation study is not finished — continuing it "
+                f"[{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. Type anything, or /quit, to take over.",
+                flush=True,
+            )
+            payload = {"messages": [{"role": "user", "content": _AUTO_IMPLEMENTATION_MESSAGE}]}
             continue
 
         BOARD.note("idle")
@@ -795,7 +928,28 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.num_candidates is not None:
         settings = settings.model_copy(update={"hypothesis_num_candidates": args.num_candidates})
 
-    hints = _PromptHints() if args.out_dir else _llm_extract_hints(topic, settings)
+    # Bind accounting BEFORE the first model is built. `_llm_extract_hints`
+    # below is an LLM call, and with no --out-dir it runs before any run
+    # directory exists, so its tokens fell through to a shared
+    # llm_token_usage.json in the working directory. Measured: 49 such calls
+    # across four providers landed in the repo root, filed as "unattributed",
+    # invisible to every per-study report. When --out-dir is given the
+    # destination is known here, so bind it now; otherwise the prelude logs to
+    # a scratch folder and its rows are moved into the study's log once the
+    # folder is known.
+    prelude_log = None
+    if args.out_dir:
+        _bind_token_log(Path(args.out_dir))
+    else:
+        # The study folder is not known until the model has read the prompt,
+        # so the prelude logs to a scratch folder and its rows are moved into
+        # the study's log below.
+        import tempfile
+        prelude_log = Path(tempfile.mkdtemp(prefix="cfd_prelude_tokens_"))
+        os.environ.pop("CFD_TOKEN_LOG_PATH", None)
+        os.environ["CFD_TOKEN_LOG_DIR"] = str(prelude_log)
+    with token_usage_logger.stage_scope("cli_prelude"):
+        hints = _PromptHints() if args.out_dir else _llm_extract_hints(topic, settings)
 
     if args.out_dir:
         out_dir = Path(args.out_dir)
@@ -806,6 +960,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         out_dir = Path("runs") / f"study_{datetime.now():%Y%m%d_%H%M%S}"
         print(f"(no --out-dir given and none found in the prompt, using {out_dir})")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if prelude_log is not None:
+        os.environ.pop("CFD_TOKEN_LOG_DIR", None)
+        _bind_token_log(out_dir)
+        for row in token_usage_logger.read_rows(prelude_log / "llm_token_usage_calls.jsonl"):
+            token_usage_logger.append_row(row)
     # The user's prompt, verbatim and immutable, as the study's authoritative
     # objective. Tools must not depend on the manager passing it through: it
     # summarises. Measured on a real run, an 86-character paraphrase reached
@@ -822,6 +981,22 @@ def cmd_run(args: argparse.Namespace) -> None:
     _start_session(settings, out_dir, {"messages": [{"role": "user", "content": topic}]})
 
 
+def _bind_token_log(out_dir: Path) -> None:
+    """Send every LLM call's accounting to this study's folder.
+
+    The study folder always wins. It used to yield to a CFD_TOKEN_LOG_DIR or
+    CFD_TOKEN_LOG_PATH already in the environment, so a value left exported in
+    a shell from an earlier study would have filed this study's tokens there.
+    """
+    target = Path(out_dir).resolve()
+    stray = os.environ.pop("CFD_TOKEN_LOG_PATH", None)
+    previous = os.environ.get("CFD_TOKEN_LOG_DIR")
+    for old in (stray, previous):
+        if old and Path(old).expanduser().resolve() not in (target, target / "llm_token_usage.json"):
+            print(f"(token accounting: ignoring {old}; this study logs to {target})")
+    os.environ["CFD_TOKEN_LOG_DIR"] = str(target)
+
+
 def _start_session(settings: Settings, out_dir: Path, payload: Any) -> None:
     """Build the graph and run it, under the live console when one is possible.
 
@@ -831,6 +1006,22 @@ def _start_session(settings: Settings, out_dir: Path, payload: Any) -> None:
     the behaviour they had before the console existed, instead of on a second
     lightly-tested path.
     """
+    # Token accounting lands in THIS study's folder rather than a shared file
+    # in the working directory. Set here because `run` and `resume` both come
+    # through this function, and set on os.environ rather than passed as an
+    # argument so it reaches every subprocess stage via os.environ.copy() --
+    # the build agents, the interpreter, the setup script -- without threading
+    # a path through each of them. An explicit CFD_TOKEN_LOG_DIR or
+    # CFD_TOKEN_LOG_PATH from the launching shell still wins.
+    _bind_token_log(out_dir)
+    # Default attribution for everything running in THIS process: the manager
+    # graph and the in-process tools it calls. Subprocess stages overwrite it
+    # with their own script name (see _run_script), and individual in-process
+    # stages narrow it with stage_scope, so this is the floor rather than the
+    # answer -- but it means no call is filed as "unattributed" by default.
+    if not os.environ.get("CFD_SCIENTIST_STAGE"):
+        os.environ["CFD_SCIENTIST_STAGE"] = "manager"
+        os.environ["CFD_SCIENTIST_STAGE_OWNER"] = token_usage_logger.process_name()
     graph, stack = build_manager(settings, out_dir)
     config = {"configurable": {"thread_id": _thread_id_for(out_dir)}}
     try:

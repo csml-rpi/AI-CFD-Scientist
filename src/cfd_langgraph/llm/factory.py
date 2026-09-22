@@ -18,7 +18,13 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_openai import ChatOpenAI
 from pydantic import PrivateAttr
 
-from cfd_langgraph.llm.token_stats import TOKEN_STATS_HANDLER
+from cfd_langgraph.llm.token_stats import (
+    TOKEN_STATS_HANDLER as _SHARED_TOKEN_HANDLER,
+    TokenStatsCallbackHandler,
+)
+
+# Module-level default so helpers outside create_langchain_llm keep working.
+TOKEN_STATS_HANDLER = _SHARED_TOKEN_HANDLER
 
 
 def _extract_gemini_text(content: Any) -> str:
@@ -58,6 +64,133 @@ def _is_pure_text_block_list(content: Any) -> bool:
     if not isinstance(content, list):
         return False
     return bool(content) and all(isinstance(b, dict) and b.get("type") == "text" for b in content)
+
+
+
+def _bound_tool_names(kwargs: dict) -> list:
+    """Names of the tools bound for this call, from bind_tools' own payload.
+
+    ``bind_tools`` forwards the formatted tool list into ``_generate``'s
+    kwargs, so the live list is available here without threading it through
+    the factory. The key and the shape differ by provider: ``tools`` holds
+    OpenAI ({"function": {"name": ...}}), Anthropic ({"name": ...}) or Bedrock
+    ({"toolSpec": {"name": ...}}) specs, and this module's Codex and Claude Code
+    models bind ``codex_tools`` and ``claude_tools``. Reading only the first two
+    shapes under ``tools`` left Bedrock, Codex and Claude Code with no names, so
+    the repair below could never run for them.
+    """
+    names = []
+    for key in ("tools", "codex_tools", "claude_tools"):
+        for t in (kwargs.get(key) or []):
+            if not isinstance(t, dict):
+                continue
+            spec = t
+            for inner in ("function", "toolSpec"):
+                if isinstance(t.get(inner), dict):
+                    spec = t[inner]
+                    break
+            n = spec.get("name")
+            if n:
+                names.append(str(n))
+    return names
+
+
+def _repair_narrated_tool_calls(llm: Any, generations: list, kwargs: dict) -> list:
+    """Recover a tool call the model wrote as prose instead of emitting.
+
+    LangGraph reads "no tool calls" as the agent choosing to stop, so a turn
+    that narrates its call ends the study. Measured on ph_llama_20260910e:
+    five such turns, including [oed_prepare_baseline(...)] and
+    [interpret_case(case_id="case_001")] -- correct decisions in the wrong
+    shape, each one fatal. The model is asked to re-express its own text as a
+    real call rather than being nudged to try again, so the decision it
+    already made is not thrown away.
+
+    Only runs when tools were bound and one of their names appears verbatim in
+    the text. A failed repair leaves the turn exactly as it was.
+    """
+    names = _bound_tool_names(kwargs)
+    if not names:
+        return generations
+    try:
+        from cfd_langgraph.llm.tool_call_repair import repair_if_narrated
+    except Exception:
+        return generations
+    out = []
+    for gen in generations:
+        msg = getattr(gen, "message", None)
+        if msg is not None and not getattr(msg, "tool_calls", None):
+            fixed = repair_if_narrated(llm, msg, names)
+            if fixed is not msg:
+                print(
+                    f"[tool-call repair] recovered {fixed.tool_calls[0]['name']} "
+                    "from a narrated turn",
+                    flush=True,
+                )
+                out.append(ChatGeneration(message=fixed, generation_info=gen.generation_info))
+                continue
+        out.append(gen)
+    return out
+
+
+_REPAIRING_CLASSES: dict = {}
+
+
+def _with_tool_call_repair(cls: type) -> type:
+    """``cls`` with the narrated-tool-call repair applied to every reply.
+
+    Only GeminiChatModel and the self-hosted Vertex endpoint had it, so the same
+    mistake was recovered on one provider and fatal on another: Llama 4 Maverick
+    on Bedrock (experiments_for_paper/llama4_maverick/slau) wrote its
+    impl_continue call out as JSON text five times and the study parked, where
+    the Vertex route would have recovered the call. Every chat model the
+    factory builds now gets the same repair, so a comparison across providers
+    compares the models, not the plumbing.
+    """
+    cached = _REPAIRING_CLASSES.get(cls)
+    if cached is None:
+        class _Repairing(cls):  # type: ignore[misc, valid-type]
+            def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+                result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+                try:
+                    fixed = _repair_narrated_tool_calls(self, list(result.generations), kwargs)
+                except Exception:
+                    return result
+                return ChatResult(generations=fixed, llm_output=result.llm_output)
+
+        _Repairing.__name__ = _Repairing.__qualname__ = f"Repairing{cls.__name__}"
+        cached = _REPAIRING_CLASSES[cls] = _Repairing
+    return cached
+
+
+def _tracked_structured(model: Any, schema: Any, extract_json: Any, count_tokens: Any) -> Any:
+    """Structured output sent through ``model.invoke``, so it is counted like any call.
+
+    The Codex and Claude Code models used to hand structured requests to their raw
+    wrapper, which calls the provider directly. That skipped LangChain's callbacks, so
+    those calls were never logged at all -- not even as an estimate -- and structured
+    output is how CFD Scientist classifies, ranks and extracts throughout a study.
+    Routing through ``model.invoke`` keeps the request identical (the same schema
+    instruction, prepended as a system message, and the same JSON extraction) while the
+    call now goes through ``_generate``: real provider usage, the agent label, the stage.
+    """
+    from langchain_core.messages import SystemMessage, convert_to_messages
+
+    hint = (
+        "Return ONLY valid JSON (no markdown) that matches this JSON Schema:\n"
+        + str(schema.model_json_schema())
+    )
+
+    class _Structured:
+        def get_num_tokens(self, text: str) -> int:
+            return count_tokens(text)
+
+        def invoke(self, messages: Any, config: Any = None, **kw: Any) -> Any:
+            msgs = convert_to_messages(messages if isinstance(messages, list) else [messages])
+            resp = model.invoke([SystemMessage(content=hint), *msgs], config=config)
+            return schema.model_validate_json(extract_json(getattr(resp, "content", "") or ""))
+
+    return _Structured()
 
 
 class GeminiChatModel(BaseChatModel):
@@ -119,6 +252,7 @@ class GeminiChatModel(BaseChatModel):
                 id=getattr(gen.message, "id", None),
             )
             normalized.append(ChatGeneration(message=msg, generation_info=gen.generation_info))
+        normalized = _repair_narrated_tool_calls(self, normalized, kwargs)
         return ChatResult(generations=normalized, llm_output=result.llm_output)
 
     def get_num_tokens(self, text: str) -> int:
@@ -128,7 +262,12 @@ class GeminiChatModel(BaseChatModel):
             return max(1, len((text or "").split()))
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
-        return self._inner.with_structured_output(schema, **kwargs)
+        # The inner client carries no callbacks -- this wrapper does -- so a structured
+        # call run on the inner client was never logged. Attaching this wrapper's
+        # callbacks to the runnable counts it once, with the inner client's real usage.
+        return self._inner.with_structured_output(schema, **kwargs).with_config(
+            callbacks=list(self.callbacks or [])
+        )
 
     def bind_tools(self, tools: Any, *, tool_choice: Any = None, **kwargs: Any) -> Any:
         """Delegate tool-schema formatting to the real Gemini client, but
@@ -317,6 +456,11 @@ class CodexOAuthChatModel(BaseChatModel):
         from .tool_bridge import messages_to_responses_input
 
         tools = kwargs.get("codex_tools")
+        # The provider's usage for every attempt of this call. An empty turn is retried
+        # (_retry_empty_turn), and the discarded attempt was still sent, processed and
+        # billed, so the call's cost is the sum over attempts, not just the last one.
+        attempt_usages: list = []
+        attempt_ids: list = []
 
         def _produce() -> tuple[str, list[dict]]:
             if tools:
@@ -326,11 +470,15 @@ class CodexOAuthChatModel(BaseChatModel):
                     tools=tools,
                     tool_choice=kwargs.get("codex_tool_choice"),
                 )
+                attempt_usages.append(getattr(response, "usage", None))
+                attempt_ids.append(getattr(response, "response_id", None))
                 return (
                     getattr(response, "content", "") or "",
                     list(getattr(response, "tool_calls", []) or []),
                 )
             response = self._codex.invoke(_lc_messages_to_dicts(messages))
+            attempt_usages.append(getattr(response, "usage", None))
+            attempt_ids.append(getattr(response, "response_id", None))
             return getattr(response, "content", "") or "", []
 
         text, tool_calls = _retry_empty_turn(_produce, "codex")
@@ -342,39 +490,59 @@ class CodexOAuthChatModel(BaseChatModel):
                 if c.get("name")
             ],
         )
+
+        # Token accounting from what the provider actually reports, not a guess.
+        # Estimating from the message text omits the tool schemas sent on every call,
+        # the reasoning tokens and the cached share of the input -- all of which the
+        # provider counts -- and makes Codex totals incomparable with every provider
+        # that reports real usage. The estimate is kept only for a response that
+        # arrives with no usage block, and it is labelled as an estimate.
+        reported = [u for u in attempt_usages if isinstance(u, dict) and u.get("input_tokens") is not None]
+        if reported:
+            prompt_tokens = sum(int(u.get("input_tokens") or 0) for u in reported)
+            completion_tokens = sum(int(u.get("output_tokens") or 0) for u in reported)
+            cached_tokens = sum(int((u.get("input_tokens_details") or {}).get("cached_tokens") or 0) for u in reported)
+            reasoning_tokens = sum(int((u.get("output_tokens_details") or {}).get("reasoning_tokens") or 0) for u in reported)
+            # Every attempt reported usage, or some did not: only the former is fully real.
+            token_source = "provider_usage" if len(reported) == len(attempt_usages) else "provider_usage_partial"
+            msg.usage_metadata = {
+                "input_tokens": prompt_tokens,
+                "output_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+                "input_token_details": {"cache_read": cached_tokens},
+                "output_token_details": {"reasoning": reasoning_tokens},
+            }
+        else:
+            prompt_tokens = completion_tokens = cached_tokens = reasoning_tokens = 0
+            try:
+                for m in messages:
+                    prompt_tokens += int(self._codex.get_num_tokens(_message_content_to_text(m.content)))
+                completion_tokens = int(self._codex.get_num_tokens(text))
+            except Exception:
+                prompt_tokens = completion_tokens = 0
+            token_source = "estimate"
         gen = ChatGeneration(message=msg)
-        prompt_tokens = 0
-        completion_tokens = 0
-        try:
-            for m in messages:
-                prompt_tokens += int(self._codex.get_num_tokens(_message_content_to_text(m.content)))
-            completion_tokens = int(self._codex.get_num_tokens(text))
-        except Exception:
-            prompt_tokens = completion_tokens = 0
         return ChatResult(
             generations=[gen],
             llm_output={
                 "token_usage": {
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
+                    "cached_input_tokens": cached_tokens,
+                    "reasoning_output_tokens": reasoning_tokens,
                 },
+                "token_source": token_source,
+                "attempts": len(attempt_usages),
+                "response_ids": [i for i in attempt_ids if i],
                 "model_name": self.model_name,
             },
         )
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
-        """Delegate to CodexResponsesWrapper (expects dict messages); bridge LangChain messages."""
-        inner = self._codex.with_structured_output(schema)
-
-        class _StructuredBridge:
-            def get_num_tokens(self, text: str) -> int:
-                return inner.get_num_tokens(text)
-
-            def invoke(self, messages: Any, config: Any = None, **kw: Any) -> Any:
-                dicts = _lc_messages_to_dicts(messages)
-                return inner.invoke(dicts)
-
-        return _StructuredBridge()
+        """Structured output through this model's own invoke, so it is counted."""
+        return _tracked_structured(
+            self, schema, self._codex._extract_json_object, self._codex.get_num_tokens
+        )
 
 
 _NEVER_WRITE_TOOL_CALLS = (
@@ -930,26 +1098,22 @@ class ClaudeCodeChatModel(BaseChatModel):
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                 },
+                # A tokenizer estimate of the message text, not the provider's usage:
+                # labelled so, instead of defaulting to "provider_usage".
+                "token_source": "estimate",
                 "model_name": self.model_name,
             },
         )
 
     def with_structured_output(self, schema: Any, **kwargs: Any) -> Any:
-        inner = self._claude.with_structured_output(schema)
-
-        class _StructuredBridge:
-            def get_num_tokens(self, text: str) -> int:
-                return inner.get_num_tokens(text)
-
-            def invoke(self, messages: Any, config: Any = None, **kw: Any) -> Any:
-                dicts = _lc_messages_to_dicts(messages)
-                return inner.invoke(dicts)
-
-        return _StructuredBridge()
+        """Structured output through this model's own invoke, so it is counted."""
+        return _tracked_structured(
+            self, schema, self._claude._extract_json_object, self._claude.get_num_tokens
+        )
 
 
 def _create_codex_oauth_chat_model(
-    model_name: str, temperature: float, effort: str | None = None
+    model_name: str, temperature: float, effort: str | None = None, handler: Any = None
 ) -> CodexOAuthChatModel:
     from .codex_oauth import CodexResponsesWrapper, default_instructions, load_codex_oauth
 
@@ -964,25 +1128,30 @@ def _create_codex_oauth_chat_model(
         stream=True,
         effort=effort,
     )
-    return CodexOAuthChatModel(
+    return _with_tool_call_repair(CodexOAuthChatModel)(
         codex_wrapper=codex,
         model_name=model_name,
-        callbacks=[TOKEN_STATS_HANDLER],
+        # The caller's handler carries the agent label; the module default would file
+        # every call under the default agent, as it did before this was threaded
+        # through -- every Codex call was attributed to "manager", whoever made it.
+        callbacks=[handler or TOKEN_STATS_HANDLER],
     )
 
 
-def _create_claude_code_chat_model(model_name: str, temperature: float, effort: str | None = None) -> ClaudeCodeChatModel:
+def _create_claude_code_chat_model(
+    model_name: str, temperature: float, effort: str | None = None, handler: Any = None
+) -> ClaudeCodeChatModel:
     claude = _ClaudeCodeAgentWrapper(
         model=model_name,
         temperature=temperature,
         max_turns=1,
         effort=effort,
     )
-    return ClaudeCodeChatModel(
+    return _with_tool_call_repair(ClaudeCodeChatModel)(
         claude_wrapper=claude,
         model_name=model_name,
         temperature=temperature,
-        callbacks=[TOKEN_STATS_HANDLER],
+        callbacks=[handler or TOKEN_STATS_HANDLER],
     )
 
 
@@ -1024,8 +1193,51 @@ def _bedrock_read_timeout() -> int:
 # code-mod turn emitting a full OpenFOAM model class is minutes of tokens, not
 # seconds -- so this is set to catch a dead connection, not to police slowness.
 # With max_retries the client then retries rather than the study stopping.
+# Measured on ph_glm_20260910e: 11.9 of that study's 15.2 wall-clock hours
+# were spent inside manager->manager gaps of 50-70 minutes with nothing else
+# running -- no OpenFOAM, no subagent, no log written. 900s x (1 + 3 retries)
+# is 3600s, which is exactly that gap. The bound below is still far longer
+# than any real generation on this transport (a code-mod turn emitting a full
+# model class runs single-digit minutes), so it catches a dead connection
+# without policing slowness -- but a hang now costs minutes, not an hour.
+# Measured 2026-09-10 across every run with a token log, gaps between logged
+# calls (so these include the tool executed in between, and overstate pure
+# generation): the slowest legitimate call is ~236s on the codex route and
+# ~227s on the glm route, while the vertex-endpoint route running llama sits
+# at median 2s / p99 13s. Stalls on that route were 601s and 602s -- two full
+# timeouts back to back with nothing in between -- so there is a clean gap
+# between "real call" and "dead connection" and no reason to wait 5 minutes
+# to tell them apart. 120s clears the observed p99 on every route by a wide
+# margin. Arms whose route is faster still (llama) set a tighter value
+# through CFD_SCIENTIST_VERTEX_TIMEOUT at launch rather than this default
+# being tuned per model.
+# OpenAI-compatible endpoints (the OpenAI API itself, OpenRouter, any
+# self-hosted gateway) hit the same trap the Vertex routes did: ChatOpenAI
+# leaves the SDK per-request timeout unset, which means no timeout at all,
+# so one stalled request holds a multi-hour study open indefinitely. These
+# endpoints answer in seconds, so the bound only ever fires on a dead call.
+def _openai_timeout() -> float:
+    return float(os.environ.get("CFD_SCIENTIST_OPENAI_TIMEOUT", "600"))
+
+
+def _openai_max_retries() -> int:
+    return int(os.environ.get("CFD_SCIENTIST_OPENAI_MAX_RETRIES", "3"))
+
+
 def _vertex_timeout() -> float:
-    return float(os.environ.get("CFD_SCIENTIST_VERTEX_TIMEOUT", "900"))
+    return float(os.environ.get("CFD_SCIENTIST_VERTEX_TIMEOUT", "120"))
+
+
+# The Google SDK routes (glm, gemini) need a longer default than the one above.
+# google-genai does not only stop waiting after `timeout`: it sends the same
+# value to Vertex as X-Server-Timeout, so the server abandons any answer still
+# being written at that point and returns 504 DEADLINE_EXCEEDED. At 120s every
+# glm hypothesis step on 2026-09-11 died that way -- one idea is ~13k output
+# tokens -- and the SDK's own retries hit the same wall each time. 600s covers
+# a multi-minute generation while a dead connection still costs minutes, not
+# the hour 900s allowed. CFD_SCIENTIST_VERTEX_TIMEOUT still overrides it.
+def _google_sdk_timeout() -> float:
+    return float(os.environ.get("CFD_SCIENTIST_VERTEX_TIMEOUT", "600"))
 
 
 def _vertex_max_retries() -> int:
@@ -1063,9 +1275,23 @@ def _default_effort() -> str | None:
     return value
 
 
-def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | None = None) -> Any:
+def create_langchain_llm(
+    model: str,
+    temperature: float = 0.2,
+    effort: str | None = None,
+    agent: str = "",
+    agent_graph: str = "",
+) -> Any:
     m = (model or "").strip()
     effort = effort or _default_effort()
+    # Token accounting rides on the model instance: every client built
+    # here gets a handler carrying this agent label, so calls are
+    # attributed without any shared mutable state. Empty label keeps the
+    # shared singleton, which files under the default agent. ``agent_graph``
+    # names the agent graph the model is built for, when that differs from
+    # the label.
+    TOKEN_STATS_HANDLER = (TokenStatsCallbackHandler(agent, graph_name=agent_graph)
+                           if agent else _SHARED_TOKEN_HANDLER)
 
     # Optional explicit provider override.
     # Supported providers:
@@ -1089,21 +1315,25 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
 
                 config = Config(read_timeout=_bedrock_read_timeout(), connect_timeout=30)
                 bedrock_client = boto_client("bedrock-runtime", config=config)
-                return ChatBedrockConverse(
+                return _with_tool_call_repair(ChatBedrockConverse)(
                     client=bedrock_client,
                     model=model_id,
                     temperature=temperature,
                     callbacks=[TOKEN_STATS_HANDLER],
                 )
             except Exception:
-                return ChatBedrockConverse(
+                return _with_tool_call_repair(ChatBedrockConverse)(
                     model=model_id,
                     temperature=temperature,
                     callbacks=[TOKEN_STATS_HANDLER],
                 )
 
         if provider == "openai":
-            return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+            # stream_usage on every ChatOpenAI: it defaults on only for
+            # api.openai.com, so behind OPENAI_BASE_URL (OpenRouter) a streamed
+            # reply -- every _llm_invoke call streams -- carried no token counts.
+            return _with_tool_call_repair(ChatOpenAI)(model=m, temperature=temperature, timeout=_openai_timeout(),
+                              max_retries=_openai_max_retries(), callbacks=[TOKEN_STATS_HANDLER], stream_usage=True)
 
         if provider == "openai-codex":
             from .codex_oauth import default_codex_model
@@ -1117,7 +1347,7 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     f"CFD_SCIENTIST_EFFORT={effort!r} is not supported by provider 'openai-codex' "
                     f"(accepts {', '.join(_CODEX_EFFORTS)})."
                 )
-            return _create_codex_oauth_chat_model(m, temperature, effort=effort)
+            return _create_codex_oauth_chat_model(m, temperature, effort=effort, handler=TOKEN_STATS_HANDLER)
 
         if provider == "claude-code":
             if effort and effort not in _CLAUDE_EFFORTS:
@@ -1126,10 +1356,10 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     f"(accepts {', '.join(_CLAUDE_EFFORTS)}). Silently running at a different "
                     "effort than asked for would be invisible except on the bill."
                 )
-            return _create_claude_code_chat_model(m, temperature, effort=effort)
+            return _create_claude_code_chat_model(m, temperature, effort=effort, handler=TOKEN_STATS_HANDLER)
 
         if provider == "anthropic":
-            return ChatAnthropic(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+            return _with_tool_call_repair(ChatAnthropic)(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
 
         if provider in {"gemini", "google"}:
             from langchain_google_genai import ChatGoogleGenerativeAI
@@ -1172,14 +1402,14 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     vertexai=True,
                     project=project,
                     location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
-                    timeout=_vertex_timeout(),
+                    timeout=_google_sdk_timeout(),
                     max_retries=_vertex_max_retries(),
                 )
             else:
                 inner = ChatGoogleGenerativeAI(
                     model=m,
                     temperature=temperature,
-                    timeout=_vertex_timeout(),
+                    timeout=_google_sdk_timeout(),
                     max_retries=_vertex_max_retries(),
                 )
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
@@ -1201,8 +1431,31 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                     "provider 'vertex-endpoint' needs CFD_SCIENTIST_VERTEX_ENDPOINT_URL "
                     "set to the endpoint's base URL (everything before /chat/completions)."
                 )
+            # Same hang budget as the Gemini/MaaS branch below. This path had
+            # its own hardcoded 600s and ignored CFD_SCIENTIST_VERTEX_TIMEOUT
+            # entirely, so a study that set that variable to bound its hangs
+            # silently did not bound this provider's.
+            # A self-hosted server has one reasoning control it reliably honours:
+            # the chat template's thinking switch, sent per request as
+            # chat_template_kwargs (the convention SGLang and vLLM share). So
+            # "none" turns thinking off, and any other effort is refused instead
+            # of being silently ignored, which is what this branch used to do.
+            # Measured on Qwen3.8-27B-FP8 with thinking on: agent turns of about
+            # 30,000 reasoning tokens, 10-17 minutes each, several of them with
+            # no tool call at all (experiments_for_paper/qwen_27b/slau).
+            extra_body = None
+            if effort == "none":
+                extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            elif effort:
+                raise ValueError(
+                    f"CFD_SCIENTIST_EFFORT={effort!r} is not supported by provider 'vertex-endpoint'. "
+                    "It accepts only 'none', which turns the model's thinking off; unset it to keep "
+                    "the served model's default."
+                )
             return create_vertex_endpoint_chat_model(
-                m, temperature, base_url=base_url, callbacks=[TOKEN_STATS_HANDLER]
+                m, temperature, base_url=base_url, callbacks=[TOKEN_STATS_HANDLER],
+                timeout=int(_vertex_timeout()), max_retries=_vertex_max_retries(),
+                extra_body=extra_body,
             )
 
         if provider in {"vertex-openai", "glm"}:
@@ -1265,7 +1518,7 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
                 vertexai=True,
                 project=project,
                 location=(os.environ.get("GOOGLE_CLOUD_LOCATION") or "global").strip(),
-                timeout=_vertex_timeout(),
+                timeout=_google_sdk_timeout(),
                 max_retries=_vertex_max_retries(),
             )
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
@@ -1284,20 +1537,20 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
             from boto3 import client as boto_client
             config = Config(read_timeout=_bedrock_read_timeout(), connect_timeout=30)
             bedrock_client = boto_client("bedrock-runtime", config=config)
-            return ChatBedrockConverse(
+            return _with_tool_call_repair(ChatBedrockConverse)(
                 client=bedrock_client,
                 model=model_id,
                 temperature=temperature,
                 callbacks=[TOKEN_STATS_HANDLER],
             )
         except Exception:
-            return ChatBedrockConverse(
+            return _with_tool_call_repair(ChatBedrockConverse)(
                 model=model_id,
                 temperature=temperature,
                 callbacks=[TOKEN_STATS_HANDLER],
             )
     if m.startswith("claude-"):
-        return ChatAnthropic(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+        return _with_tool_call_repair(ChatAnthropic)(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
 
     # Codex/OpenAI models use API-key auth via OPENAI_API_KEY.
     # Examples:
@@ -1305,19 +1558,20 @@ def create_langchain_llm(model: str, temperature: float = 0.2, effort: str | Non
     #   CFD_SCIENTIST_MODEL=gpt-5-codex
     if m.startswith("codex/"):
         openai_model = m.split("codex/", 1)[1].strip() or "gpt-5-codex"
-        return ChatOpenAI(model=openai_model, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+        return _with_tool_call_repair(ChatOpenAI)(model=openai_model, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER], stream_usage=True)
 
     if m == "codex":
-        return ChatOpenAI(model="gpt-5-codex", temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+        return _with_tool_call_repair(ChatOpenAI)(model="gpt-5-codex", temperature=temperature, callbacks=[TOKEN_STATS_HANDLER], stream_usage=True)
 
     if "gpt" in m or m.startswith("o1") or m.startswith("o3"):
-        return ChatOpenAI(model=m, temperature=temperature, callbacks=[TOKEN_STATS_HANDLER])
+        return _with_tool_call_repair(ChatOpenAI)(model=m, temperature=temperature, timeout=_openai_timeout(),
+                              max_retries=_openai_max_retries(), callbacks=[TOKEN_STATS_HANDLER], stream_usage=True)
     if "gemini" in m:
         from langchain_google_genai import ChatGoogleGenerativeAI
         inner = ChatGoogleGenerativeAI(
             model=m,
             temperature=temperature,
-            timeout=_vertex_timeout(),
+            timeout=_google_sdk_timeout(),
             max_retries=_vertex_max_retries(),
         )
         return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,

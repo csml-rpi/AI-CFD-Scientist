@@ -878,6 +878,49 @@ def _token_counter_kwargs(model: Any) -> Dict[str, Any]:
     }
 
 
+# Longest tool-error message the model is shown in full.
+_TOOL_ERROR_CHARS = int(os.getenv("CFD_SCIENTIST_TOOL_ERROR_CHARS") or 2000)
+
+
+def _tool_error_trim_middleware() -> Any:
+    """Cut an oversized tool-error message down before it enters the conversation.
+
+    When a tool's arguments fail validation, the tool node's error text repeats
+    every argument back ("Error invoking tool ... with kwargs {...} with
+    error"). A model stuck retrying with a growing argument therefore grows the
+    conversation twice per turn: on experiments_for_paper/qwen_27b_nothink/palmo
+    one such message was 13,226 characters, in a run that ended when the
+    conversation passed the endpoint's 217,718-token limit. The head and the
+    tail are kept, and the tail is where the error itself is.
+    """
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.messages import ToolMessage
+
+    def _trim(message: Any) -> Any:
+        content = getattr(message, "content", None)
+        if (
+            isinstance(message, ToolMessage)
+            and getattr(message, "status", None) == "error"
+            and isinstance(content, str)
+            and len(content) > _TOOL_ERROR_CHARS
+        ):
+            half = _TOOL_ERROR_CHARS // 2
+            omitted = len(content) - 2 * half
+            return message.model_copy(update={
+                "content": content[:half] + f"\n…[{omitted} characters omitted]…\n" + content[-half:]
+            })
+        return message
+
+    class TrimToolErrors(AgentMiddleware):
+        def wrap_tool_call(self, request: Any, handler: Any) -> Any:
+            return _trim(handler(request))
+
+        async def awrap_tool_call(self, request: Any, handler: Any) -> Any:
+            return _trim(await handler(request))
+
+    return TrimToolErrors()
+
+
 def build_context_middleware(
     model: Any, tools: Optional[List[Any]] = None
 ) -> List[Any]:
@@ -908,6 +951,8 @@ def build_context_middleware(
         # An older langchain without context editing: the agent still runs,
         # just without compaction, exactly as it did before this existed.
         return middleware
+
+    middleware.append(_tool_error_trim_middleware())
 
     # Clearing needs the tool list to know what is safe to clear. Without it,
     # summarization alone still bounds the conversation -- slower and lossier,
