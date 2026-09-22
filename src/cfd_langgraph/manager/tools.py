@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import fnmatch
+import hashlib
 import json
 import math
 import statistics
@@ -216,6 +218,12 @@ _OED_MAX_PROMOTED = 8
 # nothing to react to and proposes whatever it would have proposed anyway.
 _LIT_MIN_PAPERS = 10
 
+# How many fetch_literature calls may find no papers before the study goes on
+# without literature. Without a limit the hypothesis step stays blocked for as
+# long as the search fails: on 2026-09-11 Semantic Scholar returned 500s for
+# ~20 minutes and three studies sat calling fetch_literature 2, 9 and 11 times.
+_LIT_MAX_FAILED_FETCHES = int(os.getenv("CFD_SCIENTIST_LIT_MAX_ATTEMPTS") or 10)
+
 # Wall-clock fence for one evaluation-case solver run (seconds). These are
 # plain re-runs of a declared case with a compiled model already in hand — no
 # agent, no compile — so a case that has not reached End in an hour is stuck
@@ -260,6 +268,19 @@ _OED_EXTENSION_ATTEMPTS = 2
 # block every other candidate behind it for as long as it liked. Six hours
 # matches the ceiling already used on this file's other long-running path.
 _OED_MAX_EXTENDED_S = 21600
+
+# What a build is told before its study has a fence (_oed_candidate_timeout
+# needs four successes first): the build subprocess's 3h timeout less the 30
+# minutes of headroom always kept above what the agent was told.
+_OED_UNFENCED_S = 9000
+
+# Implementation studies: one agent does the whole job, so its clock is a
+# working session rather than one candidate's slot, and it gets more turns.
+_IMPL_TIMEOUT_S = int(os.environ.get("CFD_SCIENTIST_IMPLEMENTATION_TIMEOUT_S", "") or 21600)
+_IMPL_MAX_S = int(os.environ.get("CFD_SCIENTIST_IMPLEMENTATION_MAX_S", "") or 43200)
+_IMPL_MAX_TURNS = int(os.environ.get("CFD_SCIENTIST_IMPLEMENTATION_MAX_TURNS", "") or 400)
+_IMPL_CONTINUATIONS = 3
+_IMPL_SCORER_TIMEOUT_S = int(os.environ.get("CFD_SCIENTIST_IMPLEMENTATION_SCORER_TIMEOUT_S", "") or 7200)
 
 
 def _candidate_strategy(candidate_path: Path) -> str:
@@ -765,14 +786,254 @@ def _runtime_coefficients(case_dir: Path) -> List[str]:
     return names
 
 
+def _candidate_study_mode(candidate_path: Path) -> str:
+    """'surrogate' or 'solver' for the study a candidate belongs to.
+
+    Read from <out_dir>/study_mode.json -- candidates live in
+    <out_dir>/open_ended_discovery/ -- the record every gate inside
+    build_manager_tools reads, and 'solver' when it is absent, as there.
+    """
+    doc = _read_json(Path(candidate_path).parent.parent / "study_mode.json") or {}
+    mode = str(doc.get("mode", "") or "").strip().lower()
+    return "surrogate" if mode == "surrogate" else "solver"
+
+
+def _file_listing(root: Path, *, limit: int = 60) -> List[str]:
+    """Every file under ``root``: relative path, size, and when it was written."""
+    if not root.is_dir():
+        return [f"  (none: {root.name}/ does not exist)"]
+    try:
+        files = sorted(p for p in root.rglob("*") if p.is_file())
+    except OSError:
+        return ["  (unreadable)"]
+    if not files:
+        return [f"  (none: {root.name}/ is empty)"]
+    out: List[str] = []
+    for p in files[:limit]:
+        try:
+            st = p.stat()
+            written = datetime.fromtimestamp(st.st_mtime, timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            out.append(f"  {p.relative_to(root)} ({st.st_size} bytes, written {written})")
+        except OSError:
+            out.append(f"  {p.relative_to(root)} (unreadable)")
+    if len(files) > limit:
+        out.append(f"  ... and {len(files) - limit} more files")
+    return out
+
+
+def _evidence_sha(evidence: str) -> str:
+    return hashlib.sha1(str(evidence or "").encode("utf-8", "replace")).hexdigest()
+
+
+def _build_finished_uncleanly(result: Dict[str, Any]) -> bool:
+    """True when a build agent's result shows it did not finish its work.
+
+    The status alone does not say so. The solver runner reports OK once a
+    library compiled and a case reached End, the fitted-model runner once any
+    prediction file exists -- both true of an agent stopped part-way. On
+    airfrans_codex_20260913 a build stopped at its 9000 s limit came back OK
+    and went to scoring unexamined; one stopped after two of its five seeds
+    would have been scored as finished."""
+    if not isinstance(result, dict) or not result:
+        return True
+    if str(result.get("status", "") or "").strip().upper() != "OK":
+        return True
+    if result.get("aborted_reason") or result.get("provider_error"):
+        return True
+    if result.get("finished_cleanly") is False:
+        return True
+    # A runner that records the agent's closing report, with an empty one: the
+    # agent never said it was done (it ran out of turns, for instance).
+    return "agent_final_payload" in result and not result.get("agent_final_payload")
+
+
+def _harness_build_record(candidate_dir: Path, *, surrogate: bool, reason: str = "",
+                          started_at: float = 0.0, proc: Any = None,
+                          granted_timeout: int = 0) -> Dict[str, Any]:
+    """The framework's own record of a build whose process ended without
+    writing one -- killed at its subprocess limit, crashed, or interrupted."""
+    candidate_dir = Path(candidate_dir)
+    log_path = candidate_dir / "agentic_trajectory.log"
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="ignore") if log_path.is_file() else ""
+    except OSError:
+        text = ""
+    stderr = str(getattr(proc, "stderr", "") or "")
+    if not reason:
+        lines = [line.strip() for line in stderr.strip().splitlines() if line.strip()]
+        reason = (lines[-1][:300] if lines else
+                  f"the build process exited with code {getattr(proc, 'returncode', '?')} "
+                  "before writing its result")
+    duration = int(time.time() - started_at) if started_at else 0
+    if not duration and log_path.is_file():
+        try:
+            duration = int(log_path.stat().st_mtime
+                           - (candidate_dir / "candidate_invocation.json").stat().st_mtime)
+        except OSError:
+            duration = 0
+    record: Dict[str, Any] = {
+        "status": "KILLED",
+        "written_by": "framework: the build process ended before writing its own result",
+        "aborted_reason": reason,
+        "error": stderr[-1500:],
+        "provider_error": False,
+        "duration_s": max(0, duration),
+        "turns_used": text.count("--- turn "),
+        "granted_timeout_s": int(granted_timeout or 0),
+        "agent_final_payload": {},
+        "case_dir": str(candidate_dir) if surrogate else "",
+    }
+    if surrogate:
+        pred_dir = candidate_dir / "predictions"
+        try:
+            files = (sorted(str(p) for p in pred_dir.rglob("*") if p.is_file() and p.stat().st_size > 0)
+                     if pred_dir.is_dir() else [])
+        except OSError:
+            files = []
+        record.update({
+            "produced_predictions": bool(files),
+            "prediction_files": files,
+            "submission_files": files,
+            "submission_declared": False,
+        })
+    return record
+
+
+def _submission_files(candidate_path: Path, execution_doc: Dict[str, Any]) -> "tuple[List[Path], bool]":
+    """The prediction files a fitted-model candidate is scored on, and whether
+    its agent declared them: the files it named as final in `done` when any of
+    them exist, otherwise everything in its predictions folder."""
+    candidate_path = Path(candidate_path)
+    doc = execution_doc if isinstance(execution_doc, dict) else {}
+    declared: List[Path] = []
+    if doc.get("submission_declared"):
+        declared = [Path(p) for p in (doc.get("submission_files") or [])]
+    elif doc.get("agent_final_payload"):
+        try:
+            from surrogate_agentic import declared_submission_files  # type: ignore
+
+            names, named = declared_submission_files(doc.get("agent_final_payload") or {}, candidate_path)
+            declared = [Path(n) for n in names] if named else []
+        except Exception:
+            declared = []
+    declared = [p for p in declared if p.is_file()]
+    if declared:
+        return declared, True
+    pred_dir = candidate_path / "predictions"
+    try:
+        files = (sorted(p for p in pred_dir.rglob("*") if p.is_file() and p.stat().st_size > 0)
+                 if pred_dir.is_dir() else [])
+    except OSError:
+        files = []
+    return files, False
+
+
+def _stage_submission(candidate_path: Path, files: List[Path]) -> Path:
+    """A folder holding exactly ``files`` under predictions/, for the scoring wrapper.
+
+    The wrapper scores whatever it finds under <dir>/predictions/, and build
+    agents leave trial runs, probes and blends there: dlr_airfoil_codex_20260913b
+    recorded 9.375 for a candidate whose ten real seeds give 9.312, and a
+    folder with two real seeds and eleven blends would have passed a ten-seed
+    check. Files are linked, not copied -- predictions can run to gigabytes --
+    at the same paths below predictions/."""
+    candidate_path = Path(candidate_path)
+    stage = candidate_path / "scored_submission"
+    shutil.rmtree(stage, ignore_errors=True)
+    pred_root = (candidate_path / "predictions").resolve()
+    for source in files:
+        source = Path(source).resolve()
+        try:
+            rel = source.relative_to(pred_root)
+        except ValueError:
+            rel = Path(source.name)
+        target = stage / "predictions" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(source, target)
+        except OSError:
+            target.symlink_to(source)
+    return stage
+
+
+def _surrogate_null_score_evidence(candidate_path: Path, execution_doc: Dict[str, Any],
+                                   score_error: str,
+                                   metric_vector: Optional[Dict[str, Any]]) -> str:
+    """_null_score_evidence for a study whose candidates are fitted models.
+
+    Such a candidate has no solver, mesh or graded case, so the solver-study
+    evidence -- solver launches, "EVALUATION: never ran", a solver log -- reads
+    as a failure that is not one. On malmo_gptoss120b_bedrock_20260913b the
+    diagnosis, given exactly that, called a finished ten-seed model "not a
+    valid CFD model ... not repairable" when it had simply never been scored.
+    What explains a fitted model's missing score is whether it was scored,
+    what the scoring wrapper said, and which prediction files exist.
+    """
+    lines: List[str] = [f"CANDIDATE: {candidate_path.name}"]
+    if score_error:
+        lines.append(f"SCORING ERROR: {score_error}")
+    lines.append("")
+    lines.append("BUILD RESULT (the build agent's own report):")
+    for key in ("status", "aborted_reason", "error", "turns_used", "duration_s"):
+        if key in execution_doc:
+            lines.append(f"  {key}: {str(execution_doc.get(key))[:400]}")
+
+    record = _read_json(candidate_path / "candidate_record.json") or {}
+    vector = metric_vector if metric_vector is not None else record.get("metric_vector")
+    lines.append("")
+    if not score_error and vector is None and "score" not in record:
+        lines.append("SCORING: no score has ever been computed for this candidate -- its "
+                     "record holds no score, no scoring error and no metric vector.")
+    else:
+        lines.append(f"SCORING: recorded score {record.get('score')}")
+        if isinstance(vector, dict):
+            if vector.get("errors"):
+                lines.append("  scoring wrapper errors: "
+                             + json.dumps(vector.get("errors"), default=str)[:1500])
+            raw = vector.get("raw_outputs") or {}
+            if isinstance(raw, dict) and raw:
+                lines.append("  what the scoring wrapper printed (tail):")
+                lines.append(str(next(iter(raw.values())))[-2000:])
+
+    lines.append("")
+    lines.append("PREDICTION FILES (the candidate's predictions/ folder, which the scoring "
+                 "wrapper reads):")
+    lines.extend(_file_listing(candidate_path / "predictions"))
+    lines.append("")
+    lines.append("EVERYTHING ELSE IN THE CANDIDATE DIRECTORY:")
+    try:
+        for entry in sorted(candidate_path.iterdir()):
+            if entry.name != "predictions":
+                lines.append(f"  {'dir ' if entry.is_dir() else 'file'} {entry.name}")
+    except OSError:
+        lines.append("  (unreadable)")
+
+    trajectory = candidate_path / "agentic_trajectory.log"
+    if trajectory.is_file():
+        try:
+            size = trajectory.stat().st_size
+            with trajectory.open("r", encoding="utf-8", errors="ignore") as handle:
+                handle.seek(max(0, size - 3000))
+                lines.append("")
+                lines.append("TAIL OF THE BUILD AGENT'S TRAJECTORY:")
+                lines.append(handle.read()[-3000:])
+        except OSError:
+            pass
+    return "\n".join(lines)
+
+
 def _null_score_evidence(candidate_path: Path, execution_doc: Dict[str, Any],
-                         score_error: str) -> str:
+                         score_error: str,
+                         metric_vector: Optional[Dict[str, Any]] = None) -> str:
     """Everything on disk that bears on why this candidate produced no score.
 
     Bounded on purpose: a diverged OpenFOAM log is 30 MB and its last 60 lines
     carry the whole story, while the middle would push out the compile error
     that actually explains it.
     """
+    if _candidate_study_mode(candidate_path) == "surrogate":
+        return _surrogate_null_score_evidence(candidate_path, execution_doc, score_error,
+                                              metric_vector)
     lines: List[str] = []
     lines.append(f"CANDIDATE: {candidate_path.name}")
     if score_error:
@@ -846,8 +1107,81 @@ def _null_score_evidence(candidate_path: Path, execution_doc: Dict[str, Any],
     return "\n".join(lines)
 
 
+# The solver-study diagnosis prompts speak of meshes, graded cases and closures.
+# A study whose candidates are fitted models has none of those, and a diagnosis
+# asked in those terms judges the missing solver run to be the failure.
+_SURROGATE_NULL_SCORE_PROMPT = (
+    "A candidate in an automated model search produced no score.\n"
+    "In this study each candidate is a fitted model: it writes prediction files, "
+    "and the study's own scorer, run through a scoring wrapper, turns those files "
+    "into numbers. There is no solver, mesh or evaluation case, so the absence of "
+    "solver launches, compiled libraries or evaluation runs is expected and is not "
+    "a failure.\n\n"
+    "Diagnose it from the evidence below, the way an engineer reading the run "
+    "would: what failed, was it the tooling or the model, and is it worth another "
+    "attempt. A missing score can come from the candidate never having been "
+    "scored at all; from a scoring wrapper that could not find or read the "
+    "prediction files; from prediction files that are missing, incomplete or in a "
+    "form the scorer does not accept; or from the model itself producing unusable "
+    "predictions or breaking a data-usage rule.\n\n"
+    "Set alters_graded_setup=true if the repair you propose would change the data "
+    "split, the metric, the scorer, or the model being tested. Scoring a candidate "
+    "that was never scored, re-running the scorer, or moving or renaming finished "
+    "prediction files without changing a single predicted value does not.\n\n"
+    "Set score_anyway=true when the prediction files on disk are complete and in "
+    "the form the scorer needs, so that a score computed from them should be "
+    "trusted.\n\n"
+)
+
+_SURROGATE_UNCLEAN_FINISH_PROMPT = (
+    "A build agent in an automated model search stopped before finishing cleanly. "
+    "Decide what should happen to its work.\n\n"
+    "In this study each candidate is a fitted model: the agent trains it and writes "
+    "prediction files, and the study's own scorer turns those files into numbers. "
+    "There is no solver, mesh, compiled library or case dictionary, so their absence "
+    "is expected.\n\n"
+    "The question is NOT primarily whether it failed. It is whether what is on disk "
+    "is FINISHED. An agent killed part-way leaves prediction files that look healthy "
+    "and mean nothing: files from an early trial or a placeholder fit, files for "
+    "only some of the seeds or runs the study requires, or files from a model "
+    "version the agent had already moved past. Catching that is the single most "
+    "important thing for you to do.\n\n"
+    "So compare the prediction files, and when each was written, with what the "
+    "agent was doing at the end of its trajectory and with what the study "
+    "requires. Set model_is_complete accordingly, and say in your cause which files "
+    "you checked.\n\n"
+    "Then choose ONE verdict:\n"
+    "  complete -- every prediction file the study requires is on disk and was "
+    "written by the finished model; the agent ran out of turns or clock during "
+    "tidying-up, not during the work. Score it.\n"
+    "  repair -- something specific and bounded is broken in our plumbing, such as "
+    "finished predictions written under a name or in a folder the scorer does not "
+    "read. Name the exact steps.\n"
+    "  extend -- training or prediction was still genuinely in progress and more "
+    "time would plausibly finish it. Only choose this if the trajectory shows real "
+    "forward progress, not if the agent was thrashing on the same error.\n"
+    "  abandon -- the model itself is broken or diverging, or the agent made no "
+    "meaningful progress. Say so plainly; a candidate that is not going to work is "
+    "better dropped than ground through more attempts.\n\n"
+    "For extend you must justify extra_seconds_needed with arithmetic in "
+    "estimate_basis, from the evidence: how much training or prediction remains and "
+    "how long each unit of it has actually been taking. An estimate with no "
+    "arithmetic behind it will be refused. Be realistic rather than generous -- the "
+    "time comes out of the same budget every other candidate draws on. If the "
+    "arithmetic says the remaining work needs more than a few hours, extending is "
+    "the wrong answer however real the progress: the work itself is too big for one "
+    "slot, and the honest verdict is abandon with the cost stated in cause, so the "
+    "search can propose a cheaper version of the same idea.\n\n"
+    "A repair may fix our own plumbing. It may NOT change the data split, the "
+    "metric, the scorer or the model under test, and may not change a single "
+    "predicted value: set alters_graded_setup=true if the repair you describe would, "
+    "and it will not be applied.\n\n"
+)
+
+
 def _diagnose_null_score(candidate_path: Path, execution_doc: Dict[str, Any],
-                         score_error: str, settings: Any) -> Dict[str, Any]:
+                         score_error: str, settings: Any,
+                         metric_vector: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Read the wreckage and say what happened, the way a person would.
 
     A null score used to be a full stop: the candidate was recorded FAILED with
@@ -868,11 +1202,19 @@ def _diagnose_null_score(candidate_path: Path, execution_doc: Dict[str, Any],
     Never raises: a diagnosis that fails leaves the candidate exactly as it
     was, which is the old behaviour.
     """
-    evidence = _null_score_evidence(candidate_path, execution_doc, score_error)
+    evidence = _null_score_evidence(candidate_path, execution_doc, score_error, metric_vector)
     try:
         from cfd_langgraph.llm.factory import create_langchain_llm
 
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
+        if _candidate_study_mode(candidate_path) == "surrogate":
+            verdict = structured_output(llm, _NullScoreDiagnosis).invoke(
+                _SURROGATE_NULL_SCORE_PROMPT + evidence
+            )
+            result = verdict.model_dump()
+            result["ok"] = True
+            result["evidence_sha"] = _evidence_sha(evidence)
+            return result
         verdict = structured_output(llm, _NullScoreDiagnosis).invoke(
             "A candidate model in an automated CFD closure search produced no score.\n"
             "Diagnose it from the evidence below, the way an engineer reading the run "
@@ -900,6 +1242,7 @@ def _diagnose_null_score(candidate_path: Path, execution_doc: Dict[str, Any],
         )
         result = verdict.model_dump()
         result["ok"] = True
+        result["evidence_sha"] = _evidence_sha(evidence)
         return result
     except Exception as exc:
         return {
@@ -944,13 +1287,18 @@ def _unclean_finish_evidence(candidate_path: Path, execution_doc: Dict[str, Any]
     duration = execution_doc.get("duration_s")
     lines.append(f"  wall clock: {duration}s of a {granted_timeout_s}s fence"
                  if granted_timeout_s else f"  wall clock: {duration}s (no fence was set)")
-    solves = execution_doc.get("solver_invocations")
-    lines.append(f"  solver launches made: {solves}")
-    if isinstance(solves, int) and solves > 0 and isinstance(duration, (int, float)) and duration > 0:
-        lines.append(f"  => averaged {duration / solves:.0f}s per solver launch, which is the "
-                     f"number to reason from when estimating how much longer it needs")
-    lines.append(f"  compiled a library: {execution_doc.get('compile_ok')}")
-    lines.append(f"  its own trial case converged: {execution_doc.get('converged')}")
+    # A fitted-model candidate has no solver, library or trial case, and "solver
+    # launches made: 0" beside "compiled a library: False" reads as a build that
+    # never started. How far it got shows in the prediction files it wrote.
+    surrogate = _candidate_study_mode(candidate_path) == "surrogate"
+    if not surrogate:
+        solves = execution_doc.get("solver_invocations")
+        lines.append(f"  solver launches made: {solves}")
+        if isinstance(solves, int) and solves > 0 and isinstance(duration, (int, float)) and duration > 0:
+            lines.append(f"  => averaged {duration / solves:.0f}s per solver launch, which is the "
+                         f"number to reason from when estimating how much longer it needs")
+        lines.append(f"  compiled a library: {execution_doc.get('compile_ok')}")
+        lines.append(f"  its own trial case converged: {execution_doc.get('converged')}")
 
     # What the agent left behind. A fit that ran and then died leaves its
     # result on disk -- frozen_alphaK2.json, fit_evidence.json and the like --
@@ -965,6 +1313,14 @@ def _unclean_finish_evidence(candidate_path: Path, execution_doc: Dict[str, Any]
             lines.append(f"  {kind} {entry.name}" + (f" ({size} bytes)" if size else ""))
     except OSError:
         lines.append("  (unreadable)")
+    if surrogate:
+        lines.append("")
+        lines.append("PREDICTION FILES (predictions/, which the study's scorer reads), "
+                     "with when each was written:")
+        lines.extend(_file_listing(candidate_path / "predictions"))
+        lines.append("")
+        lines.append("MODEL FOLDER (model/):")
+        lines.extend(_file_listing(candidate_path / "model", limit=40))
 
     # The fit's OWN record of what it did, which is the direct evidence of
     # progress and the thing this diagnosis most often gets wrong without it.
@@ -1110,8 +1466,11 @@ def _diagnose_unclean_finish(candidate_path: Path, execution_doc: Dict[str, Any]
     try:
         from cfd_langgraph.llm.factory import create_langchain_llm
 
+        from cfd_langgraph.llm.retry import call_with_retry
+
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        verdict = structured_output(llm, _UncleanFinishDiagnosis).invoke(
+        diagnoser = structured_output(llm, _UncleanFinishDiagnosis)
+        prompt_text = (
             "A build agent in an automated CFD closure search stopped before finishing "
             "cleanly. Decide what should happen to its work.\n\n"
             "The question is NOT primarily whether it failed. It is whether what is on "
@@ -1172,6 +1531,15 @@ def _diagnose_unclean_finish(candidate_path: Path, execution_doc: Dict[str, Any]
             f"This candidate has already been extended {extensions_used} time(s).\n\n"
             + evidence
         )
+        if _candidate_study_mode(candidate_path) == "surrogate":
+            prompt_text = (
+                _SURROGATE_UNCLEAN_FINISH_PROMPT
+                + f"This candidate has already been extended {extensions_used} time(s).\n\n"
+                + evidence
+            )
+        # Retried through a provider refusal: on malmo_qwen38flash_20260912 a
+        # single 429 here turned a diagnosis into "unavailable".
+        verdict = call_with_retry(lambda: diagnoser.invoke(prompt_text), "unclean-finish diagnosis")
         result = verdict.model_dump()
         result["ok"] = True
         return result
@@ -1260,6 +1628,119 @@ def _llm_target_improvement_pct(topic: str, settings: Any) -> float:
         flush=True,
     )
     return 0.0
+
+
+def _llm_study_target(
+    topic: str, settings: Any, *, primary_metric: str = "", baseline_value: Any = None,
+    direction: str = "min", metric_spec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """The success threshold a study asks for, however the topic states it.
+
+    A topic may name a percentage improvement over baseline, or a value the
+    optimised quantity has to reach -- "below 0.003", "under 1.0", "at least
+    15" -- or targets on the individual quantities that the optimised quantity
+    combines. The percentage-only reader could represent just the first, so
+    for everything else it answered "no margin" and the study ran against 0%.
+    Measured on the malmo surrogate study: the topic sets three absolute error
+    targets, the model correctly answered null to "what percentage?", and the
+    search would have counted any improvement at all as reaching the goal,
+    when meeting it needs 79.76%.
+
+    So the model is shown the optimised quantity -- its name, direction,
+    definition and verified baseline -- and reports the threshold in whichever
+    form the topic uses. An absolute value is converted to a percentage with
+    the same formula every candidate is scored by, so the stopping rule and
+    the scores stay on one scale. The model reads; this only converts.
+
+    Returns {target_improvement_pct, target_kind, target_value, target_basis}.
+    target_kind is "percent", "absolute", "none", or "unavailable" when the
+    model could not be reached.
+    """
+    from cfd_langgraph.llm.factory import create_langchain_llm
+    from cfd_langgraph.utils import extract_json_object
+
+    direction = "max" if str(direction).strip().lower() == "max" else "min"
+    try:
+        baseline = float(baseline_value) if baseline_value is not None else None
+        if baseline is not None and not math.isfinite(baseline):
+            baseline = None
+    except (TypeError, ValueError):
+        baseline = None
+    spec = metric_spec or {}
+    quantity = ""
+    if primary_metric:
+        quantity = (
+            "\n\nTHE OPTIMISED QUANTITY:\n"
+            f"name: {primary_metric}\n"
+            f"direction: {'higher' if direction == 'max' else 'lower'} is better\n"
+            f"definition: {str(spec.get('computation_hint') or spec.get('description') or '(not recorded)')[:2500]}\n"
+            f"verified baseline value: {baseline if baseline is not None else '(not measured)'}"
+        )
+    system = (
+        "Read a research topic and report the success threshold it demands for "
+        "the quantity the study optimises. The topic may state it as an "
+        "improvement over baseline in percent, as a value the optimised quantity "
+        "must reach, or as targets on the individual quantities the optimised "
+        "quantity combines.\n"
+        "Reply with STRICT JSON only, exactly one of:\n"
+        '  {"kind": "percent", "value": <number>}\n'
+        '  {"kind": "absolute", "value": <number>}\n'
+        '  {"kind": "none"}\n'
+        "\"absolute\" is a value of THE OPTIMISED QUANTITY described below, in "
+        "its own units, never a value of some other quantity. If the targets are "
+        "on the individual quantities the optimised quantity combines, report the "
+        "value of the optimised quantity at which those targets are exactly met, "
+        "using its definition. Use \"none\" when the topic only asks to beat the "
+        "baseline. Never invent a threshold. A number quoted as the baseline's "
+        "value is not a target."
+    )
+
+    def _done(pct: float, kind: str, value: Any, basis: str) -> Dict[str, Any]:
+        return {"target_improvement_pct": float(pct), "target_kind": kind,
+                "target_value": value, "target_basis": basis}
+
+    last_error: Optional[Exception] = None
+    for attempt in range(_TARGET_EXTRACTION_ATTEMPTS):
+        try:
+            llm = create_langchain_llm(model=settings.model, temperature=0.0)
+            reply = llm.invoke([("system", system), ("user", f"TOPIC:\n{topic}{quantity}")])
+            text = getattr(reply, "content", "")
+            if isinstance(text, list):
+                text = "".join(b.get("text", "") for b in text if isinstance(b, dict))
+            answer = json.loads(extract_json_object(str(text)))
+            kind = str(answer.get("kind", "") or "").strip().lower()
+            if kind == "none":
+                return _done(0.0, "none", None, "the topic asks to beat the baseline without a stated margin")
+            value = float(answer.get("value"))
+            if not math.isfinite(value):
+                raise ValueError(f"non-finite target {answer.get('value')!r}")
+            if kind == "percent":
+                if value < 0 or (direction == "min" and value > 100.0):
+                    raise ValueError(f"out-of-range percentage {value}")
+                return _done(value, "percent", value, f"the topic asks for {value:g}% improvement over baseline")
+            if kind == "absolute":
+                if baseline is None:
+                    raise ValueError("absolute target given but no verified baseline to convert it against")
+                pct = _improvement_pct(value, baseline, direction)
+                if pct <= 0:
+                    print(f"[oed] WARNING: the stated target {value:g} for {primary_metric} is not better "
+                          f"than the verified baseline {baseline:g}; judging success as 'beat baseline'.",
+                          flush=True)
+                    return _done(0.0, "absolute", value,
+                                 f"stated target {value:g} is not better than baseline {baseline:g}")
+                return _done(pct, "absolute", value,
+                             f"{primary_metric} must reach {value:g} "
+                             f"({'at least' if direction == 'max' else 'at most'}), from a verified "
+                             f"baseline of {baseline:g}: {pct:.4f}% improvement")
+            raise ValueError(f"unrecognised kind {kind!r}")
+        except Exception as exc:  # noqa: BLE001 - any provider or parse error
+            last_error = exc
+        print(f"[oed] study-target extraction attempt {attempt + 1}/{_TARGET_EXTRACTION_ATTEMPTS} "
+              f"failed: {last_error}", flush=True)
+    print("[oed] WARNING: could not read this study's success threshold from its topic. Treating it "
+          "as 'beat baseline, no stated margin'; success will be judged against 0% until it is re-read.",
+          flush=True)
+    return _done(0.0, "unavailable", None, f"target extraction failed: {last_error}")
 
 
 def _improvement_pct(value: float, baseline: float, direction: str) -> float:
@@ -1366,6 +1847,128 @@ def _reference_file_inventory(out_dir: Path) -> List[str]:
                 seen.add(rel)
                 found.append(rel)
     return found
+
+
+def _resolved_reference_inventory(out_dir: Path) -> List[Path]:
+    """_reference_file_inventory as absolute paths."""
+    resolved: List[Path] = []
+    for entry in _reference_file_inventory(out_dir):
+        path = Path(entry)
+        if not path.is_absolute():
+            path = _REPO_ROOT / path
+        resolved.append(path.resolve())
+    return resolved
+
+
+def _comparator_mesh_qois(
+    *, case_a: Path, case_b: Path, metrics: List[str], starter_dir: Optional[Path],
+    topic: str, cache_path: Path, reference_candidates: List[Path],
+    declared_references: Optional[Dict[str, List[Path]]] = None,
+) -> Dict[str, Any]:
+    """Score two mesh levels with the study's own comparator, where it has one.
+
+    The mesh gate judged convergence only on quantities analyze.py extracted
+    with model-written pyvista code driven by a free-text computation hint.
+    When the starter ships the scorer the study is judged by, that is a second
+    derivation of a quantity already defined, and it failed where the scorer
+    would not have: on ph_llama_20260910f the study's own metric note said to
+    use the starter's comparator, the gate authored an extractor instead, the
+    extractor returned nothing for cf_rmse, and the gate refused to judge.
+
+    The comparator is found the way OED setup finds it -- content
+    classification of the starter's scripts, cached where setup reads it -- so
+    nothing about any one study is assumed here. A metric is taken from the
+    comparator only when it returns a finite value on BOTH meshes with the same
+    reference file; a reference that gives a different answer from another is
+    treated as ambiguous and the metric is left to analyze.py, as before.
+
+    Each metric's DECLARED reference files (the study metric spec's own
+    ``reference_files``) are tried first. Guessing across every data file in
+    the starter picks up the case's own outputs -- a Cf profile, a
+    postProcessing .dat -- beside the real reference; measured on the periodic
+    hill starter, the inventory offered cf_case.csv, wallShearStress.dat and
+    yPlus.dat alongside reference_exactmatch_cf.csv. With the declared file the
+    comparator scored both mesh levels of ph_llama_20260910f (0.004297 ->
+    0.004316) and ph_glm_20260910e (0.004297 -> 0.004297), the two gates that
+    had refused to judge. The inventory is only a fallback, and there every
+    candidate must agree.
+    """
+    result: Dict[str, Any] = {"comparator": "", "values": {}, "reference_file": "", "note": ""}
+    if _oedx is None or starter_dir is None or not Path(starter_dir).is_dir() or not metrics:
+        result["note"] = "no starter folder or comparator tooling available"
+        return result
+    try:
+        scripts_dir = str(_REPO_ROOT / "scripts")
+        if scripts_dir not in sys.path:
+            sys.path.insert(0, scripts_dir)
+        from comparator_classifier import find_comparator_for_starter  # type: ignore
+
+        comparator = find_comparator_for_starter(
+            starter_dir=Path(starter_dir), topic=topic, cache_path=cache_path,
+        )
+    except Exception as exc:  # noqa: BLE001
+        result["note"] = f"comparator classification unavailable ({type(exc).__name__}: {exc})"
+        return result
+    if comparator is None:
+        result["note"] = "the starter folder has no comparator script"
+        return result
+    result["comparator"] = str(comparator)
+    references = [r for r in reference_candidates if r.is_file()][:8]
+    inventory_data = [r for r in references if _reference_data_file([r]) == r]
+
+    def _pinned_time(case: Path) -> Optional[float]:
+        try:
+            latest = _latest_solved_time(case)
+            return float(latest) if latest is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    time_a, time_b = _pinned_time(case_a), _pinned_time(case_b)
+    reasons: List[str] = []
+    used_references: Dict[str, str] = {}
+    for metric in metrics:
+        declared = [Path(r) for r in (declared_references or {}).get(metric, []) if Path(r).is_file()]
+        declared_data = [r for r in declared if _reference_data_file([r]) == r]
+        candidates = declared_data or inventory_data
+        if not candidates:
+            reasons.append(f"{metric}: no reference data file to pass the comparator")
+            continue
+        per_reference: List[Tuple[Path, float]] = []
+        last_reason = ""
+        for reference in candidates:
+            ok, reason, value = _oedx.selftest_comparator(
+                comparator=comparator, case_dir=case_a, reference_file=reference,
+                metric_name=metric, timeout_s=600, baseline_time=time_a,
+            )
+            if ok and value is not None and math.isfinite(float(value)):
+                per_reference.append((reference, float(value)))
+            else:
+                last_reason = str(reason)
+        if not per_reference:
+            reasons.append(f"{metric}: comparator gave no value on {case_a.name} ({last_reason[:160]})")
+            continue
+        first_value = per_reference[0][1]
+        if any(abs(v - first_value) > 1e-9 * max(1.0, abs(first_value)) for _, v in per_reference[1:]):
+            reasons.append(f"{metric}: reference files give different comparator values; left to analyze.py")
+            continue
+        reference = per_reference[0][0]
+        ok_b, reason_b, value_b = _oedx.selftest_comparator(
+            comparator=comparator, case_dir=case_b, reference_file=reference,
+            metric_name=metric, timeout_s=600, baseline_time=time_b,
+        )
+        if ok_b and value_b is not None and math.isfinite(float(value_b)):
+            result["values"][metric] = (first_value, float(value_b))
+            used_references[metric] = str(reference)
+        else:
+            reasons.append(
+                f"{metric}: value on {case_a.name} but none on {case_b.name} "
+                f"({str(reason_b)[:160]}); left to analyze.py"
+            )
+    result["reference_file"] = ", ".join(sorted(set(used_references.values())))
+    result["references_by_metric"] = used_references
+    if reasons:
+        result["note"] = "; ".join(reasons)
+    return result
 
 
 def _unresolvable_reference_files(specs: List[Dict[str, Any]]) -> List[str]:
@@ -1741,6 +2344,61 @@ def _install_model_into_case(
     return None
 
 
+class _ImplementationCriterion(BaseModel):
+    criterion: str = Field(description="One acceptance criterion the task states, in the task's own words.")
+    mandatory: bool = Field(default=True, description="True if the task makes this criterion required for success.")
+    met: bool = Field(description="True only if the evidence shows the criterion is met.")
+    evidence: str = Field(description="The numbers or file contents that decide it, quoted from the evidence.")
+
+
+class _ImplementationVerdict(BaseModel):
+    """A reviewer's verdict on an implementation study."""
+
+    criteria: List[_ImplementationCriterion] = Field(
+        default_factory=list,
+        description="Every acceptance criterion the task states, each with its evidence.",
+    )
+    passed: bool = Field(
+        description="True only if every mandatory criterion is met -- by the task's own scorer's "
+                    "account wherever the task has one."
+    )
+    results_come_from_implementation: bool = Field(
+        description="True if the files the verdict rests on were produced by running the implemented "
+                    "code on the task's cases -- not copied from reference data or the task's own "
+                    "reference implementation, not written by hand, and not produced by some other "
+                    "code path than the one the report describes."
+    )
+    rule_violations: List[str] = Field(
+        default_factory=list,
+        description="Each rule of the task brief the work breaks, with the evidence. Empty if none.",
+    )
+    summary: str = Field(description="Two or three sentences: what was built, what passed, what did not.")
+    next_steps: List[str] = Field(
+        default_factory=list,
+        description="If not passed or not trustworthy: the concrete fixes the evidence points to, in order.",
+    )
+
+
+_IMPL_VERDICT_PROMPT = (
+    "An implementation study is being checked. Its task, in its own words, is below: it fixes "
+    "what was to be built, the verification it requires, the criteria that decide success, and "
+    "its rules. Judge the work against the task from the evidence below -- not from what the "
+    "agent says about its own work.\n\n"
+    "1. List every acceptance criterion the task states and decide, from the evidence, whether "
+    "it is met. Where the task has its own scorer, the scorer output below -- re-run by the "
+    "framework just now on the agent's files -- is the authority: a criterion the scorer reports "
+    "as failed is not met, whatever the report claims, and a criterion the scorer was not run "
+    "for is met only if other evidence below shows it.\n"
+    "2. passed is true only if every mandatory criterion is met.\n"
+    "3. results_come_from_implementation: from the agent's record of what it ran and the files "
+    "it left, check that the results the criteria rest on were produced by running the "
+    "implemented code on the task's cases.\n"
+    "4. rule_violations: every rule in the task brief the work breaks, with the evidence.\n"
+    "5. next_steps: if the work is not passed or not trustworthy, the concrete fixes the "
+    "evidence points to, in order.\n\n"
+)
+
+
 class _NullScoreDiagnosis(BaseModel):
     """Why a candidate produced no score, and whether that is repairable."""
 
@@ -1750,19 +2408,23 @@ class _NullScoreDiagnosis(BaseModel):
     )
     category: str = Field(
         description="One of: harness (our tooling/scoring/plumbing is at fault, the "
-                    "physics may be fine); case_setup (a case's numerics or output "
-                    "settings, not the closure); model_physics (the closure itself "
-                    "diverged or is ill-posed); unknown."
+                    "model may be fine); case_setup (how the result was set up for "
+                    "evaluation -- a case's numerics or output settings, or prediction "
+                    "files in a form the scorer cannot read -- not the model itself); "
+                    "model_physics (the model itself diverged, is ill-posed, or produced "
+                    "unusable output); unknown."
     )
     repairable: bool = Field(
         description="True only if a concrete, bounded change would plausibly turn this "
-                    "into a real score. False when the closure itself is the problem."
+                    "into a real score. False when the model itself is the problem."
     )
     alters_graded_setup: bool = Field(
         description="True if the repair would change anything the benchmark grades on: "
-                    "the mesh, the boundary conditions, the physics, endTime, or the "
-                    "closure being tested. Such a repair invalidates the comparison and "
-                    "must not be applied automatically."
+                    "in a solver study the mesh, the boundary conditions, the physics, "
+                    "endTime, or the closure being tested; in a fitted-model study the "
+                    "data split, the metric, the scorer, or the model being tested. Such "
+                    "a repair invalidates the comparison and must not be applied "
+                    "automatically."
     )
     repair_steps: List[str] = Field(
         default_factory=list,
@@ -1771,9 +2433,11 @@ class _NullScoreDiagnosis(BaseModel):
     )
     score_anyway: bool = Field(
         default=False,
-        description="True if the graded evaluation cases are sound enough that a score "
-                    "computed over them should be trusted, even though the build's own "
-                    "trial run failed. False when the evaluation itself is compromised.",
+        description="True if what would be scored is sound enough that a score computed "
+                    "from it should be trusted -- the graded evaluation cases of a solver "
+                    "study even though the build's own trial run failed, or the complete "
+                    "prediction files of a fitted-model study. False when the evaluation "
+                    "itself is compromised.",
     )
     confidence: float = Field(
         default=0.0, description="0-1 confidence that the stated cause is the real one."
@@ -1785,9 +2449,11 @@ class _UncleanFinishDiagnosis(BaseModel):
 
     cause: str = Field(
         description="What actually stopped it and how far it had got, in two or three "
-                    "sentences, citing the specific evidence. Say which coefficients "
-                    "you checked and whether you found them in the case dictionary or "
-                    "only as class defaults."
+                    "sentences, citing the specific evidence. Say what you checked to "
+                    "decide whether the work is finished: in a solver study, which "
+                    "coefficients, and whether you found them in the case dictionary or "
+                    "only as class defaults; in a fitted-model study, which prediction "
+                    "files, and whether the finished model wrote them."
     )
     stopped_because: str = Field(
         description="One of: timeout (hit the wall clock); turn_cap (used every turn); "
@@ -1796,14 +2462,18 @@ class _UncleanFinishDiagnosis(BaseModel):
     work_completed: str = Field(
         default="",
         description="What the agent actually finished before it stopped -- compiled the "
-                    "library, ran N of M optimiser iterations, wrote the fitted value "
-                    "to a file, and so on. This is what a continuation would build on."
+                    "library, ran N of M optimiser iterations, trained N of M seeds, "
+                    "wrote the fitted value or the predictions to a file, and so on. "
+                    "This is what a continuation would build on."
     )
     model_is_complete: bool = Field(
-        description="True only if the model that would run right now is the intended "
-                    "one. False if any coefficient it depends on is absent from the "
-                    "case dictionary and would fall back to a class default, which "
-                    "makes the run a disguised baseline rather than an experiment."
+        description="True only if what would be scored right now is the intended, "
+                    "finished model. False in a solver study if any coefficient it "
+                    "depends on is absent from the case dictionary and would fall back "
+                    "to a class default, which makes the run a disguised baseline "
+                    "rather than an experiment; False in a fitted-model study if any "
+                    "required prediction file is missing or came from an unfinished "
+                    "or trial run."
     )
     verdict: str = Field(
         description="One of: complete (finished, score it); repair (bounded plumbing "
@@ -1828,9 +2498,12 @@ class _UncleanFinishDiagnosis(BaseModel):
     )
     alters_graded_setup: bool = Field(
         default=False,
-        description="True if the repair described would change the mesh, boundary "
-                    "conditions, physics, endTime, or the closure under test. Such a "
-                    "repair invalidates the comparison and is never applied.",
+        description="True if the repair described would change what the benchmark "
+                    "grades on: the mesh, boundary conditions, physics, endTime, or "
+                    "closure under test of a solver study; the data split, metric, "
+                    "scorer, model under test or any predicted value of a fitted-model "
+                    "study. Such a repair invalidates the comparison and is never "
+                    "applied.",
     )
     confidence: float = Field(
         default=0.0, description="0-1 confidence that the stated cause is the real one."
@@ -1930,11 +2603,18 @@ def _study_resources(out_dir: Path, disc_dir: Optional[Path] = None) -> str:
     else:
         lines.append("  high-fidelity / reference data files: none found")
 
+    # How the starter's data is organised, as the starter reader summarised it
+    # from file headers -- array names, shapes, columns, never values. Without
+    # it the proposer plans against a dataset it has only seen by filename.
+    layout = str(understanding.get("data_layout") or "").strip()
+    if layout and layout.lower() not in {"null", "none"}:
+        lines.append(f"  data layout (from the starter's file headers; no values read): {layout[:1500]}")
+
     # Libraries a candidate can actually import inside run_bash. Probed, not
     # assumed: claiming a library that is absent sends a candidate down a path
     # that fails at import time and wastes its whole budget.
     available: List[str] = []
-    for module in ("numpy", "scipy", "sklearn", "torch", "pandas", "pyvista"):
+    for module in ("numpy", "scipy", "sklearn", "torch", "torch_geometric", "pandas", "pyvista"):
         try:
             __import__(module)
             available.append(module)
@@ -2147,6 +2827,13 @@ def _starter_case_context(
     for key in ("Re", "nu", "Ub", "dimension"):
         if flow.get(key) is not None:
             lines.append(f"  {key}: {flow[key]}")
+    # Ideation and critique need the data's shape as much as the case's: a
+    # surrogate idea that ignores that the targets are 454k-node fields, or
+    # that there are 105 samples, is not implementable. Structure only, read
+    # from file headers by the starter reader; no values.
+    layout = str(understanding.get("data_layout") or "").strip()
+    if layout and layout.lower() not in {"null", "none"}:
+        lines.append(f"  data layout (from the starter's file headers; no values read): {layout[:1500]}")
     if flow.get("geometry"):
         lines.append(f"  geometry/mesh/BCs/solver: {str(flow['geometry'])[:900]}")
     if include_scoring:
@@ -2165,6 +2852,118 @@ def _starter_case_context(
     if spec and "NO EXPLICIT FORMULA" not in spec.upper():
         lines.append(f"  model spec to implement: {spec[:600]}")
     return "\n".join(lines)
+
+
+# How many times the SAME tool may return the SAME error for the SAME
+# arguments before the wrapper stops passing the call through.
+_REPEAT_FAILURE_LIMIT = int(os.getenv("CFD_SCIENTIST_REPEAT_FAILURE_LIMIT") or 3)
+
+# Warning the model is not the same as stopping it. Measured on
+# ph_llama_20260910f: oed_propose_candidates returned the identical "not
+# initialized with a verified baseline" refusal 190 times, the breaker above
+# printed its "retrying this will fail again" notice into 118 of those
+# results, and the manager kept calling it -- 7.06M input tokens spent on a
+# search that could not start. At this second, higher threshold the error
+# the model gets back says the call is blocked, in the plainest terms. It used
+# to pause the study for a person instead, but studies run unattended: on
+# qwen_27b_nothink/periodic_hill the pause sat 9h44m waiting for an answer
+# nobody was there to give.
+_REPEAT_FAILURE_ABORT = int(os.getenv("CFD_SCIENTIST_REPEAT_FAILURE_ABORT") or 12)
+_REPEAT_FAILURES: Dict[str, int] = {}
+
+# The same call returning the same result, over and over, is a loop too, even
+# though nothing fails. Measured on qwen_27b_nothink/cavity_r8: a case-runner
+# wrote the same 173-byte script 10,000 times, and on cavity_r6 listed the same
+# folder 149 times running, each until the 9,999-step limit. The failure
+# breaker above never saw them, because every call succeeded. Status tools are
+# left out: polling one while something runs is how waiting is done.
+_REPEAT_SAME_LIMIT = int(os.getenv("CFD_SCIENTIST_REPEAT_SAME_LIMIT") or 8)
+_REPEAT_SAME: Dict[str, tuple] = {}
+_REPEAT_LOCK = threading.Lock()
+
+# Rounds of propose_and_rank_hypotheses before the last set of ideas is kept for
+# approval even though none passed review.
+_HYPOTHESIS_MAX_ATTEMPTS = int(os.getenv("CFD_SCIENTIST_HYPOTHESIS_MAX_ATTEMPTS") or 3)
+
+# Longest value a failed call may echo back from its own arguments.
+_FAILURE_ECHO_CHARS = 1500
+
+
+def _trim_failure_echo(result: Dict[str, Any], call_args: Any) -> Dict[str, Any]:
+    """A failed call's result, with values that only repeat its arguments cut down.
+
+    A refusal that lists the caller's arguments back grows with them. On
+    experiments_for_paper/qwen_27b_nothink/palmo the manager retried an approval
+    99 times with an ID list that grew by about 1,200 characters a call; every
+    refusal echoed the whole list, and the conversation passed the endpoint's
+    217,718-token limit with nothing new in it. Only a value made of the
+    arguments' own content is cut, so a diagnosis or a log excerpt a failure
+    carries is never touched.
+    """
+    try:
+        args_text = json.dumps(call_args, default=str)
+    except Exception:
+        return result
+    trimmed: Dict[str, Any] = {}
+    for key, value in result.items():
+        text = value if isinstance(value, str) else json.dumps(value, default=str)
+        if len(text) > _FAILURE_ECHO_CHARS:
+            if isinstance(value, list):
+                echoed = bool(value) and all(str(item) in args_text for item in value)
+            else:
+                echoed = isinstance(value, str) and value in args_text
+            if echoed:
+                trimmed[key] = (
+                    text[:_FAILURE_ECHO_CHARS]
+                    + f" …[{len(text) - _FAILURE_ECHO_CHARS} more characters of your own arguments omitted]"
+                )
+                continue
+        trimmed[key] = value
+    return trimmed
+
+
+def _failure_signature(result: Any) -> str:
+    """The error a tool result carries, or "" if it is not a failure.
+
+    Only a structured refusal counts. A tool that raises is handled by the
+    caller's own retry, and a tool that succeeds obviously resets everything.
+    """
+    if not isinstance(result, dict):
+        return ""
+    if result.get("ok") is False or result.get("error"):
+        return str(result.get("error") or "")[:300]
+    return ""
+
+
+def _note_repeated_same_call(label: str, arg_preview: str, result: Any) -> Any:
+    """``result``, with a warning attached once the same call has returned the
+    same result ``_REPEAT_SAME_LIMIT`` times in a row."""
+    try:
+        result_sig = hashlib.sha1(json.dumps(result, sort_keys=True, default=str).encode()).hexdigest()
+    except Exception:
+        return result
+    key = f"{label}|{hashlib.sha1(arg_preview.encode()).hexdigest()}"
+    with _REPEAT_LOCK:
+        last_sig, streak = _REPEAT_SAME.get(key, ("", 0))
+        streak = streak + 1 if result_sig == last_sig else 1
+        _REPEAT_SAME[key] = (result_sig, streak)
+    if streak < _REPEAT_SAME_LIMIT:
+        return result
+    print(f"  ↻ {label} has returned the same result {streak}x in a row for the same "
+          "arguments — telling the model it is looping.", flush=True)
+    note = (
+        f"[You have made this exact call {streak} times in a row and got the same result "
+        "every time. Repeating it will not change anything. Do something different. If you "
+        "are stuck, stop and report back what you found and what is blocking you.]"
+    )
+    if isinstance(result, dict):
+        return {**result, "repeated_identical_calls": streak, "loop_warning": note}
+    if isinstance(result, str):
+        return f"{result}\n\n{note}"
+    return result
+
+
+from cfd_langgraph.llm import token_usage_logger as _token_log  # noqa: E402
 
 
 def _with_progress(fn):
@@ -2198,13 +2997,73 @@ def _with_progress(fn):
         token = BOARD.start(label, arg_preview[:80])
         t0 = _time.monotonic()
         try:
-            result = fn(*args, **kwargs)
+            # Model calls the tool makes for itself are filed under the tool,
+            # not under whichever agent called it.
+            with _token_log.caller_scope(f"tool:{label}"):
+                result = fn(*args, **kwargs)
         except Exception as exc:
             BOARD.finish(token, ok=False)
             print(f"✗ {label} failed after {_time.monotonic() - t0:.1f}s: {exc}", flush=True)
             raise
         BOARD.finish(token, ok=True)
         print(f"✓ {label} done in {_time.monotonic() - t0:.1f}s", flush=True)
+
+        # Stop a deterministic refusal from being retried forever.
+        #
+        # A tool that refuses the same arguments with the same error will
+        # refuse them again, however many times it is asked, and the model
+        # cannot always tell why. Measured on ph_gemma_20260910d:
+        # oed_setup_search rejected the same call 57 times in a row, each
+        # rejection returning in 0.0s but costing a full manager turn with the
+        # whole context re-sent -- 570 calls and 16.8 million input tokens
+        # spent without the study advancing one step, on a mistake made in a
+        # different tool entirely.
+        #
+        # Keyed on arguments AND error text together: identical both ways means
+        # nothing changed and nothing will, while a different error means the
+        # situation moved and a retry is legitimate. Transient provider
+        # failures raise rather than return, so they never reach this.
+        sig = _failure_signature(result)
+        if sig and isinstance(result, dict):
+            result = _trim_failure_echo(result, [list(args), kwargs])
+        key = f"{label}|{hashlib.sha1(arg_preview.encode()).hexdigest()}|{sig}"
+        if sig:
+            _REPEAT_FAILURES[key] = _REPEAT_FAILURES.get(key, 0) + 1
+            n = _REPEAT_FAILURES[key]
+            if n >= _REPEAT_FAILURE_LIMIT:
+                print(
+                    f"  {label} has now failed {n}x with identical arguments and the "
+                    f"same error — refusing further identical calls.",
+                    flush=True,
+                )
+                if isinstance(result, dict):
+                    result = dict(result)
+                    result["repeated_identical_failures"] = n
+                    result["error"] = (
+                        f"{sig}\n\n[This call has failed {n} times with identical "
+                        "arguments and an identical error. Retrying it unchanged will fail "
+                        "again. The cause is upstream of this call: change an argument, fix "
+                        "the state this tool depends on, or take a different route.]"
+                    )
+            if n >= _REPEAT_FAILURE_ABORT and isinstance(result, dict):
+                print(
+                    f"\n  ⛔ {label} has failed {n}x with identical arguments and the same "
+                    f"error — telling the model this call is blocked.\n     error: {sig[:200]}\n",
+                    flush=True,
+                )
+                result["error"] = (
+                    f"{sig}\n\n[BLOCKED: this exact call has now failed {n} times with the same "
+                    "error. It will not succeed, and no one is available to intervene. Stop "
+                    "calling it with these arguments. Change the arguments, fix what this tool "
+                    "depends on, move on to a different step, or finish and report what is "
+                    "blocking you.]"
+                )
+        else:
+            _REPEAT_FAILURES.pop(key, None)
+            for k in [k for k in _REPEAT_FAILURES if k.startswith(f"{label}|")]:
+                _REPEAT_FAILURES.pop(k, None)
+            if not label.endswith("_status"):
+                result = _note_repeated_same_call(label, arg_preview, result)
         return result
 
     return wrapper
@@ -2255,6 +3114,20 @@ def _run_script(
     OpenFOAM sourced or a
     further translated/extended environment.
     """
+    run_env = dict(env if env is not None else _default_subprocess_env())
+    # Attribute this subprocess's LLM calls to the script that is running.
+    # Most pipeline stages ARE subprocesses -- interpret.py, viz.py,
+    # code_mod_agentic.py, open_ended_discovery.py -- so the script name is
+    # both the most specific stage label available and the only one that
+    # needs no per-call-site plumbing. Derived rather than tabulated so a new
+    # script is attributed the day it is added instead of falling into
+    # "unattributed" until someone remembers to register it.
+    try:
+        first = str(args[0]) if args else ""
+        if first.endswith(".py"):
+            _token_log.stage_env(run_env, first)
+    except Exception:
+        pass
     try:
         return subprocess.run(
             [sys.executable, *args],
@@ -2262,7 +3135,7 @@ def _run_script(
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=env if env is not None else _default_subprocess_env(),
+            env=run_env,
         )
     except subprocess.TimeoutExpired as exc:
         # Surface a timeout as a failed CompletedProcess, never as a raised
@@ -2546,6 +3419,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             return "", "requirement_text does not match the approved requirements.json entry."
         return canonical, None
 
+    def _requirement_issues(case_id: str) -> tuple[bool, List[str]]:
+        """Whether this case's approved requirement failed the checker, and why."""
+        for item in _read_json(out_dir / "requirements.json") or []:
+            if isinstance(item, dict) and str(item.get("case_id", "")) == case_id:
+                valid = item.get("requirement_valid", True)
+                flagged = valid is False or str(valid).strip().lower() == "false"
+                return flagged, [str(i) for i in item.get("requirement_issues") or []]
+        return False, []
+
     def _writable_path(path: str) -> tuple[Optional[Path], Optional[str]]:
         p = Path(path).expanduser()
         if not p.is_absolute():
@@ -2572,21 +3454,100 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
     # outside this repo.
     # -----------------------------------------------------------------
 
+    # Other studies' outputs and held-out data are never readable.
+    #
+    # These tools used to read any real path, and grep_files and find_files
+    # searched the whole repository, so a study could open another study's
+    # candidates and scores. gpt-oss on experiments_for_paper/gptoss120b/palmo
+    # spent most of an hour in runs/oed_search_archive_cli_test, and runs/ also
+    # holds earlier periodic-hill studies of a task the paper runs again. A
+    # study reads its own run directory, its starter folder, the framework and
+    # the OpenFOAM installation. It never reads:
+    #   - the repository's study-output stores (runs/, results/, submissions/)
+    #     or its held-out data (heldout_*);
+    #   - any folder holding another study's output, recognised by the
+    #     user_prompt.txt or state.json every study writes;
+    #   - the neighbours of its starter folder: other tasks, *_test folders.
+    _REPO_STUDY_STORES = ("runs", "results", "submissions")
+
+    def _read_scope() -> Dict[str, Optional[Path]]:
+        own = Path(out_dir).resolve()
+        repo = _REPO_ROOT.resolve()
+        starter = _starter_root_on_record()
+        siblings = None
+        if starter is not None:
+            parent = starter.parent
+            # Never when the starter sits in the repository or beside it:
+            # its neighbours would then include the framework itself.
+            if parent != repo and parent not in repo.parents and parent != Path(parent.anchor):
+                siblings = parent
+        return {"own": own, "repo": repo, "starter": starter, "siblings": siblings}
+
+    def _within(p: Path, root: Optional[Path]) -> bool:
+        return root is not None and (p == root or root in p.parents)
+
+    def _withheld_dir(d: Path, scope: Dict[str, Optional[Path]]) -> bool:
+        """True for a directory that must not be listed, entered or searched."""
+        own = scope["own"]
+        if _within(d, own) or d in own.parents or _within(d, scope["starter"]):
+            return False
+        if d.parent == scope["repo"] and (d.name in _REPO_STUDY_STORES or d.name.lower().startswith("heldout")):
+            return True
+        if scope["siblings"] is not None and d.parent == scope["siblings"]:
+            return True
+        return (d / "user_prompt.txt").is_file() or (d / "state.json").is_file()
+
+    def _read_refusal(p: Path, scope: Dict[str, Optional[Path]]) -> Optional[str]:
+        """Why ``p`` may not be read, or None when it may."""
+        if _within(p, scope["own"]) or _within(p, scope["starter"]):
+            return None
+        for d in (p, *p.parents):
+            if d == Path(d.anchor):
+                break
+            try:
+                if d.is_dir() and _withheld_dir(d, scope):
+                    return (
+                        f"Refusing to read {p}: {d} holds another study's output or held-out "
+                        "data. A study reads only its own run directory, its starter folder, "
+                        "the framework code and the OpenFOAM installation."
+                    )
+            except OSError:
+                continue
+        return None
+
+    def _withheld_note(count: int) -> Dict[str, str]:
+        if not count:
+            return {}
+        return {"withheld": f"{count} folder(s) holding other studies' outputs or held-out data are not shown."}
+
     def list_directory(path: str, max_entries: int = 300) -> dict:
         """List one directory's immediate contents (name, is_dir, size_bytes).
         ``path`` can be any real path — relative to the repo root, or absolute."""
         p = Path(path).expanduser()
         if not p.is_absolute():
-            p = (_REPO_ROOT / p).resolve()
+            p = _REPO_ROOT / p
+        p = p.resolve()
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
+        scope = _read_scope()
+        refusal = _read_refusal(p, scope)
+        if refusal:
+            return {"error": refusal}
         entries = []
-        for child in sorted(p.iterdir())[:max_entries]:
+        shown = 0
+        withheld = 0
+        for child in sorted(p.iterdir()):
             try:
-                entries.append({"name": child.name, "is_dir": child.is_dir(), "size_bytes": child.stat().st_size if child.is_file() else None})
+                is_dir = child.is_dir()
+                if is_dir and _withheld_dir(child, scope):
+                    withheld += 1
+                    continue
+                shown += 1
+                if len(entries) < max_entries:
+                    entries.append({"name": child.name, "is_dir": is_dir, "size_bytes": child.stat().st_size if child.is_file() else None})
             except OSError:
                 continue
-        return {"path": str(p), "entries": entries, "truncated": len(list(p.iterdir())) > max_entries}
+        return {"path": str(p), "entries": entries, "truncated": shown > max_entries, **_withheld_note(withheld)}
 
     def directory_tree(path: str = ".", max_depth: int = 3, max_entries: int = 500) -> dict:
         """Recursive tree view of a folder — the same kind of picture you'd
@@ -2594,21 +3555,37 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         listing one level at a time. Any real path, any depth you ask for."""
         p = Path(path).expanduser()
         if not p.is_absolute():
-            p = (_REPO_ROOT / p).resolve()
+            p = _REPO_ROOT / p
+        p = p.resolve()
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
+        scope = _read_scope()
+        refusal = _read_refusal(p, scope)
+        if refusal:
+            return {"error": refusal}
 
         lines = [str(p)]
         count = 0
+        withheld = 0
 
         def walk(d: Path, prefix: str, depth: int) -> None:
-            nonlocal count
+            nonlocal count, withheld
             if depth > max_depth or count >= max_entries:
                 return
             try:
                 entries = sorted(d.iterdir(), key=lambda x: (not x.is_dir(), x.name))
             except OSError:
                 return
+            visible = []
+            for entry in entries:
+                try:
+                    if entry.is_dir() and _withheld_dir(entry, scope):
+                        withheld += 1
+                        continue
+                except OSError:
+                    continue
+                visible.append(entry)
+            entries = visible
             for i, entry in enumerate(entries):
                 if count >= max_entries:
                     lines.append(f"{prefix}... (truncated at {max_entries} entries)")
@@ -2620,7 +3597,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     walk(entry, prefix + ("    " if last else "│   "), depth + 1)
 
         walk(p, "", 1)
-        return {"path": str(p), "tree": "\n".join(lines), "truncated": count >= max_entries}
+        return {"path": str(p), "tree": "\n".join(lines), "truncated": count >= max_entries,
+                **_withheld_note(withheld)}
 
     def make_directory(path: str) -> dict:
         """Create a directory (and missing parents) inside this study's output directory."""
@@ -2634,9 +3612,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         """Recursively glob for files under ``root`` matching ``pattern``
         (e.g. "*.csv", "**/system/controlDict").
 
-        ``root`` must resolve inside the repository, and the walk stops at
-        ``max_results`` rather than materialising the whole tree first —
-        an unbounded rglob over a home directory has no timeout to save it.
+        ``root`` must resolve inside the repository, this study's run
+        directory, the starter folder on record, or the OpenFOAM installation
+        -- the areas grep_files searches -- and the walk stops at
+        ``max_results`` rather than materialising the whole tree first: an
+        unbounded rglob over a home directory has no timeout to save it.
         """
         p = Path(root).expanduser()
         if not p.is_absolute():
@@ -2644,43 +3624,133 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         p = p.resolve()
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
-        if p != _REPO_ROOT and _REPO_ROOT not in p.parents:
+        # A study's run directory and starter folder need not live inside the
+        # repository. Refusing them sent malmo_gptoss120b_bedrock_20260913b
+        # round the same refusal five times looking for its own records.
+        allowed_roots: List[Path] = [_REPO_ROOT, Path(out_dir).resolve()]
+        starter_root_rec = _starter_root_on_record()
+        if starter_root_rec is not None:
+            allowed_roots.append(starter_root_rec)
+        openfoam_root = str(getattr(settings, "openfoam_path", "") or "").strip()
+        if openfoam_root:
+            allowed_roots.append(Path(openfoam_root).expanduser().resolve())
+        if not any(p == r or r in p.parents for r in allowed_roots):
             return {
                 "error": (
-                    f"Refusing to search outside the repository: {p}. "
-                    f"Pass a root under {_REPO_ROOT}."
+                    f"Refusing to search outside this study's areas: {p}. Pass a root under "
+                    "one of: " + ", ".join(str(r) for r in allowed_roots)
                 ),
-                "repo_root": str(_REPO_ROOT),
             }
+        scope = _read_scope()
+        refusal = _read_refusal(p, scope)
+        if refusal:
+            return {"error": refusal}
         matches = []
         truncated = False
+        withheld = 0
+        # Walked by hand rather than with rglob, so a withheld folder is never
+        # entered at all. The pattern keeps rglob's meaning: a bare name
+        # matches at any depth, a path is matched from the right.
+        flat = "/" not in pattern
         try:
-            for m in p.rglob(pattern):
-                try:
-                    if not m.is_file():
-                        continue
-                except OSError:
-                    continue
-                matches.append(str(m))
-                if len(matches) >= max_results:
-                    truncated = True
+            for dirpath, dirnames, filenames in os.walk(p):
+                d = Path(dirpath)
+                kept = []
+                for name in dirnames:
+                    if _withheld_dir(d / name, scope):
+                        withheld += 1
+                    else:
+                        kept.append(name)
+                dirnames[:] = kept
+                for name in filenames:
+                    rel = (d / name).relative_to(p)
+                    if flat:
+                        hit = fnmatch.fnmatch(name, pattern)
+                    else:
+                        hit = rel.match(pattern) or (pattern.startswith("**/") and rel.match(pattern[3:]))
+                    if hit:
+                        matches.append(str(d / name))
+                        if len(matches) >= max_results:
+                            truncated = True
+                            break
+                if truncated:
                     break
         except Exception as exc:
             return {"root": str(p), "pattern": pattern, "matches": sorted(matches),
                     "error": f"{type(exc).__name__}: {exc}"}
         return {"root": str(p), "pattern": pattern, "matches": sorted(matches),
-                "truncated": truncated}
+                "truncated": truncated, **_withheld_note(withheld)}
 
-    def read_text_file(path: str, max_chars: int = 20000) -> dict:
-        """Read a text file (source, config, reference data, notes). Any real path."""
+    def read_text_file(path: str, max_chars: int = 20000, start_char: int = 0) -> dict:
+        """Read a text file (source, config, reference data, notes). Any real path.
+
+        A file longer than ``max_chars`` comes back in pages. Pass the
+        ``next_start_char`` from the previous result as ``start_char`` to
+        continue from where that page ended; repeat until ``truncated`` is
+        false. Pages break on line boundaries, so no line is ever split
+        across two reads.
+        """
         p = Path(path).expanduser()
         if not p.is_absolute():
-            p = (_REPO_ROOT / p).resolve()
+            p = _REPO_ROOT / p
+        p = p.resolve()
+        refusal = _read_refusal(p, _read_scope())
+        if refusal:
+            return {"error": refusal}
         if not p.is_file():
             return {"error": f"Not a file: {p}"}
         text = p.read_text(encoding="utf-8", errors="ignore")
-        truncated = len(text) > max_chars
-        return {"path": str(p), "content": text[:max_chars], "truncated": truncated, "total_chars": len(text)}
+        total = len(text)
+
+        # Paging, and a cut that lands on a line.
+        #
+        # This used to return text[:max_chars] with no way to ask for the
+        # rest: the only lever a model had was to call again, which returned
+        # the identical first page. Measured on ph_gemma_20260910f, which
+        # needed a 38,729-character DNS reference and could only ever see the
+        # first 20,000 of it: it read the same file 39 times -- roughly
+        # 780,000 characters of the same data re-sent through a growing
+        # context -- and never advanced. The loop was rational; the tool had
+        # no other move to offer.
+        #
+        # The cut also landed mid-value, so a data file ended in a
+        # half-written float and read as corrupt rather than shortened. That
+        # sent an earlier run hunting for an "intact" copy that did not exist.
+        #
+        # The circuit breaker cannot catch this: every one of those reads
+        # SUCCEEDED. It was a useless success, which nothing was watching for.
+        start = max(0, int(start_char or 0))
+        if start >= total and total:
+            return {
+                "path": str(p), "content": "", "truncated": False,
+                "total_chars": total, "start_char": start, "next_start_char": None,
+                "note": f"start_char {start} is at or past the end of this {total}-character file.",
+            }
+        window = text[start:start + max_chars]
+        end = start + len(window)
+        if end < total:
+            cut = window.rfind("\n")
+            if cut > 0:
+                window = window[:cut + 1]
+                end = start + len(window)
+        truncated = end < total
+        result = {
+            "path": str(p),
+            "content": window,
+            "truncated": truncated,
+            "total_chars": total,
+            "start_char": start,
+            "next_start_char": end if truncated else None,
+        }
+        if truncated:
+            result["note"] = (
+                f"Showing characters {start}-{end} of {total}. The file is COMPLETE on "
+                f"disk. To read the next page call read_text_file(path, "
+                f"start_char={end}) -- calling again without start_char returns this "
+                "same page. For a large data file, running a script over it is usually "
+                "better than reading it all."
+            )
+        return result
 
     def write_text_file(path: str, content: str) -> dict:
         """Write a non-protected text file inside this study's output directory.
@@ -2716,8 +3786,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         """Search file contents for a regex pattern under ``root``, filtered
         to files matching ``glob`` (e.g. "*.py", "*.log", "log.*").
 
-        ``root`` must resolve inside the repository. A search that scans a
-        whole home directory is never what this tool is for, and one that
+        ``root`` must resolve inside the repository, this study's run
+        directory, the starter folder on record, or the OpenFOAM installation.
+        A search that scans a whole home directory is never what this tool is
+        for, and one that
         times out must come back as a tool *result* the model can react to
         — never as a raised exception, which would tear down the whole
         study turn over a failed grep.
@@ -2728,37 +3800,80 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         p = p.resolve()
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
-        if p != _REPO_ROOT and _REPO_ROOT not in p.parents:
+        # The run directory and the starter folder need not live inside the
+        # repository -- a study on another disk has both elsewhere -- and the
+        # refusal used to name "the run directory" as allowed while refusing
+        # it. Measured on the malmo study: grep of its own run directory on
+        # /mnt/sda1 was refused with that message.
+        allowed_roots: List[Path] = [_REPO_ROOT, Path(out_dir).resolve()]
+        starter_root_rec = _starter_root_on_record()
+        if starter_root_rec is not None:
+            allowed_roots.append(starter_root_rec)
+        openfoam_root = str(getattr(settings, "openfoam_path", "") or "").strip()
+        if openfoam_root:
+            allowed_roots.append(Path(openfoam_root).expanduser().resolve())
+        if not any(p == root or root in p.parents for root in allowed_roots):
             return {
                 "error": (
-                    f"Refusing to search outside the repository: {p}. "
-                    f"Pass a root under {_REPO_ROOT} — the run directory, "
-                    "the starter case, or scripts/."
+                    f"Refusing to search outside this study's areas: {p}. Pass a root under "
+                    "one of: " + ", ".join(str(r) for r in allowed_roots)
                 ),
-                "repo_root": str(_REPO_ROOT),
+                "allowed_roots": [str(r) for r in allowed_roots],
             }
+        scope = _read_scope()
+        refusal = _read_refusal(p, scope)
+        if refusal:
+            return {"error": refusal, "allowed_roots": [str(r) for r in allowed_roots]}
+        timed_out = {
+            "root": str(p),
+            "pattern": pattern,
+            "matches": [],
+            "match_count": 0,
+            "error": (
+                f"grep timed out after 120s under {p} with glob {glob!r}. "
+                "Narrow the search: use a deeper root and a specific glob "
+                "(e.g. '*.json', '*.py') instead of '*'."
+            ),
+        }
+        # The files are gathered by a walk that never enters a withheld
+        # folder, then searched in batches, all inside the same 120 s budget
+        # the single recursive grep had.
+        deadline = time.monotonic() + 120
+        files: List[str] = []
+        withheld = 0
+        lines: List[str] = []
         try:
-            proc = subprocess.run(
-                ["grep", "-rn", "--include", glob, "-E", pattern, str(p)],
-                capture_output=True, text=True, timeout=120,
-            )
+            for dirpath, dirnames, filenames in os.walk(p):
+                if time.monotonic() > deadline:
+                    return timed_out
+                d = Path(dirpath)
+                kept = []
+                for name in dirnames:
+                    if _withheld_dir(d / name, scope):
+                        withheld += 1
+                    else:
+                        kept.append(name)
+                dirnames[:] = kept
+                files.extend(str(d / name) for name in filenames if fnmatch.fnmatch(name, glob))
+            for start in range(0, len(files), 500):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return timed_out
+                proc = subprocess.run(
+                    ["grep", "-n", "-H", "-E", pattern, "--", *files[start:start + 500]],
+                    capture_output=True, text=True, timeout=remaining,
+                )
+                lines.extend((proc.stdout or "").splitlines())
+                if len(lines) >= max_results:
+                    break
         except subprocess.TimeoutExpired:
-            return {
-                "root": str(p),
-                "pattern": pattern,
-                "matches": [],
-                "match_count": 0,
-                "error": (
-                    f"grep timed out after 120s under {p} with glob {glob!r}. "
-                    "Narrow the search: use a deeper root and a specific glob "
-                    "(e.g. '*.json', '*.py') instead of '*'."
-                ),
-            }
+            return timed_out
         except Exception as exc:
             return {"root": str(p), "pattern": pattern, "matches": [], "match_count": 0,
                     "error": f"{type(exc).__name__}: {exc}"}
-        lines = (proc.stdout or "").splitlines()[:max_results]
-        return {"root": str(p), "pattern": pattern, "matches": lines, "match_count": len(lines)}
+        lines = lines[:max_results]
+        return {"root": str(p), "pattern": pattern, "matches": lines, "match_count": len(lines),
+                **_withheld_note(withheld)}
 
     def read_starter_folder(starter_dir: str, topic: str = "") -> dict:
         """Characterize a starter case folder — geometry/BC/solver setup,
@@ -2771,17 +3886,64 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         """
         p = Path(starter_dir).expanduser()
         if not p.is_absolute():
-            p = (_REPO_ROOT / p).resolve()
+            p = _REPO_ROOT / p
+        p = p.resolve()
+        refusal = _read_refusal(p, _read_scope())
+        if refusal:
+            return {"error": refusal}
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
         out_path = out_dir / "starter_understanding.json"
+
+        # Already characterised, same folder: return the record instead of
+        # paying for it again. This reads every file in the starter and sends
+        # up to 60,000 characters to the model, so a repeat is one of the most
+        # expensive calls in the study -- and it is a once-per-starter fact,
+        # not something that changes between calls. Measured across the
+        # four-model comparison, managers re-ran it 4, 6 and 9 times on the
+        # same unchanged folder while looking for a way past a later failure.
+        # propose_and_rank_hypotheses already refuses to redo its stage for
+        # the same reason; this is the same rule one stage earlier.
+        #
+        # A DIFFERENT folder always re-runs: pointing at a new starter is a
+        # real request, and it is also how a study recovers from having read
+        # the wrong folder in the first place.
+        existing = _read_json(out_path) or {}
+        if isinstance(existing, dict) and existing.get("status") == "ok":
+            recorded = str(existing.get("starter_dir") or "")
+            same = False
+            if recorded:
+                try:
+                    same = Path(recorded).expanduser().resolve() == p.resolve()
+                except OSError:
+                    same = False
+            if same:
+                mode_doc = _record_study_mode(p.resolve(), topic)
+                return {
+                    "ok": True,
+                    "study_mode": mode_doc.get("mode"),
+                    "study_mode_reason": mode_doc.get("reason"),
+                    "status": existing.get("status"),
+                    "path": str(out_path),
+                    "flow_parameters": existing.get("flow_parameters") or {},
+                    "stderr_tail": "",
+                    "note": (
+                        "already characterised in this study; returning the existing record "
+                        "rather than re-reading the starter. Pass a different starter_dir to "
+                        "characterise another folder."
+                    ),
+                }
+
         proc = _run_script(
             ["scripts/starter_understand.py", "--starter-dir", str(p), "--topic", topic, "--output", str(out_path)],
             timeout=900,
         )
         result = _read_json(out_path) or {}
+        mode_doc = _record_study_mode(p.resolve(), topic) if proc.returncode == 0 else {}
         return {
             "ok": proc.returncode == 0,
+            "study_mode": mode_doc.get("mode"),
+            "study_mode_reason": mode_doc.get("reason"),
             "status": result.get("status"),
             "path": str(out_path),
             "flow_parameters": (result.get("flow_parameters") or {}) if isinstance(result, dict) else {},
@@ -2791,10 +3953,34 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
     def fetch_literature(topic: str, limit: int = 20) -> dict:
         """Search Semantic Scholar for papers on ``topic`` and write lit.json —
         the standard artifact ``write_paper`` reads for the paper's literature
-        section. Call this once, near the start of a study."""
+        section. Call this once, near the start of a study. If calls keep
+        finding no papers, the study goes on without literature after a fixed
+        number of them and the result says ``literature_skipped``."""
         topic = str(topic or "").strip()
         if not topic:
             return {"ok": False, "error": "Literature topic is empty."}
+        lit_path = out_dir / "lit.json"
+        attempts_path = out_dir / "literature_attempts.json"
+
+        def skipped_result(log: Dict[str, Any]) -> dict:
+            n = len(log.get("failed_fetches") or [])
+            return {
+                "ok": True,
+                "literature_skipped": True,
+                "paper_count": 0,
+                "path": str(lit_path),
+                "failed_fetches": n,
+                "note": (
+                    f"The literature search found no papers in {n} calls, so this study "
+                    "continues without literature. Go on to the next step; do not call "
+                    "fetch_literature again. Hypotheses will rest on the topic and the "
+                    "starter folder alone."
+                ),
+            }
+
+        prior_log = _read_json(attempts_path) or {}
+        if prior_log.get("skipped"):
+            return skipped_result(prior_log)
         # A floor, not just a ceiling. Two papers is not a literature review,
         # and ideation grounded on two papers invents its own direction —
         # measured on run closure_20260824_codex, where a two-paper lit.json
@@ -2803,11 +3989,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         requested = max(1, min(int(limit), int(settings.ideation_max_papers)))
         limit = max(requested, _LIT_MIN_PAPERS) if requested < _LIT_MIN_PAPERS else requested
         _ensure_routing(topic, "research")
-        lit_path = out_dir / "lit.json"
 
-        # Search on the research question, record the objective. The topic is
-        # what propose_and_rank_hypotheses matches against, so distilling the
-        # QUERY leaves that guard working exactly as before.
+        # Search on a short query distilled from the research question; the
+        # checkpoint still records the full topic.
         query, broader = _literature_query(topic, foam_llm)
         attempts: List[Dict[str, Any]] = []
         proc = None
@@ -2830,29 +4014,68 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             if count >= _LIT_MIN_PAPERS:
                 break
 
-        ok = bool(proc is not None and proc.returncode == 0 and paper_count > 0)
-        if ok:
+        if paper_count > 0:
+            # Papers from any attempt count, and the best attempt is what stays
+            # on disk: lit.py overwrites lit.json when a search succeeds and
+            # leaves it alone when one fails, so judging by the LAST attempt
+            # called a found-5-then-500 search a failure.
+            _write_json(lit_path, papers)
             _write_checkpoint(
                 "literature_done",
                 {"path": str(lit_path), "paper_count": paper_count, "source": "semantic_scholar",
                  "topic": topic, "search_attempts": attempts},
             )
             _update_study_state(topic=topic, current_stage="literature")
+            return {
+                "ok": True,
+                "paper_count": paper_count,
+                "path": str(lit_path),
+                "search_attempts": attempts,
+                "thin_literature": (
+                    f"Only {paper_count} paper(s) found. Ideation grounded on this little "
+                    "tends to invent its own direction and fail critique; consider a "
+                    "different phrasing of the research question before proceeding."
+                    if paper_count < _LIT_MIN_PAPERS else ""
+                ),
+                "stderr_tail": "",
+            }
+
+        error_tail = (
+            proc.stderr[-1000:] if proc is not None and proc.returncode != 0
+            else "Literature search returned no papers."
+        )
+        with state_lock:
+            log = _read_json(attempts_path) or {}
+            failed = list(log.get("failed_fetches") or [])
+            failed.append({"ts": _now(), "topic": topic, "search_attempts": attempts,
+                           "error": error_tail[-300:]})
+            log["failed_fetches"] = failed
+            if len(failed) >= _LIT_MAX_FAILED_FETCHES:
+                log["skipped"] = True
+                log["skipped_at"] = _now()
+            _write_json(attempts_path, log)
+        if log.get("skipped"):
+            # An explicit empty literature set, so write_paper's input check
+            # and every reader of lit.json see "none found", not "never run".
+            _write_json(lit_path, [])
+            _write_checkpoint(
+                "literature_done",
+                {"path": str(lit_path), "paper_count": 0, "skipped": True,
+                 "failed_fetches": len(failed), "topic": topic, "search_attempts": attempts},
+            )
+            _update_study_state(topic=topic, current_stage="literature")
+            return skipped_result(log)
+        left = _LIT_MAX_FAILED_FETCHES - len(failed)
         return {
-            "ok": ok,
-            "paper_count": paper_count,
+            "ok": False,
+            "paper_count": 0,
             "path": str(lit_path),
             "search_attempts": attempts,
-            "thin_literature": (
-                f"Only {paper_count} paper(s) found. Ideation grounded on this little "
-                "tends to invent its own direction and fail critique; consider a "
-                "different phrasing of the research question before proceeding."
-                if 0 < paper_count < _LIT_MIN_PAPERS else ""
-            ),
-            "stderr_tail": (
-                proc.stderr[-1000:] if proc.returncode != 0
-                else "Literature search returned no papers; hypothesis generation is blocked."
-                if paper_count == 0 else ""
+            "failed_fetches": len(failed),
+            "stderr_tail": error_tail,
+            "note": (
+                "Hypothesis generation is blocked until papers are found. After "
+                f"{left} more call(s) that find none, the study continues without literature."
             ),
         }
 
@@ -2864,6 +4087,13 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         review. Nothing downstream (case specs, experiments) happens from
         this call alone; that requires ``advance_with_approved_hypotheses``.
         """
+        # Hypotheses are built on the study's own objective (the user's topic
+        # file), not on however the model paraphrased it in this call — the
+        # same rule the OED search tools follow.
+        refusal = _impl_refusal("propose_and_rank_hypotheses")
+        if refusal:
+            return refusal
+        topic = _effective_topic(topic)
         _ensure_routing(topic, "research")
         # Hypotheses already approved for this study: refuse to re-propose.
         # Without this, ANY later failure (a mesh gate that won't converge, a
@@ -2890,26 +4120,59 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 ),
             }
         literature = _read_json(out_dir / "lit.json")
-        if not isinstance(literature, list) or not literature:
+        # fetch_literature gave up after its failure limit: go on without papers.
+        attempt_log = _read_json(out_dir / "literature_attempts.json") or {}
+        literature_skipped = bool(attempt_log.get("skipped"))
+        if not literature_skipped and (not isinstance(literature, list) or not literature):
             return {
                 "error": "Blocked: lit.json is missing or empty; hypotheses cannot be literature-grounded.",
                 "path": str(out_dir / "lit.json"),
+                "note": (
+                    f"Call fetch_literature. After {_LIT_MAX_FAILED_FETCHES} calls that find no "
+                    "papers, the study continues without literature."
+                ),
             }
-        literature_checkpoint = _read_json(out_dir / "checkpoints" / "literature_done.json") or {}
-        if str(literature_checkpoint.get("topic", "")).strip() != str(topic or "").strip():
-            return {
-                "error": "Hypothesis topic does not match the topic used to retrieve lit.json; refetch literature first.",
-                "literature_topic": literature_checkpoint.get("topic", ""),
-                "hypothesis_topic": topic,
-            }
+        # No check that ``topic`` matches the wording fetch_literature was
+        # called with. It compared the two strings exactly, and models phrase
+        # the question differently between calls: on 2026-09-11 codex, glm and
+        # llama were all refused with 20 relevant papers on disk — two re-ran
+        # the search, and llama skipped the hypothesis step altogether.
         result = run_propose_critique_rank(
             settings,
             topic,
             num_candidates=max(1, min(num_candidates, settings.hypothesis_num_candidates)),
-            literature_records=literature,
-            require_literature=True,
+            literature_records=literature if isinstance(literature, list) and not literature_skipped else [],
+            require_literature=not literature_skipped,
             case_context=_starter_case_context(out_dir, settings.openfoam_path),
+            study_mode=_study_mode_value(),
         )
+        if literature_skipped:
+            result["literature_skipped"] = True
+        attempts_path = out_dir / "hypothesis_attempts.json"
+        attempt = int((_read_json(attempts_path) or {}).get("attempts", 0) or 0) + 1
+        _write_json(attempts_path, {"attempts": attempt, "max_attempts": _HYPOTHESIS_MAX_ATTEMPTS})
+        # Nothing passed review in the final round: go on with that round's
+        # ideas rather than stopping. With no ranked idea, approval can never
+        # succeed, and the study had no other way forward --
+        # experiments_for_paper/qwen_27b_nothink/palmo proposed four rounds,
+        # passed none, and retried approval 99 times until its context
+        # overflowed. The kept ideas carry their review issues, so whoever
+        # approves them sees why they did not pass.
+        kept_after_final_attempt = False
+        if not result["ranked_hypotheses"] and attempt >= _HYPOTHESIS_MAX_ATTEMPTS and result.get("rejected"):
+            kept = list(result["rejected"])
+            for position, candidate in enumerate(kept, start=1):
+                issues = (candidate.get("critique") or {}).get("issues") or []
+                candidate["rank"] = position
+                candidate["kept_without_passing_review"] = True
+                candidate["rank_rationale"] = (
+                    "Kept after the final proposal attempt without passing review"
+                    + (f": {str(issues[0])[:200]}" if issues else ".")
+                )
+            result["ranked_hypotheses"] = kept
+            result["rejected"] = []
+            result["kept_after_final_attempt"] = True
+            kept_after_final_attempt = True
         _write_json(out_dir / "hypotheses_ranked.json", result)
         _update_study_state(topic=topic, current_stage="hypothesis")
         top = [
@@ -2920,12 +4183,31 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             }
             for c in result["ranked_hypotheses"][:5]
         ]
-        return {
+        payload = {
             "num_proposed": result["num_proposed"],
             "num_passed_critique": result["num_passed_critique"],
             "top_ranked": top,
             "path": str(out_dir / "hypotheses_ranked.json"),
+            "attempt": attempt,
+            "max_attempts": _HYPOTHESIS_MAX_ATTEMPTS,
         }
+        if kept_after_final_attempt:
+            payload["note"] = (
+                f"No idea passed review in {attempt} attempts, so this last set is kept for approval "
+                "with its review issues attached. Choose from top_ranked and call "
+                "advance_with_approved_hypotheses."
+            )
+        elif not result["ranked_hypotheses"]:
+            payload["review_issues"] = [
+                f"{c.get('candidate_id')}: {str(((c.get('critique') or {}).get('issues') or ['no reason recorded'])[0])[:200]}"
+                for c in (result.get("rejected") or [])[:3]
+            ]
+            payload["next_step"] = (
+                f"No idea passed review on attempt {attempt} of {_HYPOTHESIS_MAX_ATTEMPTS}, so there is "
+                "nothing to approve yet. Call propose_and_rank_hypotheses again. If the final attempt "
+                "also has none, its ideas are kept for approval."
+            )
+        return payload
 
     def advance_with_approved_hypotheses(approved_candidate_ids: List[str], notes: str = "") -> dict:
         """Lock in which ranked hypotheses actually become experiments.
@@ -2939,12 +4221,24 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         """
         ranked = _read_json(out_dir / "hypotheses_ranked.json") or {}
         by_id = {c["candidate_id"]: c for c in ranked.get("ranked_hypotheses", [])}
+        if not by_id:
+            # The bare "choose a valid ID" refusal, with an empty list of valid
+            # IDs, left no move but to guess: 99 guesses on
+            # experiments_for_paper/qwen_27b_nothink/palmo.
+            return {
+                "error": "Approval rejected: no idea has passed review yet, so there is nothing to approve.",
+                "next_step": (
+                    "Call propose_and_rank_hypotheses again. If its final attempt also has no idea "
+                    "that passes review, that last set of ideas is kept for approval."
+                ),
+            }
         unknown = [cid for cid in approved_candidate_ids if cid not in by_id]
         approved = [by_id[cid] for cid in approved_candidate_ids if cid in by_id]
         if unknown or not approved:
             return {
                 "error": "Approval rejected: choose at least one valid ranked candidate ID.",
-                "unknown_candidate_ids": unknown,
+                "unknown_candidate_ids": [str(cid)[:60] for cid in unknown[:10]]
+                + ([f"... and {len(unknown) - 10} more"] if len(unknown) > 10 else []),
                 "valid_candidate_ids": list(by_id),
             }
         record = {
@@ -2977,6 +4271,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         than the plain-template synthesis ``scripts/requirements.py`` falls
         back to when no requirement text is already present.
         """
+        refusal = _impl_refusal("generate_case_requirements")
+        if refusal:
+            return refusal
         approved = _read_json(out_dir / "hypotheses_approved.json")
         if not approved:
             return {"error": "Blocked: hypotheses_approved.json is missing — approve hypotheses first."}
@@ -3060,7 +4357,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 + ("" if result.get("valid", False) else "  INVALID"),
                 flush=True,
             )
-            return {
+            entry = {
                 "case_id": f"case_{job['index']:03d}",
                 "user_requirement_text": result["requirement"],
                 "experiment_id": simulation["simulation_id"],
@@ -3068,6 +4365,16 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "study_id": job["study_id"],
                 "requirement_valid": result.get("valid", False),
             }
+            # What the checker objected to, kept with the requirement. A
+            # flagged requirement is still run (see below), so whoever runs it
+            # needs to know what is wrong with it. Only the verdict used to be
+            # kept: on qwen_27b_nothink/cavity_r8, case_002's requirement named
+            # Re = 100, 400 and 1000 at once, the case was written for 1000,
+            # and the case-runner found that out only after the run.
+            if not entry["requirement_valid"]:
+                issues = (result.get("final_verdict") or {}).get("issues") or []
+                entry["requirement_issues"] = [str(i) for i in issues][:8]
+            return entry
 
         # These calls are independent — each turns one experiment into one
         # requirement and reads nothing the others write. Serially they were a
@@ -3149,8 +4456,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "published as-is, because the validator is not reliable enough to drop "
                 "work on. Do NOT regenerate requirements to 'fix' them — regenerating "
                 "rewords every user_requirement_text and invalidates any mesh gate "
-                "already run."
+                "already run. Pass each case's checker issues on to whoever runs it; "
+                "run_case_native also returns them and accepts a clarification."
             )
+            result["unvalidated_issues"] = {
+                r["case_id"]: r.get("requirement_issues", [])[:3] for r in invalid
+            }
             result["draft_path"] = str(draft_path)
         return result
 
@@ -3182,6 +4493,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         walks the baseline -> refined chain,
         rather than letting an LLM propose the level plan up front.
         """
+        refusal = _impl_refusal("run_mesh_gate")
+        if refusal:
+            return refusal
         from cfd_langgraph.llm.factory import create_langchain_llm
         from cfd_langgraph.mesh_gate_groups import (
             heuristic_mesh_gate_pair_fallback,
@@ -3285,6 +4599,38 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             m = data.get("metrics", []) if isinstance(data, dict) else []
             q_a = m[0].get("qoi", {}) if len(m) > 0 and isinstance(m[0], dict) else {}
             q_b = m[1].get("qoi", {}) if len(m) > 1 and isinstance(m[1], dict) else {}
+            # The starter's own scorer is authoritative for the quantities it
+            # computes; see _comparator_mesh_qois.
+            try:
+                gate_topic = _effective_topic(topic)
+            except Exception:  # noqa: BLE001
+                gate_topic = topic
+            comparator_scores = _comparator_mesh_qois(
+                case_a=case_a, case_b=case_b, metrics=mesh_metrics,
+                starter_dir=_starter_root_on_record(), topic=str(gate_topic or ""),
+                cache_path=out_dir / "open_ended_discovery" / "comparator_classification.json",
+                reference_candidates=_resolved_reference_inventory(out_dir),
+                declared_references={
+                    str(spec.get("name")): [
+                        (Path(str(ref)) if Path(str(ref)).is_absolute() else _REPO_ROOT / str(ref)).resolve()
+                        for ref in (spec.get("reference_files") or []) if str(ref).strip()
+                    ]
+                    for spec in metric_specs if spec.get("name")
+                },
+            )
+            if comparator_scores["values"]:
+                q_a, q_b = dict(q_a), dict(q_b)
+                for name, (value_a, value_b) in comparator_scores["values"].items():
+                    q_a[name], q_b[name] = value_a, value_b
+                print(
+                    f"[mesh-gate] {label}: {sorted(comparator_scores['values'])} scored with the "
+                    f"study's own comparator {comparator_scores['comparator']} "
+                    f"(reference {comparator_scores['reference_file']})",
+                    flush=True,
+                )
+            if comparator_scores.get("note"):
+                print(f"[mesh-gate] {label}: study comparator notes — {comparator_scores['note']}",
+                      flush=True)
             common = [
                 k for k in q_a
                 if k in q_b and k not in skip_keys
@@ -3659,7 +5005,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             for entry in cases_entries:
                 case_dir = Path(entry["case_path"])
                 rr = _read_json(case_dir / "run_result.json") or {}
-                if entry["status"] == "success" and rr.get("oed_status") == "PROCEED":
+                if (
+                    entry["status"] == "success"
+                    and rr.get("oed_status") in {"PROCEED", "REVISE"}
+                    and entry["case_id"] != "case_oed_baseline"
+                ):
                     accepted_winners.append(entry["case_id"])
             if not accepted_winners:
                 return {
@@ -3734,6 +5084,526 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
     def _oed_disc_dir() -> Path:
         return out_dir / "open_ended_discovery"
+
+    def _study_mode_value() -> str:
+        """'solver' or 'surrogate' for this study; 'solver' when undecidable.
+
+        Decided by read_starter_folder from the folder the study was given and
+        cached at <out_dir>/study_mode.json, so every gate below reads one
+        decision rather than re-deriving it. A study that predates the cache is
+        classified once, from the same starter record. Anything unresolvable is
+        the solver behaviour every study had before surrogate studies existed.
+        """
+        doc = _read_json(out_dir / "study_mode.json") or {}
+        mode = str(doc.get("mode", "") or "").strip().lower()
+        if mode in {"solver", "surrogate", "implementation"}:
+            return mode
+        try:
+            import sys as _sys
+
+            scripts_dir = str(_REPO_ROOT / "scripts")
+            if scripts_dir not in _sys.path:
+                _sys.path.insert(0, scripts_dir)
+            from study_mode import resolve_study_mode  # type: ignore
+
+            root = _starter_root_on_record()
+            if root is None or not root.is_dir():
+                return "solver"
+            config = _read_json(_oed_disc_dir() / "search_config.json") or {}
+            decision = resolve_study_mode(
+                topic=str(config.get("topic", "") or ""),
+                starter_dir=root,
+                cache_path=out_dir / "study_mode.json",
+            )
+            return str(decision.get("mode", "solver"))
+        except Exception as exc:  # noqa: BLE001
+            # A failed classification is not "solver": let the step fail and
+            # be retried rather than run the study down the wrong path.
+            if type(exc).__name__ == "StudyModeUnavailable":
+                raise
+            return "solver"
+
+    def _starter_root_on_record() -> Optional[Path]:
+        """The starter folder read_starter_folder recorded, resolved, or None.
+
+        The same trust root oed_setup_search's provenance check uses: taken
+        from starter_understanding.json and from nowhere else, so a caller
+        cannot nominate its own scratch folder as supplied input.
+        """
+        starter_root = (_read_json(out_dir / "starter_understanding.json") or {}).get("starter_dir", "")
+        if not starter_root:
+            return None
+        root = Path(str(starter_root)).expanduser()
+        if not root.is_absolute():
+            root = _REPO_ROOT / root
+        return root.resolve()
+
+    def _record_study_mode(starter: Path, topic: str) -> Dict[str, Any]:
+        """Classify the starter once and cache the answer next to the study."""
+        cache = out_dir / "study_mode.json"
+        existing = _read_json(cache) or {}
+        if existing and str(existing.get("starter_dir") or "") != str(starter):
+            # A different folder is a different study question; never reuse
+            # an answer about another starter.
+            try:
+                cache.unlink()
+            except OSError:
+                pass
+        import sys as _sys
+
+        scripts_dir = str(_REPO_ROOT / "scripts")
+        if scripts_dir not in _sys.path:
+            _sys.path.insert(0, scripts_dir)
+        from study_mode import resolve_study_mode  # type: ignore
+
+        try:
+            effective = _effective_topic(topic)
+        except Exception:  # noqa: BLE001
+            effective = topic
+        # No fallback. If the kind of study cannot be decided, this step fails
+        # and is retried; a guessed "solver" used to be cached like a real
+        # answer. Measured on qwen_27b_nothink/slau_r2: the classifier call timed
+        # out under load and an implementation task went down the CFD-study
+        # pipeline.
+        decision = resolve_study_mode(
+            topic=str(effective or topic or ""), starter_dir=starter, cache_path=cache,
+        )
+        doc = dict(decision)
+        doc["starter_dir"] = str(starter)
+        _write_json(cache, doc)
+        print(f"  study mode: {doc.get('mode')} ({doc.get('confidence')}) — {doc.get('reason')}",
+              flush=True)
+        return doc
+
+    def _oed_runner_script() -> str:
+        """Which agentic runner this study's candidates use.
+
+        The search itself does not change with the answer -- same archive,
+        same niche selection, same allocator, same budget -- so this is the
+        single point where a study whose candidates are fitted models rather
+        than compiled solver libraries diverges from one that is. Classified
+        once from the starter folder and cached; anything unresolvable falls
+        back to the solver runner, which is what every study did before this
+        existed.
+        """
+        try:
+            import sys as _sys
+
+            scripts_dir = str(_REPO_ROOT / "scripts")
+            if scripts_dir not in _sys.path:
+                _sys.path.insert(0, scripts_dir)
+            from study_mode import runner_script_for  # type: ignore
+
+            # The cached decision, not a fresh classification of
+            # baseline_case_dir: in a surrogate study that directory is a
+            # supplied result inside the starter, and classifying it alone
+            # would be judging a folder of prediction files out of context.
+            mode = _study_mode_value()
+            script = runner_script_for(mode)
+            print(f"  study mode: {mode} -> {script}", flush=True)
+            return script
+        except Exception as exc:  # noqa: BLE001
+            print(f"  study-mode resolution failed ({exc}); using the solver runner",
+                  flush=True)
+            return "scripts/code_mod_agentic.py"
+
+    # -----------------------------------------------------------------
+    # Implementation studies: one specified method, built and verified
+    # against the task's own scorer. No search, no hypotheses, no mesh gate.
+    # -----------------------------------------------------------------
+
+    def _impl_dir() -> Path:
+        return out_dir / "implementation"
+
+    def _impl_refusal(tool_name: str) -> Optional[dict]:
+        """A search or case-writing step asked for in an implementation study."""
+        if _study_mode_value() != "implementation":
+            return None
+        return {
+            "ok": False,
+            "error": (
+                f"{tool_name} is not part of an implementation study: the task fixes what to "
+                "build and supplies its own verification cases. Use impl_run, impl_verify, "
+                "impl_continue and impl_status."
+            ),
+        }
+
+    def _impl_write_status(**fields: Any) -> Dict[str, Any]:
+        """implementation/status.json, which the CLI reads to tell a finished
+        implementation study from one that has only paused."""
+        path = _impl_dir() / "status.json"
+        status = _read_json(path) or {}
+        status.update(fields)
+        status["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _write_json(path, status)
+        return status
+
+    def _impl_launch(*, topic: str, timeout_s: int, prior_attempt: str, guidance: str) -> dict:
+        work = _impl_dir()
+        work.mkdir(parents=True, exist_ok=True)
+        starter = _starter_root_on_record()
+        output = work / "agentic_result.json"
+        # The previous attempt's result is kept beside, so a process that dies
+        # before writing its own is never read as having produced that one.
+        if output.exists():
+            try:
+                output.replace(work / "agentic_result.previous.json")
+            except OSError:
+                pass
+        started = time.time()
+        _impl_write_status(complete=False, running=True)
+        proc = _run_script(
+            [
+                "scripts/implementation_agentic.py",
+                "--run-dir", str(work),
+                "--starter-root", str(starter),
+                "--topic", topic,
+                "--output", str(output),
+                "--timeout", str(int(timeout_s)),
+                "--max-turns", str(_IMPL_MAX_TURNS),
+                *(["--prior-attempt", prior_attempt] if prior_attempt.strip() else []),
+                *(["--guidance", guidance] if str(guidance or "").strip() else []),
+            ],
+            # Above the agent's own clock, so it stops itself before this does.
+            timeout=int(timeout_s) + 1800,
+            env=_foamagent_env(settings.openfoam_path),
+        )
+        result = _read_json(output) or {}
+        if not result:
+            log = work / "agentic_trajectory.log"
+            try:
+                turns = log.read_text(encoding="utf-8", errors="ignore").count("--- turn ") if log.is_file() else 0
+            except OSError:
+                turns = 0
+            lines = [line.strip() for line in (proc.stderr or "").splitlines() if line.strip()]
+            result = {
+                "status": "KILLED",
+                "written_by": "framework: the implementation process ended before writing its own result",
+                "finished_cleanly": False,
+                "aborted_reason": (lines[-1][:300] if lines else
+                                   f"the process exited with code {proc.returncode} before writing its result"),
+                "duration_s": int(time.time() - started),
+                "turns_used": turns,
+            }
+            _write_json(output, result)
+        _impl_write_status(running=False)
+        clean = result.get("status") == "OK" and bool(result.get("finished_cleanly"))
+        return {
+            "ok": clean,
+            "workspace": str(work),
+            "status": result.get("status"),
+            "finished_cleanly": clean,
+            "aborted_reason": result.get("aborted_reason", ""),
+            "error": result.get("error", ""),
+            "turns_used": result.get("turns_used", 0),
+            "duration_s": result.get("duration_s", 0),
+            "verification_file": result.get("verification_file", ""),
+            "report_file": result.get("report_file", ""),
+            "stderr_tail": (proc.stderr or "")[-1500:] if proc.returncode != 0 else "",
+            "next_step": (
+                "Call impl_verify: the framework re-runs the task's scorer on what the agent "
+                "left and judges it against the task's acceptance criteria."
+            ),
+        }
+
+    def impl_run(topic: str, guidance: str = "") -> dict:
+        """Implementation study: hand the task's whole implementation to one build agent.
+
+        The agent works in <out_dir>/implementation/. It reads the task brief in the
+        starter folder, writes and builds the code, runs the task's verification
+        cases and scorer, writes the report the task asks for, and records in
+        verification.json how the task's scorer is run on its results. Returns
+        when the agent finishes or its time runs out. Call it once; then
+        impl_verify. A study that already has an attempt is carried on with
+        impl_continue and never started over. ``guidance`` is optional extra
+        direction for the agent."""
+        if _study_mode_value() != "implementation":
+            return {"ok": False, "error": (
+                "impl_run is for implementation studies, and read_starter_folder did not "
+                "classify this study as one.")}
+        starter = _starter_root_on_record()
+        if starter is None or not starter.is_dir():
+            return {"ok": False, "error": "No starter folder on record; call read_starter_folder first."}
+        work = _impl_dir()
+        if (work / "agentic_trajectory.log").is_file():
+            return {"ok": False, "error": (
+                "This study already has an implementation attempt. impl_status shows where it "
+                "stands, impl_verify checks it, and impl_continue carries it on; it is never "
+                "started over.")}
+        work.mkdir(parents=True, exist_ok=True)
+        topic = _effective_topic(topic)
+        _write_json(work / "implementation_topic.json", {"topic": topic})
+        _update_study_state(topic=topic, mode="implementation", current_stage="implementation")
+        return _impl_launch(topic=topic, timeout_s=_IMPL_TIMEOUT_S, prior_attempt="", guidance=guidance)
+
+    def impl_verify() -> dict:
+        """Check an implementation study's result the way a reviewer would.
+
+        Re-runs the task's own scorer, exactly as the build agent recorded it in
+        implementation/verification.json -- and only if that scorer is a file
+        inside the task's starter folder, since anything else cannot be the task's
+        own. A model then reads the task brief, that fresh scorer output, the files
+        the scorer wrote, the agent's report and its record of what it ran, and
+        says criterion by criterion what is met, whether the results come from the
+        implementation, and what breaks the task's rules. What the agent said about
+        its own work is not the verdict. The study is accepted only when every
+        mandatory criterion is met, the results come from the implementation, and
+        no rule is broken. Writes implementation/verification_result.json."""
+        if _study_mode_value() != "implementation":
+            return {"ok": False, "error": "impl_verify is for implementation studies."}
+        work = _impl_dir()
+        starter = _starter_root_on_record()
+        if starter is None or not (work / "agentic_trajectory.log").is_file():
+            return {"ok": False, "error": "There is no implementation attempt to verify yet; call impl_run first."}
+        work_root = work.resolve()
+        manifest = _read_json(work / "verification.json") or {}
+        result = _read_json(work / "agentic_result.json") or {}
+        scorer_text = str(manifest.get("scorer") or "").strip()
+        scorer_run: Dict[str, Any]
+        if not manifest:
+            scorer_run = {"error": "no verification.json: the agent did not record how its result is checked"}
+        elif not scorer_text:
+            scorer_run = {"note": "the agent recorded no scorer; the result is judged on its evidence files"}
+        else:
+            scorer = Path(scorer_text).expanduser()
+            scorer = (scorer if scorer.is_absolute() else starter / scorer).resolve()
+            if not scorer.is_file() or starter not in scorer.parents:
+                scorer_run = {"error": (
+                    f"verification.json names {scorer}, which is not a file inside the task's "
+                    f"starter folder {starter}, so it cannot be the task's own scorer; it was not run.")}
+            else:
+                args = [str(a) for a in (manifest.get("args") or [])]
+                cwd = Path(str(manifest.get("cwd") or work_root)).expanduser()
+                cwd = (cwd if cwd.is_absolute() else work_root / cwd).resolve()
+                if not cwd.is_dir() or (cwd != work_root and work_root not in cwd.parents):
+                    cwd = work_root
+                command = [sys.executable, str(scorer), *args]
+                try:
+                    res = subprocess.run(
+                        command, cwd=str(cwd), capture_output=True, text=True, errors="replace",
+                        timeout=_IMPL_SCORER_TIMEOUT_S, env=_foamagent_env(settings.openfoam_path),
+                    )
+                    scorer_run = {"command": " ".join(command), "cwd": str(cwd),
+                                  "returncode": res.returncode,
+                                  "stdout": (res.stdout or "")[-20000:],
+                                  "stderr": (res.stderr or "")[-5000:]}
+                except subprocess.TimeoutExpired:
+                    scorer_run = {"command": " ".join(command),
+                                  "error": f"the scorer did not finish within {_IMPL_SCORER_TIMEOUT_S}s"}
+                except OSError as exc:
+                    scorer_run = {"command": " ".join(command), "error": f"the scorer could not be started: {exc}"}
+
+        def _excerpt(path_text: Any, limit: int) -> str:
+            path = Path(str(path_text or "")).expanduser()
+            path = path if path.is_absolute() else work_root / path
+            try:
+                resolved = path.resolve()
+            except OSError:
+                return f"(unresolvable: {path_text})"
+            if not resolved.is_file() or (resolved != work_root and work_root not in resolved.parents):
+                return f"(not a file inside the workspace: {path_text})"
+            try:
+                text = resolved.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                return f"(unreadable: {exc})"
+            return text if len(text) <= limit else text[:limit] + f"\n... ({len(text) - limit} more characters)"
+
+        outputs_text = "\n\n".join(
+            f"--- {p} ---\n{_excerpt(p, 20000)}" for p in (manifest.get("outputs") or [])[:6]
+        ) or "(none recorded)"
+        evidence_text = "\n\n".join(
+            f"--- {p} ---\n{_excerpt(p, 8000)}" for p in (manifest.get("evidence") or [])[:10]
+        ) or "(none recorded)"
+        report_path = result.get("report_file") or ""
+        report_text = _excerpt(report_path, 30000) if report_path else "(no report recorded)"
+        try:
+            record = (work / "agentic_trajectory.log").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            record = ""
+        try:
+            import sys as _sys
+
+            scripts_dir = str(_REPO_ROOT / "scripts")
+            if scripts_dir not in _sys.path:
+                _sys.path.insert(0, scripts_dir)
+            from study_mode import _task_text  # type: ignore
+
+            brief = _task_text(starter, max_chars=40000)
+        except Exception:  # noqa: BLE001
+            brief = "(task brief unavailable)"
+        topic_text = str((_read_json(work / "implementation_topic.json") or {}).get("topic") or "")
+        prompt = (
+            _IMPL_VERDICT_PROMPT
+            + f"TASK BRIEF (from {starter}):\n{brief}\n\n"
+            + f"STUDY TOPIC:\n{topic_text[:6000]}\n\n"
+            + f"THE AGENT'S VERIFICATION RECORD (verification.json):\n{json.dumps(manifest, indent=2)[:6000]}\n\n"
+            + f"THE TASK'S SCORER, RE-RUN BY THE FRAMEWORK NOW:\n{json.dumps(scorer_run, indent=2)[:26000]}\n\n"
+            + f"FILES THE SCORER WROTE:\n{outputs_text}\n\n"
+            + f"OTHER EVIDENCE FILES THE AGENT NAMED:\n{evidence_text}\n\n"
+            + f"THE AGENT'S REPORT ({report_path or 'none'}):\n{report_text}\n\n"
+            + "FILES IN THE WORKSPACE:\n" + "\n".join(_file_listing(work_root, limit=300)) + "\n\n"
+            + f"THE LAST {min(len(record), 60000)} CHARACTERS OF THE AGENT'S RECORD OF WHAT IT RAN:\n{record[-60000:]}\n"
+        )
+        try:
+            from cfd_langgraph.llm.retry import call_with_retry
+
+            llm = create_langchain_llm(model=settings.model, temperature=0.0)
+            judge = structured_output(llm, _ImplementationVerdict)
+            verdict = call_with_retry(lambda: judge.invoke(prompt), "implementation verdict").model_dump()
+            verdict["ok"] = True
+        except Exception as exc:  # noqa: BLE001
+            verdict = {"ok": False, "passed": False, "criteria": [],
+                       "results_come_from_implementation": False, "rule_violations": [],
+                       "summary": f"no verdict could be reached ({type(exc).__name__}: {exc})",
+                       "next_steps": []}
+        attempts = _read_json(work / "attempts.json") or {}
+        used = int(attempts.get("continuations_used", 0) or 0)
+        accepted = (bool(verdict.get("ok")) and bool(verdict.get("passed"))
+                    and bool(verdict.get("results_come_from_implementation"))
+                    and not verdict.get("rule_violations"))
+        _write_json(work / "verification_result.json", {
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "accepted": accepted,
+            "scorer_run": scorer_run,
+            "verdict": verdict,
+        })
+        _impl_write_status(complete=accepted or (bool(verdict.get("ok")) and used >= _IMPL_CONTINUATIONS),
+                           accepted=accepted, continuations_used=used)
+        out: Dict[str, Any] = {
+            "ok": bool(verdict.get("ok")),
+            "accepted": accepted,
+            "passed": bool(verdict.get("passed")),
+            "results_come_from_implementation": bool(verdict.get("results_come_from_implementation")),
+            "rule_violations": verdict.get("rule_violations") or [],
+            "criteria": verdict.get("criteria") or [],
+            "summary": verdict.get("summary", ""),
+            "next_steps": verdict.get("next_steps") or [],
+            "scorer_run": {k: (v[-4000:] if isinstance(v, str) else v) for k, v in scorer_run.items()},
+            "continuations_used": used,
+        }
+        if accepted:
+            out["next_step"] = "Accepted. Report the verdict, each criterion and where the code and the report are."
+        elif not verdict.get("ok"):
+            out["next_step"] = "No verdict was reached; call impl_verify again."
+        elif used < _IMPL_CONTINUATIONS:
+            out["next_step"] = (
+                f"Not accepted. Call impl_continue(extra_seconds, guidance) with the fixes above "
+                f"({_IMPL_CONTINUATIONS - used} continuation(s) left), then impl_verify again."
+            )
+        else:
+            out["next_step"] = "Not accepted, and no continuations are left. Report the verdict as it stands."
+        return out
+
+    def impl_continue(extra_seconds: int, guidance: str) -> dict:
+        """Carry an implementation study on from where its last attempt stopped.
+
+        The agent is told what the last attempt did, what the latest impl_verify
+        found criterion by criterion, and ``guidance`` -- what to fix now,
+        normally that verdict's next_steps. It works in the same workspace, so
+        nothing already built is lost, and its record is appended to.
+        ``extra_seconds`` is the continuation's whole clock, counted from when it
+        starts. A limited number of continuations per study, counted before the
+        work runs."""
+        if _study_mode_value() != "implementation":
+            return {"ok": False, "error": "impl_continue is for implementation studies."}
+        work = _impl_dir()
+        if not (work / "agentic_trajectory.log").is_file():
+            return {"ok": False, "error": "There is no attempt to continue; call impl_run first."}
+        attempts_path = work / "attempts.json"
+        attempts = _read_json(attempts_path) or {}
+        used = int(attempts.get("continuations_used", 0) or 0)
+        if used >= _IMPL_CONTINUATIONS:
+            return {"ok": False, "error": (
+                f"All {_IMPL_CONTINUATIONS} continuations are used. Report the latest verdict as it stands.")}
+        try:
+            extra = int(extra_seconds)
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "extra_seconds must be an integer number of seconds."}
+        if extra <= 0:
+            return {"ok": False, "error": "extra_seconds must be positive."}
+        if not str(guidance or "").strip():
+            return {"ok": False, "error": "guidance is required: say what this continuation must fix."}
+        granted = min(extra, _IMPL_MAX_S)
+        previous = _read_json(work / "agentic_result.json") or {}
+        checked = _read_json(work / "verification_result.json") or {}
+        verdict = checked.get("verdict") or {}
+        facts = [
+            f"The last attempt ran {previous.get('turns_used', '?')} turns over "
+            f"{int(previous.get('duration_s') or 0)}s and "
+            + ("finished." if previous.get("finished_cleanly") else
+               f"stopped: {previous.get('aborted_reason') or previous.get('error') or 'reason not recorded'}.")
+        ]
+        if verdict:
+            facts.append(
+                f"The framework's latest check ({checked.get('checked_at', '')}): "
+                + ("ACCEPTED." if checked.get("accepted") else "NOT accepted.")
+                + f" {verdict.get('summary', '')}"
+            )
+            for item in verdict.get("criteria") or []:
+                facts.append(f"  - {'met' if item.get('met') else 'NOT met'}: {item.get('criterion')} "
+                             f"-- {str(item.get('evidence') or '')[:400]}")
+            if not verdict.get("results_come_from_implementation", True):
+                facts.append("  - The check did NOT find that the results come from the implementation.")
+            for violation in verdict.get("rule_violations") or []:
+                facts.append(f"  - Rule problem: {violation}")
+            if verdict.get("next_steps"):
+                facts.append("Fixes the check pointed to: " + " | ".join(str(s) for s in verdict["next_steps"]))
+        facts.append(f"You have {granted}s for this continuation, counted from now.")
+        attempts["continuations_used"] = used + 1
+        attempts.setdefault("log", []).append({
+            "continuation": used + 1, "granted_s": granted, "guidance": str(guidance)[:2000],
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+        _write_json(attempts_path, attempts)
+        # status.json kept the count from the last impl_verify, so a study two
+        # continuations in read "continuations_used": 0 while one was running.
+        _impl_write_status(continuations_used=used + 1)
+        topic = str((_read_json(work / "implementation_topic.json") or {}).get("topic") or "") or _effective_topic("")
+        outcome = _impl_launch(topic=topic, timeout_s=granted, prior_attempt="\n".join(facts), guidance=guidance)
+        outcome["continuations_used"] = used + 1
+        outcome["continuations_remaining"] = max(0, _IMPL_CONTINUATIONS - (used + 1))
+        if extra > _IMPL_MAX_S:
+            outcome["note"] = f"{extra}s was asked; {granted}s, the ceiling for one attempt, was granted."
+        return outcome
+
+    def impl_status() -> dict:
+        """Where an implementation study stands: its latest attempt, the latest
+        verdict, continuations used, where the report is, and the next step."""
+        if _study_mode_value() != "implementation":
+            return {"ok": False, "error": "impl_status is for implementation studies."}
+        work = _impl_dir()
+        result = _read_json(work / "agentic_result.json") or {}
+        checked = _read_json(work / "verification_result.json") or {}
+        attempts = _read_json(work / "attempts.json") or {}
+        used = int(attempts.get("continuations_used", 0) or 0)
+        started = (work / "agentic_trajectory.log").is_file()
+        out: Dict[str, Any] = {
+            "ok": True,
+            "workspace": str(work),
+            "attempt": ("not started" if not started else result.get("status") or "stopped before writing a result"),
+            "finished_cleanly": bool(result.get("finished_cleanly")),
+            "aborted_reason": result.get("aborted_reason", ""),
+            "report_file": result.get("report_file", ""),
+            "verified": bool(checked),
+            "accepted": bool(checked.get("accepted")),
+            "verdict_summary": (checked.get("verdict") or {}).get("summary", ""),
+            "checked_at": checked.get("checked_at", ""),
+            "continuations_used": used,
+            "continuations_remaining": max(0, _IMPL_CONTINUATIONS - used),
+        }
+        if not started:
+            out["next_step"] = "Call impl_run(topic)."
+        elif not checked or (result and str(checked.get("checked_at", "")) < str(
+                datetime.fromtimestamp((work / "agentic_result.json").stat().st_mtime, timezone.utc).isoformat()
+                if (work / "agentic_result.json").is_file() else "")):
+            out["next_step"] = "Call impl_verify: the latest attempt has not been checked."
+        elif checked.get("accepted"):
+            out["next_step"] = "Accepted. Report the verdict."
+        elif used < _IMPL_CONTINUATIONS:
+            out["next_step"] = "Not accepted: impl_continue(extra_seconds, guidance) with the verdict's next steps."
+        else:
+            out["next_step"] = "Not accepted and no continuations left: report the verdict as it stands."
+        return out
 
     def oed_prepare_baseline(
         baseline_case_dir: str, allrun_script: str = "", force_rerun: bool = False,
@@ -3931,6 +5801,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         present), the starter dir is picked up automatically — pass
         starter_dir explicitly only if it hasn't, or to override it.
         """
+        refusal = _impl_refusal("oed_setup_search")
+        if refusal:
+            return refusal
         _ensure_routing(topic, "open_discovery")
         _update_study_state(topic=topic, mode="open_discovery", current_stage="open_ended_discovery")
         # Everything downstream — comparator authoring, the success threshold,
@@ -3947,6 +5820,44 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "error": "A valid mesh-gate selected_level case is required before OED setup.",
                 "baseline_case_dir": baseline_case_dir,
             }
+        # A surrogate study has no mesh to converge and no case to solve: its
+        # baseline is the reference result the starter supplies. What still
+        # has to hold is provenance -- supplied input this study did not
+        # create -- which is the same trust root the mesh-gate escape uses.
+        surrogate = _study_mode_value() == "surrogate"
+        if surrogate:
+            starter_root_rec = _starter_root_on_record()
+            inside = bool(
+                starter_root_rec
+                and (baseline_path == starter_root_rec or starter_root_rec in baseline_path.parents)
+            )
+            if not inside:
+                return {
+                    "ok": False,
+                    "error": (
+                        "This is a surrogate study, so the baseline is the reference result the "
+                        "starter folder supplies and baseline_case_dir must be inside that folder. "
+                        f"The starter folder on record is {starter_root_rec or '(none recorded)'}. "
+                        "If that is not this study's starter, re-run read_starter_folder against "
+                        "the right folder first; retrying with the same arguments fails identically."
+                    ),
+                    "baseline_case_dir": str(baseline_path),
+                    "starter_dir_on_record": str(starter_root_rec or ""),
+                }
+            if not any(f.is_file() and f.stat().st_size > 0 for f in baseline_path.rglob("*")):
+                return {
+                    "ok": False,
+                    "error": "baseline_case_dir holds no non-empty files: there is no supplied result to score.",
+                    "baseline_case_dir": str(baseline_path),
+                }
+            if evaluation_cases:
+                return {
+                    "ok": False,
+                    "error": (
+                        "evaluation_cases does not apply to a surrogate study: every candidate is "
+                        "scored by the study's own scorer on its own predictions. Leave it out."
+                    ),
+                }
         allowed_selected_levels: set[Path] = set()
         aggregate = _read_json(out_dir / "selected_mesh_spec.json") or {}
         aggregate_groups = aggregate.get("groups", {}) if isinstance(aggregate, dict) else {}
@@ -3959,8 +5870,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             if isinstance(spec, dict) and spec.get("converged") and spec.get("selected_level"):
                 allowed_selected_levels.add(Path(str(spec["selected_level"])).expanduser().resolve())
         prescribed_reason = str(prescribed_mesh_reason or "").strip()
-        mesh_provenance = "mesh_gate"
-        if baseline_path not in allowed_selected_levels:
+        mesh_provenance = "not_applicable_surrogate" if surrogate else "mesh_gate"
+        if not surrogate and baseline_path not in allowed_selected_levels:
             # The gate exists so candidates are never scored on a mesh whose
             # convergence nobody established. A task that PRESCRIBES the mesh
             # satisfies that concern differently: the mesh is not this study's
@@ -4020,15 +5931,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     "allowed_selected_levels": sorted(str(p) for p in allowed_selected_levels),
                 }
             if not inside_starter:
+                # Name the folder actually compared against, not just the fact
+                # of the mismatch. The trust root comes from
+                # starter_understanding.json and from nowhere else (see above),
+                # so when read_starter_folder was pointed at the wrong place
+                # the failure is in the STARTER, while the message blames the
+                # BASELINE. Measured on ph_gemma_20260910d: the model ran
+                # read_starter_folder against
+                # heldout_closure_challenge/NASA_2DWMH -- a different study's
+                # held-out data -- then passed a perfectly correct
+                # starter_oed_turbulence/periodic_hill_sa as the baseline. The
+                # guard compared the two, found no relationship, and said the
+                # baseline was wrong. With nothing pointing at the real cause
+                # the model retried the same correct argument 57 times, each
+                # rejection costing a full manager turn: 570 calls and 16.8M
+                # input tokens spent on a one-line mistake it could not see.
+                recorded = str(starter_resolved or "")
                 return {
                     "ok": False,
                     "error": (
                         "prescribed_mesh_reason was given, but baseline_case_dir is not inside "
-                        "the starter folder. A prescribed mesh must be supplied input this study "
-                        "did not create; a case built during the study still needs the mesh gate."
+                        f"the starter folder on record, which is {recorded or '(none recorded)'}. "
+                        "A prescribed mesh must be supplied input this study did not create; a "
+                        "case built during the study still needs the mesh gate. If that starter "
+                        "folder is not the one this study is about, the baseline is not the "
+                        "problem -- re-run read_starter_folder against the correct starter "
+                        "folder first, because this check reads the trust root from "
+                        "starter_understanding.json and from nowhere else. Retrying this call "
+                        "with the same arguments will fail identically."
                     ),
                     "baseline_case_dir": str(baseline_path),
-                    "starter_dir": str(starter_resolved or ""),
+                    "starter_dir_on_record": recorded,
+                    "fix": (
+                        "read_starter_folder(starter_dir=<the study's starter folder>) "
+                        "then call oed_setup_search again"
+                    ),
                 }
             mesh_provenance = "prescribed"
             print(
@@ -4046,7 +5983,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # fields off a real mesh through pyvista, so that is what the baseline
         # has to be.
         baseline_shape = _baseline_case_shape(baseline_path)
-        if not baseline_shape["is_openfoam_case"]:
+        if not surrogate and not baseline_shape["is_openfoam_case"]:
             return {
                 "ok": False,
                 "error": (
@@ -4058,7 +5995,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "baseline_case_dir": str(baseline_path),
                 "baseline_case_shape": baseline_shape,
             }
-        if not baseline_shape["latest_solved_time"]:
+        if not surrogate and not baseline_shape["latest_solved_time"]:
             return {
                 "ok": False,
                 "error": (
@@ -4119,8 +6056,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # half-hour cap and gets killed with the comparators half-written —
         # after which nothing downstream can score anything. This is a
         # once-per-study call, so a generous cap costs nothing when setup is
-        # quick.
-        proc = _run_script(args, timeout=7200, env=_foamagent_env(settings.openfoam_path))
+        # quick. 6h, not 2h, for a study scored by its own slow scorer: each
+        # wrapper attempt runs it once and the baseline is scored after, and at
+        # ~15.5 minutes a run (ml4cfd_airfrans) four attempts plus the baseline
+        # run past two hours before a single LLM call is counted.
+        proc = _run_script(args, timeout=21600, env=_foamagent_env(settings.openfoam_path))
         disc_dir = _oed_disc_dir()
         result = {
             "ok": False,
@@ -4139,13 +6079,29 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # message. Say so here, where the cause is still visible.
         if not (_read_json(disc_dir / "bound_comparators.json") or {}):
             validation = _read_json(disc_dir / "metric_proposer_validation.json") or {}
-            result["error"] = (
-                "Setup produced no scored comparators, so no candidate could be evaluated. "
-                "The metric proposer returned no usable metric for this objective. Re-run "
-                "oed_setup_search; if it fails again, the objective or the reference data "
-                "needs a look — do not start the search without comparators."
-            )
-            result["metric_proposer_attempts"] = validation.get("attempts")
+            status = _read_json(disc_dir / "surrogate_setup_status.json") or {}
+            if status:
+                # Surrogate setup records which stage failed. The fixed sentence
+                # below used to be returned for every empty binding, blaming the
+                # metric proposer when it was the scoring wrapper that never
+                # passed (malmo_qwen38max_openrouter_20260912, three re-runs).
+                result["error"] = (
+                    "Setup produced no scored comparators, so no candidate could be evaluated. "
+                    f"Failed at stage '{status.get('stage')}': {status.get('detail', '')} "
+                    "Re-running setup repeats the same step, so read the attempts below before "
+                    "re-running."
+                )
+                result["failed_stage"] = status.get("stage")
+                if status.get("adapter_attempts"):
+                    result["scoring_wrapper_attempts"] = status["adapter_attempts"]
+            else:
+                result["error"] = (
+                    "Setup produced no scored comparators, so no candidate could be evaluated. "
+                    "The metric proposer returned no usable metric for this objective. Re-run "
+                    "oed_setup_search; if it fails again, the objective or the reference data "
+                    "needs a look — do not start the search without comparators."
+                )
+                result["metric_proposer_attempts"] = validation.get("attempts")
             return result
 
         # Baseline score: computed here (not by the --setup-only call above,
@@ -4160,7 +6116,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 contract = _read_json(disc_dir / "objective_contract.json") or {}
                 specs = _metric_specs(disc_dir)
                 ref_files = [Path(p) for p in (contract.get("reference_files") or []) if Path(p).is_file()]
-                if bound and ref_files:
+                # A surrogate study's adapter scores predictions through the
+                # study's own scorer, which knows its truth data, so a declared
+                # reference file is not required there.
+                if bound and (ref_files or surrogate):
                     # The baseline must be measured over the SAME cases a
                     # candidate is scored on. A 32-case candidate mean compared
                     # against a one-case baseline is not a comparison at all —
@@ -4180,7 +6139,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         mv_one = _oedx.compute_metric_vector(
                             case_dir=case,
                             bound_comparators=bound,
-                            reference_file=_reference_data_file(ref_files),
+                            reference_file=(_reference_data_file(ref_files) if ref_files else baseline_path),
                             metric_specs=specs,
                         )
                         if index == 0:
@@ -4232,7 +6191,19 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             )
             return result
 
-        target_pct = _llm_target_improvement_pct(_effective_topic(topic), settings)
+        primary_spec = next(
+            (s for s in _metric_specs(disc_dir) if str(s.get("name")) == str(result.get("primary_metric", ""))),
+            None,
+        )
+        target = _llm_study_target(
+            _effective_topic(topic), settings,
+            primary_metric=str(result.get("primary_metric", "") or ""),
+            baseline_value=result.get("baseline_score"),
+            direction=str(result.get("baseline_direction", "min") or "min"),
+            metric_spec=primary_spec,
+        )
+        target_pct = float(target["target_improvement_pct"])
+        print(f"[oed] success threshold: {target['target_basis']}", flush=True)
         baseline_doc = {
             # What the baseline was measured over. A reader of the run — and
             # oed_score_candidate's own guard — needs to know whether this
@@ -4253,6 +6224,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "baseline_metric": baseline_doc["metric"],
             "baseline_direction": baseline_doc["direction"],
             "target_improvement_pct": target_pct,
+            # How the topic stated it, so a percentage derived from an absolute
+            # threshold can be traced back to the number the topic named.
+            "target_kind": target["target_kind"],
+            "target_value": target["target_value"],
+            "target_basis": target["target_basis"],
             # In EVALUATIONS, not budget units. is_saturated counts entries in
             # the archive's score trace -- one per scored candidate -- while
             # total_budget is denominated in solver runs. On a 32-case
@@ -4277,7 +6253,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         if declared_cases_resolved:
             config["evaluation_cases"] = [str(p) for p in declared_cases_resolved]
         _write_json(disc_dir / "search_config.json", config)
-        result.update({"ok": True, "target_improvement_pct": target_pct, "search_config": str(disc_dir / "search_config.json")})
+        result.update({"ok": True, "target_improvement_pct": target_pct,
+                       "target_kind": target["target_kind"], "target_value": target["target_value"],
+                       "target_basis": target["target_basis"],
+                       "search_config": str(disc_dir / "search_config.json")})
         _write_checkpoint(
             "baseline_setup_done",
             {"baseline_case_dir": str(baseline_path), "baseline_score": baseline_doc},
@@ -4735,9 +6714,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             f"Budget remaining: {budget_remaining}/{total_budget} units. "
             f"On this study a code_mod has been costing about "
             f"{_expected_candidate_cost(history, 'code_mod')} units and an experiment about "
-            f"{_expected_candidate_cost(history, 'experiment')} — a unit is one solver run, so "
-            f"the cost is set by how many cases a candidate has to be evaluated on, not by a "
-            f"flat per-candidate charge.\n"
+            f"{_expected_candidate_cost(history, 'experiment')} — "
+            + (
+                "in this study every candidate is a fitted model and costs one unit, and every "
+                "candidate is a code_mod.\n"
+                if _study_mode_value() == "surrogate" else
+                "a unit is one solver run, so the cost is set by how many cases a candidate "
+                "has to be evaluated on, not by a flat per-candidate charge.\n"
+            )
             + _study_resources(out_dir, disc_dir) + "\n\n"
             + (
                 "CHOOSING HOW, NOT ONLY WHAT. Each candidate carries a `strategy`: how you "
@@ -5209,6 +7193,13 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             """
             if not isinstance(rec, dict) or rec.get("score") is not None:
                 return False
+            # Not held back when its own diagnosis says no repair is coming: a
+            # null score judged not repairable used to be deferred on every call,
+            # so it never reached history (malmo_gptoss120b_bedrock_20260913b).
+            diagnosis = rec.get("failure_diagnosis")
+            if isinstance(diagnosis, dict) and diagnosis.get("ok") and (
+                    not diagnosis.get("repairable") or diagnosis.get("alters_graded_setup")):
+                return False
             return int(rec.get("repair_attempts", 0) or 0) < _OED_REPAIR_ATTEMPTS
 
         for record_path in sorted(disc_dir.glob("cand_*/candidate_record.json")):
@@ -5218,6 +7209,16 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # Only auto-swept dirs are held back. If the manager passes one
             # explicitly it means that candidate really is finished.
             if _repair_in_flight(_read_json(record_path)):
+                deferred.append(found)
+                continue
+            # Same for a build the model provider stopped (rate limits, server
+            # errors) while it can still be re-run: filed now, it would enter
+            # history as a failed idea that never actually ran.
+            _diag = _read_json(record_path.parent / "unclean_finish_diagnosis.json") or {}
+            _ext = int((_read_json(record_path.parent / "candidate_attempts.json") or {}).get("extensions_used", 0) or 0)
+            if (_diag.get("stopped_because") == "provider_error"
+                    and (_read_json(record_path) or {}).get("score") is None
+                    and _ext < _OED_EXTENSION_ATTEMPTS):
                 deferred.append(found)
                 continue
             swept.append(found)
@@ -5447,7 +7448,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 baseline_dst = cases_root / baseline_id
                 if baseline_id not in already_promoted:
                     _copy_completed_case(baseline_src, baseline_dst)
-                baseline_ok = _case_has_clean_solver_log(baseline_dst)
+                baseline_ok = (
+                    True if _study_mode_value() == "surrogate"
+                    else _case_has_clean_solver_log(baseline_dst)
+                )
                 _write_json(
                     baseline_dst / "run_result.json",
                     {
@@ -5498,7 +7502,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 dst = cases_root / case_id
                 if case_id not in already_promoted:
                     _copy_completed_case(src, dst)
-                execution_ok = bool(entry.get("execution_ok")) and _case_has_clean_solver_log(dst)
+                execution_ok = bool(entry.get("execution_ok")) and (
+                    _study_mode_value() == "surrogate" or _case_has_clean_solver_log(dst)
+                )
                 _write_json(
                     dst / "run_result.json",
                     {
@@ -5579,6 +7585,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "search_complete": search_complete,
             "archive_summary": _render_archive_summary(archive, disc_dir),
             "missing_candidate_records": missing,
+            **({"missing_next_step": (
+                "The candidate folders above have no score on disk yet. For each one, "
+                "oed_candidate_status(candidate_dir) says where it stands; a build that "
+                "finished is scored by giving the oed-candidate-runner a task to score that "
+                "existing candidate_dir."
+            )} if missing else {}),
             # Finished candidates found on disk that were not passed in. Named
             # explicitly so a recovered result is visible rather than silently
             # appearing in the archive summary.
@@ -5674,7 +7686,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
     def run_case_native(
         case_id: str, requirement_text: str, physics_group: str = "default",
-        mesh_type: str = "standard_mesh", max_loop: int = 10,
+        mesh_type: str = "standard_mesh", max_loop: int = 10, clarification: str = "",
     ) -> dict:
         """Run one OpenFOAM case entirely through this workflow's own
         FoamAgent port (parse -> RAG -> decompose -> write -> Allrun -> run
@@ -5685,6 +7697,13 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         ``physics_group`` should be the same string for every case sharing a
         mesh/physics shape — the first call per group calibrates concurrency
         for the whole group (see scheduling/CaseCoordinator).
+
+        If this case's approved requirement failed the requirement checker,
+        the result lists the checker's issues under
+        ``requirement_checker_issues``. ``clarification`` is then accepted:
+        case-specific facts the requirement leaves wrong or ambiguous (for
+        example which one of several listed parameter values this case uses).
+        It is added after the requirement, which itself stays verbatim.
         """
         if not (out_dir / "hypotheses_approved.json").exists():
             return {"error": "Blocked: hypotheses_approved.json is missing — hypotheses have not been approved yet."}
@@ -5694,6 +7713,21 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         canonical_requirement, requirement_error = _canonical_requirement(case_id, requirement_text)
         if requirement_error:
             return {"error": requirement_error, "case_id": case_id}
+        flagged, checker_issues = _requirement_issues(case_id)
+        clarification = str(clarification or "").strip()
+        writer_requirement = canonical_requirement
+        if clarification:
+            if not flagged:
+                return {
+                    "error": "clarification is only accepted for a requirement the requirement "
+                             "checker flagged; this one passed, so run it as written.",
+                    "case_id": case_id,
+                }
+            writer_requirement = (
+                f"{canonical_requirement}\n\nClarification for this case ({case_id}), added "
+                f"because the requirement checker flagged the requirement above. Where they "
+                f"differ, this wins:\n{clarification}"
+            )
         mesh_spec = _read_json(out_dir / "mesh_gate" / physics_group / "selected_mesh_spec.json") or {}
         selected_level = Path(str(mesh_spec.get("selected_level", "")))
         if not mesh_spec.get("converged") or not selected_level.is_dir():
@@ -5706,7 +7740,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         result = coordinator.run_case(
             physics_group,
             lambda: foam_native.run_foam_case(
-                foam_llm, case_dir, canonical_requirement, mesh_type=mesh_type, max_loop=max_loop,
+                foam_llm, case_dir, writer_requirement, mesh_type=mesh_type, max_loop=max_loop,
                 openfoam_path=settings.openfoam_path,
                 mesh_seed_case_dir=selected_level,
                 functions_seed_case_dir=_starter_base_case_dir(),
@@ -5720,6 +7754,18 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         )
         result["physics_group"] = physics_group
         result["concurrency_at_group"] = coordinator.concurrency_for(physics_group)
+        if flagged:
+            result["requirement_checker_issues"] = checker_issues or [
+                "(the checker's findings were not recorded for this study)"
+            ]
+            result["requirement_checker_note"] = (
+                "This case's approved requirement failed the requirement checker; the "
+                "issues it found are listed above. Check the case against them. If one of "
+                "them made this case come out wrong, run this tool again with the same "
+                "requirement_text plus clarification='<the correct case-specific values>'."
+            )
+        if clarification:
+            result["clarification"] = clarification
         _write_json(case_dir / "run_result.json", result)
         return result
 
@@ -5756,13 +7802,19 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         topic: str, variant_name: str, hypothesis: str, plan: str = "",
         strategy: str = ""
     ) -> dict:
-        """One OED candidate: compile and run a NEW custom OpenFOAM model
-        class implementing `hypothesis` — the same agentic code-mod runner
-        open_ended_discovery.py itself uses (reads real OpenFOAM
-        turbulence-model source, writes+compiles the class, runs it). Costs
-        2 budget units. Requires oed_setup_search to have already run for
-        this study. This only compiles/runs — call oed_score_candidate on
-        the returned case_dir next, it does not score on its own.
+        """One OED candidate: a build agent implements `hypothesis` as a new
+        model in the candidate's own folder -- a compiled model class run on
+        the case in a solver study, a fitted model that writes prediction
+        files in a fitted-model study. Requires oed_setup_search to have run.
+        It builds; it does not score: call oed_run_evaluation_cases and then
+        oed_score_candidate on the candidate_dir and case_dir it returns.
+
+        Calling it again for a variant_name that already exists never starts
+        that candidate over. A finished build is returned as it is, and one
+        that did not finish comes back with its diagnosis. Pass an empty
+        hypothesis to look an existing candidate up by name. Different
+        instructions under an existing variant_name are refused: give that
+        candidate a new name.
 
         ``plan`` is optional and carries the strategy's own steps when the
         candidate needs more than "implement this hypothesis" — which data to
@@ -5801,11 +7853,26 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         starter_case = str(config.get("baseline_case_dir", "")).strip()
         if not starter_case or not Path(starter_case).is_dir():
             return {"ok": False, "error": "OED search has no valid locked-mesh baseline case."}
-        if not str(hypothesis or "").strip():
-            return {"ok": False, "error": "Candidate hypothesis is empty."}
         variant_name = _safe_variant_slug(variant_name, "candidate")
         candidate_dir = disc_dir / f"cand_{variant_name}"
         output_path = candidate_dir / "agentic_result.json"
+        invocation_path = candidate_dir / "candidate_invocation.json"
+        on_disk = _read_json(invocation_path) or {}
+        if not str(hypothesis or "").strip():
+            # Naming an existing candidate without restating it looks it up.
+            # Nothing else reached a candidate that had already been built: on
+            # malmo_gptoss120b_bedrock_20260913b the manager, refused for an
+            # empty hypothesis, passed "dummy" to get one scored and started a
+            # 37-minute rebuild instead.
+            if not str(on_disk.get("hypothesis") or "").strip():
+                return {
+                    "ok": False,
+                    "error": "Candidate hypothesis is empty, and no candidate of that name exists to look up.",
+                }
+            hypothesis = str(on_disk.get("hypothesis") or "")
+        if (not str(plan or "").strip() and on_disk
+                and str(on_disk.get("hypothesis") or "") == str(hypothesis or "")):
+            plan = str(on_disk.get("plan") or "")
 
         # A finished candidate is never built twice.
         #
@@ -5819,11 +7886,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # sst_crossdiff_scale_065 -- the study's best model -- earlier that day.
         #
         # Keyed on the hypothesis and plan, not just the directory: a variant
-        # name can legitimately be re-proposed with different instructions, and
-        # returning a stale build for a changed hypothesis would be a far worse
-        # failure than rebuilding. Same instructions, finished result, reuse;
-        # anything else runs.
-        invocation_path = candidate_dir / "candidate_invocation.json"
+        # name can be re-proposed with different instructions, and returning a
+        # stale build for a changed hypothesis would be a far worse failure
+        # than refusing it.
         invocation = {
             "hypothesis": str(hypothesis or ""),
             "plan": str(plan or ""),
@@ -5834,8 +7899,26 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # must not invalidate a finished build. Written alongside it instead,
         # where _candidate_strategy can find it for the per-strategy fence.
         strategy_note = {"strategy": str(strategy or "").strip()}
+        surrogate = _study_mode_value() == "surrogate"
+        earlier_attempt = (candidate_dir / "agentic_trajectory.log").is_file()
+        same_instructions = bool(on_disk) and all(on_disk.get(k) == v for k, v in invocation.items())
+        if earlier_attempt and on_disk and not same_instructions:
+            # One folder, one candidate. On malmo_gptoss120b_bedrock_20260913b a
+            # second build with different instructions ran in the first one's
+            # folder, over its leftover summary files, and the manager then read
+            # those as the new build's result.
+            return {
+                "ok": False,
+                "error": (
+                    f"cand_{variant_name} already holds a candidate built from different "
+                    "instructions. Give this one a new variant_name: building it in that "
+                    "folder would mix its files with the earlier candidate's."
+                ),
+                "candidate_dir": str(candidate_dir),
+                "existing_hypothesis": str(on_disk.get("hypothesis") or "")[:600],
+            }
         finished = _read_json(output_path) or {}
-        if not finished and not output_path.exists():
+        if not finished and not output_path.exists() and not surrogate:
             # Killed after the solver finished, before the verdict was written.
             #
             # This is the gap the reuse test above cannot close: on run
@@ -5893,36 +7976,58 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     }
                 _write_json(candidate_dir / "unclean_finish_diagnosis.json",
                             reconstruction_verdict)
-        if finished.get("status") == "OK":
-            previous = _read_json(invocation_path) or {}
-            if all(previous.get(k) == v for k, v in invocation.items()):
+        if same_instructions and (finished or earlier_attempt):
+            # Asked again for a candidate that already has an attempt on disk: a
+            # replayed call after an interrupt, a restart, or a manager that lost
+            # track. A finished build is returned as it is. One that did not
+            # finish is NOT started over -- a fresh start threw its work away and
+            # stepped around the extension limit: on
+            # malmo_qwen38flash_openrouter_20260913 a four-hour attempt was
+            # relaunched from zero with its extension budget untouched.
+            if not finished:
+                finished = _harness_build_record(
+                    candidate_dir, surrogate=surrogate,
+                    reason="the build process stopped before writing its result (killed or interrupted)",
+                )
+                if surrogate:
+                    _write_json(output_path, finished)
+            earlier_grant = (int(finished.get("granted_timeout_s") or 0)
+                             or _oed_candidate_timeout(disc_dir, strategy) or _OED_UNFENCED_S)
+            payload = _build_payload(candidate_dir, finished, returncode=0, stderr="",
+                                     granted_timeout=earlier_grant, strategy=strategy)
+            payload["reused"] = True
+            if payload["finished_cleanly"]:
                 standing = _read_json(candidate_dir / "unclean_finish_diagnosis.json") or {}
-                return {
-                    "ok": True,
-                    "reused": True,
-                    **({"unclean_finish_diagnosis": standing} if standing else {}),
-                    "note": (
-                        "Already built and run under identical instructions; the "
-                        "finished result on disk was returned instead of rebuilding. "
-                        "Score and record it exactly as if it had just run."
-                    ),
-                    "candidate_dir": str(candidate_dir),
-                    "case_dir": finished.get("case_dir", ""),
-                    "compile_ok": bool(finished.get("compile_ok")),
-                    "converged": bool(finished.get("converged")),
-                    "compiled_model_name": finished.get("compiled_model_name", ""),
-                    "compiled_model_description": finished.get("compiled_model_description", ""),
-                    "compiled_case_dir": finished.get("compiled_case_dir", ""),
-                    "compiled_so": finished.get("compiled_so", ""),
-                    "compile_error_hint": "",
-                    "stderr_tail": "",
-                }
+                if standing:
+                    payload["unclean_finish_diagnosis"] = standing
+                payload["note"] = (
+                    "Already built under identical instructions; the finished result on disk "
+                    "was returned instead of rebuilding. Score and record it exactly as if it "
+                    "had just run."
+                )
+            else:
+                _attach_unclean_verdict(payload, candidate_dir, finished, earlier_grant,
+                                        reuse_standing=True)
+                payload["note"] = (
+                    "This candidate already has an attempt on disk that did not finish "
+                    "cleanly, so it was not started again. Act on unclean_finish_diagnosis."
+                )
+            return payload
+
         # Written BEFORE the run, so a candidate killed mid-build is not
         # mistaken on resume for one that finished under these instructions --
         # the status=="OK" test above is what gates reuse, and this only says
         # which instructions produced whatever is there.
         candidate_dir.mkdir(parents=True, exist_ok=True)
         _write_json(invocation_path, {**invocation, **strategy_note})
+        # A result left by an earlier build under other instructions is moved
+        # aside, so a process that dies before writing its own result is never
+        # read as having produced that one.
+        if output_path.exists():
+            try:
+                output_path.replace(candidate_dir / "agentic_result.previous.json")
+            except OSError:
+                pass
 
         # Fenced against this candidate's OWN strategy where possible. See
         # _oed_candidate_timeout: a pooled fence converges on whichever
@@ -5936,25 +8041,29 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # number it is given: it would budget a 27-hour fit and be killed by
         # the subprocess timeout hours earlier, which is precisely the failure
         # the budget block exists to prevent.
-        granted_timeout = min(_oed_candidate_timeout(disc_dir, strategy) or 0,
+        #
+        # Until the study has a fence the run is still bounded, by the
+        # subprocess timeout below, and the agent is told that bound less the
+        # headroom. It used to get 0: "no fence", so it was told no time at
+        # all, planned against no deadline and was killed at 3h. That also
+        # left a provider-killed candidate told to re-run with extra_seconds=0,
+        # which oed_extend_candidate refuses.
+        granted_timeout = min(_oed_candidate_timeout(disc_dir, strategy) or _OED_UNFENCED_S,
                               _OED_MAX_EXTENDED_S)
+        started = {"at": 0.0}
 
-        # Through the coordinator, exactly like run_case_native: the manager
-        # is told to launch a whole batch of candidates as concurrent `task`
-        # calls, and each of these compiles a library and then runs a full
-        # OpenFOAM case. Called directly, four candidates meant four
-        # simultaneous wmake builds plus four solvers with nothing throttling
-        # them — the one thing CaseCoordinator exists to prevent.
-        proc = coordinator.run_case(
-            "oed_candidates",
-            lambda: _run_script(
+        def _launch() -> Any:
+            started["at"] = time.time()
+            return _run_script(
                 [
-                    "scripts/code_mod_agentic.py",
+                    _oed_runner_script(),
                     "--hypothesis", hypothesis,
                     *(["--plan", plan] if str(plan or "").strip() else []),
                     "--variant-name", variant_name,
                     "--run-dir", str(candidate_dir),
                     "--starter-case", starter_case,
+                    *(["--starter-root", str(_starter_root_on_record())]
+                      if _starter_root_on_record() else []),
                     "--topic", topic,
                     "--output", str(output_path),
                     # A real wall-clock fence. "0" disables the cap in
@@ -5966,9 +8075,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     # minutes doing its own private coefficient sweep, while
                     # three finished candidates sat blocked behind it in the
                     # batch and the archive recorded the whole thing as one
-                    # evaluation of cost 2. Typical candidates finish in
-                    # 400-1000s; 45 minutes leaves generous headroom for a
-                    # genuinely slow compile-and-run while bounding a runaway.
+                    # evaluation of cost 2.
                     "--timeout", str(granted_timeout),
                     "--max-turns", str(_OED_MAX_TURNS),
                 ],
@@ -5977,10 +8084,30 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 # is for the tail of a solver launch already in flight.
                 timeout=max(10800, granted_timeout + 1800),
                 env=_foamagent_env(settings.openfoam_path),
-            ),
-        )
+            )
+
+        # Through the coordinator, exactly like run_case_native: the manager
+        # is told to launch a whole batch of candidates as concurrent `task`
+        # calls, and a build can compile a library and run a full case or
+        # train a model. Called directly, four candidates meant four builds at
+        # once with nothing throttling them — the one thing CaseCoordinator
+        # exists to prevent.
+        proc = coordinator.run_case("oed_candidates", _launch)
         result = _read_json(output_path) or {}
-        if result.get("status") == "OK":
+        if not result:
+            # The process ended without writing a result: killed at its
+            # subprocess limit, or crashed. The diagnosis used to be handed an
+            # empty record and report the stop "unknown" while the kill message
+            # sat in stderr (dlr_airfoil_codex_20260913b).
+            result = _harness_build_record(candidate_dir, surrogate=surrogate, proc=proc,
+                                           started_at=started["at"],
+                                           granted_timeout=granted_timeout)
+            if surrogate:
+                _write_json(output_path, result)
+        payload = _build_payload(candidate_dir, result, returncode=proc.returncode,
+                                 stderr=proc.stderr or "", granted_timeout=granted_timeout,
+                                 strategy=strategy)
+        if payload["finished_cleanly"]:
             # This attempt finished cleanly, so any verdict describing an
             # earlier one no longer applies. Left in place it would keep
             # oed_score_candidate refusing a candidate that is now fine.
@@ -5990,31 +8117,104 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     stale_verdict.unlink()
                 except OSError:
                     pass
-        payload = {
-            "ok": proc.returncode == 0 and result.get("status") == "OK",
+        else:
+            # An agent that did not finish cleanly gets read before its work is
+            # accepted. Its status alone cannot say so: a half-fitted solver model
+            # compiles and converges and scores as the baseline, and a fitted
+            # model stopped after two of five seeds has prediction files -- see
+            # _diagnose_unclean_finish.
+            _attach_unclean_verdict(payload, candidate_dir, result, granted_timeout)
+        return payload
+
+    def _build_payload(candidate_dir: Path, result: Dict[str, Any], *, returncode: int,
+                       stderr: str, granted_timeout: int, strategy: Optional[str] = None) -> dict:
+        """What a build tool hands back -- the same for a fresh build, a re-run,
+        and a look-up of an existing candidate.
+
+        Study-mode aware. A fitted-model build used to come back with the solver
+        fields compile_ok=false and converged=false whatever it had done, and on
+        malmo_gptoss120b_bedrock_20260913b the candidate runner read those as
+        failure and declined to score all five builds that had finished."""
+        surrogate = _study_mode_value() == "surrogate"
+        unclean = _build_finished_uncleanly(result)
+        payload: Dict[str, Any] = {
+            "ok": returncode == 0 and not unclean,
             "candidate_dir": str(candidate_dir),
             "case_dir": result.get("case_dir", ""),
-            "compile_ok": bool(result.get("compile_ok")),
-            "converged": bool(result.get("converged")),
-            "compiled_model_name": result.get("compiled_model_name", ""),
-            "compiled_model_description": result.get("compiled_model_description", ""),
-            "compiled_case_dir": result.get("compiled_case_dir", ""),
-            "compiled_so": result.get("compiled_so", ""),
-            "compile_error_hint": result.get("compile_error_hint", ""),
-            "stderr_tail": proc.stderr[-1500:] if proc.returncode != 0 else "",
+            "status": result.get("status", ""),
+            "finished_cleanly": not unclean,
+            "aborted_reason": result.get("aborted_reason", ""),
+            "turns_used": result.get("turns_used", 0),
+            "duration_s": result.get("duration_s", 0),
+            "stderr_tail": stderr[-1500:] if returncode != 0 else "",
             "granted_timeout_s": granted_timeout,
-            "fenced_against_strategy": str(strategy or "") or "(pooled)",
         }
-        # An agent that did not finish cleanly gets read before its work is
-        # accepted. Without this the caller sees only compile_ok/converged,
-        # both of which are true for a half-fitted model that will score as
-        # the baseline -- see _diagnose_unclean_finish for the six candidates
-        # that did exactly that.
-        if result.get("status") != "OK":
-            attempts = _read_json(candidate_dir / "candidate_attempts.json") or {}
+        if strategy is not None:
+            payload["fenced_against_strategy"] = str(strategy or "") or "(pooled)"
+        if surrogate:
+            files, declared = _submission_files(Path(candidate_dir), result)
+            payload.update({
+                "produced_predictions": bool(result.get("produced_predictions")),
+                "prediction_files_to_score": len(files),
+                "prediction_files_declared_by_agent": declared,
+            })
+        else:
+            payload.update({
+                "compile_ok": bool(result.get("compile_ok")),
+                "converged": bool(result.get("converged")),
+                "compiled_model_name": result.get("compiled_model_name", ""),
+                "compiled_model_description": result.get("compiled_model_description", ""),
+                "compiled_case_dir": result.get("compiled_case_dir", ""),
+                "compiled_so": result.get("compiled_so", ""),
+                "compile_error_hint": result.get("compile_error_hint", ""),
+            })
+        if not unclean:
+            payload["next_step"] = (
+                "The build finished cleanly. Next: oed_run_evaluation_cases(candidate_dir, "
+                "case_dir) -- it returns at once when the study declares no evaluation cases "
+                "-- then oed_score_candidate with this candidate_dir and case_dir."
+            )
+        return payload
+
+    def _attach_unclean_verdict(payload: Dict[str, Any], candidate_dir: Path,
+                                result: Dict[str, Any], granted_timeout: int, *,
+                                reuse_standing: bool = False) -> None:
+        """Diagnose a build that did not finish cleanly, and put the verdict and
+        what to do about it into ``payload``."""
+        candidate_dir = Path(candidate_dir)
+        standing = ((_read_json(candidate_dir / "unclean_finish_diagnosis.json") or {})
+                    if reuse_standing else {})
+        attempts = _read_json(candidate_dir / "candidate_attempts.json") or {}
+        rerun_s = int(granted_timeout or 0) or _OED_UNFENCED_S
+        if standing:
+            diagnosis = standing
+        elif result.get("provider_error"):
+            # The provider kept refusing (rate limit / overload / a used-up
+            # usage limit) until the agent gave up. That is evidence about the
+            # provider, not the idea, so no model is asked to judge it -- on
+            # malmo_qwen38flash_openrouter_20260912 the diagnoses called such
+            # candidates "abandon", which records them as failures.
+            diagnosis = {
+                "ok": True,
+                "verdict": "extend",
+                "model_is_complete": False,
+                "stopped_because": "provider_error",
+                "cause": (
+                    "The model provider kept refusing requests until the build agent gave "
+                    "up: " + str(result.get("aborted_reason") or "")[:300]
+                    + ". Nothing is known yet about whether this idea works."
+                ),
+                "work_completed": f"{result.get('turns_used', 0)} turns before the provider stopped answering.",
+                "extra_seconds_needed": rerun_s,
+                "estimate_basis": "A provider outage, not the work: re-run with the original time.",
+                "repair_steps": [],
+                "alters_graded_setup": False,
+                "confidence": 1.0,
+            }
+        else:
             try:
                 diagnosis = _diagnose_unclean_finish(
-                    candidate_dir, result, granted_timeout, _OED_MAX_TURNS,
+                    candidate_dir, result, int(granted_timeout or 0), _OED_MAX_TURNS,
                     int(attempts.get("extensions_used", 0) or 0), settings,
                 )
             except Exception as exc:
@@ -6023,22 +8223,32 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     "verdict": "unknown",
                     "cause": f"diagnosis raised {type(exc).__name__}: {exc}",
                 }
-            payload["unclean_finish_diagnosis"] = diagnosis
+        payload["unclean_finish_diagnosis"] = diagnosis
+        if not standing:
             # Persisted, not just returned. A prompt telling the runner not to
             # score an incomplete model is advice; oed_score_candidate reading
             # this file is the same judgement actually taking effect. Cleared
             # by _rerun_build_agent, because a later attempt supersedes it.
             _write_json(candidate_dir / "unclean_finish_diagnosis.json", diagnosis)
+        payload["next_step"] = (
+            "This build did NOT finish cleanly. Read unclean_finish_diagnosis before "
+            "anything else. verdict=complete -> score it as normal. verdict=repair -> "
+            "oed_apply_repair with its repair_steps. verdict=extend -> "
+            "oed_extend_candidate with its extra_seconds_needed. verdict=abandon -> record "
+            "it null and move on. Do NOT score a candidate whose model_is_complete is "
+            "false: what is on disk is not the finished model, and its score would be "
+            "recorded as a real experiment."
+        )
+        if result.get("provider_error"):
+            payload["provider_error"] = True
             payload["next_step"] = (
-                "This agent did NOT finish cleanly. Read unclean_finish_diagnosis "
-                "before anything else. verdict=complete -> score it as normal. "
-                "verdict=repair -> call oed_apply_repair with its repair_steps. "
-                "verdict=extend -> call oed_extend_candidate with its "
-                "extra_seconds_needed. verdict=abandon -> record it null and move on. "
-                "Do NOT score a candidate whose model_is_complete is false: it will "
-                "return the baseline and be recorded as a real experiment."
+                "The model PROVIDER stopped this build (rate limits, server errors, or a "
+                "used-up usage limit), not the work. It said: "
+                f"{str(result.get('aborted_reason') or '')[:300]} -- This is not a result "
+                "about the idea: do NOT record it as a failed experiment. Re-run it with "
+                f"oed_extend_candidate(extra_seconds={rerun_s}, rationale='provider outage, "
+                "not the work') once the provider is answering again."
             )
-        return payload
 
     def _rerun_build_agent(candidate_dir: str, *, timeout_s: int,
                            prior_attempt: str = "", repair_goal: str = "") -> dict:
@@ -6048,8 +8258,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         in what the agent is told: a continuation gets the story of the last
         attempt and is asked to carry on, a repair gets a specific defect and
         is forbidden from doing anything else. Both reuse the candidate's own
-        directory, so the compiled library, the fit artifacts and the case are
-        all still there to build on.
+        directory, so whatever the earlier attempt built is still there.
         """
         disc_dir = _oed_disc_dir()
         candidate_path = Path(candidate_dir).expanduser().resolve()
@@ -6075,17 +8284,30 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 stale.unlink()
             except OSError:
                 pass
-        proc = coordinator.run_case(
-            "oed_candidates",
-            lambda: _run_script(
+        # The previous attempt's result is kept beside, not left in place: if
+        # this re-run's process dies before writing its own, the old one would
+        # be read as this attempt's.
+        if output_path.exists():
+            try:
+                output_path.replace(candidate_path / "agentic_result.previous.json")
+            except OSError:
+                pass
+        surrogate = _study_mode_value() == "surrogate"
+        started = {"at": 0.0}
+
+        def _launch() -> Any:
+            started["at"] = time.time()
+            return _run_script(
                 [
-                    "scripts/code_mod_agentic.py",
+                    _oed_runner_script(),
                     "--hypothesis", hypothesis,
                     *(["--plan", str(invocation.get("plan") or "")]
                       if str(invocation.get("plan") or "").strip() else []),
                     "--variant-name", variant_name,
                     "--run-dir", str(candidate_path),
                     "--starter-case", starter_case,
+                    *(["--starter-root", str(_starter_root_on_record())]
+                      if _starter_root_on_record() else []),
                     "--topic", str(config.get("topic", "") or ""),
                     "--output", str(output_path),
                     "--timeout", str(int(timeout_s)),
@@ -6097,40 +8319,44 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 # solver launch already in flight, never above the ceiling.
                 timeout=min(_OED_MAX_EXTENDED_S + 1800, max(10800, int(timeout_s) + 1800)),
                 env=_foamagent_env(settings.openfoam_path),
-            ),
-        )
+            )
+
+        proc = coordinator.run_case("oed_candidates", _launch)
         result = _read_json(output_path) or {}
-        return {
-            "ok": proc.returncode == 0 and result.get("status") == "OK",
-            "candidate_dir": str(candidate_path),
-            "case_dir": result.get("case_dir", ""),
-            "status": result.get("status", ""),
-            "compile_ok": bool(result.get("compile_ok")),
-            "converged": bool(result.get("converged")),
-            "compiled_model_name": result.get("compiled_model_name", ""),
-            "compiled_model_description": result.get("compiled_model_description", ""),
-            "compiled_case_dir": result.get("compiled_case_dir", ""),
-            "compiled_so": result.get("compiled_so", ""),
-            "aborted_reason": result.get("aborted_reason", ""),
-            "turns_used": result.get("turns_used", 0),
-            "duration_s": result.get("duration_s", 0),
-            "stderr_tail": proc.stderr[-1500:] if proc.returncode != 0 else "",
-        }
+        if not result:
+            result = _harness_build_record(candidate_path, surrogate=surrogate, proc=proc,
+                                           started_at=started["at"], granted_timeout=int(timeout_s))
+            if surrogate:
+                _write_json(output_path, result)
+        payload = _build_payload(candidate_path, result, returncode=proc.returncode,
+                                 stderr=proc.stderr or "", granted_timeout=int(timeout_s))
+        payload["provider_error"] = bool(result.get("provider_error"))
+        if not payload["finished_cleanly"]:
+            # A continuation or a repair can stop early too, and was handed back
+            # as "ok" on its status alone.
+            _attach_unclean_verdict(payload, candidate_path, result, int(timeout_s))
+        return payload
 
     def oed_extend_candidate(candidate_dir: str, extra_seconds: int,
                              rationale: str) -> dict:
         """Give a candidate that ran out of time more time, and carry on.
 
-        Call this when oed_run_code_mod_candidate came back with an
-        unclean_finish_diagnosis whose verdict is "extend": the agent was doing
-        real work and the wall clock stopped it. Pass the diagnosis's own
+        Call this when a build came back with an unclean_finish_diagnosis whose
+        verdict is "extend": the agent was doing real work and the wall clock
+        (or the model provider) stopped it. Pass the diagnosis's own
         extra_seconds_needed and quote its estimate_basis as the rationale.
+
+        ``extra_seconds`` is the continuation's whole clock, counted from when
+        it starts: the time the remaining work needs, plus a little for the
+        agent to look over its folder again. It used to be added to the
+        previous attempt's duration, which handed a continuation that much
+        time over again on top of what was asked.
 
         This is not a re-run from scratch. The agent is told what the previous
         attempt achieved and is asked to inspect its own directory and continue
-        from there, so a library it already compiled and optimiser iterations it
-        already paid for are not repeated. Its trajectory log is appended to
-        rather than overwritten, so the whole history stays readable.
+        from there, so work it already paid for is not repeated. Its trajectory
+        log is appended to rather than overwritten, so the whole history stays
+        readable.
 
         Two extensions per candidate. That is deliberate: a candidate needing a
         third has been mis-estimated twice, and the budget is better spent on a
@@ -6169,19 +8395,39 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     "exists to stop."
                 ),
             }
+        surrogate = _study_mode_value() == "surrogate"
         previous = _read_json(candidate_path / "agentic_result.json") or {}
-        base = int(previous.get("duration_s") or 0)
-        granted = base + extra
-        clipped = granted > _OED_MAX_EXTENDED_S
-        granted = min(granted, _OED_MAX_EXTENDED_S)
-        prior_attempt = (
+        if not previous:
+            # Killed before it wrote a result. The continuation used to be told
+            # "ran ? turns over 0s and stopped: reason not recorded"
+            # (malmo_qwen38flash_openrouter_20260913).
+            previous = _harness_build_record(
+                candidate_path, surrogate=surrogate,
+                reason="its process stopped before it wrote a result",
+            )
+        granted = min(extra, _OED_MAX_EXTENDED_S)
+        clipped = extra > _OED_MAX_EXTENDED_S
+        facts = [
             f"An earlier attempt ran {previous.get('turns_used', '?')} turns over "
-            f"{base}s and stopped: {previous.get('aborted_reason') or previous.get('error') or 'reason not recorded'}.\n"
-            f"It made {previous.get('solver_invocations', '?')} solver launches, "
-            f"compile_ok={previous.get('compile_ok')}, converged={previous.get('converged')}.\n"
-            f"You have been granted {granted}s in total for this continuation, on this "
+            f"{int(previous.get('duration_s') or 0)}s and stopped: "
+            f"{previous.get('aborted_reason') or previous.get('error') or 'reason not recorded'}."
+        ]
+        if surrogate:
+            files, declared = _submission_files(candidate_path, previous)
+            facts.append(
+                f"It left {len(files)} prediction file(s) in its predictions folder"
+                + (", which it declared as final." if declared else ", without declaring which are final.")
+            )
+        else:
+            facts.append(
+                f"It made {previous.get('solver_invocations', '?')} solver launches, "
+                f"compile_ok={previous.get('compile_ok')}, converged={previous.get('converged')}."
+            )
+        facts.append(
+            f"You have {granted}s for this continuation, counted from now, on this "
             f"reasoning: {str(rationale).strip()}"
         )
+        prior_attempt = "\n".join(facts)
         # Counted BEFORE the run, for the same reason oed_note_repair_attempt
         # is: a continuation that dies mid-way must still consume its attempt,
         # or a crash loop resets the count and the budget is unenforceable.
@@ -6200,11 +8446,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         outcome["total_granted_s"] = granted
         if clipped:
             outcome["note"] = (
-                f"The request came to {base + extra}s, above the {_OED_MAX_EXTENDED_S}s "
+                f"The request came to {extra}s, above the {_OED_MAX_EXTENDED_S}s "
                 f"ceiling on any single build, so {granted}s was granted instead. A "
                 f"candidate that genuinely needs more than that is too expensive for "
-                f"one slot -- narrow the work (fewer fit cases, a coarser optimiser "
-                f"budget) rather than asking for the time again."
+                f"one slot -- narrow the work rather than asking for the time again."
             )
         return outcome
 
@@ -6274,11 +8519,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                                      repair_goal=goal)
         outcome["repair_attempts_used"] = used + 1
         outcome["repair_attempts_remaining"] = max(0, _OED_REPAIR_ATTEMPTS - (used + 1))
-        outcome["next_step"] = (
-            "Re-run oed_run_evaluation_cases then oed_score_candidate. If the repair "
-            "agent said it could not make the change without altering the graded setup, "
-            "do NOT try another route: record the candidate null and move on."
-        )
+        if outcome.get("finished_cleanly"):
+            outcome["next_step"] = (
+                "Re-run oed_run_evaluation_cases then oed_score_candidate. If the repair "
+                "agent said it could not make the change without altering the graded setup, "
+                "do NOT try another route: record the candidate null and move on."
+            )
         return outcome
 
     def oed_run_evaluation_cases(candidate_dir: str, case_dir: str) -> dict:
@@ -6559,6 +8805,17 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         new coefficients, no recompile. Costs 1 budget unit. Copies
         base_case_dir, patches constant/fvModels from `parameters`, runs the
         case. Call oed_score_candidate on the returned case_dir next."""
+        if _study_mode_value() == "surrogate":
+            return {
+                "ok": False,
+                "error": (
+                    "oed_run_experiment_candidate re-runs a compiled solver model with new "
+                    "coefficients, and this is a surrogate study: its candidates are fitted "
+                    "models with nothing compiled to re-run. Submit the change as a code_mod "
+                    "candidate whose plan states exactly what differs from its parent (for a "
+                    "hyper-parameter change, which values), so the build agent retrains it."
+                ),
+            }
         disc_dir = _oed_disc_dir()
         variant_name = _safe_variant_slug(variant_name, "candidate")
         candidate_dir = disc_dir / f"cand_{variant_name}"
@@ -6697,26 +8954,90 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "stderr_tail": ((result.get("stderr_tail") or "") + proc.stderr[-1000:]) if not ok else "",
         }
 
+    def oed_candidate_status(candidate_dir: str) -> dict:
+        """Where one candidate stands, read from its folder: whether its build
+        finished, what it left, whether it has been scored, and any standing
+        verdict -- with the next step.
+
+        Use it to pick a candidate up after a restart, or to find one that was
+        built but never scored. To score such a candidate, give the
+        oed-candidate-runner a task to score that existing candidate_dir; it
+        calls oed_score_candidate with the case_dir reported here."""
+        disc_dir = _oed_disc_dir()
+        candidate_path = Path(candidate_dir).expanduser().resolve()
+        if candidate_path.parent != disc_dir.resolve() or not candidate_path.name.startswith("cand_"):
+            return {"ok": False, "error": "candidate_dir must be a direct cand_* child of this study's OED directory."}
+        if not candidate_path.is_dir():
+            return {"ok": False, "error": f"No such candidate directory: {candidate_path}"}
+        surrogate = _study_mode_value() == "surrogate"
+        invocation = _read_json(candidate_path / "candidate_invocation.json") or {}
+        result = (_read_json(candidate_path / "agentic_result.json")
+                  or _read_json(candidate_path / "run_result.json") or {})
+        record = _read_json(candidate_path / "candidate_record.json") or {}
+        standing = _read_json(candidate_path / "unclean_finish_diagnosis.json") or {}
+        attempts = _read_json(candidate_path / "candidate_attempts.json") or {}
+        started = (candidate_path / "agentic_trajectory.log").is_file()
+        clean = bool(result) and not _build_finished_uncleanly(result)
+        scored = isinstance(record.get("score"), dict)
+        out: Dict[str, Any] = {
+            "ok": True,
+            "candidate_dir": str(candidate_path),
+            "variant_name": invocation.get("variant_name") or candidate_path.name.removeprefix("cand_"),
+            "hypothesis": str(invocation.get("hypothesis") or "")[:600],
+            "build": (result.get("status") if result
+                      else "stopped before writing a result" if started else "not started"),
+            "finished_cleanly": clean,
+            "aborted_reason": result.get("aborted_reason", ""),
+            "case_dir": result.get("case_dir", ""),
+            "scored": scored,
+            "score": record.get("score"),
+            "score_error": record.get("score_error"),
+            "unclean_finish_verdict": standing.get("verdict"),
+            "model_is_complete": standing.get("model_is_complete"),
+            "extensions_used": int(attempts.get("extensions_used", 0) or 0),
+            "repair_attempts_used": int(record.get("repair_attempts", 0) or 0),
+        }
+        if surrogate:
+            files, declared = _submission_files(candidate_path, result)
+            out["prediction_files_to_score"] = len(files)
+            out["prediction_files_declared_by_agent"] = declared
+        if scored:
+            out["next_step"] = "Scored; record it with oed_record_candidate_results if it is not recorded yet."
+        elif clean or standing.get("verdict") == "complete":
+            out["next_step"] = (
+                "Built but not scored: oed_run_evaluation_cases(candidate_dir, case_dir), then "
+                "oed_score_candidate with this candidate_dir and case_dir. The manager does this "
+                "by giving the oed-candidate-runner a task to score this existing candidate."
+            )
+        elif started or result:
+            out["next_step"] = (
+                "The build did not finish cleanly. Call oed_run_code_mod_candidate with this "
+                "variant_name and an empty hypothesis to get its diagnosis, then act on the verdict."
+            )
+        return out
+
     def oed_diagnose_candidate(candidate_dir: str) -> dict:
         """Why did this candidate produce no score, and is it worth another try?
 
         Call this whenever oed_score_candidate returns a null score, BEFORE
         recording the candidate as failed. It reads what is actually on disk —
-        the build result, every graded case's own failure reason, the tail of a
-        solver log that failed, the build agent's last moves — and reports the
-        cause, whether a bounded change would plausibly fix it, and the concrete
-        steps.
+        the build result, every graded case's own failure reason or the
+        prediction files and what the scoring wrapper said, the tail of a log
+        that failed, the build agent's last moves — and reports the cause,
+        whether a bounded change would plausibly fix it, and the concrete steps.
 
         `alters_graded_setup` is the field that decides what you may do next. A
         repair that changes the mesh, boundary conditions, physics, endTime or
-        the closure under test is not a repair, it is a different experiment,
-        and applying it would make this candidate's score incomparable with
-        every other one. Never carry out such steps: record the candidate as
-        failed and say why.
+        the closure under test — or, in a fitted-model study, the data split,
+        the metric, the scorer or the model under test — is not a repair, it is
+        a different experiment, and applying it would make this candidate's
+        score incomparable with every other one. Never carry out such steps:
+        record the candidate as failed and say why.
 
         When `repairable` is true and `alters_graded_setup` is false, you may
         carry out `repair_steps` yourself with the file and shell tools, then
-        re-run oed_run_evaluation_cases and oed_score_candidate. Two attempts,
+        re-run what produced the result (oed_run_evaluation_cases, in a study
+        that has evaluation cases) and oed_score_candidate. Two attempts,
         no more — after that record the null score and move to a different
         mechanism. Grinding a broken closure costs budget a new one could use.
         """
@@ -6735,7 +9056,16 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         )
         attempts = int(record.get("repair_attempts", 0) or 0)
         existing = record.get("failure_diagnosis")
-        if isinstance(existing, dict) and existing.get("ok"):
+        # A saved diagnosis is reused only while the evidence it was made from
+        # is unchanged. It used to be reused whenever one existed, so a verdict
+        # from an earlier, wrong prompt -- "not a valid CFD model, not
+        # repairable" for a fitted model that had simply never been scored, on
+        # malmo_gptoss120b_bedrock_20260913b -- outlived both the fix and the
+        # candidate's own later changes.
+        current_sha = _evidence_sha(_null_score_evidence(
+            candidate_path, execution_doc, str(record.get("score_error", "") or "")))
+        if (isinstance(existing, dict) and existing.get("ok")
+                and existing.get("evidence_sha") == current_sha):
             diagnosis = existing
         else:
             try:
@@ -6933,8 +9263,24 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "expected_case_dir": str(recorded_case),
             }
         execution_ok = _run_succeeded(execution_doc)
-        if action_type == "code_mod":
+        surrogate = _study_mode_value() == "surrogate"
+        if action_type == "code_mod" and surrogate:
+            # A fitted model has no library to compile and no solver to
+            # converge. What it must have produced is fresh predictions --
+            # surrogate_agentic's own gate, read from its own result.
+            execution_ok = execution_ok and bool(execution_doc.get("produced_predictions"))
+        elif action_type == "code_mod":
             execution_ok = execution_ok and bool(execution_doc.get("compile_ok")) and bool(execution_doc.get("converged"))
+        if (not execution_ok and action_type == "code_mod" and standing.get("ok")
+                and standing.get("model_is_complete") is True
+                and str(standing.get("verdict") or "").strip().lower() == "complete"):
+            # The build was stopped before it could report success -- killed at
+            # its limit, or out of turns -- and the diagnosis read what it left
+            # and found the model finished. Its own result had no way to say so.
+            if surrogate:
+                execution_ok = bool(_submission_files(candidate_path, execution_doc)[0])
+            else:
+                execution_ok = bool(execution_doc.get("compile_ok")) and bool(execution_doc.get("converged"))
 
         # The graded cases outrank the build's own smoke run.
         #
@@ -6958,7 +9304,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # subset is not this study's metric.
         evaluation_rescue = ""
         early_diagnosis: Optional[Dict[str, Any]] = None
-        if not execution_ok and action_type == "code_mod":
+        if not execution_ok and action_type == "code_mod" and not surrogate:
             # Whether the graded cases outweigh a failed trial run is a
             # judgement, so it is the model's to make, not a rule's.
             #
@@ -7090,16 +9436,30 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     "candidate_cases_scored": len(scored_paths),
                 }
 
+        # A fitted model is scored on the prediction files it submitted, not on
+        # whatever else is in its predictions folder -- see _stage_submission.
+        submission_files: List[Path] = []
+        submission_declared = False
+        scoring_dir_for: Dict[Path, Path] = {}
+        if surrogate and action_type == "code_mod" and execution_ok:
+            submission_files, submission_declared = _submission_files(candidate_path, execution_doc)
+            if submission_files:
+                try:
+                    scoring_dir_for[case_path] = _stage_submission(candidate_path, submission_files)
+                except OSError as exc:
+                    print(f"[oed] {candidate_path.name}: could not stage its prediction files "
+                          f"({exc}); scoring its folder as it is.", flush=True)
         per_case: Dict[str, Any] = {}
-        if _oedx is not None and execution_ok and bound and ref_files and all(p.is_dir() for p in scored_paths):
+        if _oedx is not None and execution_ok and bound and (ref_files or surrogate) and all(p.is_dir() for p in scored_paths):
             try:
                 baseline_metric = str(baseline.get("metric", ""))
                 values: List[float] = []
                 for path in scored_paths:
                     mv_one = _oedx.compute_metric_vector(
-                        case_dir=path,
+                        case_dir=scoring_dir_for.get(path, path),
                         bound_comparators=bound,
-                        reference_file=_reference_data_file(ref_files),
+                        reference_file=(_reference_data_file(ref_files) if ref_files else candidate_path),
+                        output_dir=(candidate_path / "scorer_output") if surrogate else None,
                         metric_specs=specs,
                         # None keeps the per-spec baseline_final_time that has
                         # always applied; a value overrides it for this call
@@ -7263,6 +9623,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         total_runs = measured_runs + evaluation_runs
         flat_cost = 2 if action_type == "code_mod" else 1
         cost = max(flat_cost, total_runs) if total_runs > 0 else flat_cost
+        if surrogate:
+            # One fitted model, one unit: there is no solver run to count, and
+            # a surrogate study states its budget in candidates.
+            cost = 1
 
         record = {
             "action_type": action_type,
@@ -7299,6 +9663,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "per_case_scores": per_case if multi_case else None,
             "evaluation_cases_scored": len(scored_paths) if multi_case else None,
             "score_error": score_error,
+            # Exactly what a fitted model was scored on, and whether its agent
+            # named those files itself or they were everything in its folder.
+            "scored_submission_files": [str(p) for p in submission_files] if surrogate else None,
+            "submission_declared": submission_declared if surrogate else None,
             "baseline_metric": str(baseline.get("metric", "")),
             "baseline_score": baseline_value,
             "baseline_direction": baseline_direction,
@@ -7370,7 +9738,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             else:
                 try:
                     record["failure_diagnosis"] = _diagnose_null_score(
-                        candidate_path, execution_doc, score_error, settings
+                        candidate_path, execution_doc, score_error, settings,
+                        metric_vector=metric_vector,
                     )
                 except Exception as exc:
                     record["failure_diagnosis"] = {
@@ -7417,6 +9786,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             edit_text_file,
             grep_files,
             read_starter_folder,
+            impl_run,
+            impl_verify,
+            impl_continue,
+            impl_status,
             fetch_literature,
             propose_and_rank_hypotheses,
             advance_with_approved_hypotheses,
@@ -7429,6 +9802,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             oed_setup_search,
             oed_propose_candidates,
             oed_record_candidate_results,
+            oed_candidate_status,
             oed_diagnose_candidate,
             oed_note_repair_attempt,
             # On the manager as well as the candidate runner, for the same
@@ -7474,6 +9848,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             read_text_file,
             grep_files,
             oed_run_code_mod_candidate,
+            oed_candidate_status,
             oed_run_experiment_candidate,
             oed_run_evaluation_cases,
             oed_score_candidate,
