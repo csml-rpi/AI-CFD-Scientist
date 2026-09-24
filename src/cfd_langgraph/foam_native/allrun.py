@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from . import prompts as P
+from cfd_langgraph.llm.reply import reply_text
 
 _DEFAULT_COMMANDS = [
     "blockMesh", "snappyHexMesh", "checkMesh", "decomposePar", "reconstructPar",
@@ -37,7 +38,7 @@ def generate_allrun_commands(
         case_info=json.dumps(case_info),
         allrun_reference=allrun_reference,
     )
-    raw = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]).content
+    raw = reply_text(llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]))
     return (raw or "").strip()
 
 

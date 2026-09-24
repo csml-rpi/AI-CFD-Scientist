@@ -6,6 +6,7 @@ from .agents.hypothesis_critique_agent import HypothesisCritiqueAgent
 from .agents.hypothesis_rank_agent import HypothesisRankAgent
 from .config import Settings
 from .ideation import run_ideation_batch
+from .llm.retry import is_transient_error
 from .prompts.loader import PromptLoader
 
 
@@ -17,6 +18,7 @@ def run_propose_critique_rank(
     literature_records: Optional[List[Dict[str, Any]]] = None,
     require_literature: bool = True,
     case_context: str = "",
+    study_mode: str = "",
 ) -> Dict[str, Any]:
     """Propose -> Critique -> Rank: the Mechanism 2 upgrade to hypothesis generation.
 
@@ -47,6 +49,7 @@ def run_propose_critique_rank(
         literature_items=literature_records,
         require_literature=require_literature,
         case_context=case_context,
+        study_mode=study_mode,
     )
     lit_items = batch["literature_used"]
     candidates = batch["candidates"]
@@ -70,12 +73,28 @@ def run_propose_critique_rank(
             continue
         if verbose:
             print(f"[Hypothesis] Critiquing {c['candidate_id']}...", flush=True)
-        critique = critique_agent.critique(
-            c.get("idea", {}),
-            lit_items,
-            research_topic=research_topic,
-            case_context=case_context,
-        )
+        try:
+            critique = critique_agent.critique(
+                c.get("idea", {}),
+                lit_items,
+                research_topic=research_topic,
+                case_context=case_context,
+                study_mode=study_mode,
+            )
+        except Exception as exc:
+            # The call has already spent its own retries. Losing this one
+            # review must not throw away every other candidate's finished
+            # review; the idea stays on the list, visibly unreviewed, for a
+            # human to override.
+            if not is_transient_error(exc):
+                raise
+            critique = {
+                "verdict": "reject",
+                "plausible": False,
+                "feasible_for_foamagent": False,
+                "issues": [f"Critique call failed after retries ({type(exc).__name__}); not reviewed."],
+                "reason": "The reviewer could not be reached.",
+            }
         c["critique"] = critique
         if critique.get("verdict") == "pass":
             survivors.append(c)
@@ -85,7 +104,17 @@ def run_propose_critique_rank(
     if verbose:
         print(f"[Hypothesis] {len(survivors)}/{len(candidates)} candidates passed critique. Ranking...", flush=True)
 
-    ranked = rank_agent.rank(survivors, research_topic=research_topic) if survivors else []
+    try:
+        ranked = rank_agent.rank(survivors, research_topic=research_topic) if survivors else []
+    except Exception as exc:
+        # Every survivor already passed critique; a failed ordering call is no
+        # reason to lose them. Keep proposal order and say so.
+        if not is_transient_error(exc):
+            raise
+        ranked = survivors
+        for i, c in enumerate(ranked):
+            c["rank"] = i + 1
+            c["rank_rationale"] = f"Ranking call failed after retries ({type(exc).__name__}); kept proposal order."
 
     return {
         "research_topic": research_topic,

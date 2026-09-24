@@ -36,6 +36,7 @@ def to_record(paper: Any) -> Dict[str, Any]:
         "doi": doi,
         "url": getattr(paper, "url", "") or "",
         "citationCount": getattr(paper, "citationCount", 0) or 0,
+        "source": "semanticscholar",
     }
 
 
@@ -147,32 +148,91 @@ def collect_papers_via_requests(topic: str, limit: int) -> List[Dict[str, Any]]:
                 break
         return len(out) - before
 
+    # One failing query must not throw away the papers the others found (it
+    # used to: an error on query 3 restarted the search from query 1). A
+    # non-retryable HTTP error skips that query; a service that is still down
+    # after every retry ends the search with whatever was already collected.
+    query_errors: List[str] = []
+
+    def run_query(query: str, quota: int, offset_start: int = 0) -> List[Dict[str, Any]]:
+        try:
+            return _collect_papers_single_query(query, quota, offset_start=offset_start)
+        except ServiceUnavailable:
+            raise
+        except requests.RequestException as exc:
+            print(f"[LIT] Query {query!r} failed: {exc}; moving on to the next query.", file=sys.stderr)
+            query_errors.append(str(exc))
+            return []
+
     # Give every query an initial share before any one query can consume the
     # whole paper budget. This is the part the former implementation missed:
     # it asked query 1 for `limit` results and normally never reached query 2.
     initial_quota = max(1, math.ceil(limit / len(queries)))
-    for q_idx, query in enumerate(queries, 1):
-        if len(out) >= limit:
-            break
-        print(f"[LIT] === Query {q_idx}/{len(queries)}: {query!r} ===")
-        added = add_unique(_collect_papers_single_query(query, initial_quota))
-        print(f"[LIT] Query {q_idx} added {added} unique paper(s); total now {len(out)}.")
-
-    # Duplicates or sparse result sets may leave the balanced first pass
-    # short. Continue each query after its initial offset until the global
-    # budget is full or every query is exhausted.
-    if len(out) < limit:
+    try:
         for q_idx, query in enumerate(queries, 1):
-            remaining = limit - len(out)
-            if remaining <= 0:
+            if len(out) >= limit:
                 break
-            print(f"[LIT] Fill pass query {q_idx}/{len(queries)}: {query!r}")
-            added = add_unique(
-                _collect_papers_single_query(query, remaining, offset_start=initial_quota)
-            )
-            print(f"[LIT] Fill pass added {added} unique paper(s); total now {len(out)}.")
+            print(f"[LIT] === Query {q_idx}/{len(queries)}: {query!r} ===")
+            added = add_unique(run_query(query, initial_quota))
+            print(f"[LIT] Query {q_idx} added {added} unique paper(s); total now {len(out)}.")
+
+        # Duplicates or sparse result sets may leave the balanced first pass
+        # short. Continue each query after its initial offset until the global
+        # budget is full or every query is exhausted.
+        if len(out) < limit:
+            for q_idx, query in enumerate(queries, 1):
+                remaining = limit - len(out)
+                if remaining <= 0:
+                    break
+                print(f"[LIT] Fill pass query {q_idx}/{len(queries)}: {query!r}")
+                added = add_unique(run_query(query, remaining, offset_start=initial_quota))
+                print(f"[LIT] Fill pass added {added} unique paper(s); total now {len(out)}.")
+    except ServiceUnavailable as exc:
+        if not out:
+            raise
+        print(f"[LIT] {exc} Keeping the {len(out)} paper(s) already retrieved.", file=sys.stderr)
+    if not out and query_errors:
+        raise RuntimeError(f"Every Semantic Scholar query failed; last error: {query_errors[-1]}")
     print(f"[LIT] Finished {len(queries)} queries: {len(out)} unique papers.")
     return out
+
+
+# Semantic Scholar answers overload with 429 and 5xx, and the same request
+# usually succeeds seconds later: on 2026-09-11 an identical search returned
+# 500 and then 200 eighteen seconds on. The old 1 s / 2 s retries restarted the
+# whole multi-query search and gave up inside ~10 s, so three live studies read
+# "0 papers" for queries as broad as "deep learning" and looped on the call.
+_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+_RETRY_WAITS_S = (5, 10, 20, 40, 60)
+
+
+class ServiceUnavailable(RuntimeError):
+    """Semantic Scholar kept failing after every retry — not an empty result."""
+
+
+def _get_with_retry(url: str, params: Dict[str, Any], headers: Dict[str, str]) -> requests.Response:
+    """GET one page, waiting and retrying the SAME page on transient failures."""
+    last = ""
+    for attempt, wait in enumerate((*_RETRY_WAITS_S, None), 1):
+        try:
+            resp = requests.get(url, params=params, headers=headers, timeout=120)
+        except (requests.ConnectionError, requests.Timeout) as exc:
+            last = f"{type(exc).__name__}: {exc}"
+        else:
+            if resp.status_code not in _RETRY_STATUS:
+                return resp
+            last = f"HTTP {resp.status_code} from Semantic Scholar"
+            retry_after = str(resp.headers.get("Retry-After") or "")
+            if wait is not None and retry_after.isdigit():
+                wait = max(wait, min(int(retry_after), 120))
+        if wait is None:
+            break
+        print(f"[LIT] {last}; retrying the same request in {wait}s (attempt {attempt})", flush=True)
+        time.sleep(wait)
+    raise ServiceUnavailable(
+        f"Semantic Scholar service error, not an empty result: {last} after "
+        f"{len(_RETRY_WAITS_S) + 1} attempts over ~{sum(_RETRY_WAITS_S)} s."
+    )
 
 
 def _collect_papers_single_query(query: str, limit: int, offset_start: int = 0) -> List[Dict[str, Any]]:
@@ -183,7 +243,9 @@ def _collect_papers_single_query(query: str, limit: int, offset_start: int = 0) 
     api_key = os.environ.get("S2_API_KEY", "").strip()
     if api_key:
         headers["x-api-key"] = api_key
-    page_size = 5
+    # Every request is one more chance to hit a transient 5xx, so ask for a
+    # useful page rather than five records at a time (the API allows 100).
+    page_size = 20
     offset = max(0, int(offset_start))
     total_available: Optional[int] = None
     while len(out) < limit:
@@ -198,11 +260,12 @@ def _collect_papers_single_query(query: str, limit: int, offset_start: int = 0) 
             "fields": "title,abstract,year,venue,url,citationCount,authors,externalIds",
         }
         print(f"[LIT] Requesting page offset={offset} limit={want} ...")
-        resp = requests.get(base, params=params, headers=headers, timeout=120)
+        resp = _get_with_retry(base, params, headers)
         print(f"[LIT] API response status={resp.status_code} for offset={offset}")
         if not resp.ok:
-            # Do not discard papers already retrieved (S2 often returns 400 when offset exceeds total, or 429).
-            if out:
+            # Do not discard papers already retrieved (S2 returns 400 when the
+            # offset runs past the end of the result set).
+            if out or offset > 0:
                 print(
                     f"[LIT] Non-success HTTP {resp.status_code}; stopping pagination and "
                     f"keeping {len(out)} paper(s) already retrieved.",
@@ -219,6 +282,7 @@ def _collect_papers_single_query(query: str, limit: int, offset_start: int = 0) 
             print("[LIT] No more papers returned by API.")
             break
         for rec in data:
+            rec["source"] = "semanticscholar"
             out.append(rec)
             title = rec.get("title") or "(untitled)"
             year = rec.get("year")
@@ -287,21 +351,17 @@ def main() -> int:
 
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    retries = 3
+    # Retries happen per request inside the collector, so a failure here has
+    # already waited out the transient window; retrying the whole search again
+    # would only multiply that wait.
     paper_records: List[Dict[str, Any]] = []
-    for attempt in range(1, retries + 1):
-        try:
-            print(f"Searching papers for topic: {args.topic} (attempt {attempt}/{retries})")
-            paper_records = collect_papers_via_requests(args.topic, args.limit)
-            print(f"[LIT] Finished loading {len(paper_records)} paper(s).")
-            break
-        except Exception as exc:
-            if attempt == retries:
-                print(f"Failed after retries: {exc}", file=sys.stderr)
-                return 1
-            sleep_s = 2 ** (attempt - 1)
-            print(f"API error: {exc}; retrying in {sleep_s}s")
-            time.sleep(sleep_s)
+    try:
+        print(f"Searching papers for topic: {args.topic}")
+        paper_records = collect_papers_via_requests(args.topic, args.limit)
+        print(f"[LIT] Finished loading {len(paper_records)} paper(s).")
+    except Exception as exc:
+        print(f"Failed after retries: {exc}", file=sys.stderr)
+        return 1
 
     records = paper_records
     records.sort(key=lambda r: r.get("citationCount", 0), reverse=True)

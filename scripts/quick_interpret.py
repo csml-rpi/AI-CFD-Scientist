@@ -123,7 +123,7 @@ def main() -> int:
             return re.sub(r"^```(?:json)?\s*|\s*```$", "", str(s).strip(), flags=re.MULTILINE | re.DOTALL)
 
     settings = get_settings()
-    llm = create_langchain_llm(model=settings.model, temperature=0.1)
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
 
     user_content: List[Any] = [{"type": "text", "text": user_msg_text}]
     user_content.extend(img_blocks)
@@ -151,7 +151,8 @@ def main() -> int:
     dt = time.time() - t0
     print(f"  LLM returned in {dt:.1f}s", file=sys.stderr)
 
-    raw = resp.content if hasattr(resp, "content") else str(resp)
+    from cfd_langgraph.llm.reply import reply_text
+    raw = reply_text(resp)
 
     # Parse
     try:

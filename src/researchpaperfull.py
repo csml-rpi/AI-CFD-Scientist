@@ -623,7 +623,7 @@ Write in formal academic style suitable for a peer-reviewed journal.Make sure it
             {"role": "user", "content": user_prompt}
         ]
         
-        results_discussion = self.openai_client.generate_text(messages, max_tokens=1500, temperature=0.5)
+        results_discussion = self.openai_client.generate_text(messages, max_tokens=1500, temperature=0.0)
         
         if results_discussion:
             return results_discussion
@@ -684,7 +684,7 @@ Write in formal academic style."""
             {"role": "user", "content": user_prompt}
         ]
         
-        conclusion = self.openai_client.generate_text(messages, max_tokens=800, temperature=0.5)
+        conclusion = self.openai_client.generate_text(messages, max_tokens=800, temperature=0.0)
         
         if conclusion:
             return conclusion
@@ -791,7 +791,7 @@ Future work should focus on extending the analysis to three-dimensional configur
             {"role": "user", "content": user_prompt}
         ]
         
-        materials_methods = self.openai_client.generate_text(messages, max_tokens=1200, temperature=0.5)
+        materials_methods = self.openai_client.generate_text(messages, max_tokens=1200, temperature=0.0)
         
         if materials_methods:
             return materials_methods

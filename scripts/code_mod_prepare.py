@@ -385,7 +385,8 @@ def _extract_pdf_texts_llm(pdf_text: str, repo_root: Path) -> str:
     )
     try:
         resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)])
-        out = getattr(resp, "content", "") if resp else ""
+        from cfd_langgraph.llm.reply import reply_text
+        out = reply_text(resp)
         return out if isinstance(out, str) else str(out)
     except Exception:
         return ""
@@ -424,7 +425,8 @@ def _extract_image_texts(image_paths: List[Path], repo_root: Path) -> str:
                 {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
             ]
             resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=content)])
-            txt = getattr(resp, "content", "") if resp else ""
+            from cfd_langgraph.llm.reply import reply_text
+            txt = reply_text(resp)
             if isinstance(txt, str) and txt.strip():
                 out_chunks.append(txt.strip())
         except Exception:
@@ -586,7 +588,8 @@ def _llm_classify_code_mod_mode(
         settings = get_settings()
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
         resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_prompt)])
-        raw = getattr(resp, "content", "") if resp else ""
+        from cfd_langgraph.llm.reply import reply_text
+        raw = reply_text(resp)
         txt = strip_json_fences(raw if isinstance(raw, str) else str(raw))
         s, e = txt.find("{"), txt.rfind("}")
         if s == -1 or e <= s:
@@ -638,7 +641,8 @@ def _extract_formula_symbols(formula_text: str, repo_root: Optional[Path] = None
             SystemMessage(content=sys_msg),
             HumanMessage(content=f"Formula text:\n{formula_text[:4000]}"),
         ])
-        txt = str(getattr(raw, "content", raw)).strip()
+        from cfd_langgraph.llm.reply import reply_text
+        txt = reply_text(raw).strip()
         # Strip markdown fences if present
         if txt.startswith("```"):
             txt = txt.split("```", 1)[1].lstrip("json").strip()
@@ -1066,17 +1070,27 @@ def _choose_base_case(
             if _is_openfoam_case_dir(c):
                 return c.resolve(), "github_case"
 
-    # Fallback: generate baseline with foam_run.
+    # Fallback: FoamAgent writes a baseline case from the topic. This is the
+    # native port (cfd_langgraph.foam_native), which runs on the study's own
+    # model client, so its calls land in the study's token log. It used to
+    # shell out to scripts/foam_run.py, the vendored Foam-Agent pipeline, whose
+    # own LLM client was outside the study's accounting.
+    from cfd_langgraph.config import get_settings  # type: ignore
+    from cfd_langgraph.foam_native import run_foam_case  # type: ignore
+    from cfd_langgraph.llm.factory import create_langchain_llm  # type: ignore
+
+    settings = get_settings()
     gen_case = run_dir / "auto_base_case"
-    gen_case.mkdir(parents=True, exist_ok=True)
     req = f"Create a baseline OpenFOAM case for topic: {topic}"
-    proc = subprocess.run(
-        [sys.executable, "scripts/foam_run.py", "--requirement", req, "--output-dir", str(gen_case), "--max-loop", "1", "--max-time-limit", "21600"],
-        cwd=str(repo_root),
-        capture_output=True,
-        text=True,
-    )
-    if proc.returncode == 0 and _is_openfoam_case_dir(gen_case):
+    try:
+        result = run_foam_case(
+            create_langchain_llm(model=settings.model, temperature=0.0), gen_case, req,
+            max_loop=1, max_time_limit_s=21600, openfoam_path=settings.openfoam_path,
+        )
+    except Exception as exc:
+        print(f"[code_mod_prepare] FoamAgent could not generate a base case: {exc}", file=sys.stderr)
+        result = {}
+    if result.get("success") and _is_openfoam_case_dir(gen_case):
         return gen_case.resolve(), "generated_foamagent"
     return gen_case.resolve(), "generated_fallback"
 

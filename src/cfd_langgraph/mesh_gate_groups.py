@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 import json
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
+from cfd_langgraph.llm.reply import reply_text
 
 
 class MeshPhysicsGroup(BaseModel):
@@ -114,9 +117,9 @@ def plan_mesh_refinement_groups_llm(
         "Respond with the structured MeshGateGroupPlan only."
     )
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     try:
-        structured = llm.with_structured_output(MeshGateGroupPlan)
+        structured = structured_output(llm, MeshGateGroupPlan)
         out = structured.invoke([SystemMessage(content=system), HumanMessage(content=user)])
         if isinstance(out, MeshGateGroupPlan) and out.groups:
             return out
@@ -125,7 +128,7 @@ def plan_mesh_refinement_groups_llm(
 
     try:
         resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-        raw = getattr(resp, "content", str(resp))
+        raw = reply_text(resp)
         m = re.search(r"\{.*\}", raw, re.DOTALL)
         if m:
             data = json.loads(m.group(0))
@@ -377,7 +380,7 @@ def llm_mesh_gate_pair_convergence(
     try:
         from langchain_core.messages import HumanMessage, SystemMessage
 
-        structured = llm.with_structured_output(_MeshGatePairDecision)
+        structured = structured_output(llm, _MeshGatePairDecision)
         out: _MeshGatePairDecision = structured.invoke(
             [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
         )

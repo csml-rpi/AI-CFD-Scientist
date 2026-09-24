@@ -10,6 +10,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
+from cfd_langgraph.llm.reply import reply_text
 
 _MAIN_TEX_START = "<<<MAIN_TEX_START>>>"
 _MAIN_TEX_END = "<<<MAIN_TEX_END>>>"
@@ -134,7 +135,7 @@ def cleanup_hallucinated_references(
 
     def _run_once() -> str:
         out = chain.invoke(invoke_kw)
-        return getattr(out, "content", str(out))
+        return reply_text(out)
 
     content = _run_once()
     try:
@@ -155,7 +156,7 @@ def cleanup_hallucinated_references(
         )
         chain2 = prompt2 | llm
         out2 = chain2.invoke(invoke_kw)
-        content2 = getattr(out2, "content", str(out2))
+        content2 = reply_text(out2)
         try:
             payload = _parse_cleanup_payload(content2)
         except (ValueError, json.JSONDecodeError) as e2:

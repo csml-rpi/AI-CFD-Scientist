@@ -94,7 +94,61 @@ def build_interrupt_on(
             continue
         interrupt_on[name] = {
             "allowed_decisions": ["approve", "reject"],
-            "description": "Paused before this tool call — Ctrl-C was pressed in the CLI.",
+            "description": "Paused before this tool call — a pause was requested in the CLI (Ctrl-C or Esc).",
             "when": pause_requested,
         }
     return interrupt_on
+
+
+# The names deepagents' FilesystemMiddleware registers for its own built-in
+# file tools. They cannot be removed from the agent -- deepagents refuses to
+# exclude that middleware, and its own allowlist insists on keeping read_file
+# -- so they are denied (DENY_BUILTIN_FILESYSTEM_TOOLS above) and hidden here.
+BUILTIN_FILESYSTEM_TOOL_NAMES = frozenset(
+    {"ls", "read_file", "write_file", "edit_file", "glob", "grep", "execute", "delete"}
+)
+
+
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, dict):
+        fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+        return str(fn.get("name", "") or "")
+    return str(getattr(tool, "name", "") or "")
+
+
+def _hide_builtin_filesystem_tools_middleware() -> Any:
+    """Keep deepagents' denied built-in file tools out of every model request.
+
+    Denying them was meant to push a model onto the real disk-backed tools by
+    returning an explicit error. Offering a tool that always refuses is a trap
+    for any model that takes the refusal at face value: measured on
+    ph_gemma_20260910g, 231 of 436 manager calls (53%) went to `ls`,
+    `read_file`, `grep`, `glob` and `write_file`, every one answered
+    "permission denied", and the model concluded the starter folder itself was
+    unreadable. A model cannot choose a tool it is never shown, so the request
+    is filtered instead. The deny rules stay in force underneath, so a call
+    to a hidden name that somehow arrives is still refused.
+    """
+    from langchain.agents.middleware import AgentMiddleware
+
+    class HideBuiltinFilesystemTools(AgentMiddleware):
+        def _filtered(self, request: Any) -> Any:
+            tools = list(getattr(request, "tools", None) or [])
+            kept = [t for t in tools if _tool_name(t) not in BUILTIN_FILESYSTEM_TOOL_NAMES]
+            return request if len(kept) == len(tools) else request.override(tools=kept)
+
+        def wrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+            return handler(self._filtered(request))
+
+        async def awrap_model_call(self, request: Any, handler: Callable[[Any], Any]) -> Any:
+            return await handler(self._filtered(request))
+
+    return HideBuiltinFilesystemTools()
+
+
+def build_hide_builtin_filesystem_tools_middleware() -> List[Any]:
+    """The filter as a middleware list, or [] where middleware is unavailable."""
+    try:
+        return [_hide_builtin_filesystem_tools_middleware()]
+    except ImportError:
+        return []

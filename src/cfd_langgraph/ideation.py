@@ -11,8 +11,10 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from .config import Settings
 from .llm.factory import create_langchain_llm
+from .llm.retry import call_with_retry, is_transient_error
 from .literature import LiteratureClient
-from .utils import strip_json_fences
+from .utils import extract_json_object, strip_json_fences
+from cfd_langgraph.llm.reply import reply_text
 
 
 def load_prompts(prompts_path: Path) -> Dict[str, Any]:
@@ -131,9 +133,14 @@ def novelty_score_llm(
         f"{json.dumps(idea_json, ensure_ascii=False)}\n\n"
         "Evaluate novelty now."
     )
-    resp = llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-    content = resp.content if isinstance(resp.content, str) else str(resp.content)
-    parsed = json.loads(strip_json_fences(content))
+    # Retried here because the caller fails closed: a novelty check that raises
+    # marks the idea "too similar", so a provider blip would reject a good idea.
+    resp = call_with_retry(
+        lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
+        "novelty check",
+    )
+    content = reply_text(resp)
+    parsed = json.loads(extract_json_object(content))
     if not isinstance(parsed, dict):
         raise ValueError("novelty evaluator did not return a JSON object")
     value = float(parsed.get("max_similarity_to_prior"))
@@ -289,6 +296,48 @@ def _fetch_literature(settings: Settings, research_topic: str, verbose: bool = T
     return lit_items
 
 
+def _judged_too_similar(judgement: str, similarity, threshold: float) -> bool:
+    """Whether the novelty judge rejected this idea.
+
+    The judge returns a verdict AND a self-reported similarity. The verdict
+    decides; the number is a fallback for when there is no verdict to read,
+    because it scores "same research area" rather than "same idea" and a study
+    pinned to one case has a similarity floor set by its own topic.
+
+    This lives in one place because it was written in two -- the retry loop's
+    accept test and the `passed` flag recorded for the pipeline -- and fixing
+    only the first produced candidates logged as "Idea accepted
+    (judgement=novel)" and then rejected downstream with "Failed novelty gate
+    before critique ran". Three of three, on runs/ideation_probe8.
+    """
+    if judgement == "too_similar":
+        return True
+    return not judgement and similarity is not None and similarity >= threshold
+
+
+# How a fitted-model study's idea is framed. It replaces the simulation-study
+# framing instead of adding to it: given the CFD study schema and the fixed-case
+# brief, ideas for a surrogate task came back with `solver: OpenFOAM 10`, a CFL
+# and an end time, and the reviewer rejected each as "a CFD study, not the
+# surrogate task" -- 0 of 2-3 ideas in four rounds on
+# experiments_for_paper/qwen_27b_nothink/palmo, 1 of 3 for Codex and gpt-oss on
+# the same task, 0 of 3 for Maverick.
+_FITTED_MODEL_STUDY_BRIEF = (
+    "THIS IS A FITTED-MODEL STUDY. Nothing is simulated. The task supplies data, a "
+    "fixed split between what may be trained on and what is held back for scoring, and "
+    "a scorer that decides success. The deliverable is a model fitted on the permitted "
+    "data and judged by that scorer.\n\n"
+    "Propose ONE modelling idea: the model family or method, its inputs and any features "
+    "derived from them, what it is fitted on (permitted data only), how it is validated "
+    "without the held-back data, and why the prior studies suggest it can beat the "
+    "reference.\n\n"
+    "The schema below was written for simulation studies, and its simulation fields do "
+    "not apply here: set `solver`, `target_CFL`, `topology`, `dimensions` and `controls` "
+    "to null. Each experiment is one model variant, with its defining choices under "
+    "`parameters`.\n\n"
+)
+
+
 def _generate_one_idea(
     llm: Any,
     ideation_prompts: Dict[str, Any],
@@ -300,6 +349,7 @@ def _generate_one_idea(
     previous_ideas: Optional[List[Dict[str, Any]]] = None,
     candidate_similarity_threshold: float = 0.92,
     case_context: str = "",
+    study_mode: str = "",
 ) -> Dict[str, Any]:
     """One novelty-checked idea, with retries. Extracted from ``run_ideation``'s
     original loop body so both a single idea and a batch of candidates
@@ -308,6 +358,33 @@ def _generate_one_idea(
     system_prompt = str(ideation_prompts["initial_idea_prompt"]).replace(
         "{max_experiments}", str(settings.ideation_max_experiments)
     )
+    fitted_model_study = str(study_mode or "").strip().lower() == "surrogate"
+    if fitted_model_study:
+        system_prompt = _FITTED_MODEL_STUDY_BRIEF + system_prompt
+    elif case_context:
+        # The base prompt asks for "an impactful CFD research idea" and "a
+        # non-overlapping set of experiments" -- i.e. a study design. Given a
+        # fixed case that is the wrong deliverable, and saying so only in the
+        # user turn does not survive: measured on runs/ideation_probe, with the
+        # fixed-case block moved to character 0 of the user prompt, 3 of 4
+        # candidates still came back with pimpleFoam/IDDES/3D and 0 of 4 passed
+        # critique. The same run at effort=none produced 4 of 4 3D LES ideas, so
+        # it is not a reasoning-depth problem either -- the model is answering
+        # the question the system prompt asked. Redefining the deliverable has
+        # to happen here, in the same turn that sets the task.
+        system_prompt = (
+            "THIS STUDY RUNS ON A FIXED CASE. You are not designing a simulation "
+            "campaign. The setup given below under FIXED CASE SETUP is already "
+            "decided, and nothing you propose changes it.\n\n"
+            "Propose variation ONLY in what the research topic asks to be varied. "
+            "Whatever that is, your experiments are variants of it evaluated by "
+            "re-running the one existing case — not different simulations. An "
+            "idea that re-specifies any part of the fixed setup is off-topic by "
+            "construction and will be rejected, however strong it would be as an "
+            "independent study.\n\n"
+            "Use the prior studies for the mechanisms they identify, expressed "
+            "within what the topic varies; they are not study designs to copy.\n\n"
+        ) + system_prompt
     previous_ideas = previous_ideas or []
     user_prompt = ideation_prompts.get(
         "literature_aware_user_prompt",
@@ -317,19 +394,44 @@ def _generate_one_idea(
         literature_context=literature_context,
         max_experiments=settings.ideation_max_experiments,
     )
-    if case_context:
+    if case_context and fitted_model_study:
+        user_prompt = (
+            "THE TASK'S DATA AND SCORING — given, not to be changed:\n"
+            f"{case_context}\n\n"
+        ) + user_prompt
+    elif case_context:
         # Without this the ideator has no idea a concrete case already exists,
         # and proposes studies of a *different* configuration — observed on a
         # real run: every candidate was a setup-sensitivity study (confinement,
         # spanwise size, grid-scheme interaction), half of them at Re_H=10595
         # when the starter case is Re_H=5600.
-        user_prompt += (
-            "\n\nFIXED CASE SETUP — this study runs on an existing case. Geometry, "
+        #
+        # It leads the prompt rather than trailing it. Appended last it sat
+        # behind the literature block -- 807 characters of constraint after
+        # 11,544 characters of papers on run ph_codex_20260902_1402, 20,354 on
+        # oed_20260822_1626_codex_high -- and lost. Measured pass rate fell with
+        # the size of that block: 20/25 with no literature, 37/61 at ten papers,
+        # 14/32 at twenty.
+        #
+        # The field list is the other half. The required schema asks for
+        # `solver`, `topology` and `dimensions`, so a model with no instruction
+        # to the contrary invents them, and the critic then rejects the idea for
+        # exactly those fields: 45 of 64 rejections across every run cite a
+        # setup violation (mesh 33, LES 33, dimension 31, solver 30, 3D 27).
+        # Three consecutive rounds scored 0 of 5 this way. Naming the fields as
+        # copied removes the choice instead of forbidding its consequences.
+        user_prompt = (
+            "FIXED CASE SETUP — this study runs on an existing case. Geometry, "
             "mesh, boundary conditions, solver, numerics and flow parameters below are "
             "GIVEN and must not be changed or re-proposed. Your hypothesis is about what "
             "to CHANGE IN THE MODEL relative to this case, evaluated on this case:\n"
             f"{case_context}\n"
-        )
+            "\nThe schema's `solver`, `topology`, `dimensions` and `controls` fields "
+            "DESCRIBE this fixed case — copy them from above. They are not choices to "
+            "make. The only field your hypothesis decides is `parameters`: the model "
+            "change itself. Read the prior studies below for mechanisms you can express "
+            "as such a change, not for a study design to adopt.\n\n"
+        ) + user_prompt
     if previous_ideas:
         prior_summaries = [
             _idea_distinguishing_text(x)[:1200] for x in previous_ideas[-8:]
@@ -356,14 +458,17 @@ def _generate_one_idea(
     idea_json: Dict[str, Any] = {}
 
     for attempt in range(retries + 1):
-        resp = llm.invoke(
-            [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+        resp = call_with_retry(
+            lambda: llm.invoke(
+                [SystemMessage(content=system_prompt), HumanMessage(content=user_prompt)]
+            ),
+            "idea generation",
         )
-        content = resp.content if isinstance(resp.content, str) else str(resp.content)
+        content = reply_text(resp)
         last_raw = content
 
         try:
-            idea_json = json.loads(strip_json_fences(content))
+            idea_json = json.loads(extract_json_object(content))
         except Exception:
             idea_json = {"raw_output": content, "parse_error": True}
             novelty_val = 1.0
@@ -401,9 +506,18 @@ def _generate_one_idea(
                 default=0.0,
             )
 
-        too_similar = (
-            novelty_val is not None and novelty_val >= threshold
-        ) or novelty_judgement == "too_similar"
+        # The judge returns BOTH a verdict and a self-reported similarity, and
+        # the number used to be able to veto the verdict. It should not: the
+        # number scores "same research area", not "same idea", and on a study
+        # pinned to one case that floor is set by the topic itself. Measured
+        # across probes 5 and 6, every one of six rejected candidates carried
+        # judgement "novel" -- four were discarded on the number alone, one at
+        # exactly the threshold, with reasons like "none listed introduces ...
+        # the application and calibration setting overlap strongly". That is a
+        # correct similarity and an irrelevant one. The number now decides only
+        # when there is no verdict to read; the failed-closed path still sets
+        # judgement itself, and the within-batch duplicate check is unaffected.
+        too_similar = _judged_too_similar(novelty_judgement, novelty_val, threshold)
         too_similar_to_batch = max_candidate_similarity >= candidate_similarity_threshold
         invalid_count = (
             count_val is None
@@ -413,13 +527,13 @@ def _generate_one_idea(
 
         if not too_similar and not too_similar_to_batch and not invalid_count and not idea_json.get("parse_error"):
             if verbose:
-                print("[Ideation] Idea accepted (novelty=%.3f, count=%s)" % (
-                    novelty_val or 0, count_val), flush=True)
+                print("[Ideation] Idea accepted (similarity=%.3f/%.2f, judgement=%s, count=%s)" % (
+                    novelty_val or 0, threshold, novelty_judgement or "-", count_val), flush=True)
             break
 
         if verbose and (too_similar or too_similar_to_batch or invalid_count):
-            print("[Ideation] Retry %d/%d: too_similar=%s duplicate_candidate=%s invalid_experiment_count=%s" % (
-                attempt + 1, retries, too_similar, too_similar_to_batch, invalid_count), flush=True)
+            print("[Ideation] Attempt %d/%d rejected: too_similar=%s duplicate_candidate=%s invalid_experiment_count=%s" % (
+                attempt + 1, retries + 1, too_similar, too_similar_to_batch, invalid_count), flush=True)
 
         if attempt < retries:
             retry_tpl = ideation_prompts.get(
@@ -448,8 +562,7 @@ def _generate_one_idea(
             "judgement": novelty_judgement,
             "threshold": threshold,
             "passed": (
-                (novelty_val is None or novelty_val < threshold)
-                and novelty_judgement != "too_similar"
+                not _judged_too_similar(novelty_judgement, novelty_val, threshold)
                 and max_candidate_similarity < candidate_similarity_threshold
             ),
             "max_similarity_to_batch": max_candidate_similarity,
@@ -479,7 +592,7 @@ def run_ideation(settings: Settings, research_topic: str, verbose: bool = True) 
 
     lit_items = _fetch_literature(settings, research_topic, verbose=verbose)
     literature_context = build_literature_context(lit_items)
-    llm = create_langchain_llm(model=settings.model, temperature=0.2)
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
 
     result = _generate_one_idea(
         llm, ideation_prompts, research_topic, literature_context, lit_items, settings, verbose=verbose
@@ -499,6 +612,7 @@ def run_ideation_batch(
     literature_items: Optional[List[Dict[str, Any]]] = None,
     require_literature: bool = False,
     case_context: str = "",
+    study_mode: str = "",
 ) -> Dict[str, Any]:
     """Propose step of the propose -> critique -> rank hypothesis pipeline.
 
@@ -524,18 +638,36 @@ def run_ideation_batch(
             "Literature-grounded hypothesis generation requires a non-empty literature set."
         )
     literature_context = build_literature_context(lit_items)
-    # Slightly hotter than the single-idea path: candidates should differ
-    # from each other, not just from the literature.
-    llm = create_langchain_llm(model=settings.model, temperature=0.55)
+    # Was 0.55, on the reasoning that candidates should differ from each other
+    # and not just from the literature. Now 0.0 like every other call site: a
+    # study is only reproducible if its verdicts are, and the measured cost of
+    # sampling was a validator that returned 13 issues and then "valid" on
+    # identical text. Diversity between candidates comes from the prompt
+    # instead -- each generation is shown the ones already proposed in this
+    # batch and told to differ from them.
+    llm = create_langchain_llm(model=settings.model, temperature=0.0)
 
     candidates: List[Dict[str, Any]] = []
     prior_ideas: List[Dict[str, Any]] = []
     for i in range(max(1, num_candidates)):
-        one = _generate_one_idea(
-            llm, ideation_prompts, research_topic, literature_context, lit_items,
-            settings, verbose=verbose, previous_ideas=prior_ideas,
-            case_context=case_context,
-        )
+        try:
+            one = _generate_one_idea(
+                llm, ideation_prompts, research_topic, literature_context, lit_items,
+                settings, verbose=verbose, previous_ideas=prior_ideas,
+                case_context=case_context, study_mode=study_mode,
+            )
+        except Exception as exc:
+            # Its calls have already spent their retries. Keep the ideas this
+            # batch finished instead of unwinding all of them; with none
+            # finished there is nothing to keep, so the failure goes up.
+            if not candidates or not is_transient_error(exc):
+                raise
+            print(
+                f"[Ideation] Idea {i + 1} failed after retries ({type(exc).__name__}); "
+                f"keeping the {len(candidates)} finished idea(s).",
+                flush=True,
+            )
+            break
         one["candidate_id"] = f"cand_{i + 1:02d}"
         candidates.append(one)
         if isinstance(one.get("idea"), dict) and not one["idea"].get("parse_error"):

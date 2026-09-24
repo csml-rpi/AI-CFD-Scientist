@@ -16,8 +16,9 @@ from typing import Any, Dict, List, Optional, Tuple
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from cfd_langgraph.llm.factory import create_langchain_llm
-from cfd_langgraph.utils import strip_json_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences
 from cfd_langgraph.viz_creator import _PAPER_PYVISTA_ONLY_SYSTEM, _images_to_blocks
+from cfd_langgraph.llm.reply import reply_text
 
 SCRIPT_GEN_SYSTEM = (
     _PAPER_PYVISTA_ONLY_SYSTEM
@@ -230,11 +231,11 @@ def _check_one_image(
     ]
     try:
         r = llm.invoke(msgs)
-        raw = getattr(r, "content", str(r))
+        raw = reply_text(r)
     except Exception as e:
         return True, f"VLM check error, accepting: {e}"
     try:
-        parsed = json.loads(strip_json_fences(raw if isinstance(raw, str) else str(raw)))
+        parsed = json.loads(extract_json_object(raw if isinstance(raw, str) else str(raw)))
         ok = bool(parsed.get("viz_acceptable", False))
         return ok, str(parsed.get("reason", ""))
     except Exception:
@@ -259,7 +260,7 @@ def run_batch_paper_viz_loop(
     Returns (final_script_text, list of png paths, meta dict with attempts, failures history).
     Each outer attempt: generate OR revise script → run → per-image VLM; on failures, next iteration revises.
     """
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     paper_figs_dir = paper_figs_dir.resolve()
     repo_root = repo_root.resolve()
     ensure_paper_fig_layout_module(paper_figs_dir)
@@ -295,7 +296,7 @@ def run_batch_paper_viz_loop(
         msgs = [SystemMessage(content=SCRIPT_GEN_SYSTEM), HumanMessage(content=user)]
         try:
             resp = llm.invoke(msgs)
-            script_text = getattr(resp, "content", str(resp))
+            script_text = reply_text(resp)
         except Exception as e:
             meta["failures_log"].append({"attempt": attempt, "phase": "llm", "error": str(e)})
             if verbose:
@@ -368,7 +369,7 @@ def analyze_figures_for_paper(
     image_paths: List[Path],
     verbose: bool = False,
 ) -> str:
-    llm = create_langchain_llm(model=model, temperature=0.2)
+    llm = create_langchain_llm(model=model, temperature=0.0)
     names = [p.name for p in image_paths[:48]]
     excerpt = json.dumps(analysis, indent=2)[:25_000]
     user = ANALYSIS_USER.format(
@@ -378,7 +379,7 @@ def analyze_figures_for_paper(
     )
     try:
         out = llm.invoke([HumanMessage(content=user)])
-        return getattr(out, "content", str(out))[:24_000]
+        return reply_text(out)[:24_000]
     except Exception as e:
         if verbose:
             print(f"[batch_paper_viz] image analysis LLM failed: {e}")

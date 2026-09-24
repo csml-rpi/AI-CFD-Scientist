@@ -19,8 +19,9 @@ from cfd_langgraph.agents.paper_reviewer_agent import PaperReviewerAgent
 from cfd_langgraph.paper_utils import compile_tex_to_pdf, extract_pdflatex_errors
 
 _COMPILE_ERR_TAIL_CHARS = 14_000
-from cfd_langgraph.utils import strip_json_fences, strip_latex_fences
+from cfd_langgraph.utils import extract_json_object, strip_json_fences, strip_latex_fences
 from cfd_langgraph.refchecker_integration import run_refchecker_on_tex
+from cfd_langgraph.llm.reply import reply_text
 
 
 def _get_figure_paths_for_review(
@@ -86,7 +87,7 @@ class WriterAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
         self.prompts = prompt_loader.section("WriterAgent")
-        self.llm = create_langchain_llm(model=model, temperature=0.2)
+        self.llm = create_langchain_llm(model=model, temperature=0.0)
         self.lit_agent = LiteratureSurveyAgent(model=model)
         self.reviewer = PaperReviewerAgent(model=model, prompt_loader=prompt_loader)
 
@@ -105,7 +106,7 @@ class WriterAgent:
             ]
         )
         chain = prompt | self.llm
-        return chain.invoke({"section_context": section_context}).content
+        return reply_text(chain.invoke({"section_context": section_context}))
 
     def collect_citations(
         self, citation_context: str, total_rounds: int = 2
@@ -121,19 +122,19 @@ class WriterAgent:
                 ("human", usr_t),
             ]
         )
-        chain = prompt | create_langchain_llm(self.model, temperature=0.1)
+        chain = prompt | create_langchain_llm(self.model, temperature=0.0)
 
         collected: List[Dict[str, Any]] = []
         for r in range(1, max(1, total_rounds) + 1):
-            raw = chain.invoke(
+            raw = reply_text(chain.invoke(
                 {
                     "citation_context": citation_context,
                     "round": r,
                     "total_rounds": total_rounds,
                 }
-            ).content
+            ))
             try:
-                parsed = json.loads(strip_json_fences(raw))
+                parsed = json.loads(extract_json_object(raw))
             except Exception:
                 continue
             cites = parsed.get("citations", []) if isinstance(parsed, dict) else []
@@ -227,7 +228,7 @@ class WriterAgent:
                 "viz_bundle": json.dumps(visualization_bundle or []),
             }
         )
-        result = getattr(out, "content", str(out))
+        result = reply_text(out)
         if verbose:
             print("[Writer] Paper draft generated.")
         return result
@@ -307,7 +308,7 @@ class WriterAgent:
         })
         if verbose:
             print("[Writer] Revision done.")
-        return getattr(out, "content", str(out))
+        return reply_text(out)
 
     def revise_paper_for_compilation_only(
         self,
@@ -357,7 +358,7 @@ class WriterAgent:
         )
         if verbose:
             print("[Writer] Compile-only revision done.")
-        return getattr(out, "content", str(out))
+        return reply_text(out)
 
     def write_paper_with_literature_and_review(
         self,

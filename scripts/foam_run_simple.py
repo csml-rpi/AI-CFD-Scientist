@@ -74,6 +74,29 @@ def _resolve_case_dir(case_dir: Path) -> Path:
     return case_dir
 
 
+def _is_stale_time_dir(directory: str, name: str, case_root: Path) -> bool:
+    """True for a non-zero time directory sitting at the case root.
+
+    Only at the root: a file named ``100`` inside ``constant/`` or a sampling
+    directory under ``postProcessing/`` is not a time directory. Time 0 is the
+    initial condition and is kept; everything else is a previous solve's
+    output, and carrying it into a fresh case makes every QoI extractor here
+    read ``max(time_values)`` from the wrong run — on a re-meshed case the
+    field length then disagrees with ``nCells`` and no fields load at all.
+    """
+    try:
+        if Path(directory).resolve() != case_root.resolve():
+            return False
+    except OSError:
+        return False
+    if name in {"constant", "system"} or name.startswith("processor"):
+        return False
+    try:
+        return float(name) != 0.0
+    except ValueError:
+        return False
+
+
 def _copy_case(src: Path, dst: Path) -> None:
     if dst.exists():
         shutil.rmtree(dst)
@@ -84,6 +107,8 @@ def _copy_case(src: Path, dst: Path) -> None:
             if n in {"postProcessing"} or n.startswith("processor") or n.startswith("log."):
                 skip.append(n)
             if n in {"Allrun.out", "Allrun.err"}:
+                skip.append(n)
+            if _is_stale_time_dir(directory, n, src) and (Path(directory) / n).is_dir():
                 skip.append(n)
         return skip
 

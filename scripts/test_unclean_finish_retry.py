@@ -229,8 +229,10 @@ if patched:
 
     r = extend(str(cand), 600, "8 of 12 iterations done at ~90s each, ~600s remain")
     check("a justified extension runs", r.get("ok") is True, r)
-    check("the grant is the prior duration plus the extension, not the extension alone",
-          calls and calls[-1]["timeout_s"] == 2249 + 600, calls[-1] if calls else None)
+    # The continuation is a new process whose clock starts at launch, and its
+    # brief says "counted from now", so it gets the extension alone.
+    check("the grant is the extension, counted from the continuation's start",
+          calls and calls[-1]["timeout_s"] == 600, calls[-1] if calls else None)
     check("the continuation is told what the previous attempt did",
           "51 turns" in calls[-1]["prior_attempt"] and "timeout after 2249s" in calls[-1]["prior_attempt"])
     check("the continuation carries the rationale it was granted on",
@@ -638,8 +640,8 @@ try:
 
     r = by["oed_extend_candidate"](str(cand), 600, "4 of 12 iterations left at ~150s each")
     check("the extension runs", r.get("ok") is True, r)
-    check("the grant is prior duration + extension", launches[-1]["timeout"] == 2249 + 600,
-          launches[-1]["timeout"])
+    check("the grant is the extension, counted from the continuation's start",
+          launches[-1]["timeout"] == 600, launches[-1]["timeout"])
     check("the continuation is told what the previous attempt did",
           "51 turns" in launches[-1]["prior"] and "timeout after 2249s" in launches[-1]["prior"])
     check("a clean finish clears the standing verdict",
@@ -763,8 +765,8 @@ check("fit rules: a value on a bound means the bounds are wrong",
 check("fit rules: a handful of evaluations is not a fit",
       "not a fit" in withplan)
 check("fit rules: write the ledger as it happens", "ledger file on disk AS IT" in withplan)
-check("fit rules: write the fitted value into the case dictionary",
-      "WRITE THE SELECTED COEFFICIENT INTO THE CASE" in withplan)
+check("fit rules: write the fitted value where the run reads it",
+      "WRITE THE FITTED VALUE INTO THE FILE" in withplan)
 
 # And the sandbox must make orphaning impossible, not merely discouraged.
 import inspect as _insp
@@ -854,30 +856,115 @@ _s3 = _i3.spec_from_file_location(
 _c3 = _i3.module_from_spec(_s3)
 _s3.loader.exec_module(_c3)
 guide = _c3.build_agent_prompt(
-    topic="t", hypothesis="derive from kOmegaSST", variant_name="v",
+    topic="t", hypothesis="H", variant_name="v",
     starter_case=Path("/tmp/s"), run_dir=Path("/tmp/r"), wm_project_dir=None)
 
+# The guidance must be transferable, not a recipe for one framework's
+# turbulence closure. An earlier version spelled out five kOmegaSST derivation
+# rules; that fixed one candidate and made every viscosity-model, boundary-
+# condition or scheme study carry irrelevant instructions in a runner whose own
+# docstring calls itself generic.
 for label, needle in [
-    ("prerequisite includes, not just kOmegaSST.H", '#include "eddyViscosity.H"'),
-    ("kOmegaSSTBase.H named as the real base header", "kOmegaSSTBase.H"),
-    ("two template arguments spelled out",
-     "eddyViscosity<RASModel<BasicMomentumTransportModel>>"),
-    ("the 1-vs-2 template-arg error named", "wrong number of template arguments"),
-    ("type is the FIRST constructor argument", "type, alpha, rho, U, alphaRhoPhi"),
-    ("the .C needs its own include guard", "#ifndef MyModel_C"),
-    ("the redefinition symptom named", "redefinition of"),
-    ("registration header and makeRASModel", "makeIncompressibleMomentumTransportModel.H"),
-    ("the NoRepository pairing explained", "#ifdef NoRepository"),
-    ("the key heuristic: errors inside WM_PROJECT_DIR mean YOUR bug",
-     "THE BUG IS IN YOUR"),
-    ("told to copy a working sibling rather than re-derive", "fastest reference"),
+    ("the debugging heuristic, stated generally", "READ-ONLY library"),
+    ("errors in library headers mean YOUR bug", "the bug is almost always in"),
+    ("the three usual causes, framework-agnostic",
+     "wrong order"),
+    ("told to copy a working example's skeleton", "The fastest way to get the skeleton right is to copy it"),
+    ("names what to match, without naming a domain", "registration macro"),
+    ("told to change only the physics under test", "Change only the"),
 ]:
     check(f"build prompt states: {label}", needle in guide, needle)
+
+for banned in ("kOmegaSST", "dimensionedScalar", "eddyViscosity", "makeRASModel",
+               "RASModel", "alphaK2", "crossgrad", "bradshaw", "closure_2026"):
+    check(f"build prompt is free of domain/study specifics: {banned}",
+          banned not in guide, f"'{banned}' leaked into a generic prompt")
 
 # It must not fire for unrelated modification families -- this is one section of
 # a generic prompt, so it should be present but the deliverable must survive.
 check("the generic deliverable is still intact alongside it",
       "DELIVERABLE (generic" in guide and "wmake libso" in guide)
+
+
+
+
+# ---------------------------------------------------------------------------
+# 11. Budget arithmetic, and what a deepen pick actually tells the proposer.
+# ---------------------------------------------------------------------------
+print("\n--- candidate cost is measured, not assumed ---")
+
+from cfd_langgraph.manager.tools import _expected_candidate_cost
+
+check("with no history it falls back to the old flat figures",
+      (_expected_candidate_cost([], "code_mod"), _expected_candidate_cost([], "experiment")) == (2, 1))
+
+expensive = [{"action_type": "code_mod", "cost": c} for c in (32, 48, 50, 55, 97)]
+check("an expensive benchmark learns its real cost",
+      _expected_candidate_cost(expensive, "code_mod") >= 32,
+      _expected_candidate_cost(expensive, "code_mod"))
+check("an experiment is cheaper but not an order cheaper",
+      1 < _expected_candidate_cost(expensive, "experiment")
+      <= _expected_candidate_cost(expensive, "code_mod"),
+      _expected_candidate_cost(expensive, "experiment"))
+
+cheap = [{"action_type": "code_mod", "cost": 2} for _ in range(5)]
+check("a cheap single-case study is not inflated",
+      _expected_candidate_cost(cheap, "code_mod") == 2,
+      _expected_candidate_cost(cheap, "code_mod"))
+check("entries with no cost are ignored rather than counted as zero",
+      _expected_candidate_cost([{"action_type": "code_mod"}], "code_mod") == 2)
+
+_src = (Path(__file__).resolve().parents[1] / "src/cfd_langgraph/manager/tools.py").read_text()
+check("the proposer is no longer told the flat 2/1 figures",
+      "code_mod costs 2, experiment costs 1" not in _src)
+# Parsed, not string-matched: the branch's own prose contains the word
+# "continue", and the comment explaining the removed gate contains the gate's
+# source text, so both naive greps test the wrong thing.
+import ast as _ast
+
+_tree = _ast.parse(_src)
+_deepen_branch = None
+for _node in _ast.walk(_tree):
+    if not isinstance(_node, _ast.If):
+        continue
+    _cond = _ast.unparse(_node.test)
+    if "'deepen'" in _cond or '"deepen"' in _cond:
+        if "action" in _cond and "sel" in _cond:
+            _deepen_branch = _node
+            break
+
+check("the proposer has a branch for deepen picks", _deepen_branch is not None)
+if _deepen_branch is not None:
+    _cond = _ast.unparse(_deepen_branch.test)
+    check("it is not gated on the trace having more than one point",
+          "trace" not in _cond, _cond)
+    _appends = sum(
+        1 for n in _ast.walk(_deepen_branch)
+        if isinstance(n, _ast.Call) and _ast.unparse(n.func).endswith("niche_lines.append")
+    )
+    check("it emits exactly one instruction line", _appends == 1, _appends)
+    check("and it does not fall through to the generic text",
+          any(isinstance(n, _ast.Continue) for n in _deepen_branch.body))
+
+
+
+
+print("\n--- the plateau stop is reachable ---")
+from cfd_langgraph.manager.tools import _saturation_window
+
+_expensive = [{"action_type": "code_mod", "cost": 48} for _ in range(20)]
+_w = _saturation_window({}, _expensive, 4000)
+check("the window is in evaluations, not budget units", _w < 100, _w)
+check("and it is smaller than the evaluations the budget can buy",
+      _w < 4000 // 48, f"window {_w} vs ~{4000 // 48} affordable")
+check("an explicit setting still wins",
+      _saturation_window({"saturation_window": 7}, _expensive, 4000) == 7)
+check("a fresh study with no history still gets a usable window",
+      _saturation_window({}, [], 4000) >= 4)
+check("a cheap single-case study gets a larger window than an expensive one",
+      _saturation_window({}, [{"action_type": "code_mod", "cost": 2}] * 20, 4000) > _w)
+check("the config no longer hard-codes a budget-unit window",
+      '"saturation_window": max(3, total_budget // 4)' not in _src)
 
 print(f"\n{'ALL PASS' if F == 0 else str(F) + ' FAILED'}")
 sys.exit(1 if F else 0)

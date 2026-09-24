@@ -210,11 +210,28 @@ class CodexResponsesWrapper:
     """
 
     class _Resp:
-        def __init__(self, content: str, tool_calls: Optional[List[Dict[str, Any]]] = None) -> None:
+        def __init__(
+            self,
+            content: str,
+            tool_calls: Optional[List[Dict[str, Any]]] = None,
+            usage: Optional[Dict[str, Any]] = None,
+            response_id: Optional[str] = None,
+        ) -> None:
             self.content = content
+            # The provider's id for this response: lets a logged row be matched to
+            # exactly one billed response, and a duplicate be recognised as one.
+            self.response_id: Optional[str] = response_id
             # Native Responses `function_call` items, already decoded. Empty for
             # a plain text answer, so callers can treat this uniformly.
             self.tool_calls: List[Dict[str, Any]] = tool_calls or []
+            # The provider's own token accounting for this response, exactly as the
+            # Responses API reports it: input_tokens, input_tokens_details.cached_tokens,
+            # output_tokens, output_tokens_details.reasoning_tokens, total_tokens.
+            # None when the response carried none. Before this was kept, every Codex
+            # call's tokens were a tokenizer estimate of the message text, which leaves
+            # out the tool schemas, reasoning and caching the provider bills -- and was
+            # then logged as "provider_usage", so the estimate looked authoritative.
+            self.usage: Optional[Dict[str, Any]] = usage if isinstance(usage, dict) else None
 
     def __init__(
         self,
@@ -293,11 +310,58 @@ class CodexResponsesWrapper:
         return _StructuredWrapper()
 
     @staticmethod
+    def _content_parts(content: Any) -> List[Dict[str, Any]]:
+        """Translate one message's content into Responses API parts.
+
+        A LangChain message's content is either a string or a list of typed
+        blocks -- text plus images, which is how any vision call is expressed.
+        This used to wrap whatever it was found in a single input_text part,
+        so a list went into a field the API requires to be a string:
+
+            HTTP 400 ... Invalid type for 'input[1].content[0].text':
+            expected a string, but got an array instead.
+
+        Measured on ph_codex_20260902_1806: the results interpreter shows the
+        model its diagnostic figures, so every one of its calls is multimodal.
+        All nine promoted cases failed here, each after eight to ten minutes
+        of figure generation that then had nowhere to go, and the study could
+        not reach its write-up. Nothing about the images was wrong -- they
+        were never validly encoded into the request.
+        """
+        if not isinstance(content, list):
+            return [{"type": "input_text", "text": "" if content is None else str(content)}]
+        parts: List[Dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, str):
+                if block:
+                    parts.append({"type": "input_text", "text": block})
+                continue
+            if not isinstance(block, dict):
+                continue
+            btype = block.get("type")
+            if btype in {"text", "input_text", "output_text"}:
+                text = block.get("text")
+                if isinstance(text, str) and text:
+                    parts.append({"type": "input_text", "text": text})
+            elif btype in {"image_url", "input_image"}:
+                # LangChain nests the URL under image_url.url; the Responses
+                # API takes it flat. Both shapes appear depending on who built
+                # the message, so accept either rather than assuming one.
+                raw = block.get("image_url")
+                url = raw.get("url") if isinstance(raw, dict) else raw
+                if isinstance(url, str) and url:
+                    parts.append({"type": "input_image", "image_url": url})
+        # A message with no renderable part is still a turn the API must see
+        # in the right position, so keep it rather than dropping it and
+        # silently shifting the conversation.
+        return parts or [{"type": "input_text", "text": ""}]
+
+    @staticmethod
     def _to_responses_input(messages: Any) -> List[Dict[str, Any]]:
         return [
             {
                 "role": m.get("role"),
-                "content": [{"type": "input_text", "text": m.get("content", "")}],
+                "content": CodexResponsesWrapper._content_parts(m.get("content", "")),
             }
             for m in messages
         ]
@@ -384,7 +448,21 @@ class CodexResponsesWrapper:
     # connection to be dropped by anything between here and the backend.
     _RETRYABLE_STATUS = (429, 500, 502, 503, 504, 522, 524)
 
-    _MAX_ATTEMPTS = 4
+    # Six attempts over ~7 minutes, not four over fifteen seconds. The old
+    # 2/4/8s ladder was built for a one-off blip and gave up long before any
+    # real fault cleared. Measured across one evening on this account: HTTP 429
+    # rate limiting on the validate call fired immediately after a generate
+    # call, "servers are currently overloaded", a read timeout, three empty
+    # assistant turns, and a response.failed with an OpenAI request id -- none
+    # of which resolve inside fifteen seconds, and every one of them killed a
+    # study stage that had already spent minutes of work.
+    #
+    # A rate-limit window in particular is tens of seconds wide, so the ladder
+    # has to reach into minutes. The cost is a slower failure when something is
+    # genuinely broken; the benefit is not throwing away a stage because a
+    # provider hiccuped for half a minute.
+    _MAX_ATTEMPTS = 6
+    _BACKOFF_SECONDS = (5, 15, 45, 120, 240)
 
     def invoke(
         self,
@@ -445,9 +523,22 @@ class CodexResponsesWrapper:
                     continue
                 if status not in self._RETRYABLE_STATUS:
                     raise
+                from .retry import ProviderQuotaExhausted, describe_wait, provider_quota_reset_s
+
+                reset_s = provider_quota_reset_s(exc)
+                if reset_s is not None:
+                    # A usage limit that resets in hours or days: the five
+                    # retries below would only spend ~7 minutes proving it.
+                    raise ProviderQuotaExhausted(
+                        "Codex usage limit reached; the provider accepts requests again "
+                        f"in {describe_wait(reset_s)}.",
+                        reset_s=reset_s,
+                    ) from exc
                 last_error = exc
             if attempt < self._MAX_ATTEMPTS:
-                delay = 2 ** attempt
+                delay = self._BACKOFF_SECONDS[
+                    min(attempt - 1, len(self._BACKOFF_SECONDS) - 1)
+                ]
                 print(
                     f"[codex] {type(last_error).__name__} on attempt {attempt}/{self._MAX_ATTEMPTS} "
                     f"({str(last_error)[:80]}); retrying in {delay}s",
@@ -513,10 +604,17 @@ class CodexResponsesWrapper:
 
         if not self._stream:
             body = resp.json()
-            return self._Resp(self._extract_output_text(body), self._extract_tool_calls(body))
+            return self._Resp(
+                self._extract_output_text(body),
+                self._extract_tool_calls(body),
+                usage=body.get("usage") if isinstance(body, dict) else None,
+                response_id=body.get("id") if isinstance(body, dict) else None,
+            )
 
         chunks: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
+        usage: Optional[Dict[str, Any]] = None
+        response_id: Optional[str] = None
         try:
             for event in self._iter_sse_text(resp):
                 try:
@@ -551,6 +649,9 @@ class CodexResponsesWrapper:
                     if kind in {"response.completed", "response.incomplete", "response.failed"}:
                         body = parsed.get("response")
                         if isinstance(body, dict):
+                            # The terminal event is where the provider reports usage.
+                            usage = body.get("usage") or usage
+                            response_id = body.get("id") or response_id
                             if not chunks:
                                 text = self._extract_output_text(body)
                                 if text:
@@ -578,7 +679,7 @@ class CodexResponsesWrapper:
                     chunks.append(fallback)
         finally:
             resp.close()
-        return self._Resp("".join(chunks).strip(), tool_calls)
+        return self._Resp("".join(chunks).strip(), tool_calls, usage=usage, response_id=response_id)
 
     @staticmethod
     def _decode_function_call(item: Dict[str, Any]) -> Dict[str, Any]:

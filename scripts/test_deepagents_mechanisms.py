@@ -29,7 +29,6 @@ from cfd_langgraph.config import get_settings  # noqa: E402
 from cfd_langgraph.ideation import candidate_similarity, normalize_literature_records  # noqa: E402
 from cfd_langgraph.manager import tools as manager_tools_module  # noqa: E402
 from cfd_langgraph.manager.tools import (  # noqa: E402
-    _extract_target_improvement_pct,
     _improvement_pct,
     _run_succeeded,
     build_manager_tools,
@@ -198,8 +197,18 @@ def test_novelty_evaluator_fails_closed() -> None:
 def test_score_and_status_helpers() -> None:
     check("native status-only success is normalized", _run_succeeded({"status": "success"}))
     check("explicit failed success flag is not overridden", not _run_succeeded({"status": "failed", "success": False}))
-    check("topic improvement target is extracted", _extract_target_improvement_pct("targeting >=30% improvement") == 30.0)
-    check("beat-baseline phrasing extracts its percentage target", _extract_target_improvement_pct("beats the baseline Cf error by 25%") == 25.0)
+    # The pattern-matching extractor these exercised is gone: it returned 0 --
+    # "no threshold at all" -- whenever it misread the phrasing, and a 0%
+    # threshold makes any candidate that is not strictly worse a success.
+    # Reading the target is now the model's job (_llm_target_improvement_pct),
+    # so what is worth asserting here is that nothing pattern-matches it.
+    import inspect as _inspect
+    from cfd_langgraph.manager import tools as _tools
+    _src = _inspect.getsource(_tools._llm_target_improvement_pct)
+    check("the improvement target is read by the model, not by a pattern",
+          "re.search" not in _src and "re.match" not in _src)
+    check("and a failed read is reported rather than silently becoming 0%",
+          "WARNING" in _src)
     check("min-direction improvement is positive when error drops", abs(_improvement_pct(0.7, 1.0, "min") - 30.0) < 1e-9)
     check("max-direction improvement is positive when score rises", abs(_improvement_pct(1.3, 1.0, "max") - 30.0) < 1e-9)
     profile = ResourceProfile(wall_clock_s=1.0, peak_used_mem_mb=100.0, avg_cpu_percent=50.0, logical_cores=8)
@@ -247,7 +256,7 @@ def test_study_wide_concurrency_and_exclusive_calibration() -> None:
     peak = 0
     original_benchmark = coordinator_module.benchmark_case
 
-    def fake_benchmark(fn):
+    def fake_benchmark(fn, **_kwargs):
         return fn(), ResourceProfile(0.04, 256.0, 25.0, 4)
 
     try:
@@ -1190,6 +1199,95 @@ def test_oed_search_is_seeded_from_the_approved_hypotheses() -> None:
     check("already-tried ones are excluded", "already-evaluated list above" in block)
 
 
+def test_only_a_verified_baseline_names_the_number_to_beat() -> None:
+    """The half-finished setup that left a look-alike baseline on disk.
+
+    Setup has two stages. The --setup-only subprocess knows only the single
+    baseline case; oed_setup_search scores the declared evaluation set right
+    after it returns and writes the verified baseline. The subprocess used to
+    write its single-case number to baseline_score.json anyway, so whenever
+    the second stage failed, that file sat where the verified one belongs.
+
+    Measured on runs/closure_20260906_codex: the subprocess wrote 0.0208 for
+    CBFS alone, oed_setup_search hit its "no verified comparator and baseline"
+    guard and returned without overwriting, and the run stalled -- 563 of its
+    639 tool calls were greps of this source as the manager tried to work out
+    why it was blocked. The true 32-case mean is 0.1136, five times larger.
+
+    Two things keep that from recurring: the file is written only once it is
+    verified, and the reader that decides what beats baseline refuses one that
+    is not.
+    """
+    import inspect
+    from pathlib import Path
+
+    from cfd_langgraph.manager import tools as T
+
+    setup_src = Path("scripts/open_ended_discovery.py").read_text(encoding="utf-8")
+    block = setup_src[setup_src.index("    if setup_only:"):][:3000]
+    check(
+        "the setup stage no longer writes a baseline-shaped file",
+        'disc_dir / "baseline_score.json"' not in block,
+    )
+    check(
+        "it writes its single-case number under its own name instead",
+        'baseline_score_setup_stage.json' in block,
+    )
+    check(
+        "and marks it unverified",
+        '"verified": False' in block,
+    )
+
+    source = inspect.getsource(T)
+    check(
+        "an unverified baseline names nothing to beat",
+        'baseline_value = baseline_doc.get("value") if baseline_doc.get("verified") else None' in source,
+    )
+
+
+def test_a_resubmitted_case_is_not_recorded_as_a_second_candidate() -> None:
+    """The same solve entering history twice under a new variant name.
+
+    `already_recorded` keys on the candidate directory, so copying a finished
+    case into a fresh `cand_*` wrapper defeats it. On
+    ph_gemini38_20260902_2349 that happened twice: iteration 45
+    (`sa_enstrophy_core_suppression`, cost 13) came back as iteration 72
+    (`sa_enstrophy_elite_proceed`), and iteration 38 (`sa_sls_sensor`, cost 4)
+    as iteration 73 (`sa_sls_elite_proceed`) -- 17 solver runs billed twice,
+    two unearned archive visits, and two stale PROCEED stamps that closed the
+    search 2386 runs early.
+
+    Both halves of the test matter. Identical scores alone are not identity:
+    across ph_codex_20260902_1806 and that study, 16 groups of records share a
+    score to every digit of a double -- refits that settle back on the
+    parent's coefficients, and modifications too weak to move the metric --
+    and every one of those is a real evaluation that really cost solver runs.
+    The discriminating fact is that the resubmitted case directory is still
+    named after the candidate it was built for.
+    """
+    import inspect
+
+    from cfd_langgraph.manager import tools as T
+
+    source = inspect.getsource(T)
+    check(
+        "the case's own name identifies who built it",
+        "built_for = Path(case_dir.rstrip(\"/\")).name" in source,
+    )
+    check(
+        "a case submitting under its own name is never flagged",
+        "if not built_for or built_for == mine:" in source,
+    )
+    check(
+        "a rebuild under the same name that scores differently is still recorded",
+        "if mine_score is None or prior_score is None or mine_score != prior_score:" in source,
+    )
+    check(
+        "the skip is reported rather than silent",
+        '"duplicate_solves_skipped": duplicates,' in source,
+    )
+
+
 def test_promotion_does_not_require_an_interpretation_that_cannot_run() -> None:
     """The deadlock that stopped a finished study from becoming a paper.
 
@@ -1209,11 +1307,40 @@ def test_promotion_does_not_require_an_interpretation_that_cannot_run() -> None:
     check("promotion keys off measured improvement", "improving = [h for h in real_evals if _beats_baseline(h)]" in source)
     check(
         "a study with improvement counts as having a winner",
-        "has_winner = proceed_count > 0 or bool(improving)" in source,
+        "has_winner = target_reached or bool(improving)" in source,
     )
     check(
         "saturation can complete the search without an interpreter verdict",
-        "saturated and (proceed_count > 0 or bool(improving))" in source,
+        "and (target_reached or bool(improving))" in source,
+    )
+    # Both arms are measured quantities -- an improvement percentage compared
+    # against the study's target, or simply beating the baseline -- so neither
+    # can recreate the promotion/interpretation deadlock above. interpret_case
+    # is not consulted at all.
+    check(
+        "completion keys off measured improvement, not an interpreter verdict",
+        "interpret_case" not in source[source.index("target_reached = any("):source.index("has_winner = target_reached")],
+    )
+    # A candidate's PROCEED/target_met stamp records the target in force when
+    # it was scored and is never revised, so it cannot stand in for "the
+    # current target was reached". ph_gemini38_20260902_2349 closed itself at
+    # 614 of 3000 budget on two Sep-4 records stamped PROCEED under a 5%
+    # target, re-submitted after the target had been raised to 30%.
+    check(
+        "the stale-stamp path is gone from the completion rule",
+        "proceed_count == 0" not in source,
+    )
+    check(
+        "completion re-measures improvement against the live target",
+        'float(h["improvement_pct"]) >= target_pct' in source,
+    )
+    # A stated target that no candidate has reached must not be closed out by
+    # saturation while budget remains: ph_codex_20260902_1806 declared itself
+    # complete three times (-4.53%, -7.77%, -25.83%) against a 30% target, and
+    # improved substantially every time it was pushed to continue.
+    check(
+        "an unmet stated target blocks saturation-completion",
+        "target_declared_and_unmet" in source,
     )
     check("only the best are promoted", "promotable = sorted(improving, key=_score_of)[:_OED_MAX_PROMOTED]" in source)
 
@@ -1265,6 +1392,8 @@ def main() -> int:
     test_llm_duplicate_check_fails_toward_spending()
     test_hypothesis_stages_are_given_the_fixed_case_setup()
     test_oed_search_is_seeded_from_the_approved_hypotheses()
+    test_only_a_verified_baseline_names_the_number_to_beat()
+    test_a_resubmitted_case_is_not_recorded_as_a_second_candidate()
     test_promotion_does_not_require_an_interpretation_that_cannot_run()
     test_a_study_with_no_improvement_still_promotes_nothing()
     test_requirements_publish_what_passed_not_all_or_nothing()

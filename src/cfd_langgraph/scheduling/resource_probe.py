@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import psutil
 
@@ -77,39 +77,14 @@ class _SystemSampler:
             self._thread.join(timeout=self.interval_s * 2)
 
 
-def benchmark_case(
-    run_fn: Callable[[], Any], *, sample_interval_s: float = 2.0
-) -> Tuple[Any, ResourceProfile]:
-    """Run one calibration case and measure what it actually cost.
-
-    ``run_fn`` must be a blocking call that launches and waits for exactly one
-    OpenFOAM case (e.g. ``lambda: FoamAgentRunner(...).run(..., execute=True)``).
-    Call this only for the first case of a physics group / study — running it
-    alone, with nothing else competing for the machine, is what makes the
-    measurement meaningful.
-
-    Returns ``(run_fn()'s return value, ResourceProfile)``.
-    """
-    baseline = psutil.virtual_memory()
-    baseline_used_mb = (baseline.total - baseline.available) / (1024 * 1024)
-
-    sampler = _SystemSampler(interval_s=sample_interval_s)
-    t0 = time.monotonic()
-    with sampler:
-        result = run_fn()
-    wall_clock_s = time.monotonic() - t0
-
-    peak_used_mb = max(sampler.mem_used_samples_mb, default=baseline_used_mb)
-    avg_cpu = (
-        sum(sampler.cpu_percent_samples) / len(sampler.cpu_percent_samples)
-        if sampler.cpu_percent_samples
-        else 0.0
-    )
-
-    profile = ResourceProfile(
+def _profile_from(sampler: _SystemSampler, baseline_used_mb: float, wall_clock_s: float) -> ResourceProfile:
+    mem = list(sampler.mem_used_samples_mb)
+    cpu = list(sampler.cpu_percent_samples)
+    peak_used_mb = max(mem, default=baseline_used_mb)
+    return ResourceProfile(
         wall_clock_s=wall_clock_s,
         peak_used_mem_mb=max(0.0, peak_used_mb - baseline_used_mb),
-        avg_cpu_percent=avg_cpu,
+        avg_cpu_percent=(sum(cpu) / len(cpu)) if cpu else 0.0,
         # Zero samples means the case finished inside one sampling interval —
         # in practice a dict/mesh error that died in seconds, which is the
         # most common first-case outcome. Without this flag it looks like a
@@ -117,6 +92,53 @@ def benchmark_case(
         # an enormous concurrency limit from what is really a failed
         # measurement. Recorded honestly instead, so the scheduler can decline
         # to derive a limit from it.
-        sample_count=len(sampler.cpu_percent_samples),
+        sample_count=len(cpu),
     )
-    return result, profile
+
+
+def benchmark_case(
+    run_fn: Callable[[], Any], *, sample_interval_s: float = 2.0,
+    window_s: Optional[float] = None,
+    on_window: Optional[Callable[[ResourceProfile], None]] = None,
+) -> Tuple[Any, ResourceProfile]:
+    """Run one calibration case and measure what it actually cost.
+
+    ``run_fn`` must be a blocking call that launches and waits for exactly one
+    case (e.g. ``lambda: FoamAgentRunner(...).run(..., execute=True)``).
+    Call this only for the first case of a physics group / study — running it
+    alone, with nothing else competing for the machine, is what makes the
+    measurement meaningful.
+
+    With ``window_s`` and ``on_window``, ``on_window`` is called once, from a
+    timer thread, with the profile measured over the first ``window_s``
+    seconds if the case is still running then -- so a caller can stop holding
+    everything else back without waiting for a case that may run for hours.
+    It is never called after this function returns.
+
+    Returns ``(run_fn()'s return value, ResourceProfile)``, the profile over
+    the whole run.
+    """
+    baseline = psutil.virtual_memory()
+    baseline_used_mb = (baseline.total - baseline.available) / (1024 * 1024)
+
+    sampler = _SystemSampler(interval_s=sample_interval_s)
+    t0 = time.monotonic()
+    timer: Optional[threading.Timer] = None
+    with sampler:
+        if window_s and on_window is not None:
+            def _fire() -> None:
+                try:
+                    on_window(_profile_from(sampler, baseline_used_mb, time.monotonic() - t0))
+                except Exception:
+                    pass
+
+            timer = threading.Timer(float(window_s), _fire)
+            timer.daemon = True
+            timer.start()
+        try:
+            result = run_fn()
+        finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join()
+    return result, _profile_from(sampler, baseline_used_mb, time.monotonic() - t0)

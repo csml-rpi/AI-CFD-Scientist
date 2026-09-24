@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +98,200 @@ def _grep_error_lines(stdout: str, stderr: str, *, max_lines: int = 40) -> str:
     return "\n".join(out_lines)
 
 
+# Driver nodes every NVIDIA GPU needs, whichever GPUs are exposed.
+_NVIDIA_SHARED_NODES = (
+    "/dev/nvidiactl", "/dev/nvidia-uvm", "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-modeset", "/dev/nvidia-caps",
+)
+
+
+def _nvidia_minor_by_bus() -> Dict[str, int]:
+    """PCI bus id -> /dev/nvidiaN minor number, from the driver's own records.
+
+    The minor is not the nvidia-smi index. On the three-A6000 host this was
+    written on they run in opposite orders: GPU 0 is /dev/nvidia2 and GPU 2 is
+    /dev/nvidia0, so binding /dev/nvidia<index> would expose the wrong cards.
+    """
+    import glob
+
+    minors: Dict[str, int] = {}
+    for info in glob.glob("/proc/driver/nvidia/gpus/*/information"):
+        bus = Path(info).parent.name.lower()
+        for line in Path(info).read_text(errors="replace").splitlines():
+            key, _, value = line.partition(":")
+            if key.strip() == "Device Minor" and value.strip().isdigit():
+                minors[bus] = int(value.strip())
+    return minors
+
+
+def _normalise_bus_id(bus: str) -> str:
+    # nvidia-smi prints an 8-digit PCI domain (00000000:21:00.0); the driver's
+    # /proc entries use 4 (0000:21:00.0).
+    domain, _, rest = bus.strip().lower().partition(":")
+    try:
+        return f"{int(domain, 16):04x}:{rest}"
+    except ValueError:
+        return bus.strip().lower()
+
+
+def _visible_gpu_minors() -> Optional[List[int]]:
+    """Device minors of the GPUs CUDA_VISIBLE_DEVICES names, in CUDA order.
+
+    None means no restriction could be worked out -- the variable is unset, or
+    it names something this cannot map (a MIG slice, no nvidia-smi, no driver
+    records) -- and the caller then exposes every GPU, as before.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is None:
+        return None
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return []
+    try:
+        listing = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,uuid,pci.bus_id", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=30, check=True,
+        ).stdout
+    except Exception:
+        return None
+    bus_by_id: Dict[str, str] = {}
+    for row in listing.splitlines():
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) == 3:
+            bus_by_id[parts[0]] = bus_by_id[parts[1].lower()] = _normalise_bus_id(parts[2])
+    minor_by_bus = _nvidia_minor_by_bus()
+    minors: List[int] = []
+    for token in tokens:
+        if token.startswith("mig-"):
+            return None
+        bus = bus_by_id.get(token)
+        if bus is None and token.startswith("gpu-"):
+            matches = {b for k, b in bus_by_id.items() if k.startswith(token)}
+            bus = matches.pop() if len(matches) == 1 else None
+        if bus is None:
+            break  # CUDA itself stops at the first id it cannot resolve
+        if bus not in minor_by_bus:
+            return None
+        minors.append(minor_by_bus[bus])
+    return minors
+
+
+def _accelerator_sandbox_args() -> List[str]:
+    """bwrap arguments that give the sandbox this run's GPUs, and only those.
+
+    The sandbox mounts a fresh minimal /dev (bwrap --dev), which contains no GPU
+    device nodes, so nothing a build agent ran could reach a GPU: measured
+    inside the sandbox on a host with three RTX A6000s, torch reported
+    cuda_available=False, 0 devices, "Can't initialize NVML" -- while the
+    agent's own prompt, probed outside the sandbox, told it CUDA was available.
+    Every candidate trained on CPU. Binding device nodes grants device access
+    only; the read-only host, the single writable run directory and the PID
+    namespace are unchanged.
+
+    Binding EVERY GPU was the next problem. The run's CUDA_VISIBLE_DEVICES is
+    only a default the agent can override, and on crm_codex_20260911_r4 a build
+    agent launched `CUDA_VISIBLE_DEVICES=0 python model/train.py`: the study
+    had GPUs 1 and 2, and seed 0 trained for half an hour on GPU 0, the card
+    given to two other studies. So when CUDA_VISIBLE_DEVICES is set, only
+    those GPUs' device nodes are bound, and inside the sandbox they are
+    renumbered from 0 -- any index an agent picks lands on this run's GPUs or
+    fails, never on someone else's.
+    """
+    import glob
+
+    minors = _visible_gpu_minors()
+    args: List[str] = []
+    if minors is None:
+        nodes = sorted(glob.glob("/dev/nvidia*"))
+    elif not minors:
+        nodes = []
+    else:
+        nodes = [n for n in _NVIDIA_SHARED_NODES if os.path.exists(n)]
+        nodes += [f"/dev/nvidia{m}" for m in minors if os.path.exists(f"/dev/nvidia{m}")]
+        args += ["--setenv", "CUDA_VISIBLE_DEVICES", ",".join(str(i) for i in range(len(minors)))]
+    if os.path.exists("/dev/kfd"):
+        nodes.append("/dev/kfd")
+    for node in nodes:
+        args += ["--dev-bind", node, node]
+    return args
+
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+# The repository folders that hold studies' outputs, named as manager/tools.py
+# names them for its own file tools.
+_REPO_STUDY_STORES = ("runs", "results", "submissions")
+
+
+def _is_study_dir(d: Path) -> bool:
+    return (d / "user_prompt.txt").is_file() or (d / "state.json").is_file()
+
+
+def _withheld_mounts(
+    run_dir: Path, starter_root: Optional[Path], keep: Sequence[Optional[Path]]
+) -> List[str]:
+    """Folders the build shell must not see: other studies' outputs and held-out data.
+
+    The manager's file tools already refuse these (manager/tools.py,
+    _withheld_dir). The build shell, though, mounts the whole filesystem
+    read-only, so a folder those tools refuse was still one `cat` away. The same
+    set is hidden here, each folder covered by an empty tmpfs: the repository's
+    study stores and held-out folders, the starter folder's neighbours, and other
+    studies beside this one. A folder holding something this study must see (its
+    own study directory, its starter, OpenFOAM) is not hidden; its other
+    subfolders are.
+    """
+    own = run_dir
+    for d in (run_dir, *run_dir.parents):
+        if _is_study_dir(d):
+            own = d
+            break
+    kept = [own.resolve()] + [Path(k).resolve() for k in keep if k]
+
+    def children(d: Path) -> List[Path]:
+        try:
+            return sorted(c for c in d.iterdir() if c.is_dir())
+        except OSError:
+            return []
+
+    def within(p: Path, root: Path) -> bool:
+        return p == root or root in p.parents
+
+    repo = _REPO_ROOT.resolve()
+    candidates = [
+        c for c in children(repo)
+        if c.name in _REPO_STUDY_STORES or c.name.lower().startswith("heldout")
+    ]
+    if starter_root is not None:
+        parent = Path(starter_root).resolve().parent
+        # Never when the starter sits in the repository or beside it: its
+        # neighbours would then include the framework itself.
+        if parent != repo and parent not in repo.parents and parent != Path(parent.anchor):
+            candidates += children(parent)
+    if _is_study_dir(own):
+        candidates += [c for c in children(own.parent) if _is_study_dir(c)]
+
+    masks: List[str] = []
+    seen: set = set()
+
+    def add(d: Path, depth: int = 0) -> None:
+        d = d.resolve()
+        if d in seen:
+            return
+        seen.add(d)
+        if any(within(d, k) for k in kept):
+            return
+        if any(within(k, d) for k in kept):
+            if depth < 4:
+                for c in children(d):
+                    add(c, depth + 1)
+            return
+        masks.append(str(d))
+
+    for c in candidates:
+        add(c)
+    return masks
+
+
 class Sandbox:
     """Bounded read / write / shell access tied to the run directory."""
 
@@ -107,16 +301,36 @@ class Sandbox:
         run_dir: Path,
         starter_case: Path,
         wm_project_dir: Optional[Path],
+        starter_root: Optional[Path] = None,
         max_read_bytes: int = 200_000,
         max_write_bytes: int = 200_000,
         bash_timeout: int = 600,
+        max_bash_timeout: int = 14_400,
+        cost_tokens: Optional[Sequence[str]] = None,
     ) -> None:
         self.run_dir = Path(run_dir).resolve()
         self.starter_case = Path(starter_case).resolve()
         self.wm = Path(wm_project_dir).resolve() if wm_project_dir else None
+        # The study's starter folder, readable in full. Without it read_file
+        # allowed only the baseline result directory that `starter_case` points
+        # at, so TASK.md, data/README.md and the study's own scorer -- the files
+        # the task tells the agent to read -- came back "read denied" while
+        # `cat` on the same path worked, the host being read-only-mounted
+        # anyway. Measured 2026-09-12: 50 such refusals on crm_codex_20260911_r4
+        # and 12 on malmo_gemma_20260911, every one worked around with cat.
+        self.starter_root = Path(starter_root).resolve() if starter_root else None
         self.max_read_bytes = max_read_bytes
         self.max_write_bytes = max_write_bytes
         self.bash_timeout = bash_timeout
+        # A command may ask for longer than the default when it genuinely needs
+        # it. Training a model is not a ten-minute job: on
+        # malmo_gemma_20260911 a ten-seed training loop was cut at 600s five
+        # turns in a row, and because a cut command was never actually stopped,
+        # every retry left another training run going. The agent names the time
+        # it needs (after timing one epoch or seed); this is the ceiling, and
+        # ``deadline`` trims it to the candidate's own wall-clock fence.
+        self.max_bash_timeout = max(int(bash_timeout), int(max_bash_timeout))
+        self.deadline: Optional[float] = None
         # Real solver launches this candidate has made — the measured cost the
         # search charges it. See _note_solver_invocations.
         self.solver_invocations = 0
@@ -126,6 +340,18 @@ class Sandbox:
         # with progress-nudge guidance, forcing the agent to advance.
         self._writes_per_path: Dict[str, int] = {}
         self.MAX_WRITES_PER_PATH = 3
+        # The same circuit-breaker for shell commands. The write counter
+        # above only sees write_file, so an agent that writes through the
+        # shell instead loops unchecked: on malmo_gemma_20260911 one
+        # `cat <<EOF > train_v2.py` was sent 15 times, another version 7,
+        # another 4, never run and never checked, until the turn cap.
+        self._bash_repeats: Dict[str, Dict[str, Any]] = {}
+        self.MAX_IDENTICAL_BASH_RESULTS = 3
+        # What counts as one unit of measured cost in this study. Defaults to
+        # the OpenFOAM solvers; a study whose candidates are trained rather
+        # than solved passes its own tokens so the budget still measures the
+        # expensive step rather than counting nothing.
+        self._cost_tokens: Tuple[str, ...] = tuple(cost_tokens) if cost_tokens else self._SOLVER_TOKENS
 
     # ---- path checks
     def _is_under(self, p: Path, root: Path) -> bool:
@@ -141,6 +367,8 @@ class Sandbox:
             return True, "run_dir"
         if self._is_under(rp, self.starter_case):
             return True, "starter_case"
+        if self.starter_root and self._is_under(rp, self.starter_root):
+            return True, "starter_root"
         if self.wm and self._is_under(rp, self.wm):
             return True, "wm_project"
         # Allow common OpenFOAM-related read locations
@@ -161,22 +389,63 @@ class Sandbox:
         return False, "outside run_dir"
 
     # ---- tool: read_file
-    def read_file(self, path: str, max_bytes: Optional[int] = None) -> Dict[str, Any]:
+    # One page is what one turn of the transcript can hold. A read larger than
+    # that used to reach the agent as its first and last 3000 characters with
+    # the middle removed, while the result still said truncated=false.
+    # Measured on ph_glm_20260910e: the agent read a 10KB model source, said
+    # "the previous read was truncated in the middle", and re-read it to no
+    # effect. Long files are served in pages instead, each one stating where it
+    # stops and where the next begins.
+    READ_PAGE_CHARS = 6000
+    MAX_PAGEABLE_FILE_BYTES = 20_000_000
+
+    def read_file(self, path: str, max_bytes: Optional[int] = None,
+                  start: Optional[int] = None) -> Dict[str, Any]:
         p = Path(path).expanduser()
         ok, why = self._read_allowed(p)
         if not ok:
-            return {"ok": False, "error": f"read denied: {p} (must be inside run_dir / starter_case / WM_PROJECT_DIR)"}
+            return {"ok": False, "error": f"read denied: {p} (must be inside run_dir / the starter folder / WM_PROJECT_DIR)"}
         if not p.is_file():
             return {"ok": False, "error": f"not a file: {p}"}
-        cap = min(max_bytes or self.max_read_bytes, self.max_read_bytes)
-        data = p.read_bytes()[:cap]
         try:
-            content = data.decode("utf-8", errors="replace")
+            size = p.stat().st_size
+        except OSError as exc:
+            return {"ok": False, "error": f"stat failed: {exc}"}
+        if size > self.MAX_PAGEABLE_FILE_BYTES:
+            return {"ok": False, "error": (
+                f"file is {size} bytes, too large to page through; use run_bash "
+                "(head, tail, sed -n, grep) to read the part you need")}
+        try:
+            text = p.read_bytes().decode("utf-8", errors="replace")
         except Exception as exc:
-            return {"ok": False, "error": f"decode err: {exc}"}
-        truncated = len(data) >= cap
-        return {"ok": True, "path": str(p.resolve()), "content": content,
-                "size": p.stat().st_size, "truncated": truncated}
+            return {"ok": False, "error": f"read failed: {exc}"}
+        total = len(text)
+        try:
+            begin = max(0, int(start or 0))
+        except (TypeError, ValueError):
+            begin = 0
+        begin = min(begin, total)
+        try:
+            page = int(max_bytes) if max_bytes else self.READ_PAGE_CHARS
+        except (TypeError, ValueError):
+            page = self.READ_PAGE_CHARS
+        page = max(1, min(page, self.READ_PAGE_CHARS))
+        end = min(total, begin + page)
+        if end < total:
+            # Break after a newline so no line is split across pages.
+            cut = text.rfind("\n", begin, end)
+            if cut >= begin:
+                end = cut + 1
+        truncated = end < total
+        result: Dict[str, Any] = {
+            "ok": True, "path": str(p.resolve()), "content": text[begin:end],
+            "size": size, "total_chars": total, "start": begin, "end": end,
+            "truncated": truncated, "next_start": end if truncated else None,
+        }
+        if truncated:
+            result["note"] = (f"showing characters {begin}-{end} of {total}; call read_file "
+                              f"again with start={end} for the next page")
+        return result
 
     # ---- tool: write_file
     def write_file(self, path: str, content: str, *, mode: str = "w") -> Dict[str, Any]:
@@ -208,11 +477,9 @@ class Sandbox:
                         f"refused: {rp} has already been written {prior} times in this "
                         f"session and the new content is identical to what is on disk. "
                         f"This file is FINAL — do not write to it again. "
-                        f"ADVANCE: write the next required file (the implementation "
-                        f"file if you've only written the header; the build descriptor "
-                        f"files Make/files and Make/options if you've written .H and "
-                        f".C; or invoke the build/run step if all source files are in "
-                        f"place). Track which step of the workflow you are on."
+                        f"ADVANCE: write the next file your task needs, or run what "
+                        f"you already have and let its output decide the next edit. "
+                        f"Track which step of the work you are on."
                     ),
                 }
             else:
@@ -220,6 +487,11 @@ class Sandbox:
                 pass
         if len(content.encode("utf-8")) > self.max_write_bytes * 4:
             return {"ok": False, "error": f"content too large (>{self.max_write_bytes*4} bytes)"}
+        # Missing parent folders are created. The brief names folders the agent
+        # is expected to write into, and a write into one that did not exist
+        # yet failed and threw the content away -- on
+        # malmo_qwen38flash_openrouter_20260913, an 18k-token script.
+        p.parent.mkdir(parents=True, exist_ok=True)
         if mode == "w":
             p.write_text(content, encoding="utf-8")
         else:
@@ -262,10 +534,64 @@ class Sandbox:
         over-estimate — a bound in the safe direction for budget accounting.
         """
         text = str(cmd or "")
-        for token in self._SOLVER_TOKENS:
+        for token in self._cost_tokens:
             hits = text.count(token)
             if hits:
                 self.solver_invocations += hits
+
+    def _note_bash_result(self, key: str, result: Dict[str, Any]) -> None:
+        """Count how often a command came back with the very same result.
+
+        A command re-run after the script it runs was edited returns something
+        different, which resets the count, so only a loop that changes nothing
+        is counted.
+        """
+        import hashlib
+
+        signature = hashlib.md5(
+            f"{result.get('rc')}|{result.get('timeout')}|{result.get('stdout', '')}|"
+            f"{result.get('stderr', '')}".encode("utf-8", "replace")
+        ).hexdigest()
+        seen = self._bash_repeats.get(key)
+        if seen and seen.get("signature") == signature:
+            seen["count"] = int(seen.get("count", 1)) + 1
+            seen["rc"] = result.get("rc")
+        else:
+            self._bash_repeats[key] = {"signature": signature, "count": 1, "rc": result.get("rc")}
+
+    def _bash_ceiling(self) -> int:
+        """Longest a single command may run, trimmed by the candidate's own
+        wall-clock fence when it has one: no command may outlive the candidate."""
+        ceiling = int(self.max_bash_timeout)
+        if self.deadline is not None:
+            ceiling = min(ceiling, max(1, int(self.deadline - time.time())))
+        return max(1, ceiling)
+
+    def _bash_allowance(self, requested: Optional[int]) -> int:
+        """What this command actually gets: what it asked for, or the default,
+        bounded by the ceiling."""
+        try:
+            asked = int(requested) if requested else 0
+        except (TypeError, ValueError):
+            asked = 0
+        allowance = asked if asked > 0 else int(self.bash_timeout)
+        return max(1, min(allowance, self._bash_ceiling()))
+
+    @staticmethod
+    def _kill_process_group(proc: Any) -> None:
+        """Stop the command and everything it started."""
+        import signal
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(proc.pid, sig)
+            except (ProcessLookupError, PermissionError):
+                return
+            try:
+                proc.wait(timeout=5)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
     # ---- tool: run_bash
     def run_bash(self, cmd: str, cwd: Optional[str] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
@@ -275,12 +601,27 @@ class Sandbox:
         # read-only and only this candidate's run_dir is writable.
         cwd_p = Path(cwd).expanduser().resolve() if cwd else self.run_dir
         if not self._is_under(cwd_p, self.run_dir):
-            return {"ok": False, "error": f"cwd must be inside run_dir: {cwd_p}"}
+            return {"ok": False, "error": f"cwd must be inside the run directory {self.run_dir}; got {cwd_p}"}
         if not cwd_p.is_dir():
             return {"ok": False, "error": f"cwd does not exist: {cwd_p}"}
         if not isinstance(cmd, str) or not cmd.strip():
             return {"ok": False, "error": "empty command"}
         self._note_solver_invocations(cmd)
+        repeat_key = cmd.strip()
+        seen = self._bash_repeats.get(repeat_key)
+        if seen and int(seen.get("count", 0)) >= self.MAX_IDENTICAL_BASH_RESULTS:
+            return {
+                "ok": False,
+                "error": (
+                    f"refused: this exact command has already run {seen['count']} times in "
+                    f"this session and returned the same result every time (rc={seen.get('rc')}). "
+                    "Running it again changes nothing. Look at what it produced — read the "
+                    "file it wrote, run that file, or read the output you already have — and "
+                    "then do something different."
+                ),
+                "repeat_count": seen["count"],
+                "last_rc": seen.get("rc"),
+            }
         # Ensure OpenFOAM env is sourced (so wmake works) — find a bashrc.
         bashrc_candidates = []
         if self.wm:
@@ -291,7 +632,14 @@ class Sandbox:
         ]
         bashrc = next((b for b in bashrc_candidates if Path(b).is_file()), None)
         prefix = f". \"{bashrc}\" >/dev/null 2>&1 && " if bashrc else ""
-        full = f"{prefix}{cmd}"
+        # `bash -lc` runs the user's login profile, which put another conda
+        # install's python first on PATH: a bare `python` in the sandbox ran
+        # Python 3.10 with torch 2.11 while the brief listed 3.12 with torch 2.13
+        # (malmo_qwen38flash_openrouter_20260913). A folder holding only
+        # python/python3 links to this interpreter goes first instead, so no
+        # other tool on PATH is shadowed.
+        shim = _interpreter_shim_dir()
+        full = f"{prefix}export PATH=\"{shim}:$PATH\" && {cmd}" if shim else f"{prefix}{cmd}"
         bwrap = shutil.which("bwrap")
         if not bwrap:
             return {
@@ -322,6 +670,10 @@ class Sandbox:
             "--unshare-pid",
             "--ro-bind", "/", "/",
         ]
+        for masked in _withheld_mounts(
+            self.run_dir, self.starter_root, (self.starter_case, self.starter_root, self.wm)
+        ):
+            sandbox_cmd += ["--tmpfs", masked]
         try:
             self.run_dir.relative_to(Path("/tmp"))
             run_is_under_tmp = True
@@ -333,33 +685,76 @@ class Sandbox:
             "--bind", str(self.run_dir), str(self.run_dir),
             "--proc", "/proc",
             "--dev", "/dev",
+        ]
+        sandbox_cmd += _accelerator_sandbox_args()
+        sandbox_cmd += [
             "--chdir", str(cwd_p),
             "bash", "-lc", full,
         ]
-        t = min(timeout or self.bash_timeout, self.bash_timeout)
+        t = self._bash_allowance(timeout)
+        # Said up front when the allowance is cut, not discovered at the kill:
+        # an agent that asked for 6500 s and silently got 4816 s planned the
+        # whole run against the wrong number (airfrans_codex_20260913).
+        trimmed_note = ""
         try:
-            proc = subprocess.run(
-                sandbox_cmd,
-                text=True,
-                capture_output=True,
-                timeout=t,
-                check=False,
+            asked = int(timeout) if timeout else 0
+        except (TypeError, ValueError):
+            asked = 0
+        if asked > t:
+            trimmed_note = (
+                f"You asked for {asked}s; this command was given {t}s, the most any "
+                "command may run right now"
+                + (" (the time this candidate has left)." if self.deadline is not None else ".")
             )
-        except subprocess.TimeoutExpired as exc:
-            tout = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            terr = (exc.stderr or "") if isinstance(exc.stderr, str) else ""
-            return {
+        # Its own process group, so a timed-out command can actually be
+        # stopped. subprocess.run's timeout kills the bwrap process it started
+        # and returns, which left the real work running: on
+        # malmo_gemma_20260911 five cut-off training loops carried on in the
+        # background while the agent retried the same command five times.
+        proc = subprocess.Popen(
+            sandbox_cmd,
+            text=True,
+            # Replaced, not raised: a command whose output was cut mid-character
+            # (`head -c`) or held non-UTF-8 bytes used to raise
+            # UnicodeDecodeError, and the agent got no output at all.
+            encoding="utf-8",
+            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=t)
+        except subprocess.TimeoutExpired:
+            self._kill_process_group(proc)
+            tout, terr = proc.communicate()
+            ceiling = self._bash_ceiling()
+            note = (
+                f"Stopped after {t}s, the time this command was allowed, and "
+                "everything it started was stopped with it. If the work needs "
+                f"longer, pass timeout on the next call — up to {ceiling}s — and "
+                "time one epoch or one seed in a short call first, so the number "
+                "you ask for fits the whole command."
+            )
+            timed_out = {
                 "ok": True,
                 "rc": -1,
-                "error_summary": _grep_error_lines(tout, terr),
-                "stdout": tout[-16000:],
-                "stderr": terr[-16000:],
+                "error_summary": _grep_error_lines(tout, terr) or note,
+                "note": note,
+                "timeout_s": t,
+                "max_timeout_s": ceiling,
+                "stdout": (tout or "")[-16000:],
+                "stderr": (terr or "")[-16000:],
                 "timeout": True,
                 "cwd": str(cwd_p),
             }
-        out = proc.stdout or ""
-        err = proc.stderr or ""
-        return {
+            if trimmed_note:
+                timed_out["timeout_note"] = trimmed_note
+            self._note_bash_result(repeat_key, timed_out)
+            return timed_out
+        out = out or ""
+        err = err or ""
+        result = {
             "ok": True,
             "rc": int(proc.returncode),
             "error_summary": _grep_error_lines(out, err),
@@ -368,6 +763,10 @@ class Sandbox:
             "timeout": False,
             "cwd": str(cwd_p),
         }
+        if trimmed_note:
+            result["timeout_note"] = trimmed_note
+        self._note_bash_result(repeat_key, result)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -379,10 +778,13 @@ Do not output anything outside the JSON object. Do not use markdown fences.
 
 TOOLS:
 
-  {"tool": "read_file", "args": {"path": "<absolute path>", "max_bytes": <int, optional>}}
+  {"tool": "read_file", "args": {"path": "<absolute path>", "start": <int, optional>, "max_bytes": <int, optional>}}
       Read a file. Allowed paths: anywhere inside the run directory, the
       starter case (read-only), and $WM_PROJECT_DIR/src or .../tutorials.
-      Returns {ok, content, size, truncated}.
+      Long files come in pages of up to 6000 characters, split at line ends.
+      Returns {ok, content, size, total_chars, start, end, truncated,
+      next_start}. When truncated is true, call read_file again with
+      start=next_start for the next page.
 
   {"tool": "write_file", "args": {"path": "<absolute path>", "content": "<file body>", "mode": "w"|"a"}}
       Write a file. Path must be inside the run directory.
@@ -398,9 +800,15 @@ TOOLS:
       need to scan a long stdout to find the failure. A Make/files entry that
       targets $FOAM_USER_LIBBIN will fail because it is read-only: LIB output
       must be an absolute path below the case's customModels directory.
-      `stdout` and `stderr`
-      contain the LAST 16K chars (truncation is tail-biased — recent output
-      preserved). Plan your next edit from `error_summary`.
+      You see the last 6000 characters of `stdout` and of `stderr`
+      (tail-biased, so recent output is kept). Plan your next edit from
+      `error_summary`.
+      A command is stopped when its time allowance runs out — ten minutes by
+      default — and everything it started is stopped with it. For work that
+      needs longer (a compile plus a solver run, a training run), time a short
+      slice of it first, then pass `timeout` big enough for the whole command;
+      a timed-out result reports the allowance it used and the ceiling you may
+      ask for.
 
   {"tool": "done", "args": {"case_dir": "<abs path>", "class_name": "<name>", "compiled_so": "<abs .so path>", "summary": "<one-line summary>"}}
       Signal completion. Call this ONLY after wmake produced a .so AND
@@ -417,11 +825,11 @@ PROTOCOL RULES:
     by re-reading your own writes.
   - When the build step fails, read `error_summary` first (pre-extracted
     error lines with context), then scan the tail of `stdout`/`stderr` (last
-    16K chars are preserved). Edit the offending file based on the actual
-    diagnostic — do not guess. If you need more than 16K of output, re-run
-    the build while redirecting the log to a path inside the candidate run
-    directory (not /tmp, which is private to each shell call), then read that
-    file. Do not give up after one failure — iterate until
+    6000 characters are shown). Edit the offending file based on the actual
+    diagnostic — do not guess. If you need more output than that, re-run the
+    build while redirecting the log to a path inside the candidate run
+    directory (not /tmp, which is private to each shell call), then page
+    through that file with read_file. Do not give up after one failure — iterate until
     it builds.
   - Activate the new component by editing whichever case dictionary is
     appropriate for THIS modification family (turbulence model → the
@@ -524,40 +932,33 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + f"Topic: {topic.strip()}\n\n"
         + f"Hypothesis to implement (variant_name={variant_name}):\n{hypothesis.strip()}\n\n"
         + (
-            "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP (read before you start\n"
-            "one -- every one of these rules is here because ignoring it destroyed a\n"
-            "real candidate on run closure_20260826_codex):\n\n"
+            "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP\n\n"
             "  1. NEVER background it. No `nohup`, no trailing `&`, no detached\n"
-            "     process. Run it in the foreground and wait. When the wall clock\n"
-            "     kills you, a backgrounded fit keeps running with nobody left to\n"
-            "     collect its answer: crossgrad_ksource_solver_fit's agent died at\n"
-            "     0.9 hours and its orphaned fit burned another 5.7 hours of CPU,\n"
-            "     completed 16 of 32 evaluations, and was thrown away.\n\n"
+            "     process. Run it in the foreground and wait. If the wall clock\n"
+            "     kills you, a backgrounded job keeps burning compute with nobody\n"
+            "     left to collect its answer, and the work is lost anyway.\n\n"
             "  2. Probe the ends of the range BEFORE optimising. Evaluate the\n"
-            "     objective at the lowest and highest coefficient you would consider.\n"
-            "     If the objective barely moves between them, the coefficient does not\n"
-            "     matter: stop, report that finding, and do not spend the budget\n"
-            "     searching a flat function. crossgrad_ksource_solver_fit ran a\n"
-            "     32-evaluation differential evolution over an objective that varied\n"
-            "     by 0.13% end to end -- six hours to discover nothing.\n\n"
+            "     objective at the lowest and highest value you would consider. If\n"
+            "     it barely moves between them, the parameter does not matter:\n"
+            "     stop, report that finding, and do not spend the budget searching\n"
+            "     a flat function.\n\n"
             "  3. Set bounds you are willing to be wrong about, and check them. If\n"
             "     the optimiser returns a value sitting on a bound, the optimum is\n"
-            "     probably outside it and your answer is an artefact of the box.\n"
-            "     bradshaw_b1_solver_fit measured its best objective at b=0.92, then\n"
-            "     fitted inside [0.35, 0.70] and 'converged' to the edge at 0.617.\n\n"
+            "     probably outside it and your answer is an artefact of the box.\n\n"
             "  4. A handful of evaluations is not a fit. If your optimiser reports\n"
             "     success after two or three objective calls, it has not searched\n"
             "     anything -- say so rather than reporting the number as fitted.\n\n"
             "  5. Write every objective evaluation to a ledger file on disk AS IT\n"
-            "     HAPPENS -- one JSON line per evaluation with the coefficient, the\n"
-            "     per-case scores, the mean, and the elapsed seconds. If you are\n"
-            "     killed, that ledger is the only evidence the fit was working, and\n"
-            "     it is read when deciding whether to give this candidate more time.\n\n"
-            "  6. When the fit finishes, WRITE THE SELECTED COEFFICIENT INTO THE CASE\n"
-            "     DICTIONARY and verify it took effect. A fitted value that stays in\n"
-            "     a Python variable or a JSON file leaves the model running at its\n"
-            "     class default, which scores as the unmodified baseline while\n"
-            "     looking like a real experiment. Six candidates did exactly this.\n\n"
+            "     HAPPENS -- one JSON line per evaluation with the parameter value,\n"
+            "     the score, and the elapsed seconds. If you are killed, that\n"
+            "     ledger is the only evidence the fit was working, and it is read\n"
+            "     when deciding whether to give this candidate more time.\n\n"
+            "  6. When the fit finishes, WRITE THE FITTED VALUE INTO THE FILE THE\n"
+            "     RUN ACTUALLY READS, and verify it took effect. A value left in a\n"
+            "     Python variable or a JSON file means the run uses its default --\n"
+            "     which scores as the unmodified baseline while looking like a real\n"
+            "     experiment, and is the single most expensive mistake available\n"
+            "     here.\n\n"
             "STRATEGY PLAN — carry these steps out. They may require work before any\n"
             "model code is written: reading high-fidelity data, running a fit or an\n"
             "optimiser, and turning the fitted result into the model's coefficients or\n"
@@ -652,70 +1053,38 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
             if str(repair_goal or "").strip() else ""
         )
         + (
-            # Five distinct mistakes, all of which a model can spend its whole
-            # turn budget failing to find, because every compiler error points
-            # into OpenFOAM's own headers rather than at the line responsible.
-            # Measured on run closure_gemini: sst_sensitized_bradshaw_limiter
-            # made 12 wmake attempts over 119 turns and never once compiled,
-            # emitting 109 copies of "'dimensionedScalar' does not name a type"
-            # located in kOmegaSSTBase.H -- a file it had not written. It spent
-            # 58 read_file calls searching OpenFOAM source for a type that was
-            # never missing. Applying the five rules below to its own files
-            # took the error count 109 -> 27 -> 7 -> 1 -> 0.
+            # The transferable lesson, not the instance of it.
             #
-            # This is boilerplate, not science. Stating it costs a few hundred
-            # tokens and saves an entire candidate.
+            # An earlier version of this block spelled out five kOmegaSST
+            # derivation rules -- include order, template arity, constructor
+            # signature, include guards, registration. That fixed one real
+            # candidate and was wrong to put here: this runner is generic
+            # across viscosity models, boundary conditions, fvOptions and
+            # schemes, and hardcoding one framework's turbulence-closure
+            # boilerplate makes every other kind of study carry irrelevant
+            # instructions. What generalises is the DEBUGGING HEURISTIC and
+            # "copy a working example", which apply to extending any compiled
+            # library in any framework.
             "============================================================\n"
-            "DERIVING FROM kOmegaSST IN OPENFOAM 10 — EXACT REQUIRED SHAPE\n"
+            "WHEN A BUILD FAILS\n"
             "============================================================\n"
-            "If your model derives from kOmegaSST, follow this exactly. Every rule\n"
-            "here has produced a build that fails with errors pointing at OpenFOAM's\n"
-            "own headers, which is a trap: the error location is never the cause.\n\n"
-            "1. In the .H, include the PREREQUISITES, not just kOmegaSST.H:\n"
-            "       #include \"RASModel.H\"\n"
-            "       #include \"eddyViscosity.H\"\n"
-            "       #include \"kOmegaSSTBase.H\"\n"
-            "   Including only kOmegaSST.H leaves dimensionedScalar undefined when\n"
-            "   kOmegaSSTBase.H is parsed, and you get ~109 errors reported inside\n"
-            "   kOmegaSSTBase.H. Nothing is wrong with that file.\n\n"
-            "2. The base class takes TWO template arguments:\n"
-            "       template<class BasicMomentumTransportModel>\n"
-            "       class MyModel\n"
-            "       :\n"
-            "           public Foam::kOmegaSST\n"
-            "           <\n"
-            "               eddyViscosity<RASModel<BasicMomentumTransportModel>>,\n"
-            "               BasicMomentumTransportModel\n"
-            "           >\n"
-            "   Writing kOmegaSST<BasicMomentumTransportModel> gives\n"
-            "   'wrong number of template arguments (1, should be 2)'.\n\n"
-            "3. The base constructor takes `type` as its FIRST argument:\n"
-            "       MyModel<B>::MyModel(const alphaField& alpha, const rhoField& rho,\n"
-            "                           const volVectorField& U, ..., const word& type)\n"
-            "       :\n"
-            "           Foam::kOmegaSST<eddyViscosity<RASModel<B>>, B>\n"
-            "           (\n"
-            "               type, alpha, rho, U, alphaRhoPhi, phi, viscosity\n"
-            "           )\n"
-            "   Passing type last gives 'no matching function for call to kOmegaSST(...)'.\n\n"
-            "4. The .C MUST have its own include guard, because the .H includes the\n"
-            "   .C under NoRepository AND the .C is compiled directly:\n"
-            "       #ifndef MyModel_C\n"
-            "       #define MyModel_C\n"
-            "       ... entire file ...\n"
-            "       #endif\n"
-            "   Without it every member is defined twice: 'redefinition of ...'.\n\n"
-            "5. The .C includes its own header first, then the registration header:\n"
-            "       #include \"MyModel.H\"\n"
-            "       #include \"makeIncompressibleMomentumTransportModel.H\"\n"
-            "   and ends with  makeRASModel(MyModel);\n"
-            "   The .H ends with  #ifdef NoRepository / #include \"MyModel.C\" / #endif\n"
-            "   and Make/files lists the .C.\n\n"
-            "IF A COMPILER ERROR POINTS INSIDE $WM_PROJECT_DIR, THE BUG IS IN YOUR\n"
-            "FILE, NOT THAT ONE. Re-read your own .H and .C against the five rules\n"
-            "above before reading any more OpenFOAM source. An existing compiled\n"
-            "model under the starter case or a sibling candidate directory is the\n"
-            "fastest reference — copy its skeleton rather than deriving it again.\n\n"
+            "If a compiler error points at a line inside the READ-ONLY library\n"
+            "tree rather than inside a file you wrote, the bug is almost always in\n"
+            "your file, not theirs. A missing type, a template arity mismatch or a\n"
+            "redefinition reported deep inside a framework header usually means\n"
+            "your headers are included in the wrong order, your class does not\n"
+            "match the base class's expected form, or a translation unit is being\n"
+            "compiled twice. Re-read your own files against a working example\n"
+            "before reading more library source.\n\n"
+            "The fastest way to get the skeleton right is to copy it. Find an\n"
+            "existing extension of the same kind -- in the framework's own source\n"
+            "tree, in the starter case, or in a sibling candidate directory that\n"
+            "already compiled -- and match its structure exactly: the same\n"
+            "includes in the same order, the same class declaration and base-class\n"
+            "form, the same constructor signature and argument order, the same\n"
+            "registration macro, the same build-file layout. Change only the\n"
+            "physics you are here to change. Deriving that skeleton from first\n"
+            "principles is how a build budget gets spent on boilerplate.\n\n"
         )
         + "DELIVERABLE (generic — applies to ANY OpenFOAM modification family):\n"
         + "  (a) Copy the starter case into the run dir under a case folder\n"
@@ -772,6 +1141,221 @@ _NO_FUNCTION_CALL_OVERRIDE = (
 )
 
 
+# How the build agent's tools reach the model.
+#
+#   text    the model writes each call as a JSON object in plain text, which
+#           this loop parses. Every argument -- including a whole C++ source
+#           file passed to write_file -- has to be hand-escaped by the model
+#           inside a JSON string.
+#   native  the tools are bound through the provider's own function-calling
+#           API (bind_tools), and arguments come back already structured.
+#
+# The text protocol predates native tool calling in these wrappers and it is
+# the harness's own choice, not the model's, so it must not be what decides
+# whether a model can build a candidate. Measured on ph_gemma_20260910g: 17 of
+# 19 build agents were ended by the parse-fail cap, each while emitting a
+# write_file whose content was a C++ source file; that run hit the cap 29 times
+# in 1,183 turns against 7 in 2,187 for the codex run on the same protocol.
+# Set CFD_SCIENTIST_AGENT_TOOL_PROTOCOL=text to reproduce the old behaviour for
+# a like-for-like comparison. The text parser stays as the fallback in native
+# mode, for a model that answers in JSON anyway.
+_AGENT_TOOL_PROTOCOLS = ("native", "text")
+# Native by default. Checked live before switching: a write_file carrying a C++
+# source with braces, quotes and backslashes round-tripped exactly through
+# native calls on codex, glm and gemma, and a full three-turn build-loop probe
+# (write, run, done) finished with zero parse failures on gemma and codex.
+# llama-4-maverick on the Vertex OpenAI-compatible route made the native call
+# but halved the backslashes in the argument -- that is the model's own
+# encoding of the call, not a transformation made here.
+_DEFAULT_AGENT_TOOL_PROTOCOL = "native"
+
+_DEFAULT_DONE_FIELDS: Dict[str, str] = {
+    "summary": "One-line summary of what was built.",
+    "case_dir": "Absolute path of the case the new model was built and run in.",
+    "class_name": "Name of the new model class.",
+    "compiled_so": "Absolute path of the compiled .so library.",
+}
+
+_NATIVE_TOOLS_NOTE = (
+    "\n\nThe tools are provided to you as callable functions. Call exactly one "
+    "function per turn; do not write the call out as JSON text. (If you cannot "
+    "call functions, the JSON text format described in the brief is still "
+    "accepted.)"
+)
+
+_NATIVE_RETRY_NOTE = (
+    "\n\nYour previous reply contained neither text nor a tool call. Call "
+    "exactly one of the provided tools now."
+)
+
+_OUT_OF_SPACE_NOTE = (
+    "\n\nYour previous reply used up the whole output limit before it made a tool "
+    "call. Keep your reasoning short and make one tool call now."
+)
+
+
+def _transcript_cap_chars() -> int:
+    """How much of its own history a build agent sees, in characters.
+
+    60k characters (~15k tokens) kept only the last few turns once scripts and
+    logs flowed through, and an agent that cannot see its own recent plan
+    re-derives it: on malmo_qwen38flash_openrouter_20260913 the build agent
+    wrote eight versions of the same diagnostic in sixteen turns. Every provider
+    in use takes 128k tokens or more. CFD_SCIENTIST_AGENT_TRANSCRIPT_CHARS
+    overrides it."""
+    try:
+        value = int(os.environ.get("CFD_SCIENTIST_AGENT_TRANSCRIPT_CHARS", "") or 240_000)
+    except ValueError:
+        value = 240_000
+    return max(20_000, value)
+
+
+def _clip_middle(text: str, head: int, tail: int) -> str:
+    if len(text) <= head + tail:
+        return text
+    return text[:head] + f"\n…[{len(text) - head - tail} characters omitted]…\n" + text[-tail:]
+
+
+def _turn_note(text: str, limit: int = 1500) -> str:
+    """What the agent said alongside its call, for its own history. A reply that
+    is only the call itself (the JSON text protocol) adds nothing."""
+    text = str(text or "").strip()
+    if not text or (text.startswith("{") and text.endswith("}")):
+        return ""
+    return text if len(text) <= limit else text[:limit] + " …"
+
+
+def _render_call_args(tool_name: str, tool_args: Any) -> str:
+    """A call's arguments as the agent sees them in its own history.
+
+    Cut at 600 characters of JSON, a script the agent wrote through a heredoc
+    -- the way its brief tells it to -- came back as its first few lines, so it
+    paged back through files it had written a turn earlier to recall them."""
+    if not isinstance(tool_args, dict):
+        return _clip_middle(json.dumps(tool_args, default=str, ensure_ascii=False), 800, 200)
+    shown = dict(tool_args)
+    if tool_name == "write_file" and isinstance(shown.get("content"), str):
+        shown["content"] = _clip_middle(shown["content"], 3000, 1000)
+    elif tool_name == "run_bash" and isinstance(shown.get("cmd"), str):
+        shown["cmd"] = _clip_middle(shown["cmd"], 4000, 1000)
+    return _clip_middle(json.dumps(shown, default=str, ensure_ascii=False), 6000, 1000)
+
+
+def _interpreter_shim_dir() -> str:
+    """A folder holding only python/python3 links to this interpreter, or ""."""
+    try:
+        import hashlib
+
+        exe = Path(sys.executable).resolve()
+        key = hashlib.sha1(str(exe).encode("utf-8")).hexdigest()[:10]
+        shim = Path(__file__).resolve().parent.parent / ".cache" / "interpreter_bin" / key
+        shim.mkdir(parents=True, exist_ok=True)
+        for name in ("python", "python3"):
+            link = shim / name
+            if not link.exists():
+                try:
+                    link.symlink_to(exe)
+                except FileExistsError:
+                    pass
+        return str(shim)
+    except Exception:
+        return ""
+
+
+def _agent_tool_protocol() -> str:
+    value = os.environ.get("CFD_SCIENTIST_AGENT_TOOL_PROTOCOL", "").strip().lower()
+    return value if value in _AGENT_TOOL_PROTOCOLS else _DEFAULT_AGENT_TOOL_PROTOCOL
+
+
+_AGENT_TOOL_NAMES = ("read_file", "write_file", "run_bash", "done")
+
+
+def _unknown_tool_error(tool_call: Dict[str, Any], native: bool, from_text: bool) -> str:
+    """What to tell an agent whose call names none of the loop's tools.
+
+    The bare "unknown tool: ''" this replaces said neither what was wrong nor
+    what to send instead, so the mistake repeated: gpt-oss on
+    slau_openfoam_gptoss120b_bedrock_20260914 lost 7 of its first 76 turns to
+    replies that carried a command's arguments with no tool name, or named a
+    shell command (grep) as the tool.
+    """
+    name = str(tool_call.get("tool", "")).strip()
+    if name:
+        problem = f"there is no tool named {name!r}"
+    elif from_text:
+        keys = [str(k) for k in tool_call if k != "tool"]
+        problem = ('your reply was a JSON object with no "tool" field'
+                   + (f" (its keys were: {', '.join(keys)})" if keys else ""))
+    else:
+        problem = "your tool call carried no tool name"
+    how = ("Call exactly one of them by name, with its arguments." if native
+           else 'Reply with one JSON object {"tool": "<one of those names>", "args": {...}}, '
+                'with the tool\'s arguments inside "args".')
+    return (f"{problem}. The tools are {', '.join(_AGENT_TOOL_NAMES)}. {how} "
+            "A shell command goes in run_bash's cmd.")
+
+
+def _native_tool_specs(done_fields: Optional[Dict[str, str]] = None) -> List[Any]:
+    """The four build-agent tools as LangChain tool objects, for bind_tools.
+
+    Schemas only: the loop executes calls through its Sandbox, never through
+    these objects. The completion tool's fields come from the caller, because
+    what "done" must report differs by study type (a compiled library's path
+    for a solver candidate, prediction files for a fitted model); every field
+    is text so the schema is accepted by every provider's function-calling API.
+    """
+    from langchain_core.tools import StructuredTool
+    from pydantic import BaseModel, Field, create_model
+
+    class ReadFileArgs(BaseModel):
+        path: str = Field(description="Absolute path of the file to read.")
+        start: Optional[int] = Field(default=None, description=(
+            "Character offset to start from. Pass next_start from the previous result to read the next page."))
+        max_bytes: Optional[int] = Field(default=None, description="Optional page size in characters, at most 6000.")
+
+    class WriteFileArgs(BaseModel):
+        path: str = Field(description="Absolute path of the file to write, inside the run directory.")
+        content: str = Field(description="The complete file contents, exactly as they should be on disk.")
+        mode: str = Field(default="w", description="'w' to overwrite the file, 'a' to append to it.")
+
+    class RunBashArgs(BaseModel):
+        cmd: str = Field(description="The shell command to run.")
+        cwd: Optional[str] = Field(default=None, description="Working directory, inside the run directory.")
+        timeout: Optional[int] = Field(default=None, description=(
+            "Seconds this command may run before it is stopped, along with "
+            "everything it started. Defaults to 600. Pass a larger number for "
+            "long work such as training, after timing a short slice of it."))
+
+    fields = dict(done_fields or _DEFAULT_DONE_FIELDS)
+    fields.setdefault("summary", "One-line summary of the result.")
+    done_model = create_model(
+        "DoneArgs",
+        **{
+            name: ((str, Field(description=desc)) if name == "summary"
+                   else (str, Field(default="", description=desc)))
+            for name, desc in fields.items()
+        },
+    )
+
+    def _schema_only(**_kwargs: Any) -> str:
+        return ""
+
+    return [
+        StructuredTool.from_function(
+            func=_schema_only, name="read_file", args_schema=ReadFileArgs,
+            description="Read a file. Its limits are described in the brief."),
+        StructuredTool.from_function(
+            func=_schema_only, name="write_file", args_schema=WriteFileArgs,
+            description="Write a whole file (or append to one) inside the run directory."),
+        StructuredTool.from_function(
+            func=_schema_only, name="run_bash", args_schema=RunBashArgs,
+            description="Run one shell command in the sandbox."),
+        StructuredTool.from_function(
+            func=_schema_only, name="done", args_schema=done_model,
+            description="Signal completion. Call it only when the brief's completion condition is met."),
+    ]
+
+
 def _message_text(message: Any) -> str:
     """Text of an LLM reply, or "" when it carries none.
 
@@ -802,17 +1386,32 @@ def _message_text(message: Any) -> str:
     return ""
 
 
+def _unfenced(text: str) -> str:
+    s = (text or "").strip()
+    # Strip code fences if any
+    s = re.sub(r"^```(?:json)?\s*", "", s)
+    return re.sub(r"\s*```\s*$", "", s)
+
+
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
-    s = text.strip()
-    # Strip code fences if any
-    s = re.sub(r"^```(?:json)?\s*", "", s)
-    s = re.sub(r"\s*```\s*$", "", s)
+    s = _unfenced(text)
     # Find the first {...} object
     start = s.find("{")
     if start < 0:
         return None
+    # Decoded from the opening brace first. The decoder knows where strings are
+    # and the brace count below does not: a command such as `echo '}'`, or a
+    # C++ fragment with an unbalanced brace in write_file's content, ended the
+    # count early and a valid tool call was rejected as unparseable. strict=False
+    # accepts raw newlines inside strings, which the count's repair also did.
+    try:
+        obj, _ = json.JSONDecoder(strict=False).raw_decode(s, start)
+        if isinstance(obj, dict):
+            return obj
+    except ValueError:
+        pass
     depth = 0
     end = -1
     for i in range(start, len(s)):
@@ -837,6 +1436,31 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
             return None
 
 
+def _tool_call_parse_problem(text: str) -> str:
+    """Why no tool call could be read from a reply, in words the agent can act on.
+
+    "No tool call parseable" alone let one mistake repeat until the parse-fail
+    cap ended the build: gpt-oss on slau_openfoam_gptoss120b_bedrock_20260914
+    sent the same call three turns running with its closing brace written as
+    ")", and lost an 81-turn build. The decoder's own message says where the
+    object breaks. Empty when the reply does parse.
+    """
+    s = _unfenced(text)
+    start = s.find("{")
+    if start < 0:
+        return "it contained no JSON object"
+    try:
+        json.JSONDecoder(strict=False).raw_decode(s, start)
+    except ValueError as exc:
+        pos = getattr(exc, "pos", None)
+        msg = getattr(exc, "msg", None) or str(exc)
+        if isinstance(pos, int):
+            return (f"its JSON object is not valid JSON: {msg} at character {pos}, "
+                    f"here: {s[max(start, pos - 80):pos + 20]!r}")
+        return f"its JSON object is not valid JSON: {msg}"
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # agent loop using cfd-scientist's existing langchain factory
 # ---------------------------------------------------------------------------
@@ -856,17 +1480,32 @@ def run_agent_loop(
     variant_name: str,
     run_dir: Path,
     starter_case: Path,
+    starter_root: Optional[Path] = None,
     topic: str,
     model: str,
     max_turns: int,
     timeout_s: int,
     prior_attempt: str = "",
     repair_goal: str = "",
+    system_message: str = "",
+    initial_prompt: str = "",
+    cost_tokens: Optional[Sequence[str]] = None,
+    done_fields: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
+    """Run one agentic build.
+
+    ``system_message`` / ``initial_prompt`` / ``cost_tokens`` let a caller
+    reuse this loop for a study whose candidates are not OpenFOAM libraries.
+    All three default to the OpenFOAM behaviour, so existing callers are
+    unaffected -- the turn loop, tool protocol, transcript handling, repair
+    and timeout logic are the parts worth sharing, and duplicating them into a
+    second file would guarantee the two drift apart.
+    """
     _bootstrap_paths(repo_root)
     try:
         from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
         from cfd_langgraph.llm.factory import create_langchain_llm  # type: ignore
+        from cfd_langgraph.llm.retry import PROVIDER_WAITS_S, provider_retry_delay, provider_status  # type: ignore
     except Exception as exc:
         return {"status": "FAILED", "error": f"langchain factory import failed: {exc}"}
 
@@ -875,7 +1514,9 @@ def run_agent_loop(
     sandbox = Sandbox(
         run_dir=run_dir,
         starter_case=starter_case,
+        starter_root=starter_root,
         wm_project_dir=wm_path,
+        cost_tokens=cost_tokens,
     )
     trajectory_log = run_dir / "agentic_trajectory.log"
     trajectory_log.parent.mkdir(parents=True, exist_ok=True)
@@ -884,15 +1525,21 @@ def run_agent_loop(
     # time, and overwriting it would destroy the record of why. A fresh attempt
     # still starts clean.
     continuing = bool(str(prior_attempt or "").strip() or str(repair_goal or "").strip())
-    log_fh = open(trajectory_log, "a" if continuing else "w", encoding="utf-8")
+    # Always appended. A fresh attempt used to truncate the file, and a
+    # candidate relaunched after its process was killed lost the only record of
+    # its earlier work: malmo_qwen38flash_openrouter_20260913 lost a
+    # 183k-character, four-hour trajectory that way.
+    earlier_log = trajectory_log.is_file() and trajectory_log.stat().st_size > 0
+    log_fh = open(trajectory_log, "a", encoding="utf-8")
 
     def log(msg: str) -> None:
         log_fh.write(msg + "\n")
         log_fh.flush()
 
-    if continuing:
+    if continuing or earlier_log:
         log("\n" + "=" * 60)
-        log(f"# CONTINUATION at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+        log(f"# {'CONTINUATION' if continuing else 'NEW ATTEMPT'} at "
+            f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
             f"(timeout_s={timeout_s}, max_turns={max_turns})")
         log("=" * 60)
     log(f"# agentic loop start variant={variant_name} model={model}")
@@ -900,12 +1547,29 @@ def run_agent_loop(
     log(f"# starter_case={starter_case}")
     log(f"# WM_PROJECT_DIR={wm_path}")
 
-    sys_msg_text = (
+    # The batching instruction is not style advice, it is turn economy. Each
+    # candidate has a wall-clock cap, and one tool call is one turn. Measured
+    # across the 2026-09-10 ladder: the arm that finished 27 candidates spent
+    # ~95% of its calls in run_bash, writing sources with heredocs so that
+    # write + wmake + run + score happened in a single turn; the arm that
+    # finished none split the same work into separate read_file / write_file /
+    # run_bash calls and needed roughly three times the turns per unit of
+    # progress, timing out mid-build. Stated explicitly so the cheaper route
+    # does not depend on the model happening to prefer it.
+    sys_msg_text = system_message.strip() or (
         "You are an agentic OpenFOAM developer. You have read/write/bash tools "
         "(see protocol). Each turn, output ONE JSON object calling one tool. "
-        "No prose, no code fences. Iterate on compile errors patiently."
+        "No prose, no code fences. Iterate on compile errors patiently.\n\n"
+        "Turns are limited and each tool call costs one turn, so make every "
+        "call do as much as it safely can. Prefer a single run_bash that "
+        "chains the whole step — write the source with a heredoc, compile it, "
+        "run the case, and print the score — over separate read/write/bash "
+        "calls for the same work. Combine independent inspection commands "
+        "into one call with `;` or `&&` rather than issuing them one at a "
+        "time. Split into separate calls only when a later command genuinely "
+        "depends on output you have not seen yet."
     )
-    initial_user_prompt = build_agent_prompt(
+    initial_user_prompt = initial_prompt.strip() or build_agent_prompt(
         topic=topic,
         hypothesis=hypothesis,
         plan=plan,
@@ -927,13 +1591,14 @@ def run_agent_loop(
     # The transcript records every prior tool call + result the agent made.
     # Provider-agnostic — the wrapper only ever sees user (input) content.
     transcript_chunks: List[str] = []
-    TRANSCRIPT_CAP = 60_000  # chars; truncate oldest entries above this
+    TRANSCRIPT_CAP = _transcript_cap_chars()  # chars; oldest turns dropped above this
+    next_turn_prompt = "Now output your next tool-call JSON object."
 
     def render_transcript(cap: Optional[int] = None) -> str:
         cap = TRANSCRIPT_CAP if cap is None else cap
         if not transcript_chunks:
             return ""
-        full = "\n\n=== CONVERSATION SO FAR ===\n" + "\n".join(transcript_chunks) + "\n=== END CONVERSATION ===\n\nNow output your next tool-call JSON object."
+        full = "\n\n=== CONVERSATION SO FAR ===\n" + "\n".join(transcript_chunks) + "\n=== END CONVERSATION ===\n\n" + next_turn_prompt
         if len(full) <= cap:
             return full
         # Truncate from the front (keep most recent turns); always keep the
@@ -942,10 +1607,23 @@ def run_agent_loop(
         return ("\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n"
                 + keep)
 
-    llm = create_langchain_llm(model=model, temperature=0.1)
+    llm = create_langchain_llm(model=model, temperature=0.0)
+    llm_for_turns = llm
+    native_tools_enabled = False
+    if _agent_tool_protocol() == "native":
+        try:
+            llm_for_turns = llm.bind_tools(_native_tool_specs(done_fields))
+            native_tools_enabled = True
+            sys_msg_text = sys_msg_text + _NATIVE_TOOLS_NOTE
+            next_turn_prompt = "Now make your next tool call."
+        except Exception as exc:  # noqa: BLE001
+            log(f"# native tool calling unavailable ({type(exc).__name__}: {str(exc)[:200]}); "
+                "using the JSON text protocol")
+    log(f"# tool protocol: {'native' if native_tools_enabled else 'text'}")
     started = time.time()
     final_payload: Dict[str, Any] = {}
     aborted_reason = ""
+    aborted_by_provider = False
     turn = 0
     parse_fail_streak = 0
     MAX_PARSE_FAILS = 3
@@ -986,6 +1664,10 @@ def run_agent_loop(
     # LLMs (e.g. claude-sonnet-4-6) that haven't finished class_derivation
     # within 30 min but are progressing turn-by-turn within budget.
     wall_clock_enabled = timeout_s > 0
+    # No single command may outlive the candidate itself, so the sandbox's own
+    # ceiling is trimmed to whatever is left of this fence.
+    if wall_clock_enabled:
+        sandbox.deadline = started + timeout_s
 
     for turn in range(1, max_turns + 1):
         if wall_clock_enabled and time.time() - started > timeout_s:
@@ -1000,21 +1682,42 @@ def run_agent_loop(
         ]
         ai_resp = None
         last_exc: Optional[Exception] = None
-        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+        tries = 0
+        short_retries = 0
+        provider_retries = 0
+        while True:
             if wall_clock_enabled and time.time() - started > timeout_s:
                 break
+            tries += 1
             try:
-                ai_resp = llm.invoke(messages)
+                ai_resp = llm_for_turns.invoke(messages)
                 last_exc = None
                 break
             except Exception as exc:
                 last_exc = exc
+                # A provider refusing or overloaded (429 / 5xx) gets minutes to
+                # recover, honouring its Retry-After; the 2/4/8 s ladder below
+                # stays for dropped connections and read timeouts. See
+                # cfd_langgraph.llm.retry for the malmo_qwen38flash run this
+                # comes from.
+                if provider_status(exc) is not None:
+                    wait = provider_retry_delay(exc, provider_retries)
+                    if wait is None:
+                        break
+                    if wall_clock_enabled:
+                        wait = min(wait, max(0.0, timeout_s - (time.time() - started)))
+                    provider_retries += 1
+                    log(f"# provider refused the call ({type(exc).__name__}: {str(exc)[:160]}); "
+                        f"waiting {wait:.0f}s before retry {provider_retries}/{len(PROVIDER_WAITS_S)}.")
+                    time.sleep(wait)
+                    continue
                 msg = str(exc).lower()
                 is_transient = any(p in msg for p in _TRANSIENT_PATTERNS)
-                if not is_transient or attempt >= MAX_TRANSIENT_RETRIES:
+                if not is_transient or short_retries >= MAX_TRANSIENT_RETRIES:
                     break
-                backoff = 2.0 * (2 ** attempt)  # 2, 4, 8 s
-                log(f"# transient llm error (attempt {attempt + 1}/{MAX_TRANSIENT_RETRIES + 1}): "
+                backoff = 2.0 * (2 ** short_retries)  # 2, 4, 8 s
+                short_retries += 1
+                log(f"# transient llm error (attempt {tries}/{MAX_TRANSIENT_RETRIES + 1}): "
                     f"{type(exc).__name__}: {str(exc)[:200]}; sleeping {backoff:.1f}s and retrying.")
                 time.sleep(backoff)
         if ai_resp is None:
@@ -1022,13 +1725,17 @@ def run_agent_loop(
             # first try, and reporting a fixed "4 attempts" there sent the
             # investigation of run oed_20260823_opus_low looking for a retry
             # exhaustion that had never happened.
-            aborted_reason = (f"llm.invoke raised after {attempt + 1} attempt(s): "
+            # Recorded so the caller can tell "the provider kept refusing" from
+            # "the work failed": the first is not evidence about the idea.
+            aborted_by_provider = bool(last_exc is not None and provider_status(last_exc) is not None)
+            aborted_reason = (f"llm.invoke raised after {tries} attempt(s): "
                               f"{type(last_exc).__name__ if last_exc else 'Unknown'}: "
                               f"{str(last_exc)[:300] if last_exc else ''}")
             log(f"# {aborted_reason}")
             break
         ai_text = _message_text(ai_resp)
-        if not ai_text:
+        native_calls = list(getattr(ai_resp, "tool_calls", None) or [])
+        if not ai_text and not native_calls:
             # Empty reply: retry with the tool-call impulse countermanded in
             # the SYSTEM message, which is where the tool protocol is
             # described. Measured: a user-turn nudge is not enough, the same
@@ -1043,36 +1750,73 @@ def run_agent_loop(
             # source-file reads), so re-sending the identical prompt is the
             # one variation least likely to help.
             finish = (getattr(ai_resp, "response_metadata", {}) or {}).get("finish_reason", "")
-            for override_attempt, cap in enumerate(
-                (TRANSCRIPT_CAP, TRANSCRIPT_CAP // 3, TRANSCRIPT_CAP // 10), start=1
-            ):
+            # A reply cut off at the output limit is not a malformed call: the
+            # model spent its whole output reasoning. Re-sending nearly the same
+            # request buys another full-length reply -- three in a row at
+            # 131,072 tokens, ~55 minutes, on malmo_glm53flash_openrouter_20260913
+            # -- so that case starts from the shorter transcripts and says why.
+            out_of_space = str(finish or "").strip().lower() in {"length", "max_tokens", "max_output_tokens"}
+            ladder = ((TRANSCRIPT_CAP // 3, TRANSCRIPT_CAP // 10, TRANSCRIPT_CAP // 30) if out_of_space
+                      else (TRANSCRIPT_CAP, TRANSCRIPT_CAP // 3, TRANSCRIPT_CAP // 10))
+            for override_attempt, cap in enumerate(ladder, start=1):
                 log(f"# empty reply (finish_reason={finish!r}); tool-call override "
                     f"attempt {override_attempt}/3 (transcript cap {cap})")
                 try:
-                    ai_resp = llm.invoke([
-                        SystemMessage(content=sys_msg_text + _NO_FUNCTION_CALL_OVERRIDE),
-                        HumanMessage(content=initial_user_prompt + render_transcript(cap)),
-                    ])
+                    if native_tools_enabled:
+                        # The override below says "no callable tool is
+                        # registered", which is false in native mode and
+                        # would talk the model out of the one thing it
+                        # should do.
+                        ai_resp = llm_for_turns.invoke([
+                            SystemMessage(content=sys_msg_text + _NATIVE_RETRY_NOTE
+                                          + (_OUT_OF_SPACE_NOTE if out_of_space else "")),
+                            HumanMessage(content=initial_user_prompt + render_transcript(cap)),
+                        ])
+                    else:
+                        ai_resp = llm.invoke([
+                            SystemMessage(content=sys_msg_text + _NO_FUNCTION_CALL_OVERRIDE
+                                          + (_OUT_OF_SPACE_NOTE if out_of_space else "")),
+                            HumanMessage(content=initial_user_prompt + render_transcript(cap)),
+                        ])
                     ai_text = _message_text(ai_resp)
+                    native_calls = list(getattr(ai_resp, "tool_calls", None) or [])
                 except Exception as exc:
                     log(f"# override retry raised: {type(exc).__name__}: {str(exc)[:200]}")
                     ai_text = ""
-                if ai_text:
+                    native_calls = []
+                if ai_text or native_calls:
                     break
                 finish = (getattr(ai_resp, "response_metadata", {}) or {}).get("finish_reason", "")
         log(f"AI: {ai_text[:1200]}{'…' if len(ai_text) > 1200 else ''}")
 
-        tool_call = _extract_json_object(ai_text)
+        if native_calls:
+            first = native_calls[0]
+            tool_call = {"tool": str(first.get("name") or "").strip(),
+                         "args": dict(first.get("args") or {})}
+            log(f"AI tool_call: {json.dumps(tool_call, default=str)[:1200]}")
+            if len(native_calls) > 1:
+                log(f"# {len(native_calls)} tool calls in one reply; only the first is executed")
+                transcript_chunks.append(
+                    f"[turn {turn}] (you made {len(native_calls)} tool calls in one reply; only the "
+                    f"first, {tool_call['tool']}, was executed. Make one call per turn.)"
+                )
+        else:
+            tool_call = _extract_json_object(ai_text)
         if not tool_call:
             parse_fail_streak += 1
+            problem = _tool_call_parse_problem(ai_text)
+            log(f"# no tool call read from the reply: {problem or 'reason unknown'}")
             if parse_fail_streak >= MAX_PARSE_FAILS:
                 aborted_reason = f"parse-fail streak {parse_fail_streak} reached cap"
                 log(f"# {aborted_reason}")
                 break
             transcript_chunks.append(
-                f"[turn {turn}] (your reply was not parseable as a tool-call JSON object; "
-                f"reply contained: {ai_text[:300]!r}). NEXT TURN: output a single "
-                "JSON object {\"tool\":..., \"args\":{...}} only — no prose."
+                f"[turn {turn}] (your reply contained no tool call"
+                + ("" if native_tools_enabled else " parseable as a tool-call JSON object")
+                + (f" -- {problem}" if problem else "")
+                + f"; reply contained: {ai_text[:300]!r}). NEXT TURN: "
+                + ("call exactly one of the provided tools." if native_tools_enabled
+                   else "output a single JSON object {\"tool\":..., \"args\":{...}} only — no prose.")
             )
             continue
         parse_fail_streak = 0
@@ -1092,33 +1836,60 @@ def run_agent_loop(
             elif tool_name == "run_bash":
                 tool_result = sandbox.run_bash(**tool_args)
             else:
-                tool_result = {"ok": False, "error": f"unknown tool: {tool_name!r}"}
+                tool_result = {"ok": False, "error": _unknown_tool_error(
+                    tool_call, native_tools_enabled, from_text=not native_calls)}
         except TypeError as exc:
             tool_result = {"ok": False, "error": f"bad args for {tool_name}: {exc}"}
         except Exception as exc:
             tool_result = {"ok": False, "error": f"tool {tool_name} raised: {exc}"}
+        # The budget was stated once, in the brief, and never again: an agent
+        # thirty turns in had no way to see how much of it was left.
+        if wall_clock_enabled and isinstance(tool_result, dict):
+            tool_result["time_left_s"] = max(0, int(timeout_s - (time.time() - started)))
 
         # Truncate large fields before logging / before they enter the transcript.
         # For build/run output, prefer the TAIL (compile errors land at the end)
         # and never truncate `error_summary` — that's the focused diagnostic.
         compact = dict(tool_result)
-        for k in ("content",):
-            v = compact.get(k)
-            if isinstance(v, str) and len(v) > 6000:
-                compact[k] = v[:3000] + "\n…[truncated]…\n" + v[-3000:]
+        # read_file already pages to fit. This is only a safety net, and it
+        # stays honest: keep the head and say where it stops -- never head plus
+        # tail, which hid the middle of a file behind truncated=false.
+        v = compact.get("content")
+        if isinstance(v, str) and len(v) > Sandbox.READ_PAGE_CHARS:
+            base = int(compact.get("start") or 0)
+            compact["content"] = v[:Sandbox.READ_PAGE_CHARS]
+            compact["truncated"] = True
+            compact["next_start"] = base + Sandbox.READ_PAGE_CHARS
         for k in ("stdout", "stderr"):
             v = compact.get(k)
             if isinstance(v, str) and len(v) > 6000:
                 # Keep the last 6000 chars — error/failure lines are at the tail.
-                compact[k] = "…[earlier output elided]…\n" + v[-6000:]
+                compact[k] = "…[earlier output elided — last 6000 characters shown]…\n" + v[-6000:]
         log(f"TOOL [{tool_name}] -> {json.dumps({k:(v if not isinstance(v,str) or len(v)<200 else v[:200]+'…') for k,v in compact.items()}, default=str)[:1200]}")
 
         # Append a single chunk for this turn into the rolling transcript.
         # Bumped from 8000 → 18000 so the agent actually sees the gcc errors
         # (a typical wmake stdout JSON-serializes to ~10–12K chars).
+        # Cut to fit by shrinking the output tails, not by slicing the JSON: a
+        # slice at 18000 characters could end mid-string and silently drop the
+        # END of stderr, which is where a build's error is.
+        result_json = json.dumps(compact, default=str, ensure_ascii=False)
+        if len(result_json) > 18000:
+            for k in ("stdout", "stderr"):
+                v = tool_result.get(k)
+                if isinstance(v, str) and len(v) > 2000:
+                    compact[k] = "…[earlier output elided — last 2000 characters shown]…\n" + v[-2000:]
+            result_json = json.dumps(compact, default=str, ensure_ascii=False)
+        if len(result_json) > 18000:
+            result_json = result_json[:18000] + " …[result cut at 18000 characters]"
+        # The agent's own words go back into its history too. Only the call and
+        # its result used to, so whatever plan it had stated was gone a turn
+        # later.
+        note = _turn_note(ai_text)
         transcript_chunks.append(
-            f"[turn {turn}] you called {tool_name}({json.dumps(tool_args, default=str)[:600]}).\n"
-            f"[turn {turn}] tool result: {json.dumps(compact, default=str)[:18000]}"
+            (f"[turn {turn}] you wrote: {note}\n" if note else "")
+            + f"[turn {turn}] you called {tool_name}({_render_call_args(tool_name, tool_args)}).\n"
+            f"[turn {turn}] tool result: {result_json}"
         )
 
     log_fh.flush()
@@ -1127,11 +1898,13 @@ def run_agent_loop(
     return {
         "status": "OK" if final_payload else "FAILED",
         "aborted_reason": aborted_reason,
+        "provider_error": aborted_by_provider,
         "duration_s": duration,
         "turns_used": turn,
         "solver_invocations": getattr(sandbox, "solver_invocations", 0),
         "trajectory_log": str(trajectory_log),
         "final_payload": final_payload,
+        "tool_protocol": "native" if native_tools_enabled else "text",
     }
 
 
@@ -1294,6 +2067,7 @@ def run(
     variant_name: str,
     run_dir: Path,
     starter_case: Path,
+    starter_root: Optional[Path] = None,
     topic: str,
     output_path: Path,
     model: str,
@@ -1319,6 +2093,7 @@ def run(
         variant_name=variant_name,
         run_dir=run_dir,
         starter_case=starter_case,
+        starter_root=starter_root,
         topic=topic,
         model=model,
         max_turns=max_turns,
@@ -1353,6 +2128,7 @@ def run(
         "turns_used": loop.get("turns_used", 0),
         "solver_invocations": loop.get("solver_invocations", 0),
         "aborted_reason": loop.get("aborted_reason", ""),
+        "provider_error": bool(loop.get("provider_error")),
         "case_dir": artifacts.get("case_dir") or "",
         "class_name": artifacts.get("class_name") or variant_name,
         "compile_ok": bool(artifacts.get("compiled_so")),
@@ -1383,6 +2159,8 @@ def main() -> int:
     parser.add_argument("--variant-name", required=True, type=str)
     parser.add_argument("--run-dir", required=True, type=str)
     parser.add_argument("--starter-case", required=True, type=str)
+    parser.add_argument("--starter-root", default="", type=str,
+                        help="The study's starter folder, readable in full by the agent.")
     parser.add_argument("--topic", required=True, type=str)
     parser.add_argument("--output", required=True, type=str)
     parser.add_argument("--model", default="", type=str,
@@ -1418,6 +2196,8 @@ def main() -> int:
         variant_name=args.variant_name,
         run_dir=Path(args.run_dir).expanduser().resolve(),
         starter_case=Path(args.starter_case).expanduser().resolve(),
+        starter_root=(Path(args.starter_root).expanduser().resolve()
+                      if str(args.starter_root).strip() else None),
         topic=args.topic,
         output_path=Path(args.output).expanduser().resolve(),
         model=model,

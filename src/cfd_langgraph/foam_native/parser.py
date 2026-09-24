@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -33,7 +35,7 @@ def parse_requirement(
         case_domain_list=domains, case_category_list=categories, case_solver_list=solvers,
     )
     user = P.PARSE_USER_PROMPT.format(user_requirement=user_requirement)
-    out: _CaseInfo = llm.with_structured_output(_CaseInfo).invoke(
+    out: _CaseInfo = structured_output(llm, _CaseInfo).invoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     return {

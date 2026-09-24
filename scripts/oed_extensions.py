@@ -130,6 +130,35 @@ def _message_text(message: Any) -> str:
     return ""
 
 
+_LLM_HEARTBEAT_EVERY_S = 5.0
+
+
+def _stream_with_heartbeat(llm: Any, msgs: List[Any], queue: Any) -> Any:
+    """Make the call as a stream, telling the parent process it is still receiving.
+
+    A provider that streams sends pieces while it writes, so the parent can tell
+    a long answer from a dead call. A chat model that does not implement
+    streaming yields one piece when it finishes, which is exactly how the call
+    behaved before.
+    """
+    import time as _t
+
+    raw = None
+    last_beat = 0.0
+    try:
+        for chunk in llm.stream(msgs):
+            raw = chunk if raw is None else raw + chunk
+            now = _t.time()
+            if now - last_beat >= _LLM_HEARTBEAT_EVERY_S:
+                queue.put(("beat", None))
+                last_beat = now
+    except NotImplementedError:
+        raw = None
+    if raw is None:
+        raw = llm.invoke(msgs)
+    return raw
+
+
 def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None:
     """Child-process worker for `_llm_invoke`. Defined at module scope so the
     `fork` multiprocessing context can locate it cleanly. The result is
@@ -144,7 +173,7 @@ def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None
             cls = SystemMessage if role == "system" else HumanMessage
             msgs.append(cls(content=content))
         llm = create_langchain_llm(model=model, temperature=temp)
-        raw = llm.invoke(msgs)
+        raw = _stream_with_heartbeat(llm, msgs, queue)
         text = _message_text(raw)
         if not text:
             # Gemini 3 answers a prompt that *describes* a tool-call protocol
@@ -187,19 +216,69 @@ def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None
         queue.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=5)}"))
 
 
+import os as _os
+
+# How long a streaming call may go quiet before it is treated as dead, and the
+# outer bound on any single call. The old cap measured total time, which kills
+# answers that are still arriving: malmo_qwen38max_openrouter_20260912 lost every
+# scoring-wrapper attempt to it, four per setup, three setups over.
+_LLM_SILENCE_S = int(_os.environ.get("CFD_SCIENTIST_LLM_SILENCE_S", "180"))
+_LLM_CEILING_S = int(_os.environ.get("CFD_SCIENTIST_LLM_CEILING_S", "3600"))
+
+
+def _kill_llm_child(p: Any) -> List[int]:
+    """Stop the fork child and anything it spawned; return the reaped pids."""
+    # SIGTERM then SIGKILL the python fork-child. The child may have spawned a
+    # SDK subprocess (e.g. claude-code's `claude` binary). Killing only the
+    # python parent leaves the SDK reparented to init, consuming session
+    # resources (we have observed this in the wild). So before we terminate the
+    # python child, snapshot its descendants and reap them via SIGKILL.
+    descendants: List[int] = []
+    try:
+        child_pid = p.pid
+        if child_pid is not None:
+            import subprocess as _sub
+            out = _sub.run(["pgrep", "-P", str(child_pid)], capture_output=True, text=True, timeout=2)
+            descendants = [int(x) for x in out.stdout.split() if x.isdigit()]
+            # Recurse one level: each direct child may have its own descendants.
+            for d in list(descendants):
+                out2 = _sub.run(["pgrep", "-P", str(d)], capture_output=True, text=True, timeout=2)
+                descendants.extend(int(x) for x in out2.stdout.split() if x.isdigit())
+    except Exception:
+        pass
+    p.terminate()
+    p.join(timeout=5)
+    if p.is_alive():
+        p.kill()
+        p.join(timeout=2)
+    if descendants:
+        import signal as _signal
+        for d in descendants:
+            try:
+                _os.kill(d, _signal.SIGKILL)
+            except Exception:
+                pass
+    return descendants
+
+
 def _llm_invoke(messages: List[Tuple[str, str]], temperature: float = 0.0,
                 timeout_s: int = 600) -> str:
-    """Single-shot LLM call with hard timeout. messages = [(role, content), ...]
+    """Single-shot LLM call in a forked child. messages = [(role, content), ...]
     with role in {'system','user'}. Returns content string.
 
-    Runs the underlying ``llm.invoke`` in a forked child process. On timeout,
-    the child is terminated (SIGTERM then SIGKILL), which cascades to any
-    SDK subprocess (e.g. the ``claude`` binary spawned by claude-code) so we
-    do not leak hung descendants. Raises:
-      - ``TimeoutError`` if the call exceeds ``timeout_s`` (default 600s).
+    ``timeout_s`` bounds the wait for the FIRST piece of output. Once a
+    streaming provider has started answering, the call is cut only if it goes
+    silent for _LLM_SILENCE_S, or is still running at _LLM_CEILING_S. A model
+    that does not stream sends its single piece at the end, so for it
+    ``timeout_s`` remains the whole budget, as before. On a cut the child and its
+    descendants are killed. Raises:
+      - ``TimeoutError`` when the call is cut off (the message says why).
       - ``RuntimeError`` if the child terminates without producing output, or
         if the child raised an exception.
     """
+    import queue as _queue
+    import time as _time
+
     from cfd_langgraph.config import get_settings  # type: ignore
     model = get_settings().model
     ctx = _mp.get_context("fork")
@@ -208,64 +287,47 @@ def _llm_invoke(messages: List[Tuple[str, str]], temperature: float = 0.0,
         target=_llm_worker,
         args=(_pickle.dumps(messages), model, temperature, q),
     )
+    started = _time.time()
+    ceiling_at = started + max(_LLM_CEILING_S, timeout_s)
     p.start()
-    p.join(timeout=timeout_s)
-    if p.is_alive():
-        # SIGTERM then SIGKILL the python fork-child. The child may have
-        # spawned a SDK subprocess (e.g. claude-code's `claude` binary).
-        # Killing only the python parent leaves the SDK reparented to init,
-        # consuming session resources (we have observed this in the wild).
-        # So before we terminate the python child, snapshot its descendants
-        # via /proc and reap them via SIGKILL.
+    first_output = None
+    last_output = None
+    outcome = None
+    why = ""
+    while outcome is None:
+        now = _time.time()
+        if first_output is None:
+            limit, why = started + timeout_s, f"no output within {timeout_s}s"
+        elif last_output + _LLM_SILENCE_S < ceiling_at:
+            limit, why = last_output + _LLM_SILENCE_S, f"silent for {_LLM_SILENCE_S}s after it started answering"
+        else:
+            limit, why = ceiling_at, f"still answering after {int(ceiling_at - started)}s"
+        if now >= limit:
+            break
         try:
-            child_pid = p.pid
-            descendants: List[int] = []
-            if child_pid is not None:
-                # Walk /proc/<pid>/status to find PPID==child_pid (or transitive
-                # descendants) — reasonable on Linux. Also try pgrep -P.
-                try:
-                    import subprocess as _sub
-                    out = _sub.run(
-                        ["pgrep", "-P", str(child_pid)],
-                        capture_output=True, text=True, timeout=2,
-                    )
-                    descendants = [int(x) for x in out.stdout.split() if x.isdigit()]
-                    # Recurse one level: each direct child may have its own
-                    # descendants (e.g. SDK -> child workers).
-                    for d in list(descendants):
-                        out2 = _sub.run(
-                            ["pgrep", "-P", str(d)],
-                            capture_output=True, text=True, timeout=2,
-                        )
-                        descendants.extend(int(x) for x in out2.stdout.split() if x.isdigit())
-                except Exception:
-                    pass
-        except Exception:
-            descendants = []
-
-        p.terminate()
-        p.join(timeout=5)
-        if p.is_alive():
-            p.kill()
-            p.join(timeout=2)
-
-        # Reap any descendants that survived (claude SDK and the like).
-        if descendants:
-            import os as _os
-            import signal as _signal
-            for d in descendants:
-                try:
-                    _os.kill(d, _signal.SIGKILL)
-                except Exception:
-                    pass
-
+            kind, payload = q.get(timeout=max(0.05, min(5.0, limit - now)))
+        except _queue.Empty:
+            if p.is_alive():
+                continue
+            try:
+                kind, payload = q.get(timeout=1.0)
+            except _queue.Empty:
+                p.join(timeout=1)
+                raise RuntimeError("LLM child terminated without producing output")
+        if kind == "beat":
+            last_output = _time.time()
+            if first_output is None:
+                first_output = last_output
+            continue
+        outcome = (kind, payload)
+    if outcome is None:
+        descendants = _kill_llm_child(p)
         raise TimeoutError(
-            f"LLM call exceeded {timeout_s}s; SDK subprocess killed "
+            f"LLM call cut off: {why}; SDK subprocess killed "
             f"(reaped {len(descendants)} descendant pids)"
         )
-    if q.empty():
-        raise RuntimeError("LLM child terminated without producing output")
-    kind, payload = q.get_nowait()
+    p.join(timeout=5)
+    kind, payload = outcome
     if kind == "err":
         raise RuntimeError(f"LLM child raised: {payload}")
     return payload
@@ -716,9 +778,9 @@ def propose_metric_set(
     ref_block = "\n\n".join(ref_samples) if ref_samples else "(no reference samples)"
 
     starter_excerpt = json.dumps(
-        {k: starter_understanding.get(k, '') for k in ('flow_parameters', 'reference_data', 'formula_or_model_spec')},
+        {k: starter_understanding.get(k, '') for k in ('flow_parameters', 'reference_data', 'formula_or_model_spec', 'data_layout')},
         ensure_ascii=False,
-    )[:2000]
+    )[:3500]
 
     # baseline_metrics_block: stringify baseline_metrics.json (if available).
     # Resolution priority: explicit `baseline_metrics_path` kwarg, else
@@ -858,8 +920,13 @@ def propose_metric_set(
             "enumerate the QUANTITATIVE METRICS that should be tracked to judge "
             "whether a candidate model improves over baseline.\n\n"
             "RULES:\n"
-            "- Propose 2 to 6 metrics covering different aspects (global error, "
-            "spatial features, profile shape). Avoid redundancy.\n"
+            "- Let the topic decide how many. Read what it states as the "
+            "objective. If it names a single quantity to be optimised, propose "
+            "that one and stop. Propose more only where the topic itself asks to "
+            "be judged on more than one thing — then up to 6, each a different "
+            "aspect (global error, spatial features, profile shape) and none "
+            "redundant. Every extra metric costs a full comparator-authoring "
+            "cycle before the search can run its first candidate.\n"
             "- Each metric must be derivable from OpenFOAM output (boundary "
             "fields, sampling lines, postProcessing function-object outputs, "
             "surface fields) plus the reference dataset.\n"
@@ -1320,7 +1387,8 @@ def propose_metric_set(
 
 
 def discover_existing_comparators(
-    *, search_roots: List[Path], metrics: List[Dict[str, Any]]
+    *, search_roots: List[Path], metrics: List[Dict[str, Any]],
+    cache_dirs: Optional[List[Path]] = None,
 ) -> Dict[str, str]:
     """
     For each metric, find a starter-local Python script that appears to
@@ -1345,11 +1413,23 @@ def discover_existing_comparators(
     # the cache file path is derivable from any of the search_roots only if
     # one of them happens to be inside a run_dir, so we just scan search
     # roots' parents for an open_ended_discovery/ dir.
+    #
+    # ``cache_dirs`` is the run dir (and any other directory the caller knows
+    # holds the cache). It has to be passed in: the cache is written to
+    # <run_dir>/open_ended_discovery/comparator_classification.json by both
+    # baseline_setup and _resolve_objective_contract, but the run dir is
+    # never one of the search_roots -- those are the starter dir and the
+    # reference-data dirs -- so the framework was writing this file and then
+    # never reading it back. Measured on ph_llama_20260910f / ph_gemma_20260910g
+    # / ph_glm_20260910e: all three had a correct classification cached in
+    # their run dir, all three fell through to the keyword scan below, and
+    # all three bound a comparator that returned nan.
     classifier_cached: List[Dict[str, Any]] = []
-    for root in search_roots:
+    _cache_roots: List[Path] = [Path(c) for c in (cache_dirs or [])] + list(search_roots)
+    for root in _cache_roots:
         if not root.is_dir():
             continue
-        for cand in (root.parent, root):
+        for cand in (root, root.parent):
             cls_file = cand / "open_ended_discovery" / "comparator_classification.json"
             if cls_file.is_file():
                 try:
@@ -1566,18 +1646,25 @@ def author_comparator(
         return None
 
 
-def _comparator_supports_baseline_time(comparator: Path, timeout_s: int = 10) -> bool:
-    """Probe `--help` to detect `--baseline-time` support. Comparators shipped
-    by older starters may not accept the flag; we then run without it."""
+def _comparator_supports_flag(comparator: Path, flag: str, timeout_s: int = 10) -> bool:
+    """Probe `--help` to detect support for one flag. Comparators shipped by a
+    starter are hand-written and predate any of these conventions, so every
+    flag is offered rather than assumed."""
     try:
         res = subprocess.run(
             [sys.executable, str(comparator), "--help"],
             capture_output=True, text=True, timeout=timeout_s,
         )
         blob = (res.stdout or "") + "\n" + (res.stderr or "")
-        return "--baseline-time" in blob
+        return flag in blob
     except Exception:
         return False
+
+
+def _comparator_supports_baseline_time(comparator: Path, timeout_s: int = 10) -> bool:
+    """Probe `--help` to detect `--baseline-time` support. Comparators shipped
+    by older starters may not accept the flag; we then run without it."""
+    return _comparator_supports_flag(comparator, "--baseline-time", timeout_s)
 
 
 def _run_comparator_with_optional_baseline_time(
@@ -1587,21 +1674,37 @@ def _run_comparator_with_optional_baseline_time(
     reference_file: Path,
     baseline_time: Optional[float],
     timeout_s: int,
+    metric_name: str = "",
+    extra_env: Optional[Dict[str, str]] = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run a comparator, forwarding --baseline-time when supported. On any
-    error invoking with the flag, retry without it (back-compat)."""
+    error invoking with the flag, retry without it (back-compat).
+    ``extra_env`` is added to the comparator's environment."""
+    env = {**_os.environ, **extra_env} if extra_env else None
     base_cmd = [sys.executable, str(comparator),
                 "--case", str(case_dir),
                 "--reference", str(reference_file)]
+    # Every reader here scans for `METRIC <metric_name>:`, and the name is
+    # whatever the metric proposer coined this run -- so a comparator the
+    # starter shipped cannot possibly know it, and its output never matches
+    # however correct the number is. Measured on ph_codex_20260902_1806: the
+    # starter's own compare_exactmatch_cf.py, which produces the study's
+    # stated baseline exactly, was discovered, run, judged unusable, and a
+    # replacement authored that came out 1% adrift. Tell the script what to
+    # call the number and it can answer. Offered only to comparators whose
+    # --help advertises the flag, so hand-written ones that predate it are
+    # invoked exactly as before.
+    if metric_name and _comparator_supports_flag(comparator, "--metric-name"):
+        base_cmd += ["--metric-name", metric_name]
     if baseline_time is not None and _comparator_supports_baseline_time(comparator):
         try:
             return subprocess.run(
                 base_cmd + ["--baseline-time", str(baseline_time)],
-                capture_output=True, text=True, timeout=timeout_s,
+                capture_output=True, text=True, timeout=timeout_s, env=env,
             )
         except Exception:
             pass
-    return subprocess.run(base_cmd, capture_output=True, text=True, timeout=timeout_s)
+    return subprocess.run(base_cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
 
 
 _TIME_USED_RE = re.compile(r"^TIME_USED:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*$", re.MULTILINE)
@@ -1631,12 +1734,26 @@ def selftest_comparator(
     try:
         res = _run_comparator_with_optional_baseline_time(
             comparator=comparator, case_dir=case_dir, reference_file=reference_file,
-            baseline_time=baseline_time, timeout_s=timeout_s,
+            baseline_time=baseline_time, timeout_s=timeout_s, metric_name=metric_name,
         )
     except subprocess.TimeoutExpired:
         return False, "timeout", None
     except Exception as exc:
         return False, f"exec error: {exc}", None
+    return judge_comparator_output(res, metric_name=metric_name, baseline_time=baseline_time)
+
+
+def judge_comparator_output(
+    res: "subprocess.CompletedProcess[str]",
+    *,
+    metric_name: str,
+    baseline_time: Optional[float] = None,
+) -> Tuple[bool, str, Optional[float]]:
+    """selftest_comparator's verdict for one metric, from a run that already
+    happened. Split out so a script that reports every metric in one run is run
+    once and judged per metric: surrogate setup used to run the study's scorer
+    once per metric, and a scorer needing 15 minutes per result turned a
+    six-metric self-test into an hour and a half."""
     blob = (res.stdout or "") + "\n" + (res.stderr or "")
     # Time-pinned scoring: parse TIME_USED diagnostic line. Refuse if 0 or below
     # tolerance (must match baseline_time within 1e-6 when caller pinned).
@@ -1841,7 +1958,7 @@ def _selftest_comparator_full(
     try:
         res = _run_comparator_with_optional_baseline_time(
             comparator=comparator, case_dir=case_dir, reference_file=reference_file,
-            baseline_time=baseline_time, timeout_s=timeout_s,
+            baseline_time=baseline_time, timeout_s=timeout_s, metric_name=metric_name,
         )
     except subprocess.TimeoutExpired:
         return {"ok": False, "value": None, "reason": "timeout",
@@ -2313,8 +2430,17 @@ def author_and_selftest(
         pyvista_budget = max_pyvista_attempts
         current_method = "pyvista"
     elif preferred_method == "pyvista":
-        # Explicitly requested: skip text entirely.
-        text_budget = 0
+        # Explicitly requested: lead with the reader, but keep text attempts
+        # in reserve rather than switching the route off.
+        #
+        # text_budget was 0 here, so a proposer that named "pyvista" -- which
+        # it does by guesswork -- spent every attempt on one route and the
+        # metric was abandoned if that route failed. Measured on
+        # ph_gemma_20260910g and ph_llama_20260910f: 5 pyvista attempts each,
+        # 5 nan, metric unbound, study dead. The comparator that actually
+        # works on this starter is a text parser, so the abandoned route was
+        # the one with a known-good solution.
+        text_budget = max_text_attempts
         pyvista_budget = max_pyvista_attempts
         current_method = "pyvista"
     else:
@@ -2695,22 +2821,62 @@ def resolve_metric_comparators(
     exemplar_text: str = "",
     baseline_final_time: Optional[float] = None,
     topic: str = "",
+    locked_comparator: Optional[Path] = None,
+    cache_dirs: Optional[List[Path]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     For each metric:
-      - find an existing comparator if available;
+      - use the study's locked comparator if the contract names one;
+      - else find an existing comparator by classification/keyword search;
       - else have LLM author one and self-test it against the baseline case.
-    Returns {metric_name: {"path": str, "origin": "existing|authored",
+    Returns {metric_name: {"path": str, "origin": "locked|existing|authored",
                             "selftest_ok": bool, "selftest_value": float|None}}.
+
+    ``locked_comparator`` is objective_contract["comparator_script"] -- the
+    script an LLM already classified as this study's authoritative scorer.
+    baseline_setup.py has always resolved the comparator this way (contract
+    first, classifier second); this binder did not receive the contract at
+    all and went straight to keyword scoring, which counts keyword hits
+    across every .py under the search roots. With the repo root in scope that
+    reliably loses: on this repo scripts/test_deepagents_mechanisms.py scores
+    89 against the real comparator's 42 purely by being a large file that
+    talks about the metric. It is still self-tested before being trusted, so
+    a contract naming the wrong file degrades to the old behaviour rather
+    than binding something broken.
     """
-    existing = discover_existing_comparators(search_roots=search_roots, metrics=metrics)
+    existing = discover_existing_comparators(
+        search_roots=search_roots, metrics=metrics, cache_dirs=cache_dirs)
+    locked_path: Optional[Path] = None
+    if locked_comparator:
+        lp = Path(locked_comparator)
+        if lp.is_file():
+            locked_path = lp
+        else:
+            print(f"[OED-EXT][phase1] contract names a comparator that is not a file: {lp}")
     expectations = topic_expectations(topic)
     if expectations:
         print(f"[OED-EXT] baseline values stated in the topic: {expectations}")
     bound: Dict[str, Dict[str, Any]] = {}
     for m in metrics:
         name = m["name"]
-        # Try existing comparator first — but ALWAYS self-test before trusting.
+        # The contract's own comparator first -- self-tested like any other.
+        if locked_path is not None and baseline_case_dir is not None:
+            ok, reason, val = selftest_comparator(
+                comparator=locked_path, case_dir=baseline_case_dir,
+                reference_file=reference_file, metric_name=name,
+                baseline_time=baseline_final_time,
+            )
+            if ok:
+                print(f"[OED-EXT][phase1] {name} bound to the study's own comparator "
+                      f"{locked_path} (selftest {val})")
+                bound[name] = {"path": str(locked_path), "origin": "locked",
+                               "selftest_ok": True, "selftest_value": val,
+                               "selftest_reason": reason}
+                continue
+            print(f"[OED-EXT][phase1] contract comparator {locked_path} failed selftest "
+                  f"for {name}: {reason}. Falling back to discovery.")
+
+        # Try discovered comparator next — but ALWAYS self-test before trusting.
         if name in existing and baseline_case_dir is not None:
             ep = existing[name]
             ok, reason, val = selftest_comparator(
@@ -2774,24 +2940,68 @@ def resolve_metric_comparators(
     return bound
 
 
+# How long one comparator run may take. Solver-path comparators read a few
+# postProcessing files and finish in seconds, hence the 90 s default. A study
+# scored by its own scorer can need far longer -- the ml4cfd_airfrans scorer
+# integrates forces over 696 meshes, ~15.5 minutes for one seed -- and at 90 s
+# every candidate would have been cut off and recorded as unscored. Surrogate
+# setup times the scorer on the baseline (``scorer_seconds`` in the binding) and
+# the limit follows from that measurement: ten times it, since a candidate may
+# score several seeds where the baseline scored one, and never under 15 minutes.
+_DEFAULT_COMPARATOR_TIMEOUT_S = 90
+_MEASURED_TIMEOUT_FACTOR = 10
+_MEASURED_TIMEOUT_FLOOR_S = 900
+
+
+def _comparator_timeout(info: Dict[str, Any]) -> int:
+    try:
+        measured = float(info.get("scorer_seconds"))
+    except (TypeError, ValueError):
+        return _DEFAULT_COMPARATOR_TIMEOUT_S
+    if not measured > 0 or measured == float("inf"):
+        return _DEFAULT_COMPARATOR_TIMEOUT_S
+    return int(max(_MEASURED_TIMEOUT_FLOOR_S, _MEASURED_TIMEOUT_FACTOR * measured))
+
+
+def _metric_line(blob: str, name: str) -> "Optional[re.Match[str]]":
+    """The comparator contract's `METRIC <name>: <value>` line, if present."""
+    return re.search(rf"METRIC\s+{re.escape(name)}\s*:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?|nan)",
+                     blob, re.IGNORECASE)
+
+
 def compute_metric_vector(
     *,
     case_dir: Path,
     bound_comparators: Dict[str, Dict[str, Any]],
     reference_file: Path,
-    timeout_s: int = 90,
+    timeout_s: Optional[int] = None,
     baseline_final_time: Optional[float] = None,
     metric_specs: Optional[List[Dict[str, Any]]] = None,
+    output_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     Run all bound comparators against case_dir. Returns:
       {"metrics": {name: value, ...}, "raw_outputs": {name: blob}, "errors": {name: reason}}
     Skips comparators with selftest_ok=False unless their path is set
     (they may still work on a different case).
+    ``timeout_s=None`` bounds each run by _comparator_timeout of its binding.
+    ``output_dir`` is offered to comparators as CFD_SCIENTIST_SCORER_OUTPUT_DIR,
+    where a wrapper around a study's own scorer keeps the scorer's structured
+    output. Without it the ml4cfd_airfrans wrapper deleted the scorer's full
+    per-seed summary after every ~95-minute scoring run.
     """
+    extra_env: Optional[Dict[str, str]] = None
+    if output_dir is not None:
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            extra_env = {"CFD_SCIENTIST_SCORER_OUTPUT_DIR": str(output_dir)}
+        except OSError:
+            extra_env = None
     metrics: Dict[str, float] = {}
     raw_outputs: Dict[str, str] = {}
     errors: Dict[str, str] = {}
+    earlier_runs: Dict[Tuple[str, Optional[float]], str] = {}
+    failed_runs: Dict[Tuple[str, Optional[float]], str] = {}
     # Resolve baseline_final_time per metric: prefer explicit kwarg, else look
     # for it on each spec.
     spec_by_name: Dict[str, Dict[str, Any]] = {}
@@ -2822,18 +3032,34 @@ def compute_metric_vector(
                     bt = float(sp_spec["baseline_final_time"])
             except Exception:
                 bt = None
-        try:
-            res = _run_comparator_with_optional_baseline_time(
-                comparator=sp, case_dir=case_dir, reference_file=reference_file,
-                baseline_time=bt, timeout_s=timeout_s,
-            )
-        except Exception as exc:
-            errors[name] = f"exec: {exc}"
+        # A script that reports several metrics in one run is run once per
+        # case, not once per metric. The surrogate adapter prints every metric
+        # on every run, so scoring used to repeat the study's whole scorer for
+        # each metric. An earlier run's output is reused only when it carries
+        # this metric's own METRIC line, so a script that answers one metric
+        # per call is still called for each; a run that raised (a timeout,
+        # say) is not repeated for the next metric.
+        run_key = (str(sp.resolve()), bt)
+        if run_key in failed_runs:
+            errors[name] = failed_runs[run_key]
             continue
-        blob = (res.stdout or "") + "\n" + (res.stderr or "")
+        blob = earlier_runs.get(run_key)
+        m = _metric_line(blob, name) if blob is not None else None
+        if m is None:
+            try:
+                res = _run_comparator_with_optional_baseline_time(
+                    comparator=sp, case_dir=case_dir, reference_file=reference_file,
+                    baseline_time=bt,
+                    timeout_s=timeout_s if timeout_s is not None else _comparator_timeout(info),
+                    metric_name=name, extra_env=extra_env,
+                )
+            except Exception as exc:
+                errors[name] = failed_runs[run_key] = f"exec: {exc}"
+                continue
+            blob = (res.stdout or "") + "\n" + (res.stderr or "")
+            earlier_runs[run_key] = blob
+            m = _metric_line(blob, name)
         raw_outputs[name] = blob[-2000:]
-        m = re.search(rf"METRIC\s+{re.escape(name)}\s*:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?|nan)",
-                      blob, re.IGNORECASE)
         if not m:
             # Fall back only to a line that names THIS metric — e.g.
             # "cf_rmse = 0.0043" without the METRIC prefix. The previous
@@ -2864,7 +3090,25 @@ def compute_metric_vector(
             metrics[name] = float(val_s)
         except Exception:
             errors[name] = f"unparseable: {val_s}"
-    return {"metrics": metrics, "raw_outputs": raw_outputs, "errors": errors}
+    # Which time directory each number actually came from. Parsed here anyway
+    # for the wrong-time checks; it was then dropped, so a caller holding a
+    # score had no way to tell whether it described the case's own result or a
+    # field the case had merely been handed. Returning it costs nothing and is
+    # the difference between a number and a number you can trust.
+    times_used: Dict[str, float] = {}
+    for name, blob in raw_outputs.items():
+        tu = _TIME_USED_RE.search(blob or "")
+        if tu:
+            try:
+                times_used[name] = float(tu.group(1))
+            except ValueError:
+                pass
+    return {
+        "metrics": metrics,
+        "raw_outputs": raw_outputs,
+        "errors": errors,
+        "times_used": times_used,
+    }
 
 
 def render_metric_vector_for_prompt(
@@ -3297,22 +3541,25 @@ def render_diversity_constraint(
         target = f" (current best family: {current_best_family})" if current_best_family else ""
         return (
             f"\nSEARCH MODE: CLOSE-REFINEMENT{target}.\n"
-            "Propose a small, parameter-level or structural-tweak modification of "
-            "the current best direction. Explore nearby variants of the same "
-            "model family. Goal: incremental improvement.\n"
+            "Propose a modification of the current best direction that stays "
+            "inside its family. Prefer a structural change at the point where "
+            "that model actually loses to the reference over a parameter nudge; "
+            "a coefficient change is worth making when the form is right and "
+            "only a magnitude is off. Goal: incremental improvement.\n"
         )
     seen = ", ".join(families_seen_list) if families_seen_list else "(none yet)"
     return (
         f"\nSEARCH MODE: FAR-FROM-BASELINE.\n"
         f"Families ALREADY explored (do NOT repeat these): {seen}\n"
         "Propose a candidate from a DIFFERENT model family or that touches a "
-        "different equation than any explored above. Acceptable directions "
-        "include: a different turbulence model class entirely (k-ω SST, "
-        "transition models, RSM components), a different equation in the same "
-        "model (production source vs destruction vs diffusion), a fundamentally "
-        "different functional form (anisotropic stress limiter, non-equilibrium "
-        "correction, Reynolds-stress augmentation). Justify the structural "
-        "novelty in your rationale. Goal: escape local optima.\n"
+        "different equation than any explored above. Distance can come from "
+        "any of: a different established model class than the one being "
+        "modified, a different term or equation within the same model, or a "
+        "fundamentally different functional form for the same effect. What "
+        "counts as a family here is set by the research topic and by what the "
+        "archive already lists above, not by any fixed taxonomy — read those "
+        "and go somewhere they do not reach. Justify the structural novelty in "
+        "your rationale. Goal: escape local optima.\n"
     )
 
 
@@ -3341,9 +3588,9 @@ def llm_classify_family(model_description: str, model_class: str = "") -> Option
                     "EQUATION TERM it touches.\n"
                     "Reply with STRICT JSON only: "
                     '{"family": "<short-label>", "equation_touched": "<term>"}.\n'
-                    "The family names the specific mechanism, using its established "
-                    "name where one exists (SA-RC, SA-QCR2000, Kato-Launder, "
-                    "Wray-Agarwal, k-omega-SST, ...). Two modifications share a family "
+                    "The family names the specific mechanism. Give it the name "
+                    "you would use for that mechanism, short enough to be a "
+                    "label. Two modifications share a family "
                     "only if they alter the same mechanism in the same way — the label "
                     "is used to tell approaches apart, so an over-broad one hides real "
                     "differences. equation_touched is one of: production, destruction, "

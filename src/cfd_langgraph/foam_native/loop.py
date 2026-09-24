@@ -10,6 +10,7 @@ from typing import Any, Dict, List
 
 from . import allrun as allrun_mod
 from . import decomposer, parser, rag, review, writer
+from .case_clean import remove_stale_time_dirs
 from .openfoam_env import resolve_openfoam_env
 
 _CASE_FILE_DIRS = ("0", "constant", "system")
@@ -188,7 +189,7 @@ def _clean_stale_run_artifacts(case_dir: Path) -> None:
     """Remove everything a previous ``./Allrun`` attempt left behind that
     would make the next attempt skip work or read someone else's results.
 
-    Three distinct hazards, all of which have bitten this pipeline:
+    Four distinct hazards, all of which have bitten this pipeline:
 
     1. ``log.*`` — every step in an Allrun script runs via OpenFOAM's
        ``runApplication``, which refuses to rerun a step whose log file
@@ -206,11 +207,25 @@ def _clean_stale_run_artifacts(case_dir: Path) -> None:
        partially-rerun case that still carries the previous attempt's
        samples gets scored on results that did not come from the code
        currently in the case directory.
+    4. non-zero time directories — every QoI extractor here reads the case
+       with PyVista and is instructed to take ``max(time_values)``. A time
+       directory left by an earlier solve *on a different mesh* then wins
+       that selection, its ``internalField`` length no longer matches
+       ``nCells``, and the reader attaches no fields at all. Measured on
+       ``codex_sol56_none/cavity_r2``: the baseline carried 100..1000 from a
+       4096-cell solve next to the converged t=415 on the current 1024-cell
+       mesh, the extractor read t=1000, reported "fields found: none", and
+       the mesh gate died after 21 hours on a case that had solved fine.
+       See :mod:`cfd_langgraph.foam_native.case_clean`, which leaves genuine
+       restarts (``startFrom latestTime``, or a non-zero ``startTime``)
+       alone.
 
     Call this before the first attempt as well as between retries: case
     directories are reused across relaunches (a RERUN case is handed back to
     a subagent with the same ``case_id``, and the mesh gate reuses its
     baseline/refined dirs), so "first attempt" does not imply "clean dir".
+    Every call site is positioned before a ``./Allrun``; the retry loops
+    break out on success first, so a good result is never cleared.
     """
     for log_path in case_dir.glob("log.*"):
         if log_path.is_file():
@@ -221,6 +236,17 @@ def _clean_stale_run_artifacts(case_dir: Path) -> None:
     post = case_dir / "postProcessing"
     if post.is_dir() and not post.is_symlink():
         shutil.rmtree(post, ignore_errors=True)
+    removed_times = remove_stale_time_dirs(case_dir)
+    if removed_times:
+        # Say so: a silent delete of a previous solve's output is exactly the
+        # kind of thing that should be visible in a run log when a result
+        # later looks unexpected.
+        print(
+            f"[foam] cleared {len(removed_times)} stale time director"
+            f"{'y' if len(removed_times) == 1 else 'ies'} in {case_dir.name}: "
+            f"{', '.join(removed_times[:8])}{' ...' if len(removed_times) > 8 else ''}",
+            flush=True,
+        )
 
 
 def _run_seeded_case(

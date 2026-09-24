@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -12,7 +14,9 @@ from langgraph.types import Command
 from pydantic import BaseModel, Field
 
 from cfd_langgraph.config import Settings, get_settings
+from cfd_langgraph.utils import structured_output
 from cfd_langgraph.llm.factory import create_langchain_llm
+from cfd_langgraph.llm import token_usage_logger
 from cfd_langgraph.manager import build_manager
 from cfd_langgraph.cli import ui
 from cfd_langgraph.cli.activity import BOARD, STEERING_QUEUE
@@ -26,6 +30,11 @@ CONSOLE_BANNER = (
 )
 
 _HYPOTHESIS_GATE_TOOL = "advance_with_approved_hypotheses"
+
+# Whether the hypothesis gate stops for a human. Default off: in practice the
+# gate was always answered "approve", so it cost a study an overnight stall for
+# a decision nobody was actually making. `--ask-hypotheses` restores it.
+AUTO_APPROVE_HYPOTHESES = True
 
 
 def _install_sigint_handler() -> None:
@@ -172,6 +181,39 @@ def _handle_interrupt(
     # graph is stopped with nothing in flight (see manager/control.py).
     queued = list(STEERING_QUEUE)
 
+    if is_hypothesis_gate and AUTO_APPROVE_HYPOTHESES:
+        # Approve the proposed shortlist without asking.
+        #
+        # The gate was built as a human checkpoint, and in practice every
+        # invocation of it was answered "approve" -- a prompt that only ever
+        # has one answer is not a decision point, it is a place the study
+        # stops overnight waiting for someone to type. What the gate actually
+        # protects is downstream: run_case refuses to run without a
+        # hypotheses_approved.json on disk, and approving here still writes
+        # that file, so the enforcement is unchanged. Only the asking is gone.
+        #
+        # Still printed, because "which hypotheses became experiments" is a
+        # fact about the study that has to be visible somewhere.
+        print("\n-- hypothesis gate: auto-approving --")
+        _describe_hypotheses(out_dir)
+        for action in all_actions:
+            if action.get("name") == _HYPOTHESIS_GATE_TOOL:
+                ids = (action.get("args") or {}).get("approved_candidate_ids") or []
+                print(f"   approved: {', '.join(map(str, ids)) if ids else '(the proposer supplied none)'}")
+        print("   (run with --ask-hypotheses to review these by hand instead)")
+        # Stream the resume rather than returning it: this function drives the
+        # graph itself and returns None. Returning a Command here would have
+        # approved the gate and then never resumed the run.
+        for chunk in graph.stream(
+            Command(resume={
+                i.id: {"decisions": [{"type": "approve"} for _ in actions]}
+                for i, actions in per_interrupt_actions
+            }),
+            config=config, stream_mode="updates",
+        ):
+            _print_update_chunk(chunk)
+        return
+
     if is_hypothesis_gate:
         print("\nranked hypotheses:")
         _describe_hypotheses(out_dir)
@@ -299,7 +341,26 @@ def _stream_until_interrupt_or_done(
     graph: Any, payload: Any, config: Dict[str, Any], out_dir: Path, ask: Asker
 ) -> None:
     pending = _pending_interrupts(graph, config)
-    if not pending:
+    if pending and payload is not None:
+        # The message would otherwise be thrown away. A paused graph cannot be
+        # driven by a fresh input -- it has to be resumed through its pending
+        # interrupts -- and this branch used to just skip the stream call,
+        # taking the payload with it. Silently: the session printed nothing,
+        # the interrupt prompt appeared as if the user had said nothing, and
+        # answering "continue" carried on the plan the message existed to
+        # redirect. Observed on ph_codex_20260902_1806, where an instruction to
+        # stop rebuilding setup_staging vanished and the manager went straight
+        # back to rebuilding setup_staging.
+        #
+        # Write it into the thread's own message channel instead. The pending
+        # calls still resolve first -- they are already in flight and their
+        # results are owed to the model -- but the instruction is sitting in
+        # the history when the model next speaks, which is the whole point of
+        # having typed it.
+        graph.update_state(config, payload)
+        print("  (your message was added to the thread; it takes effect after "
+              "the paused call above resolves)", flush=True)
+    elif not pending:
         for chunk in graph.stream(payload, config=config, stream_mode="updates"):
             _print_update_chunk(chunk)
         pending = _pending_interrupts(graph, config)
@@ -312,6 +373,204 @@ def _stream_until_interrupt_or_done(
         pending = _pending_interrupts(graph, config)
 
     print("\nDone (or waiting on the next stage). Check the out-dir for artifacts.")
+
+
+# How many times a failed step is retried on its own before the session goes
+# idle and waits for a person. Four in a row, on a minute-scale ladder, covers
+# every transient fault measured so far without letting a genuinely broken
+# study spin.
+_AUTO_RETRY_ATTEMPTS = 4
+_AUTO_RETRY_DELAYS = (60, 120, 240, 480)
+_AUTO_RETRY_MESSAGE = "retry that step"
+
+
+# How many times in a row the session will restart a search that says it is
+# not finished. Bounded because the point is to survive a manager that stops
+# early, not to argue with one that has genuinely run out of things to try:
+# five nudges that all end the same way is itself the answer.
+_AUTO_CONTINUE_ATTEMPTS = 5
+_AUTO_CONTINUE_MESSAGE = (
+    "You stopped, but the search is not complete. Do not re-run setup and do not "
+    "re-do earlier stages. Call oed_propose_candidates for the next round and "
+    "carry on the loop until the stop conditions actually hold."
+)
+
+
+_AUTO_SETUP_MESSAGE = (
+    "You stopped before the study was set up, and no tool call was made in that "
+    "turn. Do not describe what you would do next — issue the next tool call now. "
+    "If a step failed, retry it or diagnose it with a tool; do not narrate the plan "
+    "and stop."
+)
+
+
+def _setup_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """True when a study stopped before it could possibly be finished.
+
+    ``_search_incomplete`` below only speaks once the search has recorded a
+    round, because before that there is no search_status.json to read. That
+    left the whole of setup -- starter reading, literature, hypotheses,
+    comparator authoring, baseline scoring -- with no auto-continue at all, and
+    a model that ends a turn with prose and no tool call parks the study there.
+    LangGraph reads "no tool calls" as the agent choosing to stop, so nothing
+    downstream can tell that apart from a finished study.
+
+    Measured on the four-model comparison: llama-4-maverick and gemma-4 each
+    idled inside eleven minutes this way -- gemma immediately after writing a
+    valid objective contract, so it was not blocked on anything, it simply
+    stopped. gpt-5.6-sol did not do it once in 28 hours on the same code. The
+    weaker the model, the more often a turn comes back as narration instead of
+    a call, and an unattended overnight study is exactly where that costs most.
+
+    search_config.json is the milestone: setup writes it last, and until it
+    exists the study definitionally has not finished. Once it exists this stops
+    firing and _search_incomplete takes over, so the two never overlap.
+    """
+    # An implementation study has no search to set up; whether it is done is
+    # its own status file's call (see _implementation_incomplete).
+    if _study_mode_of(out_dir) == "implementation":
+        return None
+    disc = out_dir / "open_ended_discovery"
+    if (disc / "search_config.json").is_file():
+        return None
+    state = {}
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "running":
+        return None
+    return {"stage": state.get("current_stage") or "setup"}
+
+
+def _study_mode_of(out_dir: Path) -> str:
+    try:
+        doc = json.loads((out_dir / "study_mode.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    return str((doc or {}).get("mode") or "").strip().lower() if isinstance(doc, dict) else ""
+
+
+_AUTO_IMPLEMENTATION_MESSAGE = (
+    "The implementation study is not finished. Call impl_status and carry on with the step "
+    "it names -- impl_run, impl_verify or impl_continue -- until impl_verify accepts the work "
+    "or the continuations are used up, then report the verdict."
+)
+
+
+def _implementation_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """For an implementation study, whether it has reached its own end.
+
+    Done means implementation/status.json says complete: accepted by
+    impl_verify, or checked with every continuation used. Anything short of
+    that while the study is marked running is a pause, not an end -- the same
+    distinction _setup_incomplete and _search_incomplete draw for the other
+    kinds of study."""
+    if _study_mode_of(out_dir) != "implementation":
+        return None
+    try:
+        status = json.loads((out_dir / "implementation" / "status.json").read_text())
+    except (OSError, ValueError):
+        status = {}
+    if isinstance(status, dict) and status.get("complete"):
+        return None
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("status") != "running":
+        return None
+    return {"stage": "implementation"}
+
+
+def _search_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
+    """The search's own verdict when it says it is unfinished, else None.
+
+    oed_record_candidate_results decides `search_complete` from budget and
+    saturation and writes it to search_status.json. This only reads it back.
+    Nothing here judges whether a study should continue -- the study already
+    said, and a manager that stops anyway is contradicting its own tool.
+
+    Returns None when the file is absent, which is every non-open-discovery
+    run and any search that has not recorded a round yet. Those keep the old
+    behaviour of going idle, because for them there is no computed verdict to
+    honour and "finished" is a judgement rather than a fact.
+    """
+    status = None
+    try:
+        raw = (out_dir / "open_ended_discovery" / "search_status.json").read_text()
+        status = json.loads(raw)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(status, dict) or status.get("search_complete") is not False:
+        return None
+    return status
+
+
+_STAGE_ORDER = (
+    ("routing_done", "routing"),
+    ("literature_done", "literature"),
+    ("hypothesis_done", "hypotheses"),
+    ("requirements_done", "case requirements"),
+    ("metric_setup_done", "metric setup"),
+)
+
+
+def _resume_summary(out_dir: Path) -> List[str]:
+    """Where this study stands, for someone who has just sat down at it.
+
+    Deliberately read off the artifacts on disk rather than the conversation:
+    after a crash or an overnight stall the thread's last words are about
+    whatever failed, while the files say what actually finished.
+    """
+    lines = ["", "  Resuming — nothing runs until you say so.", ""]
+    state = {}
+    try:
+        state = json.loads((out_dir / "state.json").read_text())
+    except (OSError, ValueError):
+        pass
+    if state.get("topic"):
+        lines.append(f"  topic         {str(state['topic'])[:96]}")
+    if state.get("current_stage"):
+        lines.append(f"  last stage    {state['current_stage']}")
+
+    done = [
+        label for name, label in _STAGE_ORDER
+        if (out_dir / "checkpoints" / f"{name}.json").is_file()
+    ]
+    lines.append(f"  completed     {', '.join(done) if done else '(nothing checkpointed)'}")
+
+    artifacts = [
+        name for name in (
+            "lit.json", "starter_understanding.json", "requirements.json",
+            "hypotheses_approved.json", "study_metrics.json", "analysis.json",
+        )
+        if (out_dir / name).is_file()
+    ]
+    lines.append(f"  on disk       {', '.join(artifacts) if artifacts else '(none)'}")
+
+    discovery = out_dir / "open_ended_discovery"
+    if discovery.is_dir():
+        history = discovery / "history.json"
+        count = 0
+        try:
+            entries = json.loads(history.read_text())
+            count = len(entries) if isinstance(entries, list) else 0
+        except (OSError, ValueError):
+            pass
+        lines.append(f"  search        {count} candidate(s) recorded")
+
+    cases = out_dir / "cases"
+    if cases.is_dir():
+        lines.append(f"  cases         {len([d for d in cases.iterdir() if d.is_dir()])}")
+
+    lines += [
+        "",
+        "  Tell it which stage to pick up and what to read. Type 'continue' to",
+        "  let it carry on from the checkpoint on its own, or /quit to stop.",
+        "",
+    ]
+    return lines
 
 
 def _drive_study(
@@ -329,7 +588,34 @@ def _drive_study(
     something, or push the search further. Each follow-up is a new turn on the
     same thread ID, so the whole checkpointed history is still there.
     """
+    auto_retries_left = _AUTO_RETRY_ATTEMPTS
+    auto_continues_left = _AUTO_CONTINUE_ATTEMPTS
     while True:
+        if payload is None:
+            # A resume reaches here with no payload, and handing LangGraph a
+            # None input does not mean "wait for me" -- it means "continue from
+            # the checkpoint". So the manager woke up mid-thought and started
+            # working immediately, before the person who typed `resume` could
+            # say what they wanted done. Measured on run ph_codex_20260902_1806:
+            # 47 tool calls of source-code reading in the first 2m23s, while the
+            # instruction meant to redirect it sat unsent in the input box, and
+            # 24 more after it landed because the model was already committed to
+            # a line of enquiry.
+            #
+            # A resume is a person sitting down at a study, and what they need
+            # first is to see where it stands and say where to go next. So show
+            # that and block. Continuing from the checkpoint untouched is still
+            # one word away -- "continue" -- it is just no longer the default
+            # that happens before anyone can object.
+            for line in _resume_summary(out_dir):
+                print(line, flush=True)
+            BOARD.note("idle")
+            text = next_message()
+            if not text:
+                return
+            BOARD.note("")
+            payload = {"messages": [{"role": "user", "content": text}]}
+            continue
         try:
             _stream_until_interrupt_or_done(graph, payload, config, out_dir, ask)
         except SystemExit:
@@ -340,18 +626,123 @@ def _drive_study(
             # restart the process; measured on a real run, a single dropped
             # HTTPS stream after 587s of a `generate_case_requirements` turn
             # killed everything. The checkpoint survives either way, so stay
-            # up and let the user decide: type to retry, or /quit.
+            # up.
             print(f"\n✗ that step failed: {type(exc).__name__}: {exc}", flush=True)
+            from cfd_langgraph.llm.retry import describe_wait, provider_quota_reset_s
+
+            # A usage limit that resets in hours or days is a wall, not a blip.
+            # Retrying the step, or nudging the search to carry on, only spends
+            # those hours hitting it again -- on 2026-09-13 both codex studies
+            # did exactly that against a limit 5.4 days from resetting.
+            quota_wait = provider_quota_reset_s(exc)
+            if quota_wait is not None:
+                print(
+                    "  the model provider's usage limit is used up; it accepts requests "
+                    f"again in {describe_wait(quota_wait)}. Not retrying, and nothing "
+                    "completed is lost: resume this study after that, or /quit.",
+                    flush=True,
+                )
+                auto_retries_left = 0
+                auto_continues_left = 0
+
+            # Staying up is not the same as continuing, and this used to
+            # conflate them: it printed "type an instruction to continue" and
+            # then blocked on stdin. Overnight there is nobody to type, so a
+            # provider blip that clears in a minute cost the entire night
+            # instead -- observed repeatedly on one evening of 429s, empty
+            # assistant turns, a read timeout and a response.failed, each of
+            # which left a study idle for hours with its checkpoint intact and
+            # nothing driving it.
+            #
+            # The per-call ladders in codex_oauth and factory sit INSIDE one
+            # model call. This is a level above them: once a call has spent its
+            # own retries and the exception propagates, nothing tried again.
+            # Retry the step itself, on a slower ladder, then hand back to the
+            # human -- so an unattended run rides out a transient fault while a
+            # genuinely broken study still stops rather than spinning.
+            if auto_retries_left > 0:
+                attempt = _AUTO_RETRY_ATTEMPTS - auto_retries_left + 1
+                delay = _AUTO_RETRY_DELAYS[
+                    min(attempt - 1, len(_AUTO_RETRY_DELAYS) - 1)
+                ]
+                auto_retries_left -= 1
+                print(
+                    f"  auto-retrying that step in {delay}s "
+                    f"(attempt {attempt}/{_AUTO_RETRY_ATTEMPTS}); "
+                    f"nothing completed is lost. Type anything, or /quit, to take over.",
+                    flush=True,
+                )
+                BOARD.note(f"retrying in {delay}s")
+                time.sleep(delay)
+                BOARD.note("")
+                payload = {"messages": [{"role": "user", "content": _AUTO_RETRY_MESSAGE}]}
+                continue
+            if quota_wait is None:
+                print(
+                    "  auto-retries exhausted. Type an instruction to continue "
+                    "(e.g. 'retry that step'), or /quit to stop.",
+                    flush=True,
+                )
+        else:
+            # A turn that got through resets the budget, so a long study is
+            # not capped at four recoveries for its whole life -- only at four
+            # in a row, which is what distinguishes a blip from a wall.
+            auto_retries_left = _AUTO_RETRY_ATTEMPTS
+        # A turn that ends cleanly is not the same as a study that is finished,
+        # and this used to treat them identically -- park, and wait for a human
+        # who is asleep. An open-ended search publishes its own verdict, so
+        # when that verdict says unfinished, say so and carry on rather than
+        # accepting a stop the search itself contradicts.
+        status = _search_incomplete(out_dir)
+        if status is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
             print(
-                "  Nothing completed is lost. Type an instruction to continue "
-                "(e.g. 'retry that step'), or /quit to stop.",
+                f"\n  the search reports search_complete=false "
+                f"(budget {status.get('budget_used')}/{status.get('budget_total')}, "
+                f"saturated={status.get('is_saturated')}) — continuing it "
+                f"[{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. Type anything, or /quit, to take over.",
                 flush=True,
             )
+            payload = {"messages": [{"role": "user", "content": _AUTO_CONTINUE_MESSAGE}]}
+            continue
+
+        # Same reasoning one stage earlier: a study that has not finished setup
+        # cannot be finished, whatever the turn looked like.
+        pre = _setup_incomplete(out_dir)
+        if pre is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
+            print(
+                f"\n  the study stopped during {pre.get('stage')} with setup "
+                f"unfinished — continuing it [{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. "
+                "Type anything, or /quit, to take over.",
+                flush=True,
+            )
+            payload = {"messages": [{"role": "user", "content": _AUTO_SETUP_MESSAGE}]}
+            continue
+
+        impl = _implementation_incomplete(out_dir)
+        if impl is not None and auto_continues_left > 0:
+            attempt = _AUTO_CONTINUE_ATTEMPTS - auto_continues_left + 1
+            auto_continues_left -= 1
+            print(
+                f"\n  the implementation study is not finished — continuing it "
+                f"[{attempt}/{_AUTO_CONTINUE_ATTEMPTS}]. Type anything, or /quit, to take over.",
+                flush=True,
+            )
+            payload = {"messages": [{"role": "user", "content": _AUTO_IMPLEMENTATION_MESSAGE}]}
+            continue
+
         BOARD.note("idle")
         text = next_message()
         if not text:
             return
         BOARD.note("")
+        auto_retries_left = _AUTO_RETRY_ATTEMPTS
+        # A person taking over resets the nudge budget: the next stop after
+        # their instruction is a fresh one, not a continuation of the streak.
+        auto_continues_left = _AUTO_CONTINUE_ATTEMPTS
         payload = {"messages": [{"role": "user", "content": text}]}
 
 
@@ -386,7 +777,7 @@ def _llm_extract_hints(topic: str, settings: Settings) -> _PromptHints:
     """
     try:
         llm = create_langchain_llm(model=settings.model, temperature=0.0)
-        return llm.with_structured_output(_PromptHints).invoke(
+        return structured_output(llm, _PromptHints).invoke(
             "Find any output/working-directory path and any starter/base-case folder path "
             f"mentioned in this text. Return null for whichever isn't mentioned.\n\nText:\n{topic}"
         )
@@ -537,7 +928,28 @@ def cmd_run(args: argparse.Namespace) -> None:
     if args.num_candidates is not None:
         settings = settings.model_copy(update={"hypothesis_num_candidates": args.num_candidates})
 
-    hints = _PromptHints() if args.out_dir else _llm_extract_hints(topic, settings)
+    # Bind accounting BEFORE the first model is built. `_llm_extract_hints`
+    # below is an LLM call, and with no --out-dir it runs before any run
+    # directory exists, so its tokens fell through to a shared
+    # llm_token_usage.json in the working directory. Measured: 49 such calls
+    # across four providers landed in the repo root, filed as "unattributed",
+    # invisible to every per-study report. When --out-dir is given the
+    # destination is known here, so bind it now; otherwise the prelude logs to
+    # a scratch folder and its rows are moved into the study's log once the
+    # folder is known.
+    prelude_log = None
+    if args.out_dir:
+        _bind_token_log(Path(args.out_dir))
+    else:
+        # The study folder is not known until the model has read the prompt,
+        # so the prelude logs to a scratch folder and its rows are moved into
+        # the study's log below.
+        import tempfile
+        prelude_log = Path(tempfile.mkdtemp(prefix="cfd_prelude_tokens_"))
+        os.environ.pop("CFD_TOKEN_LOG_PATH", None)
+        os.environ["CFD_TOKEN_LOG_DIR"] = str(prelude_log)
+    with token_usage_logger.stage_scope("cli_prelude"):
+        hints = _PromptHints() if args.out_dir else _llm_extract_hints(topic, settings)
 
     if args.out_dir:
         out_dir = Path(args.out_dir)
@@ -548,6 +960,11 @@ def cmd_run(args: argparse.Namespace) -> None:
         out_dir = Path("runs") / f"study_{datetime.now():%Y%m%d_%H%M%S}"
         print(f"(no --out-dir given and none found in the prompt, using {out_dir})")
     out_dir.mkdir(parents=True, exist_ok=True)
+    if prelude_log is not None:
+        os.environ.pop("CFD_TOKEN_LOG_DIR", None)
+        _bind_token_log(out_dir)
+        for row in token_usage_logger.read_rows(prelude_log / "llm_token_usage_calls.jsonl"):
+            token_usage_logger.append_row(row)
     # The user's prompt, verbatim and immutable, as the study's authoritative
     # objective. Tools must not depend on the manager passing it through: it
     # summarises. Measured on a real run, an 86-character paraphrase reached
@@ -564,6 +981,22 @@ def cmd_run(args: argparse.Namespace) -> None:
     _start_session(settings, out_dir, {"messages": [{"role": "user", "content": topic}]})
 
 
+def _bind_token_log(out_dir: Path) -> None:
+    """Send every LLM call's accounting to this study's folder.
+
+    The study folder always wins. It used to yield to a CFD_TOKEN_LOG_DIR or
+    CFD_TOKEN_LOG_PATH already in the environment, so a value left exported in
+    a shell from an earlier study would have filed this study's tokens there.
+    """
+    target = Path(out_dir).resolve()
+    stray = os.environ.pop("CFD_TOKEN_LOG_PATH", None)
+    previous = os.environ.get("CFD_TOKEN_LOG_DIR")
+    for old in (stray, previous):
+        if old and Path(old).expanduser().resolve() not in (target, target / "llm_token_usage.json"):
+            print(f"(token accounting: ignoring {old}; this study logs to {target})")
+    os.environ["CFD_TOKEN_LOG_DIR"] = str(target)
+
+
 def _start_session(settings: Settings, out_dir: Path, payload: Any) -> None:
     """Build the graph and run it, under the live console when one is possible.
 
@@ -573,6 +1006,22 @@ def _start_session(settings: Settings, out_dir: Path, payload: Any) -> None:
     the behaviour they had before the console existed, instead of on a second
     lightly-tested path.
     """
+    # Token accounting lands in THIS study's folder rather than a shared file
+    # in the working directory. Set here because `run` and `resume` both come
+    # through this function, and set on os.environ rather than passed as an
+    # argument so it reaches every subprocess stage via os.environ.copy() --
+    # the build agents, the interpreter, the setup script -- without threading
+    # a path through each of them. An explicit CFD_TOKEN_LOG_DIR or
+    # CFD_TOKEN_LOG_PATH from the launching shell still wins.
+    _bind_token_log(out_dir)
+    # Default attribution for everything running in THIS process: the manager
+    # graph and the in-process tools it calls. Subprocess stages overwrite it
+    # with their own script name (see _run_script), and individual in-process
+    # stages narrow it with stage_scope, so this is the floor rather than the
+    # answer -- but it means no call is filed as "unattributed" by default.
+    if not os.environ.get("CFD_SCIENTIST_STAGE"):
+        os.environ["CFD_SCIENTIST_STAGE"] = "manager"
+        os.environ["CFD_SCIENTIST_STAGE_OWNER"] = token_usage_logger.process_name()
     graph, stack = build_manager(settings, out_dir)
     config = {"configurable": {"thread_id": _thread_id_for(out_dir)}}
     try:
@@ -612,10 +1061,22 @@ def build_parser() -> argparse.ArgumentParser:
     run_p.add_argument("--out-dir", default=None, help="If omitted, defaults to runs/study_<timestamp>.")
     run_p.add_argument("--num-candidates", type=int, default=None)
     run_p.add_argument("--max-parallel-cases", type=int, default=None)
+    run_p.add_argument(
+        "--ask-hypotheses", action="store_true",
+        help="Stop at the hypothesis gate for manual approval. Off by default: "
+             "the gate is auto-approved, since in practice it was always "
+             "answered 'approve' and only served to stall the study.",
+    )
     run_p.set_defaults(func=cmd_run)
 
     resume_p = sub.add_parser("resume", help="resume a paused study")
     resume_p.add_argument("--out-dir", required=True)
+    resume_p.add_argument(
+        "--ask-hypotheses", action="store_true",
+        help="Stop at the hypothesis gate for manual approval. Off by default: "
+             "the gate is auto-approved, since in practice it was always "
+             "answered 'approve' and only served to stall the study.",
+    )
     resume_p.set_defaults(func=cmd_resume)
 
     return p
@@ -625,6 +1086,11 @@ def main(argv: Optional[List[str]] = None) -> None:
     _install_sigint_handler()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Opt back in to the human checkpoint. Set before the graph runs, since the
+    # gate is consulted from inside the interrupt handler.
+    global AUTO_APPROVE_HYPOTHESES
+    if getattr(args, "ask_hypotheses", False):
+        AUTO_APPROVE_HYPOTHESES = False
     args.func(args)
 
 

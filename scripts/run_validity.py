@@ -65,7 +65,8 @@ def _llm_worker(msgs_pickle: bytes, model: str, temp: float, queue: Any) -> None
             msgs.append(cls(content=content))
         llm = create_langchain_llm(model=model, temperature=temp)
         raw = llm.invoke(msgs)
-        queue.put(("ok", str(getattr(raw, "content", raw))))
+        from cfd_langgraph.llm.reply import reply_text
+        queue.put(("ok", reply_text(raw)))
     except Exception as e:  # pragma: no cover — child-process error path
         import traceback
         queue.put(("err", f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=5)}"))

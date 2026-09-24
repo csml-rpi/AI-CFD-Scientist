@@ -14,6 +14,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.viz_creator import viz_creator
+from cfd_langgraph.llm.reply import reply_text
 
 try:
     from PIL import Image
@@ -138,7 +139,7 @@ class AnalysisAgent:
             ("human", user),
         ])
         chain = prompt | self.llm
-        return chain.invoke({"batch_name": batch_name, "bundle_text": bundle_text, "extra_context": extra_context or ""}).content
+        return reply_text(chain.invoke({"batch_name": batch_name, "bundle_text": bundle_text, "extra_context": extra_context or ""}))
 
     def save_analysis(self, out_path: Path, text: str, topic: Optional[str] = None) -> None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,7 +246,7 @@ class AnalysisAgent:
         user = "\n".join(parts)
         prompt = ChatPromptTemplate.from_messages([("system", system), ("human", "{user}")])
         out = (prompt | self.llm).invoke({"user": user})
-        return getattr(out, "content", str(out)).strip()
+        return reply_text(out).strip()
 
     def create_analysis_viz_for_experiments(
         self,
@@ -362,7 +363,7 @@ class AnalysisAgent:
             messages = [SystemMessage(content=system), HumanMessage(content=content_parts)]
             try:
                 out = self.llm.invoke(messages)
-                return getattr(out, "content", str(out)).strip()
+                return reply_text(out).strip()
             except Exception as e:
                 if _is_image_dimension_error(e) and attempt < max_retries - 1:
                     if verbose:
@@ -588,7 +589,7 @@ class AnalysisAgent:
         user = "Case contexts:\n" + json.dumps(contexts, ensure_ascii=False)[:120000]
         try:
             raw = self.llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
-            txt = _strip_json_fences(str(getattr(raw, "content", raw)).strip())
+            txt = _strip_json_fences(reply_text(raw).strip())
             arr = json.loads(txt)
             if isinstance(arr, list):
                 out = [x for x in arr if isinstance(x, dict)]
@@ -646,7 +647,7 @@ class AnalysisAgent:
 
         try:
             out = self.llm.invoke([SystemMessage(content=system), HumanMessage(content=content_parts)])
-            text = str(getattr(out, "content", str(out))).strip()
+            text = reply_text(out).strip()
         except Exception as e:
             text = (
                 "Cross-experiment interpretation generation failed.\n\n"
@@ -721,10 +722,10 @@ class AnalysisAgent:
         planner_raw_path = proc_dir / "planner_raw.txt"
         planner_json_path = proc_dir / "planner_parsed.json"
         try:
-            plan_raw = (self.llm.invoke([
+            plan_raw = reply_text(self.llm.invoke([
                 SystemMessage(content=planner_system),
                 HumanMessage(content=planner_user),
-            ])).content
+            ]))
             plan_raw = str(plan_raw)
             try:
                 planner_raw_path.write_text(plan_raw, encoding="utf-8")
@@ -896,7 +897,7 @@ class AnalysisAgent:
             )
             try:
                 resp = self.llm.invoke([SystemMessage(content=script_system), HumanMessage(content=user)])
-                script_text = getattr(resp, "content", str(resp))
+                script_text = reply_text(resp)
             except Exception as e:
                 last_error = f"LLM script generation failed: {e}"
                 continue

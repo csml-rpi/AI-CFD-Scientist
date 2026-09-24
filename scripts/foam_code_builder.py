@@ -105,7 +105,8 @@ def _llm_suggest_activation_dictionary_path(
                 HumanMessage(content=json.dumps(user_payload, ensure_ascii=False)[:50000]),
             ]
         )
-        raw = getattr(resp, "content", "") if resp else ""
+        from cfd_langgraph.llm.reply import reply_text
+        raw = reply_text(resp)
         txt = strip_json_fences(raw if isinstance(raw, str) else str(raw))
         s, e = txt.find("{"), txt.rfind("}")
         if s == -1 or e <= s:

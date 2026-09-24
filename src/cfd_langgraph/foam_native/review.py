@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from cfd_langgraph.utils import structured_output
+
 from typing import Any, Dict, List
 
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -7,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..llm.caching import cacheable_human_message
 from . import prompts as P
+from cfd_langgraph.llm.reply import reply_text
 
 
 def review_errors(
@@ -36,10 +39,10 @@ def review_errors(
         user_requirement=user_requirement,
         history_text=history_text,
     ).partition(P.REVIEW_CACHE_SPLIT_MARKER)
-    raw = llm.invoke([
+    raw = reply_text(llm.invoke([
         SystemMessage(content=system),
         cacheable_human_message(llm, stable, P.REVIEW_CACHE_SPLIT_MARKER + tail),
-    ]).content
+    ]))
     return (raw or "").strip()
 
 
@@ -67,7 +70,7 @@ def plan_rewrite(
         foamfiles_xml=foamfiles_xml, error_logs=error_logs,
         review_analysis=review_analysis, user_requirement=user_requirement,
     )
-    out: _RewritePlan = llm.with_structured_output(_RewritePlan).invoke(
+    out: _RewritePlan = structured_output(llm, _RewritePlan).invoke(
         [SystemMessage(content=system), HumanMessage(content=user)]
     )
     return [{"file": t.file, "changes": t.changes} for t in out.target_files]
