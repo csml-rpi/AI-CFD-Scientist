@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from . import allrun as allrun_mod
 from . import decomposer, parser, rag, review, writer
-from .case_clean import remove_stale_time_dirs
+from .case_clean import parse_time_dir, remove_stale_time_dirs
 from .openfoam_env import resolve_openfoam_env
 
 _CASE_FILE_DIRS = ("0", "constant", "system")
@@ -103,6 +105,14 @@ def collect_error_logs(case_dir: Path, max_lines: int = 200) -> str:
             "these, and the solver cannot converge on this mesh:\n"
             + "\n".join(mesh_errors)
         )
+    solver = _read_solver_from_control_dict(case_dir)
+    if solver and _solver_ran_no_steps(case_dir, solver):
+        parts.append(
+            f"--- {solver} ran no time steps ---\n"
+            f"log.{solver} ends normally but the solver never advanced past its start time, so "
+            "nothing was solved. Check startTime, endTime, deltaT and stopAt in "
+            "system/controlDict: endTime must be later than startTime."
+        )
     candidates = sorted(case_dir.glob("log.*")) + [case_dir / "Allrun.out"]
     for log_path in candidates:
         if log_path.is_file():
@@ -122,12 +132,30 @@ def _has_fatal(case_dir: Path) -> bool:
     return False
 
 
-def _solver_ended_cleanly(case_dir: Path, solver: str) -> bool:
+# A run that ends at its start time still prints "End"; recorded as a success, its
+# initial fields were later judged as if they were a solution (qwen_retest_20261005/cavity_r3).
+def _solver_ran_no_steps(case_dir: Path, solver: str) -> bool:
+    """Whether the solver's log ends normally without having advanced a time step
+    (endTime at or before startTime)."""
     log_path = case_dir / f"log.{solver}"
     if not log_path.is_file():
         return False
-    tail = log_path.read_text(encoding="utf-8", errors="ignore")[-2000:]
-    return tail.rstrip().endswith("End")
+    text = log_path.read_text(encoding="utf-8", errors="ignore")
+    return "\nTime = " not in text and text.rstrip().endswith(("End", "Finalising parallel run"))
+
+
+def _solver_ended_cleanly(case_dir: Path, solver: str) -> bool:
+    """The solver advanced at least one time step and its log ended normally."""
+    log_path = case_dir / f"log.{solver}"
+    if not log_path.is_file():
+        return False
+    if _solver_ran_no_steps(case_dir, solver):
+        return False
+    tail = log_path.read_text(encoding="utf-8", errors="ignore")[-2000:].rstrip()
+    # A parallel run prints "Finalising parallel run" after its "End".
+    if tail.endswith("Finalising parallel run"):
+        tail = tail[: -len("Finalising parallel run")].rstrip()
+    return tail.endswith("End")
 
 
 def _extract_functions_block(control_dict_text: str) -> str:
@@ -185,6 +213,28 @@ def _seed_function_objects(case_dir: Path, seed_case_dir: Path) -> str:
     return ", ".join(names) or "functions"
 
 
+def _drop_old_mesh_fields(case_dir: Path) -> List[str]:
+    """Remove initial-time files holding per-cell or per-face lists.
+
+    After re-meshing, a list sized for the old mesh cannot be read on the new
+    one; a solver that needs such a field fails either way, and one that does
+    not (function-object output such as yPlus, written at the first time)
+    otherwise stops decomposePar, which reads every field in 0/.
+    """
+    zero = Path(case_dir) / "0"
+    dropped: List[str] = []
+    if not zero.is_dir():
+        return dropped
+    for f in sorted(zero.iterdir()):
+        if f.is_file() and "nonuniform" in f.read_text(errors="ignore"):
+            f.unlink()
+            dropped.append(f.name)
+    if dropped:
+        print(f"[foam] {Path(case_dir).name}: dropped 0/ fields sized for the old mesh: "
+              f"{', '.join(dropped)}", flush=True)
+    return dropped
+
+
 def _clean_stale_run_artifacts(case_dir: Path) -> None:
     """Remove everything a previous ``./Allrun`` attempt left behind that
     would make the next attempt skip work or read someone else's results.
@@ -236,7 +286,13 @@ def _clean_stale_run_artifacts(case_dir: Path) -> None:
     post = case_dir / "postProcessing"
     if post.is_dir() and not post.is_symlink():
         shutil.rmtree(post, ignore_errors=True)
-    removed_times = remove_stale_time_dirs(case_dir)
+    # A restart from an earlier time is only valid on the mesh that wrote it.
+    # When this case's Allrun regenerates the mesh, those fields no longer
+    # fit it, so they go regardless of startFrom.
+    allrun = case_dir / "Allrun"
+    regenerates_mesh = allrun.is_file() and any(
+        tool in allrun.read_text(errors="ignore") for tool in ("blockMesh", "snappyHexMesh"))
+    removed_times = remove_stale_time_dirs(case_dir, force=regenerates_mesh)
     if removed_times:
         # Say so: a silent delete of a previous solve's output is exactly the
         # kind of thing that should be visible in a run log when a result
@@ -249,6 +305,53 @@ def _clean_stale_run_artifacts(case_dir: Path) -> None:
         )
 
 
+def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
+               timeout: Optional[float]) -> tuple[int, str, str, bool]:
+    """Run a case script in its own process group and return (returncode,
+    stdout, stderr, timed_out). On a timeout, or if this process is
+    interrupted, the whole group is stopped: killing only the script would
+    leave mpirun and its solver ranks running, still writing into the case."""
+    proc = subprocess.Popen(cmd, cwd=str(cwd), env=env, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, out or "", err or "", False
+    except subprocess.TimeoutExpired:
+        _stop_group(proc)
+        out, err = proc.communicate()
+        return -1, out or "", err or "", True
+    except BaseException:
+        _stop_group(proc)
+        raise
+    finally:
+        # The script can exit while something it started in the background
+        # is still running in its group.
+        _stop_group(proc, quiet=True)
+
+
+def _stop_group(proc: subprocess.Popen, quiet: bool = False) -> None:
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+    for sig, wait in ((signal.SIGTERM, 10.0), (signal.SIGKILL, 5.0)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            if not quiet:
+                raise
+            return
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pgid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.2)
+
+
 def _run_seeded_case(
     base_case_seed_dir: Path,
     case_dir: Path,
@@ -257,30 +360,36 @@ def _run_seeded_case(
     max_loop: int,
     max_time_limit_s: int,
     t0: float,
+    prepare: Optional[Callable[[Path], Any]] = None,
 ) -> Dict[str, Any]:
-    """Copy a validated case and run it, unmodified. No LLM calls at all."""
+    """Copy a validated case and run it. No LLM calls at all. ``prepare``, if
+    given, may add output-only settings (extra function objects) to the copy
+    before it runs; it must not change the physics or the mesh."""
     _copy_case_files(base_case_seed_dir, case_dir)
+    if prepare is not None:
+        prepare(case_dir)
     solver = _read_solver_from_control_dict(case_dir) or "simpleFoam"
+    # Record the source case: a copy under a new name has lost the condition
+    # its original directory name carried, which scoring depends on.
     (case_dir / ".foamagent_state.json").write_text(
-        json.dumps({"case_info": {"case_solver": solver}}, indent=2)
+        json.dumps(
+            {
+                "case_info": {"case_solver": solver},
+                "seed_source": str(base_case_seed_dir),
+                "seed_name": base_case_seed_dir.name,
+            },
+            indent=2,
+        )
     )
     allrun_path = case_dir / "Allrun"
-    allrun_path.write_text(allrun_mod.build_allrun_script("blockMesh", case_solver=solver))
+    allrun_path.write_text(allrun_mod.build_mesh_and_solve_allrun(solver))
     allrun_path.chmod(0o755)
     allrun_env = resolve_openfoam_env(openfoam_path)
     _clean_stale_run_artifacts(case_dir)
 
     remaining = max(60, max_time_limit_s - int(time.monotonic() - t0))
-    try:
-        proc = subprocess.run(
-            ["./Allrun"], cwd=str(case_dir), env=allrun_env,
-            capture_output=True, text=True, timeout=remaining,
-        )
-        allrun_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-        returncode = proc.returncode
-    except subprocess.TimeoutExpired as exc:
-        allrun_out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-        returncode = -1
+    returncode, out, err, _ = run_script(["./Allrun"], case_dir, allrun_env, remaining)
+    allrun_out = out + "\n" + err
     (case_dir / "Allrun.out").write_text(allrun_out)
 
     mesh_errors = mesh_check_errors(case_dir)
@@ -293,7 +402,7 @@ def _run_seeded_case(
     # A failure here is NOT something a review loop can repair: the case was
     # not authored, it was copied from the study's own validated base case.
     # Report it plainly instead of rewriting files nobody wrote.
-    return {
+    result = {
         "status": "success" if success else "failed",
         "case_dir": str(case_dir),
         "case_solver": solver,
@@ -307,6 +416,62 @@ def _run_seeded_case(
             "base case itself."
         ),
     }
+    (case_dir / "run_result.json").write_text(json.dumps(result, indent=2))
+    return result
+
+
+def _canonical_dict(path: Path, env: Optional[Dict[str, str]]) -> str:
+    """A dictionary file's content in OpenFOAM's own canonical form, from its
+    FoamFile header on (the banner above it names the file)."""
+    proc = subprocess.run(["foamDictionary", "-expand", str(path)], env=env, capture_output=True, text=True)
+    if proc.returncode != 0:
+        return f"unreadable:{path}"
+    start = proc.stdout.find("FoamFile")
+    return proc.stdout[start:] if start >= 0 else proc.stdout
+
+
+def _apply_start_case(case_dir: Path, start_case: Path, seed_case: Path,
+                      env: Optional[Dict[str, str]]) -> str:
+    """Start this case the way the study's runs start (see
+    mesh_assessment.make_start_case): from the settled flow when the start
+    case carries it and this case's initial and boundary conditions are still
+    the selected level's, from rest otherwise -- a settled field whose
+    boundaries were set up differently would start the case from a state its
+    own conditions never produced."""
+    from cfd_langgraph.mesh_assessment import _set_entry, set_averaging_start
+
+    (case_dir / "start_applied.json").unlink(missing_ok=True)  # from an earlier run of this case
+    try:
+        decision = json.loads((start_case / "start_decision.json").read_text())
+    except (OSError, ValueError):
+        return "from rest: the start case has no decision on record"
+    if not decision.get("from_settled_state"):
+        return "from rest, as the study's start decision says"
+    names = sorted(f.name for f in (case_dir / "0").iterdir() if f.is_file())
+    if names != sorted(f.name for f in (seed_case / "0").iterdir() if f.is_file()) or any(
+            _canonical_dict(case_dir / "0" / n, env) != _canonical_dict(seed_case / "0" / n, env) for n in names):
+        return "from rest: its initial or boundary conditions differ from the selected level's"
+    for n in names:
+        shutil.copy2(start_case / "0" / n, case_dir / "0" / n)
+    cd = case_dir / "system" / "controlDict"
+    length = float(decision["run_length"])
+    _set_entry(cd, "startFrom", "startTime", env)
+    _set_entry(cd, "startTime", "0", env)
+    _set_entry(cd, "endTime", f"{length:g}", env)
+    averaging = set_averaging_start(cd, float(decision.get("averaging_start") or 0.0), env)
+    (case_dir / "start_applied.json").write_text(json.dumps({
+        "from_settled_state": True,
+        "fields_replaced": names,
+        "endTime": length,
+        "averaging_start": decision.get("averaging_start") if averaging else None,
+        "note": (
+            "Set on purpose by the study's start protocol: this case starts from the selected "
+            "mesh level's settled flow, so 0/ holds that flow (not uniform initial fields) and "
+            f"endTime is {length:g}, the run length decided for every run of this study, "
+            "whatever the requirement text says. Do not change these or re-run to 'fix' them."
+        ),
+    }, indent=2))
+    return f"from the settled flow and runs {length:g}"
 
 
 def run_foam_case(
@@ -322,6 +487,8 @@ def run_foam_case(
     functions_seed_case_dir: Path | None = None,
     base_case_seed_dir: Path | None = None,
     seed_only: bool = False,
+    prepare: Optional[Callable[[Path], Any]] = None,
+    start_case_dir: Path | None = None,
 ) -> Dict[str, Any]:
     """The full FoamAgent loop — parse, RAG, decompose, write, Allrun, run,
     review/rewrite/retry, run_result.json — ported stage-by-stage from
@@ -357,6 +524,7 @@ def run_foam_case(
         return _run_seeded_case(
             Path(base_case_seed_dir), case_dir, openfoam_path=openfoam_path,
             max_loop=max_loop, max_time_limit_s=max_time_limit_s, t0=t0,
+            prepare=prepare,
         )
 
     # Stage 1 — parse
@@ -455,6 +623,20 @@ def run_foam_case(
         if seeded:
             print(f"[foam-native] seeded function objects from base case: {seeded}", flush=True)
 
+    # What the caller needs on every case, authored as well as seeded -- the
+    # mesh gate adds time averaging to a transient case this way. Applied only
+    # on the seeded path, an authored baseline never wrote the averaged
+    # fields its gate quantities are defined on (qwen_retest_20261005/cavity:
+    # 6 of 16 failed gate calls).
+    if prepare is not None:
+        prepare(case_dir)
+    drop_unread_transport_properties(case_dir)
+
+    if start_case_dir is not None and base_case_seed_dir is not None:
+        how = _apply_start_case(case_dir, Path(start_case_dir), Path(base_case_seed_dir),
+                                resolve_openfoam_env(openfoam_path))
+        print(f"[foam-native] {case_dir.name} starts {how}", flush=True)
+
     # Stage 6 — Allrun
     command_text = allrun_mod.generate_allrun_commands(
         llm, dir_structure=refs.get("dir_structure", ""), case_info=case_info,
@@ -462,7 +644,11 @@ def run_foam_case(
     )
     allrun_path = case_dir / "Allrun"
     allrun_path.write_text(
-        allrun_mod.build_allrun_script(command_text, case_solver=case_info["case_solver"])
+        allrun_mod.build_allrun_script(
+            command_text, case_solver=case_info["case_solver"],
+            needs_blockmesh=(case_dir / "system" / "blockMeshDict").is_file()
+            and not (case_dir / "constant" / "polyMesh" / "points").exists(),
+        )
     )
     allrun_path.chmod(0o755)
 
@@ -488,17 +674,11 @@ def run_foam_case(
     # therefore recorded as a success without having run anything.
     _clean_stale_run_artifacts(case_dir)
     for loop_count in range(1, max_loop + 1):
+        if prepare is not None:
+            prepare(case_dir)  # a reviewer's rewrite may have dropped it
         remaining = max(60, max_time_limit_s - int(time.monotonic() - t0))
-        try:
-            proc = subprocess.run(
-                ["./Allrun"], cwd=str(case_dir), env=allrun_env,
-                capture_output=True, text=True, timeout=remaining,
-            )
-            allrun_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired as exc:
-            allrun_out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            returncode = -1
+        returncode, out, err, _ = run_script(["./Allrun"], case_dir, allrun_env, remaining)
+        allrun_out = out + "\n" + err
         (case_dir / "Allrun.out").write_text(allrun_out)
 
         clean = (
@@ -601,6 +781,23 @@ def _copy_case_files(base_case_dir: Path, case_dir: Path) -> None:
         src = base_case_dir / item
         if src.is_dir():
             shutil.copytree(src, case_dir / item, dirs_exist_ok=True)
+    drop_unread_transport_properties(case_dir)
+
+
+# A second, unread copy misleads: a case-runner edited the unused file and
+# "fixed" a viscosity that was already right (qwen_retest_20261005/cavity_r11).
+def drop_unread_transport_properties(case_dir: Path) -> bool:
+    """Remove constant/transportProperties when constant/physicalProperties is
+    present, since OpenFOAM 10 reads only the latter. Returns whether a file was
+    removed."""
+    constant = Path(case_dir) / "constant"
+    stale = constant / "transportProperties"
+    if (constant / "physicalProperties").is_file() and stale.is_file():
+        stale.unlink()
+        print(f"[foam] {Path(case_dir).name}: removed constant/transportProperties "
+              "(physicalProperties is the file OpenFOAM 10 reads)", flush=True)
+        return True
+    return False
 
 
 def _read_solver_from_control_dict(case_dir: Path) -> str:
@@ -610,6 +807,165 @@ def _read_solver_from_control_dict(case_dir: Path) -> str:
     text = path.read_text(encoding="utf-8", errors="ignore")
     m = re.search(r"\bapplication\s+(\w+)\s*;", text)
     return m.group(1) if m else ""
+
+
+def _n_cells(case_dir: Path) -> Optional[int]:
+    """Cell count from the header OpenFOAM writes into polyMesh/owner."""
+    owner = Path(case_dir) / "constant" / "polyMesh" / "owner"
+    if not owner.is_file():
+        return None
+    with owner.open(errors="ignore") as f:
+        head = f.read(4000)
+    i = head.find("nCells:")
+    if i < 0:
+        return None
+    digits = ""
+    for ch in head[i + len("nCells:"):].lstrip():
+        if not ch.isdigit():
+            break
+        digits += ch
+    return int(digits) if digits else None
+
+
+# Most cells one refinement step may have, as a multiple of its parent's.
+REFINE_BUDGET = float(os.environ.get("CFD_SCIENTIST_REFINE_BUDGET") or 2.25)
+
+
+def _layers_along_empty_axis(case_dir: Path) -> Optional[int]:
+    """Cells across the out-of-plane direction of a 2-D case (one with an
+    empty patch), or None if the case is 3-D or its mesh cannot be read.
+    Read from the mesh alone, so an unsolved level can be checked."""
+    try:
+        import numpy as np
+
+        from cfd_langgraph.foam_load import patch_types
+        from cfd_langgraph.mesh_assessment import _read_mesh
+
+        if "empty" not in set(patch_types(case_dir).values()):
+            return None
+        points = np.asarray(_read_mesh(Path(case_dir), solved=False)[0].points)
+        span = np.ptp(points, axis=0)
+        span[span == 0] = 1.0
+        counts = [len(np.unique(np.round((points[:, a] - points[:, a].min()) / span[a], 6)))
+                  for a in range(3)]
+        return max(1, min(counts) - 1)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# Checked in code: a reviewer passed an unchanged blockMeshDict and a coarser mesh,
+# and the gate then compared a mesh with itself (qwen_retest_20261005/cavity).
+def _not_finer(case_dir: Path, parent_dir: Path) -> Optional[str]:
+    """Why a refined mesh is not a valid refinement step of its parent (unchanged,
+    not finer, over the cell budget, or no longer 2-D), or None."""
+    def bmd(d: Path) -> str:
+        f = d / "system" / "blockMeshDict"
+        return " ".join(f.read_text(errors="ignore").split()) if f.is_file() else ""
+
+    if bmd(case_dir) and bmd(case_dir) == bmd(parent_dir):
+        return ("The refined blockMeshDict is identical to the parent's: nothing was refined. "
+                "Increase the cell counts where the refinement instruction says.")
+    child, parent = _n_cells(case_dir), _n_cells(parent_dir)
+    if child is not None and parent is not None and child <= parent:
+        return (f"The refined mesh has {child} cells and its parent {parent}: it is not finer. A "
+                "refinement must add cells -- increase the cell counts where the refinement "
+                "instruction says, and do not reduce them anywhere.")
+    layers = _layers_along_empty_axis(parent_dir), _layers_along_empty_axis(case_dir)
+    if layers[0] == 1 and layers[1] not in (None, 1):
+        return (f"This is a 2-D case: the out-of-plane direction (its empty patches) must keep "
+                f"exactly one cell, but the refined mesh has {layers[1]} there. Refine only the "
+                "two in-plane directions.")
+    # The budget is a number, so it is checked here rather than by a reviewer:
+    # on qwen_retest_20261005/cavity_r4 the reviewer rejected a step of 1.98x
+    # as over a budget of "about twice", five times, and the gate stopped.
+    # 2.25 admits a uniform 1.5x step in two directions.
+    if child is not None and parent is not None and child > REFINE_BUDGET * parent:
+        return (f"The refined mesh has {child} cells, {child / parent:.2f} times its parent's {parent}: "
+                f"one refinement step may add at most {REFINE_BUDGET:g} times the cells. Refine only "
+                "the regions and directions the instruction names, or by a smaller factor.")
+    return None
+
+
+def _foam_tokens(text: str) -> List[Any]:
+    """An OpenFOAM list as nested Python lists of word tokens."""
+    stack: List[List[Any]] = [[]]
+    word = ""
+    for ch in text + " ":
+        if ch in "()" or ch.isspace():
+            if word:
+                stack[-1].append(word)
+                word = ""
+            if ch == "(":
+                stack.append([])
+            elif ch == ")":
+                if len(stack) == 1:
+                    raise ValueError("unbalanced ')'")
+                done = stack.pop()
+                stack[-1].append(done)
+        else:
+            word += ch
+    if len(stack) != 1:
+        raise ValueError("unbalanced '('")
+    return stack[0]
+
+
+def _foam_text(item: Any) -> str:
+    if isinstance(item, list):
+        return "(" + " ".join(_foam_text(x) for x in item) + ")"
+    return str(item)
+
+
+def refine_block_counts(block_mesh_dict: Path, env: Dict[str, str],
+                        budget: float = REFINE_BUDGET) -> Optional[str]:
+    """Refine every block of a blockMeshDict uniformly, in code: each direction
+    with more than one cell is multiplied by the same factor, chosen so the
+    total grows by at most ``budget``. Directions with one cell (the empty or
+    wedge direction) stay at one, and equal counts stay equal, so blocks that
+    share a face still match. Returns None on success, else why it could not."""
+    path = Path(block_mesh_dict)
+    read = subprocess.run(["foamDictionary", "-entry", "blocks", "-value", "-expand", str(path)],
+                          env=env, capture_output=True, text=True)
+    if read.returncode != 0 or not read.stdout.strip():
+        return f"foamDictionary could not read the blocks: {(read.stderr or '').strip()[-300:]}"
+    try:
+        top = _foam_tokens(read.stdout)
+    except ValueError as exc:
+        return f"the blocks entry could not be parsed: {exc}"
+    if len(top) != 1 or not isinstance(top[0], list):
+        return "the blocks entry is not a single list"
+    blocks = top[0]
+    counts: List[List[Any]] = []
+    for i, item in enumerate(blocks):
+        if item != "hex":
+            continue
+        # After the vertex list: an optional zone name, then the cell counts.
+        found = None
+        for nxt in blocks[i + 2:]:
+            if nxt == "hex":
+                break
+            if isinstance(nxt, list) and len(nxt) == 3 and all(
+                    isinstance(x, str) and x.isdigit() for x in nxt):
+                found = nxt
+                break
+        if found is None:
+            return f"block {len(counts)} has no cell counts this step can read"
+        counts.append(found)
+    if not counts:
+        return "the blockMeshDict has no hex blocks"
+    dims = max(sum(1 for x in c if int(x) > 1) for c in counts)
+    if dims == 0:
+        return "no block has more than one cell in any direction"
+    factor = budget ** (1.0 / dims)
+    for c in counts:
+        for k, x in enumerate(c):
+            n = int(x)
+            if n > 1:
+                c[k] = str(max(n + 1, int(n * factor + 1e-9)))
+    write = subprocess.run(["foamDictionary", "-entry", "blocks", "-set", _foam_text(blocks), str(path)],
+                           env=env, capture_output=True, text=True)
+    if write.returncode != 0:
+        return f"foamDictionary could not write the blocks: {(write.stderr or '').strip()[-300:]}"
+    return None
 
 
 def refine_mesh_from_parent(
@@ -622,8 +978,13 @@ def refine_mesh_from_parent(
     max_loop: int = 10,
     max_time_limit_s: int = 21600,
     openfoam_path: str = "",
+    mesh_review: Optional[Callable[[Path], Optional[str]]] = None,
+    max_mesh_reviews: int = 4,
+    uniform: bool = False,
 ) -> Dict[str, Any]:
     """Copy an existing case's files wholesale and refine only its mesh —
+    with ``uniform``, every block is refined by one factor in code
+    (:func:`refine_block_counts`) and the model is used only if that fails —
     the ``base_case_dir`` mesh-copy-and-edit capability
     ``scripts/foam_run.py --base-case-dir --mesh-gate-role refined`` used to
     provide, ported here so mesh-independence checking doesn't need that
@@ -642,28 +1003,94 @@ def refine_mesh_from_parent(
     case_dir = Path(case_dir)
     base_case_dir = Path(base_case_dir)
     _copy_case_files(base_case_dir, case_dir)
+    _drop_old_mesh_fields(case_dir)
+    # A refined level is the same case at another resolution, so it inherits
+    # the parent's provenance; _copy_case_files carries only 0/, constant/
+    # and system/.
+    parent_state = base_case_dir / ".foamagent_state.json"
+    if parent_state.is_file():
+        try:
+            inherited = json.loads(parent_state.read_text())
+        except Exception:
+            inherited = {}
+        carried = {k: inherited[k] for k in ("seed_source", "seed_name") if k in inherited}
+        if carried:
+            (case_dir / ".foamagent_state.json").write_text(json.dumps(carried, indent=2))
 
     solver = case_solver or _read_solver_from_control_dict(case_dir) or "simpleFoam"
 
     block_mesh_path = case_dir / "system" / "blockMeshDict"
-    current_bmd = block_mesh_path.read_text(encoding="utf-8", errors="ignore") if block_mesh_path.is_file() else ""
-    refined_bmd = writer.edit_file(
-        llm,
-        file_name="blockMeshDict",
-        folder_name="system",
-        changes=refine_instruction,
-        current_content=current_bmd,
-        written_files_ctx="",
-        case_solver=solver,
-    )
-    block_mesh_path.parent.mkdir(parents=True, exist_ok=True)
-    block_mesh_path.write_text(refined_bmd)
+    parent_bmd = base_case_dir / "system" / "blockMeshDict"
+    allrun_env = resolve_openfoam_env(openfoam_path)
+    # Uniform refinement is arithmetic, so it is done in code: asked for 1.5x,
+    # a model wrote 1458x1458 for a 192x192 parent (qwen_retest_20261005/cavity_r13).
+    refined_in_code = False
+    if uniform and block_mesh_path.is_file():
+        why_not = refine_block_counts(block_mesh_path, allrun_env)
+        refined_in_code = why_not is None
+        print(f"[foam] {case_dir.name}: "
+              + ("refined every block uniformly in code" if refined_in_code
+                 else f"could not refine in code ({why_not}); asking the model"), flush=True)
+    if refined_in_code:
+        mesh_review = None
+    else:
+        current_bmd = parent_bmd.read_text(encoding="utf-8", errors="ignore") if parent_bmd.is_file() else ""
+        block_mesh_path.parent.mkdir(parents=True, exist_ok=True)
+        block_mesh_path.write_text(writer.edit_file(
+            llm,
+            file_name="blockMeshDict",
+            folder_name="system",
+            changes=refine_instruction,
+            current_content=current_bmd,
+            written_files_ctx="",
+            case_solver=solver,
+        ))
+
+    def _reviewed_mesh() -> Optional[str]:
+        """Mesh only and check the result against the parent before any
+        solver time is spent -- first in code (a refinement must add cells),
+        then with ``mesh_review`` -- and rewrite with the correction. Every
+        version is checked, the last one included: returns None once a
+        version passes, or the last correction if none did -- a mesh that
+        failed the check is never solved."""
+        correction: Optional[str] = None
+        for attempt in range(max_mesh_reviews + 1):
+            proc = subprocess.run(
+                ["bash", "-c", "blockMesh > log.blockMesh 2>&1 && checkMesh > log.checkMesh 2>&1"],
+                cwd=str(case_dir), env=allrun_env, capture_output=True, text=True,
+            )
+            if proc.returncode != 0:
+                return None  # the solve loop below diagnoses a mesh that does not build
+            correction = _not_finer(case_dir, base_case_dir) or (
+                mesh_review(case_dir) if mesh_review is not None else None)
+            if not correction:
+                return None
+            if attempt == max_mesh_reviews:
+                break
+            print(f"[foam] {case_dir.name}: refinement rejected before solving ({correction[:200]}); "
+                  "rewriting the mesh from the parent's", flush=True)
+            # From the parent's file each time: editing a rejected version
+            # compounds its error (r13 above: four corrections, none passed).
+            block_mesh_path.write_text(writer.edit_file(
+                llm,
+                file_name="blockMeshDict",
+                folder_name="system",
+                changes=(f"{refine_instruction}\n\nA previous attempt at this refinement was rejected: "
+                         f"{correction}\nStart again from the parent's file below."),
+                current_content=parent_bmd.read_text(encoding="utf-8", errors="ignore"),
+                written_files_ctx="",
+                case_solver=solver,
+            ))
+        print(f"[foam] {case_dir.name}: no version of the refined mesh passed the check; not solving it",
+              flush=True)
+        return correction
+
+    mesh_rejection = _reviewed_mesh()
 
     allrun_path = case_dir / "Allrun"
-    allrun_path.write_text(allrun_mod.build_allrun_script(f"blockMesh\ncheckMesh\n{solver}", case_solver=solver))
+    allrun_path.write_text(allrun_mod.build_mesh_and_solve_allrun(solver))
     allrun_path.chmod(0o755)
 
-    allrun_env = resolve_openfoam_env(openfoam_path)
     loop_count = 0
     success = False
     history: List[str] = []
@@ -672,18 +1099,10 @@ def refine_mesh_from_parent(
     # baseline/refined_* directories across re-runs, so a re-run gate could
     # otherwise "converge" on a mesh that was never actually built.
     _clean_stale_run_artifacts(case_dir)
-    for loop_count in range(1, max_loop + 1):
+    for loop_count in range(1, (0 if mesh_rejection else max_loop) + 1):
         remaining = max(60, max_time_limit_s - int(time.monotonic() - t0))
-        try:
-            proc = subprocess.run(
-                ["./Allrun"], cwd=str(case_dir), env=allrun_env,
-                capture_output=True, text=True, timeout=remaining,
-            )
-            allrun_out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            returncode = proc.returncode
-        except subprocess.TimeoutExpired as exc:
-            allrun_out = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
-            returncode = -1
+        returncode, out, err, _ = run_script(["./Allrun"], case_dir, allrun_env, remaining)
+        allrun_out = out + "\n" + err
         (case_dir / "Allrun.out").write_text(allrun_out)
 
         clean = (
@@ -722,6 +1141,9 @@ def refine_mesh_from_parent(
             case_solver=solver,
         )
         block_mesh_path.write_text(refined_bmd)
+        mesh_rejection = _reviewed_mesh()
+        if mesh_rejection:
+            break
         _clean_stale_run_artifacts(case_dir)
 
     wall_time_s = round(time.monotonic() - t0, 1)
@@ -738,5 +1160,81 @@ def refine_mesh_from_parent(
         "wall_time_s": wall_time_s,
         "error_logs": [] if success else [collect_error_logs(case_dir)[-3000:]],
     }
+    if mesh_rejection and not success:
+        run_result["mesh_check_failed"] = mesh_rejection[:3000]
     (case_dir / "run_result.json").write_text(json.dumps(run_result, indent=2))
     return run_result
+
+
+def extend_run(
+    case_dir: Path,
+    *,
+    factor: float = 1.0,
+    openfoam_path: str = "",
+    max_time_limit_s: int = 21600,
+) -> Dict[str, Any]:
+    """Continue a solved transient case from its latest time on the same mesh,
+    lengthening the run by ``factor`` times its current end time.
+
+    For a solution whose monitored quantities have not settled yet: running
+    longer, not a finer mesh, is what answers that. The mesh and the solved
+    fields are left as they are; only endTime, startFrom and the start of the
+    gate's own averaging window change.
+    """
+    case_dir = Path(case_dir)
+    cd_path = case_dir / "system" / "controlDict"
+    text = cd_path.read_text(errors="ignore")
+    m = re.search(r"\bendTime\s+([0-9.eE+-]+)\s*;", text)
+    if not m:
+        return {"status": "failed", "error": "endTime not found in controlDict"}
+    end = float(m.group(1))
+    times = [t for t in (parse_time_dir(p.name) for p in case_dir.iterdir() if p.is_dir()) if t]
+    latest = max(times) if times else 0.0
+    if latest <= 0.0:
+        return {"status": "failed", "error": "no solved time to continue from"}
+    new_end = end * (1.0 + factor)
+    text = text[: m.start(1)] + f"{new_end:g}" + text[m.end(1):]
+    text = re.sub(r"\bstartFrom\s+\w+\s*;", "startFrom latestTime;", text)
+    # The gate's own averaging restarts at the continuation, so the averaged
+    # fields cover the later, settled part of the run.
+    block = re.search(r"gateFieldAverage\s*\{(.*?)\n\s*\}", text, re.S)
+    if block:
+        body = re.sub(r"timeStart\s+[0-9.eE+-]+\s*;", f"timeStart {latest:g};", block.group(1))
+        if "restartOnRestart" not in body:
+            body = body + "\n        restartOnRestart yes;"
+        text = text[: block.start(1)] + body + text[block.end(1):]
+    cd_path.write_text(text)
+
+    solver = _read_solver_from_control_dict(case_dir) or "pimpleFoam"
+    parallel = (case_dir / "system" / "decomposeParDict").is_file() and any(case_dir.glob("processor*"))
+    lines = ["#!/bin/sh", 'cd "${0%/*}" || exit 1', '. "$WM_PROJECT_DIR/bin/tools/RunFunctions"', ""]
+    if parallel:
+        lines += ["rm -rf processor*",
+                  "runApplication -o decomposePar -force -latestTime",
+                  f"runParallel -o {solver}",
+                  "runApplication -o reconstructPar -newTimes"]
+    else:
+        lines += [f"runApplication -o {solver}"]
+    script = case_dir / "Allrun.extend"
+    script.write_text("\n".join(lines) + "\n")
+    script.chmod(0o755)
+
+    t0 = time.monotonic()
+    returncode, out, err, timed_out = run_script(["./Allrun.extend"], case_dir,
+                                                 resolve_openfoam_env(openfoam_path), max_time_limit_s)
+    out = out + "\n" + err + ("\ntimed out" if timed_out else "")
+    (case_dir / "Allrun.extend.out").write_text(out)
+    ok = returncode == 0 and _solver_ended_cleanly(case_dir, solver) and not _has_fatal(case_dir)
+    result_path = case_dir / "run_result.json"
+    try:
+        result = json.loads(result_path.read_text()) if result_path.is_file() else {}
+    except Exception:  # noqa: BLE001
+        result = {}
+    result.setdefault("extensions", []).append(
+        {"from": latest, "to": new_end, "ok": ok, "wall_time_s": round(time.monotonic() - t0, 1)})
+    if not ok:
+        result["status"], result["success"] = "failed", False
+    result_path.write_text(json.dumps(result, indent=2))
+    print(f"[foam] {case_dir.name}: continued from t={latest:g} to t={new_end:g} "
+          f"({'ok' if ok else 'FAILED'})", flush=True)
+    return {"status": "success" if ok else "failed", "from": latest, "to": new_end}

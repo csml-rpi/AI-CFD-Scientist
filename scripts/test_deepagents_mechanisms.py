@@ -524,8 +524,8 @@ def test_mesh_gate_is_idempotent_and_explains_a_rejected_requirement() -> None:
               converged.get("already_converged") is True and converged.get("selected_level") == str(level))
 
         rejected = gate("fresh_group", "a paraphrase")
-        check("a rejected mesh-gate requirement says it must be copied verbatim",
-              "verbatim" in rejected.get("error", ""))
+        check("a rejected mesh-gate requirement says to pass a case_id instead",
+              "case_id" in rejected.get("error", ""))
         check("a rejected mesh-gate requirement names the case_ids to choose from",
               rejected.get("available_case_ids") == ["case_001"])
 

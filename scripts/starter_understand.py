@@ -6,7 +6,7 @@ Reads every file in the starter directory (any format — OpenFOAM case files,
 text/formula specs, CSVs, dat files, Python scripts, PDFs, images, etc.),
 passes each one with its path to the LLM, and asks it to classify and extract:
 
-  - base_case_path      : which sub-directory is the OpenFOAM case
+  - base_case_path      : which sub-directories are OpenFOAM cases (a list)
   - formula_or_model_spec: the full equation/model change to implement
   - flow_parameters     : Re, nu, Ub, dimension, geometry, …
   - reference_data      : what validation data is available, quantities, excerpt
@@ -423,7 +423,7 @@ data is organised.
 Return ONLY valid JSON (no markdown, no commentary) with this exact structure:
 
 {
-  "base_case_path": "<relative path to the OpenFOAM case directory, or null>",
+  "base_case_path": ["<relative path to an OpenFOAM case directory>", "..."],
   "formula_or_model_spec": "<full verbatim text of the model equation / modification \
 to implement — copy the relevant lines exactly as written in the file>",
   "formula_file": "<filename that contains the formula, or null>",
@@ -447,6 +447,11 @@ to implement — copy the relevant lines exactly as written in the file>",
   "data_layout": "<how the data is organised: what each data file holds (inputs, targets, geometry, splits), its shape, and how inputs map to outputs; null if there are no data files>",
   "notes": "<any important observation about the starter folder>"
 }
+
+"base_case_path" is an ARRAY. List EVERY complete OpenFOAM case directory in \
+the folder, one string per case -- a starter often ships several, for instance \
+one per Reynolds number. Use [] if there is none. Never join several paths into \
+a single string; each element must be a path that exists on its own.
 """
 
 
@@ -500,7 +505,22 @@ def understand_starter_folder(
         result["files_read"] = len(entries)
         result["data_files_described"] = len(data_entries)
         print(f"[starter_understand] LLM classified {len(entries)} files.")
-        print(f"[starter_understand] base_case_path : {result.get('base_case_path')}")
+        # Print what RESOLVED, not just what was claimed. Downstream stages
+        # copy this case instead of authoring one, and a value that names no
+        # directory on disk used to read as "this starter has no case".
+        try:
+            from cfd_langgraph.starter_cases import resolve_starter_base_cases
+            cases = resolve_starter_base_cases(result)
+            print(f"[starter_understand] base_case_path : {result.get('base_case_path')}")
+            print(f"[starter_understand] cases resolved : "
+                  f"{[str(d) for d in cases.dirs] or 'NONE'}")
+            problem = cases.problem()
+            if problem:
+                print(f"[starter_understand] WARNING: {problem}", file=sys.stderr)
+        except Exception as exc:  # resolution must never sink the scan
+            print(f"[starter_understand] base_case_path : {result.get('base_case_path')}")
+            print(f"[starter_understand] warning: could not resolve base cases: {exc}",
+                  file=sys.stderr)
         print(f"[starter_understand] formula_file   : {result.get('formula_file')}")
         print(f"[starter_understand] flow_parameters: {result.get('flow_parameters')}")
         print(f"[starter_understand] ref quantities : {result.get('reference_data', {}).get('quantities')}")

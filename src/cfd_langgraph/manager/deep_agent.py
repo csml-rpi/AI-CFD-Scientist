@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
 
 from deepagents import FilesystemPermission, create_deep_agent
 
@@ -18,7 +19,11 @@ from .control import (
     build_hide_builtin_filesystem_tools_middleware,
     build_interrupt_on,
 )
-from .subagents import build_case_runner_subagent, build_oed_candidate_runner_subagent
+from .subagents import (
+    build_case_runner_subagent,
+    build_general_purpose_subagent,
+    build_oed_candidate_runner_subagent,
+)
 
 _MANAGER_GRAPH_NAME = "cfd-scientist-manager"
 from .tools import build_manager_tools
@@ -76,7 +81,9 @@ Sequence for a standard study:
 5. Call `generate_case_requirements` — turns every approved hypothesis's experiments
    into validated FoamAgent requirements (requirements.json). Use each requirement's
    `study_id` as its `physics_group` for the steps below, unless you have a reason to
-   split further.
+   split further. When the brief requires mesh independence for each condition
+   separately, give each condition its own physics_group,
+   so each gets its own mesh gate.
 6. For each physics_group present in requirements.json, call `run_mesh_gate` once
    with a representative requirement's text (and the research topic) before running
    the rest of that group's cases — mesh-independence is mandatory ahead of every
@@ -84,7 +91,10 @@ Sequence for a standard study:
    stopping at the first level where an LLM judges the physically-trustworthy QoIs
    converged (~5% rule) — read `converged` and `selected_level` in its result before
    trusting the mesh; `converged: false` means it hit max_refine_levels without
-   settling and needs a human look, not a silent pass.
+   settling, and its `next_steps` says what you may do then. No case of that group can
+   run until it converges, so do not launch case-runners for it. Its result also says how every
+   later run of the group starts (`start_decision`): from the selected level's settled
+   flow for a set run length, or from rest. That is applied for you.
 7. Launch every approved case via the `task` tool with subagent_type="case-runner",
    giving it a case_id (from requirements.json), the matching physics_group, and the
    requirement text. `run_case_native` enforces that physics_group's converged
@@ -96,7 +106,11 @@ Sequence for a standard study:
    REVISE, decide whether to retry that one case (revise the requirement, relaunch via
    `task`) — do not stop the whole study over one failing case.
 9. Once every case has a decision, call `analyze_all_cases` with the full list of
-   case_ids for a cross-case comparison.
+   case_ids for a cross-case comparison. If the topic or the task's brief names its own
+   scorer or verdict script, run it with `run_python` exactly as the brief shows, on each
+   condition's final case, and report its output as the study's verdict; use `run_python`
+   for any figures the task asks for too. Only `run_python` runs a script: files you
+   write are not run.
 10. Call `write_paper` to draft the manuscript, generate figures, and run the
     reviewer loop.
 11. Call `run_audit_and_record` to run the stage-gate audit and, if it passes, record
@@ -167,7 +181,7 @@ selected case and cannot invent a separate baseline requirement:
      point `starter_dir` at a folder this study created. Neither works — the baseline is
      checked for real solved fields — and both cost hours before the failure surfaces.
 
-  a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's selected_level>,
+  a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's baseline_case, or its selected_level if it gives none>,
      total_budget=<in SOLVER RUNS, not candidates: a code-mod candidate costs roughly 50 runs on a multi-case benchmark and ~2 on a single-case one, so budget for the number of candidates you want times that — e.g. 2000-4000 for a 40-80 candidate campaign>)` once. It resolves reference data and
      authors the scored comparators every candidate will be judged against, and computes
      the baseline score to gate on.
@@ -301,6 +315,93 @@ def _require_tool_calling_support(model: Any, settings: Settings) -> None:
     )
 
 
+# Refused calls in a row after which the manager is stopped and the study
+# recorded as stuck (see llm/caching.build_loop_control_middleware).
+_MANAGER_REFUSAL_STOP = int(os.environ.get("CFD_SCIENTIST_MANAGER_REFUSALS") or 30)
+
+# Tools a study of each kind never uses, by the prompt's own instructions for
+# that kind. Hidden from the model once read_starter_folder has decided the
+# kind: fewer wrong options and about 4-6k fewer tokens of schemas a turn.
+_IMPL_TOOLS = {"impl_run", "impl_status", "impl_verify", "impl_continue"}
+_TOOLS_NOT_FOR_MODE = {
+    "implementation": {
+        "propose_and_rank_hypotheses", "advance_with_approved_hypotheses",
+        "generate_case_requirements", "run_mesh_gate", "interpret_case", "analyze_all_cases",
+        "write_paper", "task",
+    },
+    "surrogate": _IMPL_TOOLS | {
+        "generate_case_requirements", "run_mesh_gate", "oed_prepare_baseline",
+        "interpret_case", "analyze_all_cases", "write_paper",
+    },
+    "solver": set(_IMPL_TOOLS),
+}
+_MODE_HEADER = {
+    "implementation": (
+        "STUDY TYPE: implementation (decided by read_starter_folder). Follow the steps for an "
+        "implementation study in this prompt -- the part that begins 'If `read_starter_folder` "
+        "reports `study_mode: \"implementation\"`'. The standard, open-ended-discovery and "
+        "surrogate sequences do not apply, and their tools are not offered."
+    ),
+    "surrogate": (
+        "STUDY TYPE: surrogate (decided by read_starter_folder). Follow the changes for a "
+        "surrogate study in this prompt -- the part that begins 'If `read_starter_folder` "
+        "reports `study_mode: \"surrogate\"`'. Tools that do not apply are not offered."
+    ),
+}
+
+
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, dict):
+        return str(tool.get("name") or (tool.get("function") or {}).get("name") or "")
+    return str(getattr(tool, "name", "") or "")
+
+
+def build_study_mode_middleware(out_dir: Path) -> Any:
+    """Offer each kind of study only its own tools, and say which kind it is at
+    the top of the system prompt, once read_starter_folder has decided it
+    (study_mode.json). Until then nothing changes."""
+    import json as _json
+
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.messages import SystemMessage
+
+    def _mode() -> str:
+        try:
+            return str(_json.loads((Path(out_dir) / "study_mode.json").read_text()).get("mode", "")).lower()
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _prepare(request: Any) -> Any:
+        mode = _mode()
+        hidden = _TOOLS_NOT_FOR_MODE.get(mode)
+        if not hidden:
+            return request
+        overrides: Dict[str, Any] = {"tools": [
+            t for t in request.tools
+            if _tool_name(t) not in hidden
+            and not (mode == "implementation" and _tool_name(t).startswith("oed_"))
+        ]}
+        header = _MODE_HEADER.get(mode)
+        system = request.system_message
+        if header and system is not None:
+            content = system.content
+            if isinstance(content, str):
+                content = header + "\n\n" + content
+            else:
+                content = [{"type": "text", "text": header}, *content]
+            overrides["system_message"] = SystemMessage(content=content)
+        return request.override(**overrides)
+
+    class StudyModeTools(AgentMiddleware):
+        def wrap_model_call(self, request: Any, handler: Any) -> Any:
+            return handler(_prepare(request))
+
+        async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+            return await handler(_prepare(request))
+
+    return StudyModeTools()
+
+
 def build_manager(
     settings: Settings, out_dir: Path
 ) -> Tuple[Any, contextlib.ExitStack]:
@@ -361,7 +462,13 @@ def build_manager(
         model=model,
         tools=manager_tools,
         system_prompt=_build_manager_system_prompt(out_dir),
-        subagents=[case_runner, oed_candidate_runner],
+        subagents=[
+            case_runner, oed_candidate_runner,
+            build_general_purpose_subagent(
+                manager_tools,
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="general-purpose"),
+            ),
+        ],
         # Blocks deepagents' own built-in ls/read_file/write_file/grep/etc —
         # they'd silently run against an empty virtual filesystem instead of
         # the real disk (see control.py). Forces the model onto our real,
@@ -381,8 +488,10 @@ def build_manager(
         # means a result that somehow reaches this conversation from a
         # subagent tool is protected rather than silently discarded.
         + build_context_middleware(
-            model, manager_tools + case_runner_tools + oed_candidate_tools
-        ),
+            model, manager_tools + case_runner_tools + oed_candidate_tools,
+            refusal_stop=_MANAGER_REFUSAL_STOP, status_file=out_dir / "stuck.json",
+        )
+        + [build_study_mode_middleware(out_dir)],
         # Every manager tool is watched for a Ctrl-C-requested pause (see
         # control.py) — cost-free until GLOBAL_INTERRUPT is actually set, and
         # the pause always lands *before* a tool runs, never mid-call, so

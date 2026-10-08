@@ -19,6 +19,7 @@ def run_propose_critique_rank(
     require_literature: bool = True,
     case_context: str = "",
     study_mode: str = "",
+    prescribed: bool = False,
 ) -> Dict[str, Any]:
     """Propose -> Critique -> Rank: the Mechanism 2 upgrade to hypothesis generation.
 
@@ -50,6 +51,7 @@ def run_propose_critique_rank(
         require_literature=require_literature,
         case_context=case_context,
         study_mode=study_mode,
+        prescribed=prescribed,
     )
     lit_items = batch["literature_used"]
     candidates = batch["candidates"]

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import os
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import HumanMessage
@@ -864,18 +867,23 @@ def _token_counter_kwargs(model: Any) -> Dict[str, Any]:
     Unlike gemini and glm, this provider raises no ``ContextOverflowError``
     the emergency clip could catch, so the estimate is the only defence.
     """
-    llm_type = str(getattr(model, "_llm_type", "")).lower()
-    if "claude" not in llm_type and "anthropic" not in llm_type:
-        return {}
     from functools import partial
 
     from langchain_core.messages.utils import count_tokens_approximately
 
-    return {
-        "token_counter": partial(
-            count_tokens_approximately, use_usage_metadata_scaling=True, chars_per_token=3.3
-        )
-    }
+    llm_type = str(getattr(model, "_llm_type", "")).lower()
+    if "claude" in llm_type or "anthropic" in llm_type:
+        return {
+            "token_counter": partial(
+                count_tokens_approximately, use_usage_metadata_scaling=True, chars_per_token=3.3
+            )
+        }
+    # Every other provider: the same estimate, scaled by the input tokens the
+    # provider itself reported on the last turn. Characters per token vary
+    # with content -- CSV tables of numbers run well below 4 -- and the
+    # unscaled estimate let a Qwen conversation pass its 262k window
+    # (qwen_retest_20261005/slau_r4) without the summary trigger seeing it.
+    return {"token_counter": partial(count_tokens_approximately, use_usage_metadata_scaling=True)}
 
 
 # Longest tool-error message the model is shown in full.
@@ -921,8 +929,261 @@ def _tool_error_trim_middleware() -> Any:
     return TrimToolErrors()
 
 
+# How the tool wrapper words a call it did not run (manager/tools.py).
+_REFUSAL_MARKERS = ("Not run: this exact call", "[BLOCKED:")
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+    return content if isinstance(content, str) else json.dumps(content, default=str)
+
+
+def _is_refusal(message: Any) -> bool:
+    text = _message_text(message)
+    return any(marker in text for marker in _REFUSAL_MARKERS)
+
+
+def _segments(messages: List[Any]) -> List[List[Any]]:
+    """Messages grouped into rounds: an AI message that calls tools together
+    with the tool results answering it; every other message on its own."""
+    out: List[List[Any]] = []
+    i = 0
+    while i < len(messages):
+        m = messages[i]
+        if getattr(m, "type", "") == "ai" and getattr(m, "tool_calls", None):
+            ids = {tc.get("id") for tc in m.tool_calls}
+            j = i + 1
+            while j < len(messages) and getattr(messages[j], "type", "") == "tool" \
+                    and getattr(messages[j], "tool_call_id", None) in ids:
+                j += 1
+            out.append(messages[i:j])
+            i = j
+        else:
+            out.append([m])
+            i += 1
+    return out
+
+
+# Fields the tool wrapper adds to a repeated call's result; they count the
+# repeats, so they differ every time while saying nothing new.
+_REPEAT_FIELDS = ("repeated_identical_calls", "loop_warning", "repeated_identical_failures")
+
+
+def _result_key(message: Any) -> str:
+    if _is_refusal(message):
+        return "REFUSED"
+    text = _message_text(message)
+    try:
+        doc = json.loads(text)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict):
+        text = json.dumps({k: v for k, v in doc.items() if k not in _REPEAT_FIELDS}, sort_keys=True, default=str)
+    else:
+        text = text.split("\n\n[You have made this exact call", 1)[0]
+    return hashlib.sha1(text.encode()).hexdigest()
+
+
+def _round_signature(segment: List[Any]) -> Optional[str]:
+    """The same calls with the same results give the same signature; a refusal
+    counts as one result whatever its count of repeats says."""
+    ai = segment[0]
+    if not (getattr(ai, "type", "") == "ai" and getattr(ai, "tool_calls", None)) or len(segment) < 2:
+        return None
+    calls = sorted(json.dumps([tc.get("name"), tc.get("args")], sort_keys=True, default=str)
+                   for tc in ai.tool_calls)
+    results = sorted(_result_key(m) for m in segment[1:])
+    return json.dumps([calls, results])
+
+
+# Replaying a looping small model's exact request repeated the call every time; with
+# the repeats collapsed it noted the loop and moved on (qwen_retest_20261005, 2 of 2).
+def collapse_repeated_rounds(messages: List[Any]) -> List[Any]:
+    """``messages`` with repeated identical rounds (same calls, same results) cut
+    to the first and the latest, the latest saying how many there were."""
+    segments = _segments(messages)
+    seen: Dict[str, List[int]] = {}
+    for i, seg in enumerate(segments):
+        sig = _round_signature(seg)
+        if sig is not None:
+            seen.setdefault(sig, []).append(i)
+    drop: set = set()
+    count_at: Dict[int, int] = {}
+    for idxs in seen.values():
+        if len(idxs) > 2:
+            drop.update(idxs[1:-1])
+            count_at[idxs[-1]] = len(idxs)
+    if not drop:
+        return messages
+    out: List[Any] = []
+    for i, seg in enumerate(segments):
+        if i in drop:
+            continue
+        if i in count_at:
+            first = seg[1]
+            note = (f"[This same call, with the same result, has now been made {count_at[i]} times; "
+                    "the repeats between the first and this one are left out here. Repeating it "
+                    "again will not change anything.]\n")
+            content = first.content if isinstance(first.content, str) else _message_text(first)
+            seg = [seg[0], first.model_copy(update={"content": note + content}), *seg[2:]]
+        out.extend(seg)
+    return out
+
+
+def _refusal_streak(messages: List[Any]) -> int:
+    """Tool results at the end of the conversation that were refusals, in a row."""
+    n = 0
+    for m in reversed(messages or []):
+        if getattr(m, "type", "") != "tool":
+            continue
+        if not _is_refusal(m):
+            break
+        n += 1
+    return n
+
+
+def recent_refusals(messages: List[Any], window: int) -> int:
+    """Refused tool results among the last ``window`` tool results."""
+    tools = [m for m in (messages or []) if getattr(m, "type", "") == "tool"][-window:]
+    return sum(1 for m in tools if _is_refusal(m))
+
+
+def stuck(messages: List[Any], limit: int) -> int:
+    """How many refusals mark this run as stuck, or 0: ``limit`` in a row, or
+    ``limit`` among the last ``limit + limit // 3`` tool results -- a loop that
+    alternates a refused call with one that runs never makes an unbroken row."""
+    streak = _refusal_streak(messages)
+    if streak >= limit:
+        return streak
+    recent = recent_refusals(messages, limit + limit // 3)
+    return recent if recent >= limit else 0
+
+
+def _last_round_refused(messages: List[Any]) -> bool:
+    for m in reversed(messages or []):
+        if getattr(m, "type", "") == "tool":
+            if _is_refusal(m):
+                return True
+            continue
+        if getattr(m, "type", "") == "ai":
+            return False
+    return False
+
+
+def _thinking_on(model: Any) -> Optional[Dict[str, Any]]:
+    """Request settings that switch a model's thinking on for one turn, or
+    None if it was not switched off through the chat template (the only
+    switch this applies to; other providers are left alone)."""
+    extra = getattr(model, "extra_body", None)
+    kwargs = (extra or {}).get("chat_template_kwargs") if isinstance(extra, dict) else None
+    if not (isinstance(kwargs, dict) and kwargs.get("enable_thinking") is False):
+        return None
+    return {**extra, "chat_template_kwargs": {**kwargs, "enable_thinking": True}}
+
+
+# Thinking-on broke both loop types in replays (qwen_retest_20261005, 2 of 2); an
+# unattended manager otherwise refused 746 calls in 19 minutes without stopping.
+_EMPTY_REPLY_RETRIES = 2
+_EMPTY_REPLY_NOTE = ("Your last reply was empty: no text and no tool call, so nothing happened. "
+                     "Make your next tool call now, or, if the work is finished, say so in words.")
+
+
+def build_loop_control_middleware(*, refusal_stop: Optional[int] = None,
+                                  status_file: Optional[Path] = None) -> Any:
+    """Middleware for a model that keeps making the same call: collapse repeated
+    rounds in what it is sent, run the turn after a refused call with thinking on
+    (when thinking was switched off through the chat template), and, with
+    ``refusal_stop`` set, end the agent after that many refused calls in a row,
+    recording why in ``status_file``."""
+    from langchain.agents.middleware import AgentMiddleware, hook_config
+    from langchain_core.messages import AIMessage
+
+    def _prepare(request: Any) -> Any:
+        messages = collapse_repeated_rounds(list(request.messages))
+        overrides: Dict[str, Any] = {}
+        if len(messages) != len(request.messages):
+            overrides["messages"] = messages
+        if _last_round_refused(messages):
+            extra = _thinking_on(request.model)
+            if extra is not None:
+                print("  🧠 the last call was refused: this turn runs with thinking on", flush=True)
+                cap = getattr(request.model, "max_tokens", None)
+                overrides["model_settings"] = {
+                    **(request.model_settings or {}), "extra_body": extra,
+                    # Reasoning counts against the output limit; leave room for it.
+                    **({"max_tokens": 2 * cap} if isinstance(cap, int) else {}),
+                }
+        return request.override(**overrides) if overrides else request
+
+    def _stop(state: Any) -> Optional[Dict[str, Any]]:
+        if not refusal_stop:
+            return None
+        streak = stuck((state or {}).get("messages", []), refusal_stop)
+        if not streak:
+            return None
+        reason = (f"Stopped: {streak} of the recent tool calls were refused as repeats of calls "
+                  "already made, so this run is stuck. Nothing done before is lost.")
+        print(f"  ⛔ {reason}", flush=True)
+        if status_file is not None:
+            try:
+                status_file.write_text(json.dumps({"status": "stuck", "refused_in_a_row": streak,
+                                                   "reason": reason}, indent=2))
+            except OSError:
+                pass
+        return {"jump_to": "end", "messages": [AIMessage(content=reason)]}
+
+    def _empty(response: Any) -> bool:
+        """A reply with no text and no tool call. The agent loop reads it as the
+        final answer and ends the run; qwen_retest_20261005/slau_r7, with
+        thinking on, thought for 13.6k tokens and then replied with nothing."""
+        messages = getattr(response, "result", None)
+        reply = next((m for m in reversed(messages if isinstance(messages, list) else [response])
+                      if isinstance(m, AIMessage)), None)
+        if reply is None or reply.tool_calls:
+            return False
+        content = reply.content
+        text = content if isinstance(content, str) else "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part) for part in (content or []))
+        return not text.strip()
+
+    def _asked_again(request: Any) -> Any:
+        return request.override(messages=[*request.messages, HumanMessage(content=_EMPTY_REPLY_NOTE)])
+
+    class LoopControl(AgentMiddleware):
+        @hook_config(can_jump_to=["end"])
+        def before_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+            return _stop(state)
+
+        @hook_config(can_jump_to=["end"])
+        async def abefore_model(self, state: Any, runtime: Any) -> Optional[Dict[str, Any]]:
+            return _stop(state)
+
+        def wrap_model_call(self, request: Any, handler: Any) -> Any:
+            request = _prepare(request)
+            response = handler(request)
+            for _ in range(_EMPTY_REPLY_RETRIES):
+                if not _empty(response):
+                    break
+                print("  ↻ the reply was empty (no text, no tool call): asking again", flush=True)
+                response = handler(_asked_again(request))
+            return response
+
+        async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+            request = _prepare(request)
+            response = await handler(request)
+            for _ in range(_EMPTY_REPLY_RETRIES):
+                if not _empty(response):
+                    break
+                print("  ↻ the reply was empty (no text, no tool call): asking again", flush=True)
+                response = await handler(_asked_again(request))
+            return response
+
+    return LoopControl()
+
+
 def build_context_middleware(
-    model: Any, tools: Optional[List[Any]] = None
+    model: Any, tools: Optional[List[Any]] = None, *,
+    refusal_stop: Optional[int] = None, status_file: Optional[Path] = None,
 ) -> List[Any]:
     """Bound the conversation two ways: clear stale tool results, and summarise.
 
@@ -953,6 +1214,7 @@ def build_context_middleware(
         return middleware
 
     middleware.append(_tool_error_trim_middleware())
+    middleware.append(build_loop_control_middleware(refusal_stop=refusal_stop, status_file=status_file))
 
     # Clearing needs the tool list to know what is safe to clear. Without it,
     # summarization alone still bounds the conversation -- slower and lossier,
@@ -970,9 +1232,13 @@ def build_context_middleware(
                         # again rather than being confused about what it did.
                         clear_tool_inputs=False,
                         exclude_tools=_tools_to_exempt(tools),
+                        # Not "call again if you still need it": read as an
+                        # instruction, that sent a no-thinking model back to
+                        # files it had already used.
                         placeholder=(
-                            "[tool result cleared to free context - call this tool "
-                            "again if you still need its output]"
+                            "[result cleared to save space. Read it again only if you "
+                            "need specific lines you no longer have; otherwise go on "
+                            "from what you already know.]"
                         ),
                     )
                 ],

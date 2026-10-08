@@ -20,6 +20,7 @@ already does, and reimplementing it is how the Codex path got it wrong.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from typing import Any, Optional
 
@@ -182,6 +183,27 @@ def create_vertex_openai_chat_model(
         stream_usage=True,
     )
 
+# A self-hosted OpenAI-compatible server answers HTTP 400 "maximum context length"
+# instead, so the clip never fired (qwen_retest_20261005/slau_r4).
+def _context_overflow(exc: BaseException) -> Optional[BaseException]:
+    """The provider's "request too large" refusal as LangChain's
+    ContextOverflowError, which the summariser's emergency clip catches, or None
+    for any other error."""
+    text = str(exc).lower()
+    if "maximum context length" not in text and "context length" not in text:
+        return None
+    try:
+        from langchain_core.exceptions import ContextOverflowError
+    except ImportError:
+        return None
+    return ContextOverflowError(str(exc))
+
+
+def _vertex_max_tokens() -> int:
+    """Most tokens one reply from a self-hosted endpoint may generate."""
+    return int(os.environ.get("CFD_SCIENTIST_VERTEX_MAX_TOKENS") or 16384)
+
+
 def create_vertex_endpoint_chat_model(
     model: str,
     temperature: float = 0.0,
@@ -224,7 +246,13 @@ def create_vertex_endpoint_chat_model(
         """
 
         def _generate(self, messages, stop=None, run_manager=None, **kwargs):
-            result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            try:
+                result = super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                overflow = _context_overflow(exc)
+                if overflow is not None:
+                    raise overflow from exc
+                raise
             try:
                 from cfd_langgraph.llm.factory import _repair_narrated_tool_calls
                 from langchain_core.outputs import ChatResult
@@ -253,6 +281,13 @@ def create_vertex_endpoint_chat_model(
         # metric_setup, surrogate_setup, run_validity, OED. On the Qwen studies
         # each of those calls was logged as zero tokens.
         stream_usage=True,
+        # A self-hosted server has no output limit of its own, so one reply
+        # that never stops holds the GPU until the context is full. Measured on
+        # qwen_retest_20261005/slau_r3: twice an agent request at ~90k tokens
+        # never returned, and the single-H100 endpoint stopped answering every
+        # caller until it was redeployed. One turn is a tool call or a file;
+        # 16k tokens is far more than either needs.
+        max_tokens=_vertex_max_tokens(),
         **({"max_retries": max_retries} if max_retries is not None else {}),
         **({"extra_body": extra_body} if extra_body else {}),
     )

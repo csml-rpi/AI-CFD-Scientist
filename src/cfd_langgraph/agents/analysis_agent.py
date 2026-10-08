@@ -907,6 +907,12 @@ class AnalysisAgent:
                 script_text = script_text.strip("`")
                 if script_text.lower().startswith("python"):
                     script_text = script_text[6:]
+            try:
+                from cfd_langgraph.foam_load import install_beside
+
+                install_beside(script_path.parent)
+            except Exception:  # noqa: BLE001 -- the script can still try its own loader
+                pass
             script_path.write_text(script_text, encoding="utf-8")
             last_script = script_text
             if verbose:

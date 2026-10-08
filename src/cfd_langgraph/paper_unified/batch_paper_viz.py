@@ -308,6 +308,12 @@ def run_batch_paper_viz_loop(
         lines = script_text.lstrip().splitlines()
         if lines and lines[0].strip().lower() in {"python", "bash", "sh"}:
             script_text = "\n".join(lines[1:])
+        try:
+            from cfd_langgraph.foam_load import install_beside
+
+            install_beside(script_path.parent)
+        except Exception:  # noqa: BLE001 -- the script can still try its own loader
+            pass
         script_path.write_text(script_text, encoding="utf-8")
         last_script = script_text
         pending_qa_block = ""

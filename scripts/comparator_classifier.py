@@ -264,6 +264,149 @@ def classify_starter_scripts(
     return result
 
 
+def describe_comparator_interface(
+    *,
+    comparator: Path,
+    metrics: List[str],
+    cache_path: Optional[Path] = None,
+) -> Dict[str, Any]:
+    """How to run a starter's own scorer, when it does not speak our contract.
+
+    Everything that reads a comparator assumes one interface: invoked as
+    ``--case <dir> --reference <file>``, answering with ``METRIC <name>:
+    <number>`` on stdout. Comparators this pipeline authors are told to do
+    that. A scorer the starter shipped has never heard of it.
+
+    So a starter's scorer can be correctly identified as the one script that
+    computes the study's metric by definition, and still be unusable: it may
+    take its cases in a different argument shape, find its own reference data
+    rather than accept a path, and report under its own names in its own
+    format. The invocation then fails in argparse and there is no METRIC line
+    to find either way -- and the one component whose whole job is to rescue a
+    failed extractor sits the failure out.
+
+    Returns ``{"argv": [...], "metric_keys": {metric: key}, "json_out": str,
+    "status": ...}``. ``argv`` carries the placeholders ``{python}``,
+    ``{script}``, ``{case}``, ``{reference}`` and ``{out}``; ``metric_keys``
+    maps each metric asked for to the name the script actually reports it
+    under; ``json_out`` is non-empty when the script writes results to
+    ``{out}``.
+
+    Cached beside the classification, so this costs one model call per starter.
+    """
+    result: Dict[str, Any] = {
+        "argv": [], "metric_keys": {}, "json_out": "", "status": "unavailable", "reasoning": "",
+    }
+    if not comparator or not Path(comparator).is_file():
+        result["status"] = "no_comparator"
+        return result
+
+    wanted = [str(m).strip() for m in (metrics or []) if str(m).strip()]
+    if cache_path:
+        try:
+            cached = json.loads(Path(cache_path).read_text())
+            if (cached.get("comparator") == str(comparator)
+                    and sorted(cached.get("metrics_asked") or []) == sorted(wanted)):
+                cached["cached"] = True
+                return cached
+        except Exception:
+            pass
+
+    help_text = ""
+    try:
+        import subprocess
+
+        proc = subprocess.run(
+            [sys.executable, str(comparator), "--help"],
+            capture_output=True, text=True, timeout=60,
+        )
+        help_text = ((proc.stdout or "") + "\n" + (proc.stderr or ""))[:4000]
+    except Exception:
+        help_text = "(--help could not be run)"
+
+    source = _format_excerpt(Path(comparator))
+
+    sys_prompt = (
+        "You are told how to run one scoring script. Answer with JSON only:\n"
+        '{"argv": ["{python}", "{script}", "--case", "{case}"],\n'
+        ' "metric_keys": {"<metric asked for>": "<the name THIS script reports it under>"},\n'
+        ' "json_out": "",\n'
+        ' "reasoning": "one line"}\n\n'
+        "Rules:\n"
+        "- argv is the exact command to score ONE finished case directory. Use only these "
+        "placeholders: {python} (the interpreter), {script} (this file), {case} (the case "
+        "directory), {reference} (a reference data file), {out} (a writable path for its "
+        "output). Fit them to whatever argument shape the script really takes -- if it wants "
+        "--case RE=DIR, write \"--case\", \"100={case}\" with the Reynolds number or condition "
+        "the script expects; if it has no --reference flag because it finds its own reference "
+        "data, leave {reference} out entirely.\n"
+        "- metric_keys maps each metric name you were asked about to the key the script actually "
+        "reports. Read its print statements and the dictionary it writes. Leave out any metric "
+        "the script does not compute.\n"
+        "- json_out is \"{out}\" if the script writes its results to a file you passed as {out}, "
+        "otherwise \"\".\n"
+        "- Do not invent flags. Every flag in argv must appear in the script's own argument "
+        "parser."
+    )
+    user_msg = (
+        f"METRICS ASKED FOR: {wanted}\n\n"
+        f"SCRIPT: {comparator}\n\n"
+        f"--help SAYS:\n{help_text}\n\n"
+        f"ITS SOURCE:\n{source}\n"
+    )
+
+    try:
+        _bootstrap_repo()
+        from langchain_core.messages import HumanMessage, SystemMessage  # type: ignore
+        from cfd_langgraph.config import get_settings  # type: ignore
+        from cfd_langgraph.llm.factory import create_langchain_llm  # type: ignore
+        from cfd_langgraph.llm.reply import reply_text  # type: ignore
+
+        llm = create_langchain_llm(model=get_settings().model, temperature=0.0)
+        resp = llm.invoke([SystemMessage(content=sys_prompt), HumanMessage(content=user_msg)])
+        raw = reply_text(resp)
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            raise ValueError(f"no JSON object in response: {raw[:200]!r}")
+        parsed = json.loads(match.group(0))
+
+        argv = [str(token) for token in (parsed.get("argv") or []) if str(token).strip()]
+        keys = {
+            str(k): str(v) for k, v in (parsed.get("metric_keys") or {}).items()
+            if str(k) in wanted and str(v).strip()
+        }
+        # Anti-contamination, as everywhere else here: the script that runs is
+        # the one we classified. A model that names some other path in argv
+        # gets its answer discarded rather than honoured.
+        if argv and not any("{script}" in token for token in argv):
+            argv = []
+        if any(Path(token).is_absolute() and "{" not in token for token in argv):
+            argv = []
+        result = {
+            "argv": argv,
+            "metric_keys": keys,
+            "json_out": str(parsed.get("json_out") or ""),
+            "status": "ok" if argv and keys else "no_usable_interface",
+            "reasoning": str(parsed.get("reasoning") or "")[:400],
+        }
+    except Exception as exc:  # noqa: BLE001
+        result = {
+            "argv": [], "metric_keys": {}, "json_out": "",
+            "status": "llm_unavailable", "reasoning": repr(exc)[:300],
+        }
+
+    result["comparator"] = str(comparator)
+    result["metrics_asked"] = wanted
+    result["cached"] = False
+    if cache_path:
+        try:
+            Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache_path).write_text(json.dumps(result, indent=2))
+        except Exception:
+            pass
+    return result
+
+
 def find_comparator_for_starter(
     *,
     starter_dir: Optional[Path],

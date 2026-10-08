@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from . import allrun, decomposer, parser, rag, review, writer
-from .loop import refine_mesh_from_parent, run_foam_case
+from .loop import extend_run, refine_mesh_from_parent, run_foam_case
 
 __all__ = [
     "run_foam_case",
+    "extend_run",
     "refine_mesh_from_parent",
     "parser",
     "decomposer",

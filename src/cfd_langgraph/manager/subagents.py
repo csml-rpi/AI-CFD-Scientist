@@ -1,9 +1,134 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from deepagents import SubAgent
+
+# A subagent that loops runs until the graph's step limit stops it, and
+# deepagents sets that to 9,999. Measured on the ALCF nemotron-3-ultra cavity
+# runs: a case-runner called run_case_native 352 times against a precondition
+# only the manager could clear ("no converged mesh-gate selection"), and would
+# have kept going for hours. One case legitimately needs tens of steps, so a
+# few hundred is generous; past that the subagent is told to report back and
+# the manager -- the only agent that can fix an upstream block -- gets its turn.
+_SUBAGENT_STEP_LIMIT = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_STEPS") or 300)
+
+
+def _stopped_message(name: str) -> Any:
+    """What the manager is told when a subagent is stopped at its step limit."""
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(content=(
+        f"The {name} subagent was stopped after {_SUBAGENT_STEP_LIMIT} steps without "
+        "finishing: it kept repeating the same actions. Nothing it did is lost. Read "
+        "its case/candidate directory to see how far it got, fix whatever blocked it "
+        "(for example run the mesh gate if a case run was refused for a missing "
+        "converged mesh), and only then launch it again."
+    ))
+
+
+# Refusals in a row after which a subagent is stopped. Each refusal already
+# tells the model to do something else; one that keeps making refused calls
+# is not going to finish, and every further turn costs a full model call.
+# Measured on qwen_retest_20261005/cavity: case-runners made 2,436 refused
+# run_case_native calls and 4,881 refused re-reads over twelve hours.
+_REFUSAL_STOP = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_REFUSALS") or 20)
+from cfd_langgraph.llm.caching import stuck  # noqa: E402
+
+
+def _refused_message(name: str) -> Any:
+    from langchain_core.messages import AIMessage
+
+    return AIMessage(content=(
+        f"The {name} subagent was stopped after {_REFUSAL_STOP} or more refused calls among its recent ones: "
+        "it kept making calls the tools would not run. Nothing it did is lost. Read its "
+        "case/candidate directory and the refusals' reasons, fix what blocked it, and only "
+        "then launch it again."
+    ))
+
+
+# The limit is set per call because a recursion_limit in the caller's config wins over
+# a bound one, and the task tool passes the manager's 9,999: case-runners told to stop
+# at 300 ran ~10,000 steps (qwen_retest_20261005/cavity). Raised, GraphRecursionError
+# failed the manager's whole step and left the study idle (nemotron cavity runs).
+def _capped(spec: SubAgent, precheck: Optional[Callable[[], Optional[str]]] = None) -> Any:
+    """``spec`` compiled with a step limit applied on every call, a stop after a
+    run of refused calls, and an optional ``precheck`` that may refuse to start
+    it; unchanged if deepagents' compile entrypoint is not where it used to be.
+    Hitting a limit hands the manager a plain message instead of an exception."""
+    try:
+        from deepagents.middleware.subagents import create_sub_agent
+        from langgraph.errors import GraphRecursionError
+        from langchain_core.messages import AIMessage
+        from langchain_core.runnables import RunnableLambda
+
+        compiled = create_sub_agent(spec)
+        name = spec["name"]
+
+        def _config(config: Any) -> Dict[str, Any]:
+            return {**(config or {}), "recursion_limit": _SUBAGENT_STEP_LIMIT}
+
+        def _refused_start() -> Any:
+            reason = precheck() if precheck is not None else None
+            if not reason:
+                return None
+            print(f"  ⛔ {name} not started: {reason[:200]}", flush=True)
+            return {"messages": [AIMessage(content=reason)]}
+
+        def _run(state: Any, config: Any = None) -> Any:
+            refused = _refused_start()
+            if refused is not None:
+                return refused
+            last = None
+            try:
+                for last in compiled.stream(state, _config(config), stream_mode="values"):
+                    if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
+                        print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
+                        return {"messages": [_refused_message(name)]}
+                return last
+            except GraphRecursionError:
+                print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
+                return {"messages": [_stopped_message(name)]}
+
+        async def _arun(state: Any, config: Any = None) -> Any:
+            refused = _refused_start()
+            if refused is not None:
+                return refused
+            last = None
+            try:
+                async for last in compiled.astream(state, _config(config), stream_mode="values"):
+                    if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
+                        print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
+                        return {"messages": [_refused_message(name)]}
+                return last
+            except GraphRecursionError:
+                print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
+                return {"messages": [_stopped_message(name)]}
+
+        runnable = RunnableLambda(_run, afunc=_arun)
+    except Exception as exc:  # pragma: no cover - depends on deepagents internals
+        print(f"[subagents] step limit not applied to {spec['name']}: {exc}", flush=True)
+        return spec
+    return {"name": spec["name"], "description": spec["description"], "runnable": runnable}
+
+
+def _no_converged_mesh_gate(out_dir: Path) -> Optional[str]:
+    """Why a case-runner cannot do anything yet, or None. run_case_native
+    refuses every case of a physics group without a converged mesh gate, and
+    only the manager can run the gate."""
+    for spec_path in (Path(out_dir) / "mesh_gate").glob("*/selected_mesh_spec.json"):
+        try:
+            if json.loads(spec_path.read_text()).get("converged"):
+                return None
+        except (OSError, ValueError):
+            continue
+    return ("Not started: no physics group in this study has a converged mesh gate yet, so "
+            "run_case_native would refuse every case. Only you, the manager, can run "
+            "run_mesh_gate. Get a converged gate for the case's physics group first; launching "
+            "case-runners before that cannot succeed.")
 
 from cfd_langgraph.llm.caching import (
     build_caching_middleware,
@@ -44,6 +169,11 @@ repo root, never in /tmp — both are shared across every study and case that ha
 and writing there either pollutes them permanently or risks a collision with another
 case running concurrently right now.
 
+If run_case_native's result has `start_protocol`, the case was started from the study's
+settled flow on purpose: its 0/ fields hold that flow and its endTime is the study's run
+length, whatever the requirement text says about initial fields or iteration counts. That
+is not a setup error -- do not change those files, and do not re-run to "fix" them.
+
 If run_case_native's result lists `requirement_checker_issues`, the approved requirement
 failed the requirement checker. Check the case against those issues and your task
 description. If one made this case come out wrong (e.g. the requirement lists several
@@ -58,7 +188,7 @@ that one clarified re-run), and do not include the full stdout/stderr in your fi
 report — the manager only needs the outcome, not the transcript."""
 
 
-def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> SubAgent:
+def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> Any:
     """The subagent every experiment case runs through.
 
     Isolated context by design: FoamAgent's planner/writer/reviewer loop for
@@ -75,7 +205,7 @@ def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> S
     file, then a review/rewrite round per retry), all sharing the same large
     system prompt + tool-definitions prefix.
     """
-    return SubAgent(
+    return _capped(SubAgent(
         name="case-runner",
         description=(
             "Runs exactly one OpenFOAM case (plan, write, run, review-and-retry) using "
@@ -95,7 +225,7 @@ def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> S
         # tools so a case can't silently "read" or "grep" an empty virtual
         # filesystem instead of the real case directory.
         permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
-    )
+    ), precheck=lambda: _no_converged_mesh_gate(out_dir))
 
 
 def _build_oed_candidate_runner_prompt(out_dir: Path) -> str:
@@ -197,7 +327,7 @@ candidate_dir the run tool returns) — the run tools already write there. {out_
 shared across every study, and other candidates are running concurrently right now."""
 
 
-def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> SubAgent:
+def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> Any:
     """The subagent every open-ended-discovery candidate runs through.
 
     Mirrors build_case_runner_subagent exactly, for the same reason: the
@@ -211,7 +341,7 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
     oed_score_candidate / oed_record_candidate_results, and
     scripts/oed_search_archive.py for the archive this whole loop serves.
     """
-    return SubAgent(
+    return _capped(SubAgent(
         name="oed-candidate-runner",
         description=(
             "Runs exactly one open-ended-discovery candidate (build a proposed model, or "
@@ -227,4 +357,26 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
         + build_caching_middleware(model) + build_context_middleware(model, tools),
         interrupt_on=build_interrupt_on(tools),
         permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
-    )
+    ))
+
+
+# deepagents adds a "general-purpose" subagent with the manager's own tools
+# unless one is supplied, and that default carries none of this harness's
+# controls: on qwen_retest_20261005/cavity_r11 one ran to the 9,999-step limit
+# with 375 refused calls in a row. Supplying it here keeps the capability with
+# the same step cap, refusal stop and loop control as the other subagents.
+def build_general_purpose_subagent(tools: List[Any], model: Any) -> Any:
+    """deepagents' general-purpose subagent, with this harness's controls."""
+    from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+
+    return _capped(SubAgent(
+        name=GENERAL_PURPOSE_SUBAGENT["name"],
+        description=GENERAL_PURPOSE_SUBAGENT["description"],
+        system_prompt=GENERAL_PURPOSE_SUBAGENT["system_prompt"],
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))

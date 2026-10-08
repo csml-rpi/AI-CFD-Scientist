@@ -32,6 +32,7 @@ Phase 3 — multi-flow:
 """
 from __future__ import annotations
 
+import math
 import json
 import multiprocessing as _mp
 import pickle as _pickle
@@ -1786,6 +1787,116 @@ def judge_comparator_output(
     if res.returncode != 0:
         return False, f"non-zero exit ({res.returncode}); stderr: {(res.stderr or '')[:300]}", val
     return True, "ok", val
+
+
+def _numbers_under_key(blob: Any, key: str) -> List[float]:
+    """Every finite number stored under ``key`` anywhere in a JSON structure.
+
+    A starter's scorer nests its results however it likes -- often one level
+    per case, e.g. {"cases": {"<case>": {"<metric>": ...}}} -- so the key is
+    searched for rather than addressed by a path we would have to know in
+    advance.
+    """
+    found: List[float] = []
+    if isinstance(blob, dict):
+        for k, v in blob.items():
+            if str(k) == key and isinstance(v, (int, float)) and not isinstance(v, bool):
+                value = float(v)
+                if math.isfinite(value):
+                    found.append(value)
+            else:
+                found.extend(_numbers_under_key(v, key))
+    elif isinstance(blob, list):
+        for item in blob:
+            found.extend(_numbers_under_key(item, key))
+    return found
+
+
+def score_with_comparator_interface(
+    *,
+    comparator: Path,
+    interface: Dict[str, Any],
+    case_dir: Path,
+    reference_file: Optional[Path],
+    metric_name: str,
+    work_dir: Path,
+    timeout_s: int = 600,
+) -> Tuple[bool, str, Optional[float]]:
+    """Run a starter's own scorer through the interface described for it.
+
+    ``selftest_comparator`` speaks one contract and refuses everything else,
+    which is right for a comparator this pipeline authored and wrong for one
+    the starter shipped. This is the second attempt, used only after the
+    strict path has already failed: run the script the way its own argument
+    parser wants it, and read the number out under the key it really reports.
+
+    The value is accepted only when the script reports ONE value for the key.
+    Several different values means the command scored more than the case we
+    asked about, and a number that might belong to another case is worse than
+    no number -- the caller then refuses, as it did before.
+
+    Returns (ok, reason, value), like selftest_comparator.
+    """
+    argv_template = [str(token) for token in (interface.get("argv") or [])]
+    key = str((interface.get("metric_keys") or {}).get(metric_name) or "").strip()
+    if not argv_template or not key:
+        return False, "no interface described for this comparator", None
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_path = work_dir / f"comparator_out_{re.sub(r'[^A-Za-z0-9_.-]', '_', metric_name)}.json"
+    substitutions = {
+        "{python}": sys.executable,
+        "{script}": str(comparator),
+        "{case}": str(case_dir),
+        "{reference}": str(reference_file) if reference_file else "",
+        "{out}": str(out_path),
+    }
+    argv: List[str] = []
+    for token in argv_template:
+        for placeholder, value in substitutions.items():
+            token = token.replace(placeholder, value)
+        if token.strip():
+            argv.append(token)
+    if not argv:
+        return False, "interface produced an empty command", None
+
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, "timeout", None
+    except Exception as exc:  # noqa: BLE001
+        return False, f"exec error: {exc}", None
+
+    # A scorer commonly exits non-zero because the case missed its pass
+    # tolerance. That is a verdict, not a failure to measure, so the number it
+    # wrote still counts; only the absence of a number is a failure here.
+    values: List[float] = []
+    if out_path.is_file():
+        try:
+            values = _numbers_under_key(json.loads(out_path.read_text()), key)
+        except Exception:
+            values = []
+    if not values:
+        blob = (res.stdout or "") + "\n" + (res.stderr or "")
+        m = re.search(rf"\b{re.escape(key)}\s*[:=]\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)", blob)
+        if m:
+            try:
+                candidate = float(m.group(1))
+                if math.isfinite(candidate):
+                    values = [candidate]
+            except ValueError:
+                values = []
+    if not values:
+        return False, (
+            f"ran as {' '.join(argv[1:])[:160]} (exit {res.returncode}) but reported no "
+            f"{key}: {((res.stderr or res.stdout or '').strip()[:200])}"
+        ), None
+    if any(abs(v - values[0]) > 1e-12 * max(1.0, abs(values[0])) for v in values[1:]):
+        return False, (
+            f"reported {len(values)} different values for {key}; that command scored more than "
+            "the one case it was given"
+        ), None
+    return True, "ok", values[0]
 
 
 def _classify_selftest_failure(

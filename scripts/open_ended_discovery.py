@@ -1005,7 +1005,8 @@ def _llm_decide_next_action(
 
     fp = starter_understanding.get("flow_parameters", {}) or {}
     ref = starter_understanding.get("reference_data", {}) or {}
-    base_case = starter_understanding.get("base_case_path", "")
+    _declared = _declared_starter_cases(starter_understanding)
+    base_case = ", ".join(str(d) for d in _declared) or starter_understanding.get("base_case_path", "")
 
     compiled_summary = ""
     if compiled_models:
@@ -1255,7 +1256,8 @@ def _llm_decide_next_action(
     except Exception:
         pass
     # Re-derive run_dir from starter_understanding.base_case_path if possible
-    base_case_path = starter_understanding.get("base_case_path", "")
+    declared_cases = _declared_starter_cases(starter_understanding)
+    base_case_path = declared_cases[0] if declared_cases else starter_understanding.get("base_case_path", "")
     _run_dir_candidate = None
     try:
         if base_case_path:
@@ -2022,7 +2024,8 @@ def _run_code_mod_iteration(
     print(out)
 
     # interpret
-    _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+    _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
     metrics = _extract_case_metrics(
         exp_dir,
         starter_dir=starter_dir,
@@ -2043,6 +2046,21 @@ def _run_code_mod_iteration(
     }
 
 
+def _declared_starter_cases(starter_understanding: Dict[str, Any]) -> List[Path]:
+    """Every case starter_understanding names, resolved against the starter.
+
+    ``base_case_path`` may be a list, a single path, or one string naming
+    several -- a two-case starter answers with both. Treating that answer as
+    one path finds neither case, so resolution is shared rather than
+    re-implemented per call site.
+    """
+    try:
+        from cfd_langgraph.starter_cases import starter_base_case_dirs  # type: ignore
+        return starter_base_case_dirs(starter_understanding)
+    except Exception:
+        return []
+
+
 def _resolve_starter_case_dir(
     starter_dir: Optional[Path],
     starter_understanding: Dict[str, Any],
@@ -2053,6 +2071,9 @@ def _resolve_starter_case_dir(
     cand = (base_case_dir or "").strip() or str(starter_understanding.get("base_case_path", "") or "").strip()
     if cand and Path(cand).exists() and (Path(cand) / "constant").is_dir():
         return Path(cand)
+    for declared in _declared_starter_cases(starter_understanding):
+        if (declared / "constant").is_dir():
+            return declared
     if starter_dir is not None and Path(starter_dir).is_dir():
         for d in sorted(Path(starter_dir).rglob("*")):
             if not d.is_dir():
@@ -2202,7 +2223,8 @@ def _run_agentic_code_mod_iteration(
                 "run_validity": gate_result,
             }
         # Run interpret on the converged case to score it.
-        _run_interpret(Path(case_dir), repo_root, timeline_path, env=env, objective_contract=objective_contract)
+        _run_interpret(Path(case_dir), repo_root, timeline_path, env=env,
+                           objective_contract=objective_contract, topic=topic)
         metrics = _extract_case_metrics(
             Path(case_dir),
             starter_dir=starter_dir,
@@ -2388,6 +2410,11 @@ def _run_runtime_code_mod_iteration(
     # modifications (e.g. a broken customSource in fvModels) that would
     # contaminate independent hypotheses with unrelated bugs.
     base = (base_case_dir or "").strip() or str(starter_understanding.get("base_case_path", "") or "").strip()
+    if not base or not Path(base).exists():
+        for declared in _declared_starter_cases(starter_understanding):
+            if (declared / "constant").is_dir():
+                base = str(declared)
+                break
     if (not base or not Path(base).exists()) and starter_dir is not None:
         # Scan starter_dir (1-3 levels deep) for a complete OpenFOAM case.
         for d in sorted(Path(starter_dir).rglob("*")):
@@ -2748,7 +2775,8 @@ def _run_runtime_code_mod_iteration(
     # to visualize, and the viz/interpret LLM calls can stall indefinitely
     # on streaming responses (we've seen 15+ min hangs).
     if run_ok:
-        _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+        _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
         metrics = _extract_case_metrics(
             exp_dir,
             starter_dir=starter_dir,
@@ -3149,7 +3177,8 @@ def _run_experiment_iteration(
             }
         run_ok = (rc == 0) and (str(runtime_run_result.get("status", "")).upper() == "OK")
         if run_ok:
-            _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+            _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
             metrics = _extract_case_metrics(
                 exp_dir,
                 starter_dir=starter_dir,
@@ -3275,6 +3304,69 @@ def _comparator_exemplar_text(
     return fallback
 
 
+def _interpret_requirement(topic: str, objective_contract: Optional[Dict[str, Any]]) -> str:
+    """What the case is for, in the words the judge needs to judge it.
+
+    Without this the judge is shown figures and a solver log and asked whether
+    the run is acceptable, with no statement of what the case is or what the
+    study is measuring. It then reports what it sees as unremarkable: the same
+    figures judged with and without this text came back PROCEED at confidence
+    0.8 and RERUN at 0.15.
+    """
+    parts: List[str] = []
+    if str(topic or "").strip():
+        parts.append(str(topic).strip()[:2000])
+    quantities = (objective_contract or {}).get("objective_quantities") or []
+    named = [str(q).strip() for q in quantities if str(q).strip()]
+    if named:
+        parts.append("The quantities this study is judged on are: " + ", ".join(named[:12]) + ".")
+    return "\n\n".join(parts)
+
+
+def _incumbent_best_from_history(case_dir: Path, direction: str) -> Optional[float]:
+    """The best score recorded so far, read from the discovery history on disk.
+
+    Derived here rather than threaded through every call site, so a caller that
+    does not track the leader still gets the check gated rather than run on
+    every candidate.
+    """
+    hist = _read_json(case_dir.parent / "history.json", [])
+    values: List[float] = []
+    for h in hist if isinstance(hist, list) else []:
+        if not isinstance(h, dict):
+            continue
+        value = (h.get("metric_aggregated") or {}).get("primary")
+        if value is None:
+            score = h.get("score")
+            value = score.get("value") if isinstance(score, dict) else None
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    return max(values) if str(direction).lower().startswith("max") else min(values)
+
+
+def _takes_the_lead(value: Any, incumbent: Optional[float], direction: str) -> bool:
+    """Is this score better than the one currently leading?
+
+    Nothing leading yet counts as taking the lead, so the first scored
+    candidate is checked rather than skipped.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if incumbent is None:
+        return True
+    try:
+        best = float(incumbent)
+    except (TypeError, ValueError):
+        return True
+    return v > best if str(direction).lower().startswith("max") else v < best
+
+
 def _run_interpret(
     case_dir: Path,
     repo_root: Path,
@@ -3282,6 +3374,9 @@ def _run_interpret(
     env: Optional[Dict[str, str]] = None,
     *,
     objective_contract: Optional[Dict[str, Any]] = None,
+    incumbent_best: Optional[float] = None,
+    direction: str = "min",
+    topic: str = "",
 ) -> None:
     """Run viz + interpret on a finished case.
 
@@ -3296,6 +3391,15 @@ def _run_interpret(
 
     Vision-only path (when no comparator score is available): run the
     existing viz_creator + vision-LLM scoring pipeline.
+
+    A score cannot see the solution it came from. A quantity read on a
+    boundary leaves the interior unconstrained, so a candidate can match it
+    while the field is wrong -- and then the fast path reports the match and
+    nothing looks at the field. Rendering every candidate is too slow to be
+    worth it, but a candidate only matters once it takes the lead: so when the
+    comparator score beats ``incumbent_best``, the field is rendered and judged
+    as well as scored. ``incumbent_best`` of None means nothing leads yet, and
+    the check runs.
     """
     decision_path = case_dir / "decision.json"
 
@@ -3307,28 +3411,39 @@ def _run_interpret(
                 extracted = _extract_error_metrics(comp_out)
                 primary = _choose_primary_score(extracted)
                 if primary is not None:
+                    value = primary.get("value")
+                    facing = str(primary.get("direction", direction) or direction)
+                    if incumbent_best is None:
+                        incumbent_best = _incumbent_best_from_history(case_dir, facing)
+                    leads = _takes_the_lead(value, incumbent_best, facing)
                     _write_json(decision_path, {
                         "status": "UNKNOWN",
                         "confidence": 0.0,
                         "reason": (
-                            f"interpret skipped — using deterministic comparator score "
+                            f"deterministic comparator score "
                             f"{primary.get('metric','?')}={primary.get('value','?')} "
                             f"(direction={primary.get('direction','min')}). "
-                            f"Vision interpret is not invoked when a numeric score is available."
+                            + ("This candidate takes the lead, so its field is also being "
+                               "rendered and judged." if leads else
+                               "It does not lead, so the field is not rendered.")
                         )[:500],
                         "suggested_changes": [],
                         "raw": {"comparator_output_head": str(comp_out)[:800]},
                         "score_only_path": True,
+                        "field_check_run": bool(leads),
                     })
-                    print(f"[OED][interpret] score-only path: skipping LLM interpret "
-                          f"(score={primary})")
                     append_timeline_event(timeline_path, {
                         "stage": "interpret",
                         "case_id": case_dir.name,
-                        "status": "score_only_skipped",
+                        "status": "scored_and_field_checked" if leads else "score_only_skipped",
                         "score": primary,
                     })
-                    return
+                    if not leads:
+                        print(f"[OED][interpret] score-only path: does not lead, field not "
+                              f"rendered (score={primary}, incumbent={incumbent_best})")
+                        return
+                    print(f"[OED][interpret] score={primary} takes the lead over "
+                          f"{incumbent_best}; rendering and judging its field")
         except Exception as ex:
             print(f"[OED][interpret] score-only short-circuit failed "
                   f"({type(ex).__name__}: {ex}); falling through to vision interpret")
@@ -3361,7 +3476,9 @@ def _run_interpret(
              "--case", str(case_dir),
              "--figs", str(figs_dir),
              "--output", str(decision_path),
-             "--timeline", str(timeline_path)],
+             "--timeline", str(timeline_path),
+             *(["--requirement", _interpret_requirement(topic, objective_contract)]
+               if _interpret_requirement(topic, objective_contract) else [])],
             cwd=repo_root,
             env=env,
             timeout=INTERP_TIMEOUT_S,

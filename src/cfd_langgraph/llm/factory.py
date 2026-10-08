@@ -1415,6 +1415,40 @@ def create_langchain_llm(
             return GeminiChatModel(inner=inner, model_name=m, temperature=temperature,
                                    callbacks=[TOKEN_STATS_HANDLER])
 
+        if provider == "alcf":
+            # ALCF's gateway in front of Sophia/Metis/Minerva: OpenAI-compatible,
+            # but authenticated with a refreshing Globus token instead of a key.
+            # One first-time setup step per machine:
+            #   python scripts/inference_auth_token.py authenticate
+            from .alcf import create_alcf_chat_model
+
+            # How reasoning is switched off depends on who serves the model.
+            # Minerva and Metis are vendor APIs and take `reasoning_effort`
+            # (measured on nemotron-3-ultra: effort "none" cut a reply from 38
+            # output tokens to 2). Sophia is vLLM, where the only control that
+            # lands is the chat template's own thinking switch.
+            cluster = (os.environ.get("CFD_SCIENTIST_ALCF_CLUSTER") or "sophia").strip().lower()
+            extra_body = None
+            if effort:
+                if cluster == "sophia":
+                    if effort != "none":
+                        raise ValueError(
+                            f"CFD_SCIENTIST_EFFORT={effort!r} is not supported on ALCF's Sophia "
+                            "cluster. It accepts only 'none', which turns the model's thinking "
+                            "off; unset it to keep the served model's default."
+                        )
+                    extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+                else:
+                    # The model advertises its own levels under
+                    # /resource_server/<cluster>/models; the endpoint refuses one
+                    # it does not serve, which is the check we want anyway.
+                    extra_body = {"reasoning_effort": effort}
+            return create_alcf_chat_model(
+                m, temperature, callbacks=[TOKEN_STATS_HANDLER],
+                timeout=int(_vertex_timeout()), max_retries=_vertex_max_retries(),
+                extra_body=extra_body, cls=_with_tool_call_repair(ChatOpenAI),
+            )
+
         if provider == "vertex-endpoint":
             # A model YOU deployed on Vertex, not a MaaS publisher model. The
             # Gemini route (ChatGoogleGenerativeAI) cannot reach it: that speaks

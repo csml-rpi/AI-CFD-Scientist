@@ -114,7 +114,8 @@ def _with_mesh_check(commands: List[str]) -> List[str]:
     return commands[: last_mesher + 1] + ["checkMesh"] + commands[last_mesher + 1 :]
 
 
-def build_allrun_script(command_list_text: str, case_solver: str = "") -> str:
+def build_allrun_script(command_list_text: str, case_solver: str = "", *,
+                        needs_blockmesh: bool = False) -> str:
     """Wrap the model's bare command list in the standard FoamAgent Allrun header.
 
     ``case_solver`` comes from the case's own controlDict ``application``
@@ -122,8 +123,17 @@ def build_allrun_script(command_list_text: str, case_solver: str = "") -> str:
     solver a case runs is a fact recorded in the case, not a judgement call —
     and a case whose Allrun omits it produces no solver log, so every retry
     fails for a reason no rewrite of the *dictionaries* can fix.
+
+    ``needs_blockmesh`` is the same kind of fact about the mesh: the case has a
+    blockMeshDict and no mesh yet, so blockMesh runs first if the list leaves
+    it out; the retry loop rewrites dictionaries, never the Allrun, so a
+    missing mesh step could not otherwise be repaired.
     """
-    commands = parse_command_list(command_list_text)
+    # A shell variable is not an application: `runApplication $application`
+    # left an empty log file named "log." and ran nothing.
+    commands = [c for c in parse_command_list(command_list_text) if "$" not in c]
+    if needs_blockmesh and not any("blockMesh" in cmd.split() for cmd in commands):
+        commands.insert(0, "blockMesh")
     commands = _with_mesh_check(commands)
     solver = (case_solver or "").strip()
     if solver and not any(solver in cmd.split() for cmd in commands):
@@ -142,3 +152,36 @@ def build_allrun_script(command_list_text: str, case_solver: str = "") -> str:
             lines.append(f"runApplication {cmd}")
     lines.append("")
     return "\n".join(lines)
+
+
+def build_mesh_and_solve_allrun(case_solver: str, *, max_procs: int = 16, cells_per_proc: int = 8000) -> str:
+    """Allrun for a case whose dictionaries are already complete: mesh it,
+    check the mesh, then solve -- in parallel when the mesh is large enough to
+    gain from it. The core count is decided after blockMesh, from the cell
+    count, so a refined level gets more cores than its parent."""
+    solver = (case_solver or "").strip() or "simpleFoam"
+    return "\n".join([
+        "#!/bin/sh",
+        'cd "${0%/*}" || exit 1',
+        '. "$WM_PROJECT_DIR/bin/tools/RunFunctions"',
+        "",
+        "runApplication blockMesh",
+        "runApplication checkMesh",
+        "cells=$(sed -n 's/.*nCells:[ ]*\\([0-9]*\\).*/\\1/p' constant/polyMesh/owner | head -1)",
+        f"np=$(( ${{cells:-0}} / {int(cells_per_proc)} ))",
+        f'[ "$np" -gt {int(max_procs)} ] && np={int(max_procs)}',
+        'if [ "$np" -ge 2 ]; then',
+        "    cat > system/decomposeParDict <<EOF",
+        "FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }",
+        "numberOfSubdomains $np;",
+        "method scotch;",
+        "EOF",
+        "    runApplication decomposePar -force",
+        f"    runParallel {solver}",
+        "    runApplication reconstructPar",
+        "else",
+        f"    runApplication {solver}",
+        "fi",
+        "",
+    ])
+

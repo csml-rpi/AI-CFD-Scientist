@@ -226,7 +226,18 @@ class _PathLLM:
         self.calls = 0
         self.prompts: list[str] = []
 
-    def with_structured_output(self, _schema):
+    def with_structured_output(self, schema):
+        # The spec is now judged twice: the paths must exist, and what the hint
+        # reads out of them must exist too. This test is about the paths, so
+        # the content audit answers "no problem" — and answers off to the side,
+        # so it does not count as one of the proposer's calls.
+        if getattr(schema, "__name__", "") == "_MetricReferenceAudit":
+            class _NoProblems:
+                @staticmethod
+                def invoke(_prompt):
+                    return schema(checks=[])
+
+            return _NoProblems()
         return self
 
     def invoke(self, prompt):

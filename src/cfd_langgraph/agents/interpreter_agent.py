@@ -64,6 +64,16 @@ def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
     return ""
 
 
+def _case_inventory_text(case_dir: Path) -> str:
+    """What the case contains, for a planner that would otherwise guess."""
+    try:
+        from cfd_langgraph.case_inventory import collect
+
+        return collect(case_dir).describe()
+    except Exception as exc:  # noqa: BLE001
+        return f"(inventory unavailable: {type(exc).__name__}: {exc})"
+
+
 class ResultsInterpreterAgent:
     """Max distinct visualization types to suggest per experiment (tweak as needed)."""
     MAX_EXP_VIZ = 10
@@ -396,7 +406,8 @@ class ResultsInterpreterAgent:
                 parts.append(str(experiment_spec["case_name"]).strip())
         return "\n".join(p for p in parts if p) or "No user requirement provided."
 
-    def _plan_what_to_visualize(self, user_req: str, case_structure: Dict[str, Any]) -> str:
+    def _plan_what_to_visualize(self, user_req: str, case_structure: Dict[str, Any],
+                                inventory: str = "") -> str:
         """
         Decide, per experiment, what to visualize based on:
         - user requirement text
@@ -433,11 +444,16 @@ class ResultsInterpreterAgent:
                 "{times}\n\n"
                 "Available field variables (cell/point data):\n"
                 "{variables}\n\n"
+                "WHAT THIS CASE CONTAINS:\n"
+                "{inventory}\n\n"
                 f"Describe at most {max_viz} distinct visualization types to create "
                 "to best evaluate whether the simulation satisfies the requirement. "
                 "Mention which fields (e.g., U, p), which times (early/mid/late or specific values), "
                 "and what types of plots (contours, slices, centerline profiles, etc.). "
-                "Only request plots derivable from this single case's data. "
+                "Request only what this single case can produce. Anything derivable from the fields listed is available: compute it rather than calling it missing. PyVista derives vorticity, Q-criterion and gradients from a velocity field, streamlines and magnitudes from it too, and samples any line, plane or point out of the volume at any written time. A wall quantity comes from its boundary patch. Only a quantity the simulation genuinely never produced -- a field it did not solve for, or a time it did not write -- is actually unavailable, and that is the only case to treat as out of reach. "
+                "Asking for something it never produced -- a probe history when no probe ran -- "
+                "cannot be satisfied by any redraw, and the figures are then judged incomplete "
+                "for a reason nothing can fix. "
                 "Plain text only, no bullet lists, no JSON, no code."
             )
             prompt = ChatPromptTemplate.from_messages(
@@ -452,6 +468,7 @@ class ResultsInterpreterAgent:
                     "user_requirement": user_req,
                     "times": ", ".join(times) if times else "(no time folders discovered)",
                     "variables": ", ".join(vars_) if vars_ else "(no variables discovered)",
+                    "inventory": inventory or "(inventory unavailable)",
                 }
             ))
             text = str(content or "").strip()
@@ -560,7 +577,8 @@ class ResultsInterpreterAgent:
             model=self.model,
             foam_output_dir=output_dir,
             viz_dir=viz_base,
-            what_to_visualize=self._plan_what_to_visualize(user_req, case_structure),
+            what_to_visualize=self._plan_what_to_visualize(
+                user_req, case_structure, inventory=_case_inventory_text(output_dir)),
             user_requirement=user_req,
             reference_viz_script=None,
             max_retries=VIZ_MAX_RETRIES,

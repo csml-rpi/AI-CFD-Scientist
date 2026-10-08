@@ -232,7 +232,13 @@ class _RepairingStructured:
 
     def invoke(self, prompt: Any, *args: Any, **kwargs: Any) -> Any:
         try:
-            return self._bound.invoke(prompt, *args, **kwargs)
+            result = self._bound.invoke(prompt, *args, **kwargs)
+            # Some models answer with no structured call at all; the binding
+            # then returns None rather than raising, and the caller fails on
+            # it far from the cause. That is a malformed reply like any other.
+            if result is None:
+                raise ValueError("the reply contained no answer in the required structure")
+            return result
         except Exception as first_error:
             try:
                 return self._repair(prompt, first_error)
@@ -246,8 +252,8 @@ class _RepairingStructured:
         import json as _json
 
         instruction = (
-            "Your previous reply had the right content but did not match the "
-            "required schema, so it was rejected.\n\n"
+            "Your previous reply did not match the required schema, so it was "
+            "rejected.\n\n"
             "REQUIRED JSON SCHEMA:\n"
             + _json.dumps(self._schema.model_json_schema(), indent=2)
             + "\n\nVALIDATION ERROR:\n"
