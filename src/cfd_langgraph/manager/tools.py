@@ -1886,6 +1886,11 @@ def _foamagent_env(openfoam_path: str = "") -> Dict[str, str]:
     if model:
         env["FOAMAGENT_MODEL_VERSION"] = model
     env["PYTHONPATH"] = f"{_REPO_ROOT}:{env.get('PYTHONPATH', '')}"
+    # A build process finds the view of the data it may see from its own study
+    # folder (cfd_langgraph.withheld_data.find_manifest), which during the search
+    # is the validation view. A variable inherited from the launching shell would
+    # override that with whatever it named.
+    env.pop("CFD_SCIENTIST_WITHHELD_MANIFEST", None)
     return env
 
 
@@ -6055,11 +6060,101 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             mode = _study_mode_value()
             script = runner_script_for(mode)
             print(f"  study mode: {mode} -> {script}", flush=True)
-            return script
         except Exception as exc:  # noqa: BLE001
             print(f"  study-mode resolution failed ({exc}); using the solver runner",
                   flush=True)
             return "scripts/code_mod_agentic.py"
+        if script.endswith("surrogate_agentic.py"):
+            _withhold_test_targets()
+        return script
+
+    def _withhold_test_targets() -> None:
+        """Hide the test set's targets from every candidate this study builds.
+
+        Built once, from the starter's own data documentation, before the first
+        candidate starts, and handed to each build process through the
+        environment (cfd_langgraph.withheld_data). A study whose documentation
+        names no target file is said so loudly rather than silently left open.
+        """
+        from cfd_langgraph import withheld_data
+        from cfd_langgraph.llm.factory import create_langchain_llm
+
+        view = out_dir / "withheld_test_targets"
+        manifest_path = view / "manifest.json"
+        if not manifest_path.is_file():
+            root = _starter_root_on_record()
+            if root is None:
+                print("  [withheld] no starter folder on record; nothing withheld", flush=True)
+                return
+            llm = create_langchain_llm(model=settings.model, temperature=0.0)
+            spec = withheld_data.propose_spec(llm, root) or withheld_data.propose_spec(llm, root)
+            manifest = withheld_data.build_view(root, spec, view)
+            kinds = [f"{Path(e['path']).name} ({e['action']})" for e in manifest["entries"]]
+            print(f"  [withheld] test targets withheld from candidates: {kinds or 'NONE FOUND'}",
+                  flush=True)
+        # Found by build processes from the study folder, not named in the
+        # environment: once setup has built the validation view, that view and
+        # not this one is what candidates see (withheld_data.find_manifest).
+        os.environ.pop(withheld_data.MANIFEST_ENV, None)
+
+    def _validation_scoring() -> Dict[str, Any]:
+        """Where this study's search is scored, when it is scored on a
+        validation split of the training data rather than on the test set
+        (cfd_langgraph.validation_split, built by setup): the scorer view, the
+        reference result for the stand-ins, the per-seed file spec, and the
+        folder for the scorer's full output. Empty otherwise."""
+        from cfd_langgraph import pipeline_contract, validation_split
+
+        if not validation_split.ready(out_dir):
+            return {}
+        p = validation_split.paths(out_dir)
+        spec_path = _oed_disc_dir() / pipeline_contract.SPEC_FILE
+        if not spec_path.is_file():
+            return {}
+        return {
+            "scorer_view": str(p["scorer_manifest"]),
+            "candidate_manifest": str(p["candidate_manifest"]),
+            "final_manifest": str(p["final_manifest"]),
+            "baseline": p["baseline"],
+            "scores": p["scores"],
+            "private": p["private"],
+            "spec_path": spec_path,
+        }
+
+    def _pipeline_missing(candidate_path: Path, validation: Dict[str, Any]) -> List[str]:
+        from cfd_langgraph import pipeline_contract
+
+        spec = pipeline_contract.load_spec(validation["spec_path"])
+        return pipeline_contract.missing_parts(candidate_path, spec) if spec else ["pipeline spec"]
+
+    def _run_candidate_pipeline(candidate_path: Path, validation: Dict[str, Any], *,
+                                train: bool = False, manifest: str = "", out: Optional[Path] = None,
+                                models: Optional[Path] = None, train_timeout: int = 6 * 3600) -> Dict[str, Any]:
+        """scripts/pipeline_run.py on one candidate: predict.sh (and, with
+        ``train``, train.sh first) for every seed, in the candidate's sandbox."""
+        starter = _starter_root_on_record()
+        out = out or candidate_path / "framework_scored" / "predictions"
+        result_path = out.parent / "pipeline_run.json"
+        result_path.unlink(missing_ok=True)
+        args = [
+            "scripts/pipeline_run.py",
+            "--run-dir", str(candidate_path),
+            "--starter", str(starter),
+            "--spec", str(validation["spec_path"]),
+            "--manifest", manifest or validation["candidate_manifest"],
+            "--out", str(out),
+            "--result", str(result_path),
+        ]
+        if train:
+            args += ["--train", "--models", str(models), "--train-timeout", str(train_timeout)]
+        spec = _read_json(validation["spec_path"]) or {}
+        n_runs = max(1, len(spec.get("seeds") or [])) * max(1, len(spec.get("sets") or []))
+        budget = n_runs * 7200 + (len(spec.get("seeds") or []) * train_timeout if train else 0)
+        proc = _run_script(args, timeout=budget + 600, env=_foamagent_env(settings.openfoam_path))
+        doc = _read_json(result_path) or {
+            "ok": False, "errors": [f"pipeline_run.py exited {proc.returncode}: {(proc.stderr or '')[-1500:]}"]}
+        doc["case_dir"] = str(out.parent)
+        return doc
 
     # -----------------------------------------------------------------
     # Implementation studies: one specified method, built and verified
@@ -6953,6 +7048,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         su_path = out_dir / "starter_understanding.json"
         su = _read_json(su_path) or {}
         resolved_starter_dir = starter_dir or su.get("starter_dir", "")
+        # Setup scores the search on a validation split of the training data
+        # whenever the test targets are withheld, and needs to know which files
+        # hold them to build it (cfd_langgraph.validation_split).
+        if surrogate:
+            _withhold_test_targets()
 
         args = [
             "scripts/open_ended_discovery.py",
@@ -7052,6 +7152,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     # catastrophic for arithmetic reasons. The run detected it
                     # and refused to proceed, which was correct.
                     scored_baseline_cases = declared_cases_resolved or [baseline_path]
+                    validation = _validation_scoring() if surrogate else {}
+                    if validation:
+                        scored_baseline_cases = [validation["baseline"]]
                     per_case_baseline: Dict[str, Any] = {}
                     primary_name = ""
                     direction = "min"
@@ -7063,6 +7166,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                             bound_comparators=bound,
                             reference_file=(_reference_data_file(ref_files) if ref_files else baseline_path),
                             metric_specs=specs,
+                            scorer_view=validation.get("scorer_view"),
                         )
                         if index == 0:
                             mv = mv_one
@@ -7138,6 +7242,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "verified": True,
             "case_dir": str(baseline_path),
         }
+        if surrogate and _validation_scoring():
+            # Measured on the reference result for the validation stand-ins,
+            # where every candidate is scored, not on the supplied test result.
+            baseline_doc["case_dir"] = str(_validation_scoring()["baseline"])
+            baseline_doc["scored_on"] = "validation split of the training data"
         _write_json(disc_dir / "baseline_score.json", baseline_doc)
         config = {
             "topic": topic,
@@ -7221,6 +7330,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         config = _read_json(disc_dir / "search_config.json") or {}
         if not config or not (_read_json(disc_dir / "baseline_score.json") or {}).get("verified"):
             return {"error": "OED search is not initialized with a verified baseline."}
+        if (out_dir / "final_test" / "result.json").is_file():
+            return {"error": (
+                "The final test has been run, so the search is closed: a candidate proposed now "
+                "would be chosen knowing the test score. Report the result in "
+                "final_test/result.json.")}
         topic = _effective_topic(topic)
         if str(topic or "").strip() != str(config.get("topic", "") or "").strip():
             # Hand back the locked topic. The match is byte-exact on purpose —
@@ -8543,6 +8657,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         })
 
+        validation_study = bool(_validation_scoring()) if _study_mode_value() == "surrogate" else False
         return {
             "budget_used": budget_used,
             "budget_total": total_budget,
@@ -8551,6 +8666,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "budget_exhausted": budget_exhausted,
             "is_saturated": saturated,
             "search_complete": search_complete,
+            **({"scored_on": "validation split of the training data",
+                "final_test_next": (
+                    "Every score above is on the validation split. The search is over: call "
+                    "oed_final_test now. It re-trains the best candidate and scores it on the "
+                    "test set once; that is the study's result."
+                    if search_complete else
+                    "Every score above is on the validation split. When the search is over, call "
+                    "oed_final_test once to score the best candidate on the test set.")}
+               if validation_study else {}),
             "archive_summary": _render_archive_summary(archive, disc_dir),
             "missing_candidate_records": missing,
             **({"missing_next_step": (
@@ -9983,6 +10107,109 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "stderr_tail": ((result.get("stderr_tail") or "") + proc.stderr[-1000:]) if not ok else "",
         }
 
+    def oed_final_test() -> dict:
+        """Score the search's best candidate on the test set, once. Call it when
+        the search is over (oed_record_candidate_results says search_complete,
+        or the budget is spent), and only in a study scored on a validation
+        split -- one whose candidates leave pipeline/train.sh and predict.sh.
+
+        During the search every candidate was scored on a validation split of
+        the training data, never on the test set. This picks the candidate
+        with the best validation score, re-runs its train.sh for every seed on
+        the full training data (the evaluation sets hidden while it trains),
+        runs its predict.sh on the test inputs, timed by the framework, and
+        scores the result with the study's scorer: the study's one test score.
+        If the best candidate's scripts fail to run, the next best is tried, up
+        to three; a test score is computed for one candidate only.
+
+        Takes a long time (it trains every seed again). Call it once: a second
+        call returns the recorded result, and no candidate can be proposed
+        afterwards. The result is in <study>/final_test/result.json, with the
+        scorer's full output beside it, and is what the report states.
+        """
+        validation = _validation_scoring()
+        if not validation:
+            return {"ok": False, "error": (
+                "This study is not scored on a validation split, so there is no separate final "
+                "test: its candidates' scores are already the study's result.")}
+        final_dir = out_dir / "final_test"
+        result_path = final_dir / "result.json"
+        done = _read_json(result_path)
+        if done:
+            return {"ok": True, "already_done": True, **done}
+        disc_dir = _oed_disc_dir()
+        history = _read_json(disc_dir / "history.json") or []
+        best: Dict[str, Dict[str, Any]] = {}
+        for h in history:
+            score = h.get("score") or {}
+            value = score.get("value")
+            folder = h.get("candidate_dir") or h.get("case_dir")
+            if not (h.get("valid_case") and isinstance(value, (int, float)) and math.isfinite(value) and folder):
+                continue
+            best[str(folder)] = {"candidate_dir": str(folder), "value": float(value),
+                                 "direction": str(score.get("direction") or "min"),
+                                 "metric": score.get("metric"), "status": h.get("status")}
+        ranked = sorted(best.values(), key=lambda r: r["value"] if r["direction"] == "min" else -r["value"])
+        if not ranked:
+            return {"ok": False, "error": "No candidate has a valid validation score, so there is nothing to test."}
+
+        bound = _read_json(disc_dir / "bound_comparators.json") or {}
+        specs = _metric_specs(disc_dir)
+        contract = _read_json(disc_dir / "objective_contract.json") or {}
+        ref_files = [Path(p) for p in (contract.get("reference_files") or []) if Path(p).is_file()]
+        config = _read_json(disc_dir / "search_config.json") or {}
+        final_dir.mkdir(parents=True, exist_ok=True)
+        attempts: List[Dict[str, Any]] = []
+        outcome: Dict[str, Any] = {}
+        for pick in ranked[:3]:
+            cand = Path(pick["candidate_dir"])
+            work = cand / "final_test"
+            print(f"[oed] final test: re-training {cand.name} (validation "
+                  f"{pick['metric']} = {pick['value']:.6g}) on the full training data", flush=True)
+            run = _run_candidate_pipeline(
+                cand, validation, train=True, manifest=validation["final_manifest"],
+                out=work / "predictions", models=work / "models")
+            attempt = {"candidate": cand.name, "validation": pick,
+                       **{k: run.get(k) for k in ("ok", "errors", "seed_copies", "training")},
+                       "predict_seconds": [(r.get("seed"), r.get("set"), r.get("seconds"))
+                                           for r in ((run.get("prediction") or {}).get("runs") or [])]}
+            attempts.append(attempt)
+            if not run.get("ok"):
+                print(f"[oed] final test: {cand.name}'s pipeline did not run: "
+                      f"{'; '.join(run.get('errors') or [])[:400]}", flush=True)
+                continue
+            mv = _oedx.compute_metric_vector(
+                case_dir=work, bound_comparators=bound,
+                reference_file=(_reference_data_file(ref_files) if ref_files else cand),
+                metric_specs=specs, output_dir=final_dir / "scorer_output",
+            ) if _oedx is not None else {}
+            metrics = (mv or {}).get("metrics") or {}
+            primary = pick["metric"]
+            value = metrics.get(primary)
+            target_value = config.get("target_value")
+            target_met = None
+            if isinstance(value, (int, float)) and isinstance(target_value, (int, float)):
+                target_met = value < target_value if pick["direction"] == "min" else value > target_value
+            outcome = {
+                "candidate": cand.name, "candidate_dir": str(cand),
+                "validation_score": pick,
+                "test_metric": primary, "test_value": value, "test_metrics": metrics,
+                "test_errors": (mv or {}).get("errors") or {},
+                "target_value": target_value, "target_met_on_test": target_met,
+                "baseline_test_value": (bound.get(primary) or {}).get("selftest_value"),
+                "scorer_output": str(final_dir / "scorer_output"),
+                "predictions": str(work / "predictions"),
+            }
+            break
+        result = {"ok": bool(outcome), **outcome, "attempts": attempts,
+                  "rule": ("The test set was used once, here. Every candidate was trained, compared and "
+                           "selected on a validation split of the training data; the selected one was "
+                           "re-trained on the full training data and scored on the test set.")}
+        if not outcome:
+            result["error"] = "None of the best candidates' pipelines ran to completion; no test score."
+        _write_json(result_path, result)
+        return result
+
     def oed_candidate_status(candidate_dir: str) -> dict:
         """Where one candidate stands, read from its folder: whether its build
         finished, what it left, whether it has been scored, and any standing
@@ -10293,7 +10520,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             }
         execution_ok = _run_succeeded(execution_doc)
         surrogate = _study_mode_value() == "surrogate"
-        if action_type == "code_mod" and surrogate:
+        validation = _validation_scoring() if surrogate else {}
+        if action_type == "code_mod" and surrogate and validation:
+            # Scored on the scripts and trained seeds it left, which the
+            # framework runs itself (cfd_langgraph.pipeline_contract).
+            execution_ok = execution_ok and not _pipeline_missing(candidate_path, validation)
+        elif action_type == "code_mod" and surrogate:
             # A fitted model has no library to compile and no solver to
             # converge. What it must have produced is fresh predictions --
             # surrogate_agentic's own gate, read from its own result.
@@ -10306,7 +10538,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # The build was stopped before it could report success -- killed at
             # its limit, or out of turns -- and the diagnosis read what it left
             # and found the model finished. Its own result had no way to say so.
-            if surrogate:
+            if surrogate and validation:
+                execution_ok = not _pipeline_missing(candidate_path, validation)
+            elif surrogate:
                 execution_ok = bool(_submission_files(candidate_path, execution_doc)[0])
             else:
                 execution_ok = bool(execution_doc.get("compile_ok")) and bool(execution_doc.get("converged"))
@@ -10470,7 +10704,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         submission_files: List[Path] = []
         submission_declared = False
         scoring_dir_for: Dict[Path, Path] = {}
-        if surrogate and action_type == "code_mod" and execution_ok:
+        pipeline_doc: Dict[str, Any] = {}
+        if surrogate and action_type == "code_mod" and execution_ok and validation:
+            # The framework runs the candidate's predict.sh for every seed and
+            # set, times it and writes the timing files, and rejects seeds that
+            # are copies of each other; those files, not the candidate's own,
+            # are scored, on the validation split.
+            pipeline_doc = _run_candidate_pipeline(candidate_path, validation)
+            if pipeline_doc.get("ok"):
+                scoring_dir_for[case_path] = Path(pipeline_doc["case_dir"])
+                submission_files = sorted(Path(pipeline_doc["case_dir"], "predictions").glob("*"))
+            else:
+                execution_ok = False
+                score_error = ("The framework could not score this candidate's pipeline: "
+                               + "; ".join(pipeline_doc.get("errors") or ["no result"])[:1500])
+                print(f"[oed] {candidate_path.name}: {score_error[:400]}", flush=True)
+        elif surrogate and action_type == "code_mod" and execution_ok:
             submission_files, submission_declared = _submission_files(candidate_path, execution_doc)
             if submission_files:
                 try:
@@ -10488,7 +10737,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         case_dir=scoring_dir_for.get(path, path),
                         bound_comparators=bound,
                         reference_file=(_reference_data_file(ref_files) if ref_files else candidate_path),
-                        output_dir=(candidate_path / "scorer_output") if surrogate else None,
+                        # During a validation-split search the scorer's full
+                        # output names every stand-in's error, so it is kept
+                        # where no candidate can read it.
+                        output_dir=(
+                            (validation["scores"] / candidate_path.name) if validation
+                            else (candidate_path / "scorer_output") if surrogate else None
+                        ),
+                        scorer_view=validation.get("scorer_view"),
                         metric_specs=specs,
                         # None keeps the per-spec baseline_final_time that has
                         # always applied; a value overrides it for this call
@@ -10801,6 +11057,28 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         for _carry in ("repair_attempts", "repair_log", "extensions_used"):
             if _carry in _prior and _carry not in record:
                 record[_carry] = _prior[_carry]
+        if validation:
+            record["scored_on"] = "validation split of the training data (the test set is scored once, at the end)"
+            record["pipeline_run"] = {k: pipeline_doc.get(k) for k in ("ok", "errors", "seed_copies")}
+            record["pipeline_run"]["predict_seconds"] = [
+                (r.get("seed"), r.get("set"), r.get("seconds"))
+                for r in ((pipeline_doc.get("prediction") or {}).get("runs") or [])]
+            # What the next candidates may read: the aggregate numbers only.
+            _write_json(candidate_path / "validation_score.json", {
+                "scored_on": record["scored_on"],
+                "status": status,
+                "metric": metric_name or str(baseline.get("metric", "")),
+                "value": score_value,
+                "direction": baseline_direction,
+                "baseline_value_on_validation": baseline_value,
+                "metrics": {k: v for k, v in ((metric_vector or {}).get("metrics") or {}).items()},
+                "error": score_error or None,
+            })
+            # The framework's predictions are large and were only needed for
+            # the score; the timing it measured is kept in the record.
+            scored = Path(pipeline_doc.get("case_dir") or "") / "predictions"
+            if pipeline_doc.get("case_dir") and scored.is_dir():
+                shutil.rmtree(scored, ignore_errors=True)
         _write_json(candidate_path / "candidate_record.json", record)
         return {"ok": True, "candidate_dir": str(candidate_path), **record}
 
@@ -10832,6 +11110,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             oed_setup_search,
             oed_propose_candidates,
             oed_record_candidate_results,
+            oed_final_test,
             oed_candidate_status,
             oed_diagnose_candidate,
             oed_note_repair_attempt,

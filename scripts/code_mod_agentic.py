@@ -227,6 +227,8 @@ def _accelerator_sandbox_args() -> List[str]:
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 # The repository folders that hold studies' outputs, named as manager/tools.py
 # names them for its own file tools.
 _REPO_STUDY_STORES = ("runs", "results", "submissions")
@@ -367,6 +369,11 @@ class Sandbox:
         self._reads_seen: Dict[str, Tuple[int, int]] = {}
         self.last_call_repeated = False
         self.last_call_changed = False
+        # Test-set targets this study withholds from candidates: copies holding only
+        # the legal input fields are mounted over the originals, and files that
+        # cannot be split are hidden (cfd_langgraph.withheld_data).
+        from cfd_langgraph.withheld_data import find_manifest, load_manifest
+        self._withheld = load_manifest(find_manifest(self.run_dir))
         # What counts as one unit of measured cost in this study. Defaults to
         # the OpenFOAM solvers; a study whose candidates are trained rather
         # than solved passes its own tokens so the budget still measures the
@@ -425,6 +432,22 @@ class Sandbox:
         ok, why = self._read_allowed(p)
         if not ok:
             return {"ok": False, "error": f"read denied: {p} (must be inside run_dir / the starter folder / WM_PROJECT_DIR)"}
+        entries = self._withheld.get("entries") or []
+        rp = p.resolve()
+        revealed = any(entry.get("action") == "reveal"
+                       and (rp == Path(entry["path"]) or Path(entry["path"]) in rp.parents)
+                       for entry in entries)
+        for entry in ([] if revealed else entries):
+            held = Path(entry["path"])
+            if entry.get("action") == "reveal":
+                continue
+            if rp == held and entry.get("action") == "replace":
+                p = Path(entry["source"])
+                break
+            if rp == held or (entry.get("is_dir") and held in rp.parents):
+                return {"ok": False, "error": (
+                    f"withheld: {held} holds target values of an evaluation set, which candidates "
+                    "never see. The framework scores your predictions after you finish.")}
         if not p.is_file():
             return {"ok": False, "error": f"not a file: {p}"}
         try:
@@ -757,6 +780,21 @@ class Sandbox:
             self.run_dir, self.starter_root, (self.starter_case, self.starter_root, self.wm)
         ):
             sandbox_cmd += ["--tmpfs", masked]
+        entries = self._withheld.get("entries") or []
+        for entry in entries:
+            if entry.get("action") == "replace":
+                sandbox_cmd += ["--ro-bind", entry["source"], entry["path"]]
+            elif entry.get("action") == "reveal":
+                continue
+            elif entry.get("is_dir"):
+                sandbox_cmd += ["--tmpfs", entry["path"]]
+            else:
+                sandbox_cmd += ["--ro-bind", self._withheld.get("empty_file", "/dev/null"), entry["path"]]
+        # Training samples' own folders inside a hidden folder, shown again
+        # after it is hidden (a raw dataset holding train and test side by side).
+        for entry in entries:
+            if entry.get("action") == "reveal":
+                sandbox_cmd += ["--ro-bind", entry["path"], entry["path"]]
         try:
             self.run_dir.relative_to(Path("/tmp"))
             run_is_under_tmp = True
@@ -1488,6 +1526,8 @@ _AGENT_TOOL_NAMES = ("read_file", "write_file", "run_bash", "done")
 # many turns before the end the agent is told to wrap up.
 DONE_REFUSALS = 2
 FINISH_WARNING_TURNS = 5
+# ...and the share of a session's wall clock left when it is told the same.
+FINISH_WARNING_FRACTION = 0.15
 # A session ends early when this many of its last STUCK_WINDOW calls repeated an
 # earlier call with nothing changed in between (or were refused for it), and
 # says what it kept repeating, so whoever started it can redirect it. The four
@@ -1495,6 +1535,10 @@ FINISH_WARNING_TURNS = 5
 # with 13-30 such refusals.
 STUCK_WINDOW = int(os.environ.get("CFD_SCIENTIST_AGENT_STUCK_WINDOW", "") or 12)
 STUCK_REPEATS = int(os.environ.get("CFD_SCIENTIST_AGENT_STUCK_REPEATS", "") or 8)
+# The same for a session that reads and searches without ever acting on it:
+# qwen_retest_20261005/slau_r8 named its own bug at turn 88 and then spent 40
+# calls grepping OpenFOAM headers, each one different, so no repeat was counted.
+NO_CHANGE_LIMIT = int(os.environ.get("CFD_SCIENTIST_AGENT_NO_CHANGE_LIMIT", "") or 25)
 
 
 def _unknown_tool_error(tool_call: Dict[str, Any], native: bool, from_text: bool) -> str:
@@ -1888,6 +1932,9 @@ def run_agent_loop(
     last_refused = False
     recent_repeats: List[bool] = []
     repeated_calls: List[str] = []
+    quiet_calls: List[str] = []
+    session_changed = False
+    quiet_warned = False
     stuck_reason = ""
     started = time.time()
     final_payload: Dict[str, Any] = {}
@@ -2155,15 +2202,47 @@ def run_agent_loop(
         if repeated and thinking_settings is not None:
             log("# the last call repeated an earlier one: thinking stays on until a call changes something")
         recent_repeats = (recent_repeats + [repeated])[-STUCK_WINDOW:]
+        shown = (tool_args.get("cmd") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
+        call_line = f"{tool_name}: {' '.join(str(shown).split())[:160]}"
         if repeated:
-            shown = (tool_args.get("cmd") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
-            repeated_calls = (repeated_calls + [f"{tool_name}: {' '.join(str(shown).split())[:160]}"])[-STUCK_REPEATS:]
+            repeated_calls = (repeated_calls + [call_line])[-STUCK_REPEATS:]
         if len(recent_repeats) == STUCK_WINDOW and sum(recent_repeats) >= STUCK_REPEATS:
             distinct = list(dict.fromkeys(repeated_calls))
             stuck_reason = (
                 f"stuck: {sum(recent_repeats)} of the last {STUCK_WINDOW} calls repeated an earlier "
                 "call with nothing changed in between, so the session was ended early. It kept "
                 "repeating: " + " | ".join(distinct[:4]))
+        # Reading without acting is counted from the session's first change on,
+        # so the opening read of the brief is not cut short.
+        # The first such streak only turns thinking on and says so; ending the
+        # session at once spent a whole continuation of slau_r8 in 2.5 minutes,
+        # when 25 quick reads followed a crash.
+        if getattr(sandbox, "last_call_changed", False):
+            session_changed = True
+            quiet_calls = []
+            quiet_warned = False
+        elif session_changed:
+            quiet_calls.append(call_line)
+            if len(quiet_calls) >= NO_CHANGE_LIMIT and not stuck_reason:
+                if not quiet_warned:
+                    quiet_warned = True
+                    quiet_calls = []
+                    last_refused = True
+                    log(f"# {NO_CHANGE_LIMIT} calls without a change: told to act; thinking stays on until one")
+                    if isinstance(tool_result, dict):
+                        tool_result["act_now"] = (
+                            f"You have made {NO_CHANGE_LIMIT} calls in a row without changing anything in "
+                            "your run directory. Stop gathering information: make the change you judge most "
+                            "likely to fix the problem, then build and run it to find out. If you cannot, call "
+                            f"done and say what is blocking you. Another {NO_CHANGE_LIMIT} calls without a "
+                            "change end this session.")
+                else:
+                    aim = _turn_note(ai_text, limit=500)
+                    stuck_reason = (
+                        f"stuck: {2 * NO_CHANGE_LIMIT} calls read or searched without changing anything in the "
+                        "run directory, after being told to act, so the session was ended early."
+                        + (f" What it said it was looking for: {aim}" if aim else "")
+                        + " Its last calls: " + " | ".join(quiet_calls[-4:]))
         if isinstance(tool_result, dict):
             turns_left = max_turns - turn
             tool_result["turns_left"] = turns_left
@@ -2171,6 +2250,14 @@ def run_agent_loop(
                 tool_result["finish_now"] = (
                     f"{turns_left} turn(s) left. Start nothing new. Finish what is in hand and "
                     "call done with what you have, saying in its summary what is incomplete.")
+            # The clock runs out too, usually first: slau_r8 had 270 turns but 27
+            # minutes left, with its results in hand and its record unwritten.
+            elif wall_clock_enabled and timeout_s - (time.time() - started) <= FINISH_WARNING_FRACTION * timeout_s:
+                minutes = max(0, int((timeout_s - (time.time() - started)) // 60))
+                tool_result["finish_now"] = (
+                    f"About {minutes} minute(s) of this session's time left. Start nothing new: write "
+                    "what the task needs recorded (the verification record and the report) from what "
+                    "you have, then call done, saying in its summary what is incomplete.")
 
         # Truncate large fields before logging / before they enter the transcript.
         # For build/run output, prefer the TAIL (compile errors land at the end)

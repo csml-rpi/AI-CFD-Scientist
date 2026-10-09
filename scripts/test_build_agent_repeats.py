@@ -102,6 +102,43 @@ with tempfile.TemporaryDirectory() as td:
           f"calls={fake.n} reason={reason[:200]}")
     check("the reason names what it repeated", "cat a.txt" in reason and "cat b.txt" in reason, reason)
 
+    print("== 3b. a session that only reads after it has started acting ends early")
+
+    class _Reader(_Fake):
+        """Writes one file, then reads a different thing every turn."""
+
+        def __init__(self, write_first: bool) -> None:
+            super().__init__()
+            self.write_first = write_first
+
+        def invoke(self, messages):
+            from langchain_core.messages import AIMessage
+            self.n += 1
+            if self.write_first and self.n == 1:
+                call = {"tool": "write_file", "args": {"path": str(quiet_dir / "solver.C"), "content": "x"}}
+            else:
+                call = {"tool": "run_bash", "args": {"cmd": f"echo looking for api {self.n}"}}
+            return AIMessage(content=json.dumps(call))
+
+    for write_first in (True, False):
+        quiet_dir = root / f"quiet_{write_first}"
+        quiet_dir.mkdir()
+        reader = _Reader(write_first)
+        factory.create_langchain_llm = lambda *a, **k: reader
+        res = cma.run_agent_loop(
+            repo_root=ROOT, hypothesis="h", variant_name="v", run_dir=quiet_dir, starter_case=starter,
+            topic="t", model="fake", max_turns=70, timeout_s=600, system_message="sys", initial_prompt="go",
+        )
+        reason = str(res.get("aborted_reason", ""))
+        if write_first:
+            check("the first 25 quiet calls only warn; the next 25 end the session",
+                  reason.startswith("stuck: 50 calls") and 50 <= reader.n <= 53, f"calls={reader.n} reason={reason[:160]}")
+            log_text = (quiet_dir / "agentic_trajectory.log").read_text()
+            check("the warning reaches the agent", '"act_now"' in log_text or "act_now" in log_text)
+        else:
+            check("reading before any change is never cut short", not reason.startswith("stuck"),
+                  f"calls={reader.n} reason={reason[:160]}")
+
     print("== 4. a continuation is told what the last session did")
     from cfd_langgraph.manager.tools import _impl_last_actions
     log = root / "agentic_trajectory.log"

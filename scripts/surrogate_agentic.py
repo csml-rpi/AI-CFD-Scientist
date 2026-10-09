@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from code_mod_agentic import run_agent_loop  # noqa: E402
 
@@ -211,6 +212,7 @@ def build_surrogate_prompt(
     pred_dir = run_dir / "predictions"
     model_dir = run_dir / "model"
     scorer_s = _baseline_scoring_seconds(run_dir)
+    vspec = validation_spec(run_dir)
     parts: List[str] = []
     parts.append(_environment_block())
     parts.append(f"# Tools\n{_TOOLS_SPEC}")
@@ -219,7 +221,10 @@ def build_surrogate_prompt(
         f"# Your candidate: {variant_name}\n{hypothesis.strip()}\n"
         + (f"\nPlan:\n{plan.strip()}\n" if plan.strip() else "")
     )
-    parts.append(
+    if vspec:
+        parts.append(_pipeline_block(run_dir, model_dir, vspec))
+    else:
+        parts.append(
         "# What you must produce\n"
         f"1. Your model code and environment notes under: {model_dir}\n"
         f"2. Your final predictions on the study's evaluation inputs under: {pred_dir}\n"
@@ -234,7 +239,7 @@ def build_surrogate_prompt(
         "   (a scratch/ folder, for example).\n"
         "3. If the study asks for multiple seeds, produce every seed it asks for.\n"
         "   A single-seed result does not satisfy a multi-seed requirement.\n"
-    )
+        )
     parts.append(
         "# Rules\n"
         f"- Everything you write goes under {run_dir}. The starter folder\n"
@@ -247,17 +252,42 @@ def build_surrogate_prompt(
         "- Use the libraries listed as installed above. The environment is shared\n"
         "  and fixed: do not install, upgrade, or vendor anything.\n"
         "- Set and record explicit seeds so your result can be reproduced.\n"
-        "- Judge your model while you build it on data the study lets you use for\n"
-        "  that, normally a validation split you hold out from the training data.\n"
-        "  Run the study's scorer on your files to check that it accepts them, and\n"
-        "  use its numbers only as far as the study's data-usage rules allow. The\n"
-        "  framework runs the scorer on your final files after you finish, and that\n"
-        "  is the only score that counts, so you do not need to score the final set\n"
-        "  yourself.\n"
+        + (
+            "- The data you see is a validation version of the study's data: the framework has\n"
+            "  moved part of the training samples into the evaluation sets' place, and their\n"
+            "  target values are withheld from you, as the test set's are. The real test set is\n"
+            "  not used during the search at all. When the search ends, the framework re-runs the\n"
+            "  best candidate's train.sh for every seed on the full training data and scores its\n"
+            "  predict.sh output on the test set, once. So your scripts must take sample lists and\n"
+            "  counts from the starter folder's files at run time and never hard-code them.\n"
+            "- The study's scorer cannot score anything here (the targets are withheld): do not\n"
+            "  try. Judge your model on a split you hold out from the training data you see, and\n"
+            "  choose every setting on it. Read the scorer's code to match its file format.\n"
+            "- After you finish, the framework scores your predictions on the validation sets and\n"
+            f"  writes the aggregate result to {run_dir / 'validation_score.json'}. Other\n"
+            "  candidates' folders beside yours show what they tried and their\n"
+            "  validation_score.json.\n"
+            if vspec else
+            "- The test set's target values are withheld from you. In this workspace the\n"
+            "  files that hold them show only their input fields, and files that cannot\n"
+            "  be split are not readable, so the study's scorer cannot score your test\n"
+            "  predictions here: do not try. Judge your model on a validation split you\n"
+            "  hold out from the training data, and choose every setting on it. Read the\n"
+            "  scorer's code to match the file format it expects. The framework scores\n"
+            "  your final files after you finish, and that is the only score that counts.\n"
+            if _targets_withheld(run_dir) else
+            "- Judge your model while you build it on data the study lets you use for\n"
+            "  that, normally a validation split you hold out from the training data.\n"
+            "  Run the study's scorer on your files to check that it accepts them, and\n"
+            "  use its numbers only as far as the study's data-usage rules allow. The\n"
+            "  framework runs the scorer on your final files after you finish, and that\n"
+            "  is the only score that counts, so you do not need to score the final set\n"
+            "  yourself.\n"
+        )
         + (
             f"- On this machine the study's scorer took about {scorer_s:.0f}s to score the\n"
             "  supplied baseline result. Allow for that whenever you run it.\n"
-            if scorer_s else ""
+            if scorer_s and not _targets_withheld(run_dir) else ""
         )
     )
     if prior_attempt.strip():
@@ -272,6 +302,12 @@ def build_surrogate_prompt(
         )
     parts.append(
         "# Finish\n"
+        "When train.sh and predict.sh are in place and every seed is trained, call the done "
+        "tool with a one-line summary, the seeds you trained, and your own validation score "
+        "if you measured one (prediction_files may be empty). The framework runs predict.sh "
+        "and scores what it writes; the score you report is informational.\n"
+        if vspec else
+        "# Finish\n"
         "When your final predictions are written, call the done tool with a one-line "
         "summary, prediction_files listing exactly your final prediction files, the "
         "seeds you ran, and your own score if you measured one. The framework scores "
@@ -279,6 +315,59 @@ def build_surrogate_prompt(
         "the score you report is informational.\n"
     )
     return "\n".join(parts)
+
+
+def validation_spec(run_dir: Optional[Path]) -> Dict[str, Any]:
+    """The per-seed file spec, when this study's search is scored on a
+    validation split and candidates leave scripts the framework runs
+    (cfd_langgraph.validation_split, cfd_langgraph.pipeline_contract)."""
+    from cfd_langgraph import pipeline_contract, validation_split
+
+    if run_dir is None:
+        return {}
+    for folder in Path(run_dir).resolve().parents:
+        if validation_split.ready(folder):
+            return pipeline_contract.load_spec(Path(run_dir).resolve().parent / pipeline_contract.SPEC_FILE)
+    return {}
+
+
+def _pipeline_block(run_dir: Path, model_dir: Path, spec: Dict[str, Any]) -> str:
+    pipe = run_dir / "pipeline"
+    sets = ", ".join(str(s["name"]) for s in spec["sets"])
+    files = "; ".join(f"{s['name']}: " + ", ".join(s["files"]) for s in spec["sets"])
+    seeds = ", ".join(str(k) for k in spec["seeds"])
+    timing = spec.get("timing")
+    return (
+        "# What you must produce\n"
+        f"1. Your model code under {model_dir}.\n"
+        f"2. Two scripts in {pipe}, which the framework runs itself:\n"
+        f"     bash {pipe}/train.sh SEED MODEL_DIR\n"
+        "       trains seed SEED from scratch on the starter folder's training data and writes\n"
+        "       everything prediction needs into MODEL_DIR. Each seed is its own training run,\n"
+        "       with its random initialisation and data order drawn from SEED.\n"
+        f"     bash {pipe}/predict.sh SEED MODEL_DIR OUT_DIR SET\n"
+        "       loads MODEL_DIR and writes seed SEED's prediction file(s) for evaluation set SET\n"
+        f"       into OUT_DIR, named as the scorer reads them ({files}; {{seed}} is the seed\n"
+        f"       number). SET is one of: {sets}. It reads the set's inputs from the starter folder.\n"
+        + (f"       Do not write {timing['file']}: the framework times predict.sh itself and\n"
+           "       writes it.\n" if timing else "")
+        + "   Both must work from any directory, find your code relative to their own location,\n"
+        "   read data only from the starter folder, and never reuse predictions or arrays an\n"
+        "   earlier run left behind. train.sh must not read the evaluation sets at all: when the\n"
+        "   framework re-runs it, their files are hidden.\n"
+        f"3. Every seed ({seeds}) trained with your train.sh, each into\n"
+        f"   {pipe}/models/seed<SEED>/. Run predict.sh on one of them yourself to check it.\n"
+        "   The framework scores this candidate by running predict.sh on those models for every\n"
+        "   seed and set; prediction files you write yourself are not scored. Seeds whose\n"
+        "   predictions are copies, or near-copies, of each other are rejected.\n"
+    )
+
+
+def _targets_withheld(run_dir: Optional[Path] = None) -> bool:
+    """Whether this study withholds its test targets from candidates."""
+    from cfd_langgraph.withheld_data import find_manifest, load_manifest
+
+    return bool(load_manifest(find_manifest(run_dir)).get("entries"))
 
 
 def _baseline_scoring_seconds(run_dir: Path) -> Optional[float]:
@@ -419,6 +508,15 @@ def run(
         started_at=0.0 if continuing else started_at,
     )
     produced = bool(artifacts.get("prediction_files"))
+    vspec = validation_spec(run_dir)
+    pipeline_missing: List[str] = []
+    if vspec:
+        # Scored on the scripts and trained seeds it leaves, not on files it
+        # wrote itself (cfd_langgraph.pipeline_contract).
+        from cfd_langgraph.pipeline_contract import missing_parts
+
+        pipeline_missing = missing_parts(run_dir, vspec)
+        produced = not pipeline_missing
     final_payload = loop.get("final_payload") or {}
     declared, has_declared = declared_submission_files(final_payload, run_dir)
     result: Dict[str, Any] = {
@@ -450,7 +548,10 @@ def run(
         "trajectory_log": loop.get("trajectory_log", ""),
         "agent_final_payload": loop.get("final_payload", {}),
     }
-    if not produced:
+    if not produced and vspec:
+        result["error"] = "missing what the framework runs: " + ", ".join(pipeline_missing)
+        result["compile_error_hint"] = result["error"]
+    elif not produced:
         if artifacts.get("stale_prediction_files"):
             result["error"] = (
                 "prediction files exist but none were written by this attempt "
@@ -473,6 +574,10 @@ def main() -> int:
     ap.add_argument("--variant-name", required=True)
     ap.add_argument("--run-dir", required=True)
     ap.add_argument("--starter-case", required=True)
+    # Sent by the shared candidate launcher, which also starts solver builds; a
+    # fitted model spends no solver runs, so it is accepted and unused. Refusing
+    # it killed every first launch of every candidate in a surrogate study.
+    ap.add_argument("--solver-budget", type=int, default=0, help=argparse.SUPPRESS)
     ap.add_argument("--starter-root", default="",
                     help="The study's starter folder, readable in full by the agent.")
     ap.add_argument("--topic", default="")

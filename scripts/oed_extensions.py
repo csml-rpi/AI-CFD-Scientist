@@ -1677,11 +1677,26 @@ def _run_comparator_with_optional_baseline_time(
     timeout_s: int,
     metric_name: str = "",
     extra_env: Optional[Dict[str, str]] = None,
+    scorer_view: Optional[str] = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run a comparator, forwarding --baseline-time when supported. On any
     error invoking with the flag, retry without it (back-compat).
-    ``extra_env`` is added to the comparator's environment."""
+    ``extra_env`` is added to the comparator's environment. ``scorer_view``
+    names a manifest whose files are mounted over the originals while it runs:
+    the validation copy a study's search is scored on
+    (cfd_langgraph.validation_split)."""
     env = {**_os.environ, **extra_env} if extra_env else None
+    if scorer_view:
+        _src = str(Path(__file__).resolve().parent.parent / "src")
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        from cfd_langgraph.withheld_data import view_command
+
+        def _viewed(cmd: List[str]) -> List[str]:
+            return view_command(cmd, scorer_view)
+    else:
+        def _viewed(cmd: List[str]) -> List[str]:
+            return cmd
     base_cmd = [sys.executable, str(comparator),
                 "--case", str(case_dir),
                 "--reference", str(reference_file)]
@@ -1700,12 +1715,12 @@ def _run_comparator_with_optional_baseline_time(
     if baseline_time is not None and _comparator_supports_baseline_time(comparator):
         try:
             return subprocess.run(
-                base_cmd + ["--baseline-time", str(baseline_time)],
+                _viewed(base_cmd + ["--baseline-time", str(baseline_time)]),
                 capture_output=True, text=True, timeout=timeout_s, env=env,
             )
         except Exception:
             pass
-    return subprocess.run(base_cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
+    return subprocess.run(_viewed(base_cmd), capture_output=True, text=True, timeout=timeout_s, env=env)
 
 
 _TIME_USED_RE = re.compile(r"^TIME_USED:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*$", re.MULTILINE)
@@ -3089,6 +3104,7 @@ def compute_metric_vector(
     baseline_final_time: Optional[float] = None,
     metric_specs: Optional[List[Dict[str, Any]]] = None,
     output_dir: Optional[Path] = None,
+    scorer_view: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run all bound comparators against case_dir. Returns:
@@ -3162,7 +3178,7 @@ def compute_metric_vector(
                     comparator=sp, case_dir=case_dir, reference_file=reference_file,
                     baseline_time=bt,
                     timeout_s=timeout_s if timeout_s is not None else _comparator_timeout(info),
-                    metric_name=name, extra_env=extra_env,
+                    metric_name=name, extra_env=extra_env, scorer_view=scorer_view,
                 )
             except Exception as exc:
                 errors[name] = failed_runs[run_key] = f"exec: {exc}"

@@ -272,6 +272,11 @@ selected case and cannot invent a separate baseline requirement:
      proceed_count is at least 1 (the search has plateaued and you already have a working
      result — stopping earlier than that discards budget for nothing, stopping much later
      than that just burns budget on a family that's already flat).
+  e2. In a study scored on a validation split (step d's result says so in
+     `final_test_next`), the search never sees the test set. When the search is over,
+     call `oed_final_test` once, before anything else: it re-trains the best candidate
+     on the full training data and scores it on the test set. Its result is the
+     study's result; report the validation and test scores side by side.
   f. When step d returns search_complete=true, use every case ID in
      `case_ids_to_interpret` (baseline plus promoted candidates) with
      `interpret_case`. Pass only cases whose interpreter status is PROCEED to

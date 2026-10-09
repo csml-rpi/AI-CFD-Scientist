@@ -3766,15 +3766,29 @@ def run_open_ended_discovery(
                         ),
                         "adapter_attempts": _attempt_lines,
                     })
+                    _val_case, _val_view = _sur_base, None
+                    if bound:
+                        _val_case, _val_view, _val_error = _surrogate_validation_split(
+                            run_dir=run_dir, disc_dir=disc_dir, topic=topic, starter=_sur_starter,
+                            scorer=Path(_sur_scorer), baseline=_sur_base, bound=bound, specs=specs,
+                            primary=_primary, reference=Path(_sur_ref),
+                        )
+                        if _val_error:
+                            bound = {}
+                            _write_json(disc_dir / "bound_comparators.json", bound)
+                            ext_state["bound_comparators"] = bound
+                            _write_json(disc_dir / "surrogate_setup_status.json", {
+                                "stage": "validation_split", "ok": False, "detail": _val_error})
                     if bound:
                         bv = _oedx.compute_metric_vector(
-                            case_dir=_sur_base, bound_comparators=bound,
+                            case_dir=_val_case, bound_comparators=bound,
                             reference_file=Path(_sur_ref), baseline_final_time=None,
-                            metric_specs=specs,
+                            metric_specs=specs, scorer_view=_val_view,
                         )
                         _write_json(disc_dir / "baseline_metric_vector.json", bv)
                         ext_state["baseline_metric_vector"] = bv
-                        print(f"[OED-SURROGATE] baseline metric vector: {bv.get('metrics', {})}", flush=True)
+                        print(f"[OED-SURROGATE] baseline metric vector"
+                              f"{' (validation split)' if _val_view else ''}: {bv.get('metrics', {})}", flush=True)
                 else:
                     print("[OED-SURROGATE] no usable metrics were proposed.", flush=True)
                     _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "metric_proposal", "ok": False,
@@ -5312,6 +5326,71 @@ def run_open_ended_discovery(
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
+def _surrogate_validation_split(
+    *, run_dir: Path, disc_dir: Path, topic: str, starter: Path, scorer: Path, baseline: Path,
+    bound: Dict[str, Any], specs: List[Dict[str, Any]], primary: str, reference: Path,
+) -> Tuple[Path, Optional[str], str]:
+    """Where this study's search is scored: on a validation split of the
+    training data when its test targets are withheld from candidates, so the
+    test set is scored once, at the end (cfd_langgraph.validation_split).
+    Returns (baseline case to score, scorer view manifest, error)."""
+    import math
+
+    import oed_extensions as _ox  # type: ignore
+    import surrogate_setup as _sur  # type: ignore
+
+    test_manifest = run_dir / "withheld_test_targets" / "manifest.json"
+    if not test_manifest.is_file():
+        return baseline, None, ""
+    for _p in (str(Path(__file__).resolve().parent.parent / "src"),):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    from cfd_langgraph import pipeline_contract as pc
+    from cfd_langgraph import validation_split as vs
+
+    def _invoke(messages: List[Tuple[str, str]]) -> str:
+        return _ox._llm_invoke(messages, timeout_s=900)
+
+    spec_path = disc_dir / pc.SPEC_FILE
+    spec = pc.load_spec(spec_path)
+    if not spec:
+        spec, problems = pc.propose_spec(
+            llm_invoke=_invoke, brief=f"{topic}\n\n{_sur._task_brief(starter)}", scorer_path=scorer,
+            baseline_dir=baseline, baseline_listing=_sur._result_listing(baseline))
+        if not spec:
+            return baseline, None, ("Could not establish which prediction and timing files the scorer "
+                                    f"reads per seed: {'; '.join(problems)[:800]}")
+        _write_json(spec_path, spec)
+    print(f"[OED-SURROGATE] pipeline spec: {json.dumps(spec)[:600]}", flush=True)
+
+    def _smoke(case_dir: Path, scorer_manifest: str) -> Tuple[bool, str]:
+        mv = _ox.compute_metric_vector(case_dir=case_dir, bound_comparators=bound,
+                                       reference_file=reference, metric_specs=specs,
+                                       scorer_view=scorer_manifest)
+        value = (mv.get("metrics") or {}).get(primary)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return True, f"{primary} = {value}"
+        raw = (mv.get("raw_outputs") or {}).get(primary, "")
+        return False, f"{json.dumps(mv.get('errors') or {})[:800]} {raw[-1500:]}"
+
+    status = vs.build(study_dir=run_dir, starter=starter, scorer_path=scorer, baseline_dir=baseline,
+                      test_manifest_path=test_manifest, llm_invoke=_invoke, smoke_test=_smoke,
+                      strip_fences=_ox._strip_code_fences)
+    if not status.get("ok"):
+        last = (status.get("attempts") or [{}])[-1]
+        return baseline, None, ("No validation split of the training data passed its checks, so the "
+                                "search cannot be scored without the test set. Last attempt: "
+                                + "; ".join(last.get("problems") or [str(last.get("error", ""))])[:1200])
+    paths = vs.paths(run_dir)
+    problems = pc.check_spec(spec, paths["baseline"])
+    if problems:
+        return baseline, None, ("The validation reference result does not follow the scorer's file "
+                                f"names: {'; '.join(problems)[:800]}")
+    print(f"[OED-SURROGATE] validation split: {status.get('train_count')} training samples kept, "
+          f"stand-ins {status.get('validation_counts')}", flush=True)
+    return paths["baseline"], str(paths["scorer_manifest"]), ""
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Closed-loop open-ended CFD discovery.")
