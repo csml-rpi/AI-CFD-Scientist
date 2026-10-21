@@ -19,7 +19,7 @@ class ResourceProfile:
 
     wall_clock_s: float
     peak_used_mem_mb: float
-    avg_cpu_percent: float  # system-wide psutil.cpu_percent() average, 0-100
+    avg_cpu_percent: float  # the case's processes, as percent of the whole machine, 0-100
     logical_cores: int = field(default_factory=lambda: psutil.cpu_count(logical=True) or 1)
     sample_count: int = 1  # how many live samples backed this profile; 0 = unmeasured
 
@@ -42,13 +42,15 @@ class ResourceProfile:
 
 
 class _SystemSampler:
-    """Samples system-wide memory/CPU on a background thread while calibration runs.
+    """Samples the CPU and memory of this process's child processes on a
+    background thread while calibration runs.
 
-    Deliberately system-wide rather than per-process: the calibration case is
-    run alone (no other case running concurrently), so the delta attributable
-    to it is a reasonable proxy without needing to track the FoamAgent
-    subprocess's PID tree. Known limitation: unrelated load on a shared
-    machine during calibration will skew the measurement.
+    The calibration case is the only case this study runs at the time, so its
+    work is this process's children. It used to be measured system-wide,
+    which counted every other study on a shared machine as this case's cost:
+    on airfrans_codex_20261009, calibrated while three other studies were
+    solving, one candidate build was taken to need a third of the machine and
+    the study ran its builds three at a time on a machine 91% idle.
     """
 
     def __init__(self, interval_s: float = 2.0):
@@ -58,13 +60,38 @@ class _SystemSampler:
         self.mem_used_samples_mb: List[float] = []
         self.cpu_percent_samples: List[float] = []
 
+    @staticmethod
+    def _tree() -> Tuple[dict, float]:
+        """{pid: CPU seconds so far} and resident MB of this process's children."""
+        cpu: dict = {}
+        rss_mb = 0.0
+        for proc in psutil.Process().children(recursive=True):
+            try:
+                with proc.oneshot():
+                    times = proc.cpu_times()
+                    cpu[proc.pid] = times.user + times.system
+                    rss_mb += proc.memory_info().rss / (1024 * 1024)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return cpu, rss_mb
+
     def _loop(self) -> None:
-        psutil.cpu_percent(interval=None)  # prime psutil's internal delta timer
+        cores = psutil.cpu_count(logical=True) or 1
+        last, _ = self._tree()
+        t_last = time.monotonic()
         while not self._stop.is_set():
             time.sleep(self.interval_s)
-            vm = psutil.virtual_memory()
-            self.mem_used_samples_mb.append((vm.total - vm.available) / (1024 * 1024))
-            self.cpu_percent_samples.append(psutil.cpu_percent(interval=None))
+            now_cpu, rss_mb = self._tree()
+            now = time.monotonic()
+            # A child first seen now started since the last sample: all its
+            # CPU time falls in this interval.
+            used_s = sum(max(0.0, t - last.get(pid, 0.0)) for pid, t in now_cpu.items())
+            busy_cores = used_s / max(now - t_last, 1e-6)
+            last, t_last = now_cpu, now
+            self.mem_used_samples_mb.append(rss_mb)
+            # Kept on the old scale, percent of the whole machine, which
+            # ResourceProfile.cores_used converts back to cores.
+            self.cpu_percent_samples.append(min(100.0, 100.0 * busy_cores / cores))
 
     def __enter__(self) -> "_SystemSampler":
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -118,8 +145,8 @@ def benchmark_case(
     Returns ``(run_fn()'s return value, ResourceProfile)``, the profile over
     the whole run.
     """
-    baseline = psutil.virtual_memory()
-    baseline_used_mb = (baseline.total - baseline.available) / (1024 * 1024)
+    # The sampler measures this process's children only, which start at nothing.
+    baseline_used_mb = 0.0
 
     sampler = _SystemSampler(interval_s=sample_interval_s)
     t0 = time.monotonic()

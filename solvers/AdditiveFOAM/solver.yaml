@@ -1,0 +1,25 @@
+name: AdditiveFOAM
+summary: >
+  Heat and mass transfer for additive manufacturing (laser powder-bed fusion,
+  directed energy deposition): a moving heat source melting metal, melt-pool
+  formation and solidification, with optional melt-pool flow.
+domains: [additive manufacturing, laser powder bed fusion, melt pool, welding,
+          moving heat source, solidification, metal printing, laser scanning]
+repo: https://github.com/ORNL/AdditiveFOAM
+license: GPL-3.0
+builds:
+  # 1.x targets openfoam.org 10; 2.0.0 and later need openfoam.org 14.
+  - fork: openfoam.org
+    versions: ["10"]
+    ref: b8f6d48c53555c303fa8186c895aee5712b6ea02   # tag 1.2.0
+    build: ./Allwmake
+provides:
+  applications: [additiveFoam, createScanPath]
+  libraries: [libmovingBeamModels, libadditiveFoamFunctionObjects]
+usage: >
+  Run the additiveFoam application. The beam path is in constant/scanPath and
+  the heat source in constant/heatSourceDict; material properties are
+  temperature polynomials in constant/thermoPath and transportProperties.
+  The meltPoolDimensions function object (libadditiveFoamFunctionObjects)
+  reports melt-pool length, width and depth.
+tutorials: tutorials

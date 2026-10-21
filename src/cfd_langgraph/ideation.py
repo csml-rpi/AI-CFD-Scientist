@@ -342,9 +342,11 @@ _PRESCRIBED_STUDY_BRIEF = (
     "THE BRIEF PRESCRIBES THIS STUDY. The configuration, the cases or parameter values to "
     "run and the comparisons to make are already decided by it. Your idea is that study, "
     "stated exactly as the brief gives it: one experiment per case the brief names, with "
-    "the brief's own values. Do not add cases, physics, models or variations, do not drop "
-    "any, and do not substitute a study you find more interesting. Novelty is not asked "
-    "for: carrying out what the brief asks is the task.\n\n"
+    "the brief's own values. When the brief has several steps or phases -- a validation "
+    "step and then the study, or several configurations -- every step is part of the idea "
+    "and every case in every step is an experiment. Do not add cases, physics, models or "
+    "variations, do not drop any, and do not substitute a study you find more interesting. "
+    "Novelty is not asked for: carrying out what the brief asks is the task.\n\n"
 )
 _PRESCRIBED_NOVELTY = {
     "max_similarity_to_prior": 0.0,
@@ -430,6 +432,22 @@ def _generate_one_idea(
         user_prompt = (
             "THE TASK'S DATA AND SCORING — given, not to be changed:\n"
             f"{case_context}\n\n"
+        ) + user_prompt
+    elif case_context and prescribed:
+        # A prescribed brief can name more than one case: a validation run on
+        # one configuration and the study proper on another. Presented as THE
+        # fixed case on which only a model change is allowed, the starter
+        # swallowed the brief: on shelf_demo_olaflow_20261010_1356 the starter
+        # was the empty-flume validation case, and the brief's validation and
+        # its four-condition breakwater sweep came back as one "incident-wave
+        # baseline" experiment in a flume with no breakwater.
+        user_prompt = (
+            "A CASE THE BRIEF NAMES — use it where the brief uses it:\n"
+            f"{case_context}\n\n"
+            "This is one starting case, not the whole study. The brief may name other cases, "
+            "configurations, steps or phases (for example a validation run on one setup and a "
+            "parameter sweep on another); each of them is part of the study and gets its own "
+            "experiments, with the brief's own values.\n\n"
         ) + user_prompt
     elif case_context:
         # Without this the ideator has no idea a concrete case already exists,

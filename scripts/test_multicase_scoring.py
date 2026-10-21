@@ -810,6 +810,51 @@ def test_diagnosis_failure_leaves_the_candidate_as_it_was() -> None:
         tools._diagnose_null_score = original
 
 
+def test_a_comparator_that_scores_the_whole_study_is_refused() -> None:
+    """closure_20260826_codex bound a comparator that walked all 32 cases and
+    printed their mean whatever --case it was given: the study mean was right,
+    and every one of the 32 per-case scores was that mean copied."""
+    import oed_extensions as oedx
+
+    work = Path(tempfile.mkdtemp())
+    try:
+        cases = []
+        for name in ("hill_a", "duct_b", "duct_c"):
+            (work / name / "system").mkdir(parents=True)
+            (work / name / "system" / "controlDict").write_text("application simpleFoam;\n")
+            cases.append(work / name)
+        reference = work / "reference.csv"
+        reference.write_text("x,y\n0,0\n")
+        header = ("import argparse\np = argparse.ArgumentParser()\np.add_argument('--case')\n"
+                  "p.add_argument('--reference')\np.add_argument('--time')\n"
+                  "p.add_argument('--baseline-time')\np.add_argument('--out')\na = p.parse_args()\n")
+        whole = work / "compare_whole.py"
+        whole.write_text(header + "print('METRIC mae: 0.0739291')\nprint('TIME_USED: 100')\n")
+        per_case = work / "compare_case.py"
+        per_case.write_text(header + "import os\nv = {'hill_a': 0.0151, 'duct_b': 0.0712, 'duct_c': 0.099}"
+                            "[os.path.basename(a.case.rstrip('/'))]\n"
+                            "print(f'METRIC mae: {v}')\nprint('TIME_USED: 100')\n")
+        why = oedx.scores_whole_study(comparator=whole, baseline_case_dir=cases[0], baseline_value=0.0739291,
+                                      probe_cases=cases, reference_file=reference, metric_name="mae")
+        check("a comparator returning one value for every case is refused", bool(why), why)
+        check("the refusal says to score only the case given", "--case" in why, why)
+        ok = oedx.scores_whole_study(comparator=per_case, baseline_case_dir=cases[0], baseline_value=0.0151,
+                                     probe_cases=cases, reference_file=reference, metric_name="mae")
+        check("a per-case comparator passes", ok == "", ok)
+        single = oedx.scores_whole_study(comparator=whole, baseline_case_dir=cases[0], baseline_value=0.0739291,
+                                         probe_cases=[cases[0]], reference_file=reference, metric_name="mae")
+        check("a single-case study is not probed", single == "", single)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    check("copied per-case values are recognised", tools._copied_study_score([0.0739291] * 32))
+    check("distinct per-case values are not", not tools._copied_study_score([0.0151, 0.0712, 0.099]))
+    check("a repeated flag value is not taken for a copy", not tools._copied_study_score([1.0, 1.0, 1.0]))
+    mean = tools._mean_metrics([{"mae": 0.1, "iou": 0.8}, {"mae": 0.3, "iou": float("nan")}])
+    check("secondary metrics are averaged over the cases, not taken from the first",
+          mean == {"mae": 0.2}, str(mean))
+
+
 def main() -> int:
     for test in (
         test_declared_cases_resolve,
@@ -836,6 +881,7 @@ def main() -> int:
         test_every_null_score_carries_a_diagnosis,
         test_a_converged_build_never_pays_for_a_diagnosis,
         test_diagnosis_failure_leaves_the_candidate_as_it_was,
+        test_a_comparator_that_scores_the_whole_study_is_refused,
     ):
         try:
             test()

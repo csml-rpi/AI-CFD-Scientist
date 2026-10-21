@@ -69,3 +69,6 @@ mechanism.md
 /.debuglogs/
 /llm_token_usage.json
 /llm_token_usage.json.lock
+
+# Tutorial indices built from the installed OpenFOAM (scripts/build_tutorial_index.py)
+database/faiss_versions/

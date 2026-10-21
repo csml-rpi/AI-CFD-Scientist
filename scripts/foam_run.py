@@ -559,19 +559,25 @@ def _maybe_increase_timestep_cfl_safe(case_dir: str) -> Dict[str, Any]:
 
 
 def _read_solver_from_control_dict(case_dir: Path) -> str:
-    p = case_dir / "system" / "controlDict"
-    if not p.is_file():
-        return ""
-    txt = p.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"(?m)^\s*application\s+([^\s;]+)\s*;", txt)
-    return m.group(1).strip() if m else ""
+    """The case's application, or foamRun when it names a solver module."""
+    from cfd_langgraph.openfoam_version import case_solver
+
+    return case_solver(case_dir)["application"]
+
+
+def _installed_version_facts() -> str:
+    from cfd_langgraph.openfoam_version import describe, get_profile
+
+    return describe(get_profile())
 
 
 def _ensure_minimal_allrun(case_dir: Path, solver: str, mesh_exists: bool) -> None:
     allrun = case_dir / "Allrun"
     if allrun.exists():
         return
-    solver_cmd = solver or "simpleFoam"
+    from cfd_langgraph.openfoam_version import get_profile, run_command
+
+    solver_cmd = solver or run_command(get_profile(), "simpleFoam")
     mesh_cmd = "" if mesh_exists else "runApplication blockMesh\nrunApplication checkMesh\n"
     script = (
         "#!/bin/sh\n"
@@ -987,8 +993,22 @@ def _safe_read_snippet(path: Path, max_chars: int = 2000) -> str:
     return txt[:max_chars]
 
 
+
+def _installed_default_solver() -> str:
+    from cfd_langgraph.openfoam_version import get_profile, run_command
+
+    return run_command(get_profile(), "simpleFoam")
+
+def _turbulence_file(case_dir: Path) -> Path:
+    """momentumTransport (openfoam.org) or turbulenceProperties (openfoam.com),
+    whichever the case has."""
+    from cfd_langgraph.openfoam_version import case_file
+
+    return case_file(case_dir, "turbulence") or case_dir / "constant" / "momentumTransport"
+
+
 def _active_viscosity_model(case_dir: Path) -> str:
-    mt = case_dir / "constant" / "momentumTransport"
+    mt = _turbulence_file(case_dir)
     if not mt.is_file():
         return ""
     txt = mt.read_text(encoding="utf-8", errors="ignore")
@@ -1054,13 +1074,13 @@ def _build_local_custom_model_context(case_dir: Path) -> str:
                 except Exception:
                     lines.append(f"  - {f.relative_to(case_dir)} (unreadable)")
 
-    mt = case_dir / "constant" / "momentumTransport"
+    mt = _turbulence_file(case_dir)
     cd = case_dir / "system" / "controlDict"
     mt_snip = _safe_read_snippet(mt, 2200)
     cd_snip = _safe_read_snippet(cd, 1200)
     if mt_snip:
         lines.append("")
-        lines.append("Current activation dictionary snippet (constant/momentumTransport):")
+        lines.append(f"Current activation dictionary snippet (constant/{mt.name}):")
         lines.append(mt_snip)
     if cd_snip:
         lines.append("")
@@ -1310,14 +1330,15 @@ def _llm_precheck_case_files(
             "A. SOURCE / FORCING TERMS:\n"
             "   - Body forces, velocity constraints, and momentum sources that CONSTRAIN the solution\n"
             "     (e.g. meanVelocityForce, buoyancyForce, MRFZone, porousMedia, SHM refinement regions)\n"
-            "     belong in system/fvConstraints (OpenFOAM v6+/v10).\n"
+            "     belong in system/fvConstraints on openfoam.org 9+, in fvOptions on openfoam.com.\n"
             "   - Volumetric source terms that ADD to equations but do not constrain\n"
             "     (e.g. Smagorinsky forcing, custom scalar sources, energy deposition)\n"
-            "     belong in system/fvModels (v6+) or constant/fvOptions (older).\n"
+            "     belong in fvModels on openfoam.org 9+, in fvOptions on openfoam.com and older versions.\n"
             "   - Never place a velocity/momentum CONSTRAINT in fvModels, or a pure source in fvConstraints.\n"
             "   - If you see meanVelocityForce/pressureGradientExplicitSource in fvModels, move it to fvConstraints.\n"
             "B. TURBULENCE MODEL LOCATION:\n"
-            "   - constant/momentumTransport (OpenFOAM 10) or constant/turbulenceProperties (older).\n"
+            "   - constant/momentumTransport (openfoam.org 10+) or constant/turbulenceProperties\n"
+            "     (openfoam.com, older openfoam.org). The installed version is named below.\n"
             "   - Never put turbulence settings in system/.\n"
             "C. NORMALIZATION IN POST-PROCESSING:\n"
             "   - Any script that computes a non-dimensional coefficient (Cf, Cd, Nu, Cp, etc.) MUST\n"
@@ -1328,7 +1349,9 @@ def _llm_precheck_case_files(
             "     quantity acting ON THE FLUID (not on the wall). If the reference data uses the\n"
             "     opposite convention, the post-processing script must negate the extracted value.\n"
             "   - Always verify sign by checking that physically expected attached-flow regions\n"
-            "     give the correct sign (e.g. positive streamwise wall friction in attached flow)."
+            "     give the correct sign (e.g. positive streamwise wall friction in attached flow).\n\n"
+            "OPENFOAM INSTALLATION (the version every file must be written for):\n"
+            + _installed_version_facts()
         )
         user_prompt_parts = []
         if aux:
@@ -1516,7 +1539,7 @@ def main() -> int:
         seed_solver = _read_solver_from_control_dict(out_path)
         plan = {
             "case_name": out_path.name,
-            "case_solver": seed_solver or "simpleFoam",
+            "case_solver": seed_solver or _installed_default_solver(),
             "case_dir": args.output_dir,
             "subtasks": [],
             "tutorial_reference": "",

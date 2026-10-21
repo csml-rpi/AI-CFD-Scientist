@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import asyncio
+import contextlib
+import contextvars
 import os
 import re
 import shutil
@@ -368,10 +370,34 @@ _EMPTY_TURN_ATTEMPTS = 5
 _EMPTY_TURN_BACKOFF = (5, 15, 45, 120)
 
 
+# A call whose caller copes with an empty reply gets one quick retry. A step
+# that keeps its input unchanged on an empty reply had each one retried five
+# times, waiting up to 120 s, for hours of a DAFoam study's requirement writing
+# (shelf_demo_dafoam_20261019_1057). Opt-in, through quick_empty_replies():
+# given to every call without tools, it failed a case whose setup got two
+# empty replies in a row, which the full ladder would have ridden out.
+# Added to a request retried after an empty reply, so it is not sent identical.
+_EMPTY_RETRY_NOTE = "Your previous reply to this was empty. Reply now with the requested output."
+_QUICK_EMPTY_ATTEMPTS = 2
+_QUICK_EMPTY_BACKOFF = (5,)
+_QUICK_EMPTY = contextvars.ContextVar("cfd_quick_empty_replies", default=False)
+
+
+@contextlib.contextmanager
+def quick_empty_replies():
+    """Model calls made inside this block get the short empty-reply ladder."""
+    token = _QUICK_EMPTY.set(True)
+    try:
+        yield
+    finally:
+        _QUICK_EMPTY.reset(token)
+
+
 def _retry_empty_turn(produce, provider: str):
     """Call ``produce`` until it yields a non-empty assistant turn.
 
-    ``produce`` returns ``(text, tool_calls)``.
+    ``produce`` returns ``(text, tool_calls)``. Inside quick_empty_replies()
+    the short ladder above is used.
 
     A turn with neither text nor a tool call is never a valid answer from an
     agent: LangGraph reads "no tool calls" as the agent choosing to stop, so
@@ -387,19 +413,20 @@ def _retry_empty_turn(produce, provider: str):
     """
     import time as _time
 
+    quick = _QUICK_EMPTY.get()
+    attempts = _QUICK_EMPTY_ATTEMPTS if quick else _EMPTY_TURN_ATTEMPTS
+    backoff = _QUICK_EMPTY_BACKOFF if quick else _EMPTY_TURN_BACKOFF
     last_text, last_calls = "", []
-    for attempt in range(1, _EMPTY_TURN_ATTEMPTS + 1):
+    for attempt in range(1, attempts + 1):
         text, tool_calls = produce()
         if (text or "").strip() or tool_calls:
             return text, tool_calls
         last_text, last_calls = text, tool_calls
-        if attempt < _EMPTY_TURN_ATTEMPTS:
-            delay = _EMPTY_TURN_BACKOFF[
-                min(attempt - 1, len(_EMPTY_TURN_BACKOFF) - 1)
-            ]
+        if attempt < attempts:
+            delay = backoff[min(attempt - 1, len(backoff) - 1)]
             print(
                 f"[{provider}] empty assistant turn (no text, no tool calls) on attempt "
-                f"{attempt}/{_EMPTY_TURN_ATTEMPTS}; retrying in {delay}s",
+                f"{attempt}/{attempts}; retrying in {delay}s",
                 flush=True,
             )
             _time.sleep(delay)
@@ -408,7 +435,7 @@ def _retry_empty_turn(produce, provider: str):
     # empty turn ends the run while reporting success.
     raise RuntimeError(
         f"{provider} returned an empty assistant turn "
-        f"{_EMPTY_TURN_ATTEMPTS} times in a row (no text and no tool calls)."
+        f"{attempts} times in a row (no text and no tool calls)."
     )
 
 
@@ -462,11 +489,20 @@ class CodexOAuthChatModel(BaseChatModel):
         attempt_usages: list = []
         attempt_ids: list = []
 
+        tries = {"n": 0}
+
         def _produce() -> tuple[str, list[dict]]:
+            # A retry after an empty reply is not sent identical: the same
+            # request came back empty five times running inside a long DAFoam
+            # study while it was answered at once from another process
+            # (shelf_demo_dafoam_20261019_1057), so the request itself is
+            # changed by one line.
+            tries["n"] += 1
+            sent = list(messages) + ([HumanMessage(content=_EMPTY_RETRY_NOTE)] if tries["n"] > 1 else [])
             if tools:
                 response = self._codex.invoke(
                     None,
-                    items=messages_to_responses_input(messages),
+                    items=messages_to_responses_input(sent),
                     tools=tools,
                     tool_choice=kwargs.get("codex_tool_choice"),
                 )
@@ -476,7 +512,7 @@ class CodexOAuthChatModel(BaseChatModel):
                     getattr(response, "content", "") or "",
                     list(getattr(response, "tool_calls", []) or []),
                 )
-            response = self._codex.invoke(_lc_messages_to_dicts(messages))
+            response = self._codex.invoke(_lc_messages_to_dicts(sent))
             attempt_usages.append(getattr(response, "usage", None))
             attempt_ids.append(getattr(response, "response_id", None))
             return getattr(response, "content", "") or "", []

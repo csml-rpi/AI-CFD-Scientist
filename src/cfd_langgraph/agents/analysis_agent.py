@@ -483,9 +483,14 @@ class AnalysisAgent:
         if not foam_dir or not foam_dir.is_dir():
             return {"ok": False, "error": "missing foam_output_dir", "authoritative": {}, "files": {}}
 
-        tp = foam_dir / "constant" / "transportProperties"
-        mt = foam_dir / "constant" / "momentumTransport"
-        fv = foam_dir / "system" / "fvConstraints"
+        # Whichever file each role uses on the installation the case was written
+        # for: physicalProperties or transportProperties, momentumTransport or
+        # turbulenceProperties, fvConstraints or fvOptions.
+        from cfd_langgraph.openfoam_version import case_file, turbulence_model
+
+        tp = case_file(foam_dir, "transport") or foam_dir / "constant" / "transportProperties"
+        mt = case_file(foam_dir, "turbulence") or foam_dir / "constant" / "momentumTransport"
+        fv = case_file(foam_dir, "constraints") or foam_dir / "system" / "fvConstraints"
         cd = foam_dir / "system" / "controlDict"
         rr = foam_dir / "run_result.json"
         dj = foam_dir / "decision.json"
@@ -508,7 +513,7 @@ class AnalysisAgent:
             authoritative["Ubar"] = ubar
             sources["Ubar"] = str(fv)
 
-        model = self._extract_model_name(mt_txt)
+        model = turbulence_model(foam_dir).get("model") or self._extract_model_name(mt_txt)
         if model:
             authoritative["turbulence_model"] = model
             sources["turbulence_model"] = str(mt)
@@ -522,7 +527,7 @@ class AnalysisAgent:
         coeffs: Dict[str, float] = {}
         for m in re.finditer(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([-+0-9.eE]+)\s*;\s*$", mt_txt, re.MULTILINE):
             k, raw = m.group(1), m.group(2)
-            if k in {"model", "simulationType", "turbulence", "printCoeffs"}:
+            if k in {"model", "RASModel", "LESModel", "simulationType", "turbulence", "printCoeffs"}:
                 continue
             try:
                 coeffs[k] = float(raw)

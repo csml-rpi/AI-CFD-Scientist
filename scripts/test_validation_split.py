@@ -360,9 +360,47 @@ with (tempfile.TemporaryDirectory() if not os.environ.get("KEEP_TMP") else __imp
     check("the timing it measured is in the record",
           len((rec.get("pipeline_run") or {}).get("predict_seconds") or []) == 6, rec.get("pipeline_run"))
 
+    print("== 8b. screening: scored on two seeds, the third trained only when it comes near the best")
+    os.environ["CFD_SCIENTIST_SCREEN_SEEDS"] = "2"
+    screened = {}
+    for name, best_in_history in (("cand_c", None), ("cand_d", 1e-9)):
+        c = disc / name
+        make_candidate(c, starter)
+        sbc = Sandbox(run_dir=c, starter_case=starter, wm_project_dir=None, starter_root=starter)
+        for k in (0, 1):
+            sbc.run_bash(f"bash pipeline/train.sh {k} pipeline/models/seed{k}", cwd=str(c))
+        (c / "agentic_result.json").write_text(json.dumps({
+            "status": "OK", "case_dir": str(c), "produced_predictions": True, "finished_cleanly": True}))
+        proposals = json.loads((disc / "proposals.json").read_text())
+        proposals[name] = {"strategy": "analytic", "target_family": "mean"}
+        (disc / "proposals.json").write_text(json.dumps(proposals))
+        (disc / "history.json").write_text(json.dumps([] if best_in_history is None else [{
+            "candidate_dir": str(cand), "valid_case": True,
+            "score": {"metric": "mse", "value": best_in_history, "direction": "min"}}]))
+        screened[name] = (c, tool["oed_score_candidate"](candidate_dir=str(c), case_dir=str(c),
+                                                        action_type="code_mod", variant_name=name,
+                                                        model_description="mean model"))
+    c, r = screened["cand_c"]
+    check("with no full-seed best, the framework trains the other seed and scores all three",
+          r.get("ok") and r.get("seeds_scored") == [0, 1, 2] and not r.get("screened_only")
+          and pc.missing_parts(c, spec) == [], {k: r.get(k) for k in ("seeds_scored", "screening", "score")})
+    c, r = screened["cand_d"]
+    check("one far from the best is recorded on its screening seeds and its other seed is not trained",
+          r.get("ok") and r.get("seeds_scored") == [0, 1] and r.get("screened_only")
+          and not (c / "pipeline" / "models" / "seed2").exists(),
+          {k: r.get(k) for k in ("seeds_scored", "screening", "screening_note")})
+    del os.environ["CFD_SCIENTIST_SCREEN_SEEDS"]
+
     (disc / "history.json").write_text(json.dumps([{
         "candidate_dir": str(cand), "case_dir": str(cand), "valid_case": True, "status": rec.get("status"),
         "score": rec.get("score")}]))
+    (disc / "search_status.json").write_text(json.dumps({"search_complete": False, "budget_used": 1,
+                                                         "budget_total": 500}))
+    early = tool["oed_final_test"]()
+    check("the final test is refused while the search is not over",
+          (early.get("ok"), "not over" in str(early.get("error"))), (False, True))
+    (disc / "search_status.json").write_text(json.dumps({"search_complete": True, "budget_used": 1,
+                                                         "budget_total": 500}))
     result = tool["oed_final_test"]()
     check("the final test re-trains the best candidate and scores it on the test set",
           result.get("ok") and isinstance(result.get("test_value"), float) and result.get("candidate") == "cand_a",

@@ -434,20 +434,28 @@ class Sandbox:
             return {"ok": False, "error": f"read denied: {p} (must be inside run_dir / the starter folder / WM_PROJECT_DIR)"}
         entries = self._withheld.get("entries") or []
         rp = p.resolve()
+        # The same answer the shell's mounts give (run_bash): replacements and
+        # hidden paths apply in order, a later one covering an earlier one --
+        # a folder hidden after files inside it were replaced hides them too --
+        # and folders shown again (reveal) apply last, as the originals.
+        effect: Optional[Dict[str, Any]] = None
+        for entry in entries:
+            held = Path(entry["path"])
+            action = entry.get("action")
+            if action == "replace" and rp == held:
+                effect = entry
+            elif action == "hide" and (rp == held or (entry.get("is_dir") and held in rp.parents)):
+                effect = entry
         revealed = any(entry.get("action") == "reveal"
                        and (rp == Path(entry["path"]) or Path(entry["path"]) in rp.parents)
                        for entry in entries)
-        for entry in ([] if revealed else entries):
-            held = Path(entry["path"])
-            if entry.get("action") == "reveal":
-                continue
-            if rp == held and entry.get("action") == "replace":
-                p = Path(entry["source"])
-                break
-            if rp == held or (entry.get("is_dir") and held in rp.parents):
+        if effect is not None and not revealed:
+            if effect.get("action") == "replace":
+                p = Path(effect["source"])
+            else:
                 return {"ok": False, "error": (
-                    f"withheld: {held} holds target values of an evaluation set, which candidates "
-                    "never see. The framework scores your predictions after you finish.")}
+                    f"withheld: {effect['path']} holds target values of an evaluation set, which "
+                    "candidates never see. The framework scores your predictions after you finish.")}
         if not p.is_file():
             return {"ok": False, "error": f"not a file: {p}"}
         try:
@@ -581,7 +589,7 @@ class Sandbox:
     _SOLVER_TOKENS = (
         "simpleFoam", "pimpleFoam", "pisoFoam", "rhoCentralFoam", "rhoPimpleFoam",
         "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam",
-        "potentialFoam", "sonicFoam", "Allrun",
+        "potentialFoam", "sonicFoam", "foamRun", "Allrun",
     )
 
     def _note_solver_invocations(self, cmd: str) -> None:
@@ -729,15 +737,20 @@ class Sandbox:
                 "last_rc": seen.get("rc"),
             }
         # Ensure OpenFOAM env is sourced (so wmake works) — find a bashrc.
-        bashrc_candidates = []
-        if self.wm:
-            bashrc_candidates.append(str(self.wm / "etc" / "bashrc"))
-        bashrc_candidates += [
-            "/mnt/sda1/openfoam10/etc/bashrc",
-            "/opt/openfoam10/etc/bashrc",
-        ]
-        bashrc = next((b for b in bashrc_candidates if Path(b).is_file()), None)
+        from cfd_langgraph.openfoam_version import find_installation
+
+        install = find_installation(str(self.wm) if self.wm else "")
+        bashrc = str(Path(install) / "etc" / "bashrc") if install else None
         prefix = f". \"{bashrc}\" >/dev/null 2>&1 && " if bashrc else ""
+        # Validated third-party solvers on the shelf (cfd_langgraph.solver_shelf)
+        # go on PATH / LD_LIBRARY_PATH after the bashrc, which would reset them.
+        if install:
+            from cfd_langgraph.openfoam_version import get_profile
+            from cfd_langgraph.solver_shelf import shell_exports
+
+            exports = shell_exports(get_profile(str(install)))
+            if exports:
+                prefix += f"{exports} && "
         # `bash -lc` runs the user's login profile, which put another conda
         # install's python first on PATH: a bare `python` in the sandbox ran
         # Python 3.10 with torch 2.11 while the brief listed 3.12 with torch 2.13
@@ -919,7 +932,7 @@ TOOLS:
       Run a shell command in a filesystem sandbox: the host is read-only and
       only the run directory (plus an ephemeral /tmp) is writable. The OpenFOAM
       bashrc is auto-sourced before each command, so wmake / blockMesh /
-      simpleFoam etc. are on PATH. Returns {rc, stdout, stderr, timeout,
+      the solvers are on PATH. Returns {rc, stdout, stderr, timeout,
       error_summary}. ALWAYS check `error_summary` first — it pre-extracts
       gcc/wmake/FOAM/runtime error lines (with 2-line context) so you don't
       need to scan a long stdout to find the failure. A Make/files entry that
@@ -937,7 +950,7 @@ TOOLS:
 
   {"tool": "done", "args": {"case_dir": "<abs path>", "class_name": "<name>", "compiled_so": "<abs .so path>", "summary": "<one-line summary>"}}
       Signal completion. Call this ONLY after wmake produced a .so AND
-      simpleFoam reached End. The framework will validate.
+      the case's solver reached End. The framework will validate.
 
 PROTOCOL RULES:
   - Output EXACTLY ONE JSON object per turn. No prose. No code fences. No
@@ -958,8 +971,9 @@ PROTOCOL RULES:
     it builds.
   - Activate the new component by editing whichever case dictionary is
     appropriate for THIS modification family (turbulence model → the
-    momentum/turbulence transport dictionary; viscosity model →
-    transportProperties; volumetric source → fvModels; field BC →
+    turbulence dictionary; viscosity model → the transport properties
+    dictionary; volumetric source → the source-term dictionary — each named
+    for this OpenFOAM in the OPENFOAM INSTALLATION block; field BC →
     0/<field>; numerical scheme → fvSchemes; thermo / radiation → the
     relevant constant/ dict; etc.) and add a libs (...) entry to
     system/controlDict if a compiled .so must be loaded.
@@ -1007,8 +1021,8 @@ PROTOCOL RULES:
 
   When the modification is a RUNTIME (coded* / dictionary edit only):
     [1] Edit the relevant case dictionary in-place (e.g. add a coded entry
-        to constant/fvModels, or replace a BC in 0/<field>, or apply a
-        dict patch).
+        to the source-term dictionary, or replace a BC in 0/<field>, or
+        apply a dict patch).
     [2] Run the case (application from system/controlDict). Coded blocks
         are JIT-compiled by OpenFOAM at solver startup; no wmake needed.
     [3] If the JIT compile fails, fix the C++ in the SAME dictionary file
@@ -1031,8 +1045,24 @@ _SAFETY = """SAFETY RULES (every tool call enforces these; violations get a deni
    that case-local customModels tree. $FOAM_USER_LIBBIN is not an allowed
    compilation target.
 4. Activation by case dictionaries only: system/controlDict.libs and the
-   relevant constant/ dictionary (constant/momentumTransport, etc.).
+   relevant constant/ dictionary (the turbulence dictionary, etc.).
 """
+
+
+def _version_facts(wm_project_dir: Optional[Path]) -> str:
+    from cfd_langgraph.openfoam_version import describe, get_profile
+
+    return describe(get_profile(str(wm_project_dir) if wm_project_dir else ""))
+
+
+def _post_process_hint() -> str:
+    """How to evaluate a function object afterwards on this installation."""
+    from cfd_langgraph.openfoam_version import get_profile
+
+    profile = get_profile()
+    if profile.get("solver_style") == "modules" or (profile.get("utilities") or {}).get("foamPostProcess"):
+        return "foamPostProcess -solver <the controlDict's solver module> -func wallShearStress -latestTime"
+    return "<application> -postProcess -func wallShearStress -latestTime"
 
 
 def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: str = "",
@@ -1061,6 +1091,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         _SAFETY
         + "\n" + _TOOLS_SPEC.replace("@SCAFFOLD@", str(Path(__file__).resolve().parent / "foam_scaffold.py"))
         + ("\n" + grounding if grounding else "")
+        + "\n\nOPENFOAM INSTALLATION (write every file for this version):\n" + _version_facts(wm_project_dir)
         + "\n============================================================\n"
         + "TASK\n"
         + "============================================================\n\n"
@@ -1297,9 +1328,9 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "      directory. Iterate on errors as needed.\n"
         + "  (d) Activate the compiled library by editing the appropriate case\n"
         + "      dictionary. The right dictionary depends on the modification\n"
-        + "      kind (constant/momentumTransport for turbulence, constant/\n"
-        + "      transportProperties for viscosity, constant/fvModels for sources,\n"
-        + "      0/<field> boundaryField for BCs, system/fvSchemes for schemes,\n"
+        + "      kind (the turbulence, transport-properties and source-term\n"
+        + "      dictionaries named in the OPENFOAM INSTALLATION block, 0/<field>\n"
+        + "      boundaryField for BCs, system/fvSchemes for schemes,\n"
         + "      etc.) and add a `libs (\"libYourName.so\");` entry to system/controlDict.\n"
         + "  (e) Run the application named in system/controlDict (whatever it\n"
         + "      is — simpleFoam, pimpleFoam, foamRun, chtMultiRegionFoam, etc.)\n"
@@ -1314,7 +1345,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "      bogus RMSE. Run the solver with default flags. If you must\n"
         + "      skip them for performance during debugging, run them as a\n"
         + "      post-processing pass afterwards via\n"
-        + "      `<application> -postProcess -func wallShearStress -latestTime`\n"
+        + f"      `{_post_process_hint()}`\n"
         + "      (or the relevant function names from controlDict).\n"
         + "  (f) Call `done` with the case_dir, class_name, and .so path.\n\n"
         + "Begin. Output ONE tool call per turn as a single JSON object.\n"

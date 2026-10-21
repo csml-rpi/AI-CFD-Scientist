@@ -149,6 +149,7 @@ def viz_creator(
     max_retries: int = VIZ_MAX_RETRIES,
     paper_pyvista_only: bool = False,
     strict_quality: bool = True,
+    deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Central visualization creator.
@@ -404,7 +405,17 @@ def viz_creator(
     else:
         reference_block = ""
 
+    # ``deadline`` (time.monotonic()): no attempt starts that the last one's
+    # length says would end past it, and the last attempt that fits keeps
+    # its images even when rejected. Ten retries of ~5 min each used the
+    # interpreter's whole hour, and it was killed before interpreting
+    # (shelf_demo_olaflow_20261011_1242, cases 005 and 006).
+    took = 0.0
     for attempt in range(1, max_retries + 1):
+        if deadline is not None and attempt > 1 and time.monotonic() + took > deadline:
+            _log(f"attempt {attempt}: not started, too little time left")
+            break
+        started = time.monotonic()
         # Ask LLM for script
         user_prompt = active_user_tpl.format(
             user_requirement=user_requirement,
@@ -448,6 +459,7 @@ def viz_creator(
             snippet = (err or out or "Unknown error")[-4000:]
             last_error = f"Return code: {rc}\nSTDOUT:\n{out[-1000:]}\nSTDERR:\n{snippet}\n"
             last_script = script_text
+            took = time.monotonic() - started
             # Clean up any partial images
             for p in pngs:
                 try:
@@ -504,7 +516,9 @@ def viz_creator(
         # rather than discarding. The reviewer has been observed to hallucinate
         # missing/uniform figures on legitimately usable output; losing the whole
         # case over that wastes the simulation.
-        if attempt >= max_retries:
+        took = time.monotonic() - started
+        last_in_time = deadline is not None and time.monotonic() + took > deadline
+        if attempt >= max_retries or last_in_time:
             _log(
                 f"attempt {attempt}: max retries reached — accepting {len(pngs)} images "
                 f"from final attempt despite reviewer rejection"

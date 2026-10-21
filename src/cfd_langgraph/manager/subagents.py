@@ -17,16 +17,74 @@ from deepagents import SubAgent
 _SUBAGENT_STEP_LIMIT = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_STEPS") or 300)
 
 
-def _stopped_message(name: str) -> Any:
-    """What the manager is told when a subagent is stopped at its step limit."""
-    from langchain_core.messages import AIMessage
+def _text(content: Any) -> str:
+    """A message's text, whether the provider gave a string or a list of parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p if isinstance(p, str) else str(p.get("text", "")) for p in content
+                         if isinstance(p, (str, dict)))
+    return str(content or "")
 
+
+def _record(messages: List[Any]) -> str:
+    """A stopped subagent's task, its own notes and its latest tool calls, short
+    enough for any model's context."""
+    task, notes, calls, counts, results = "", [], [], {}, {}
+    for message in messages or []:
+        kind = getattr(message, "type", "")
+        if kind == "human" and not task:
+            task = _text(message.content)[:3000]
+        elif kind == "ai":
+            note = _text(message.content).strip()
+            if note:
+                notes.append(note[:600])
+            for call in getattr(message, "tool_calls", None) or []:
+                counts[call.get("name", "?")] = counts.get(call.get("name", "?"), 0) + 1
+                calls.append(call)
+        elif kind == "tool":
+            results[getattr(message, "tool_call_id", "")] = _text(message.content)
+    lines = [f"TASK:\n{task}", "", "ITS OWN NOTES (latest last):", *notes[-15:], "",
+             "TOOL CALLS MADE: " + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())),
+             "", "ITS LATEST CALLS AND WHAT CAME BACK:"]
+    for call in calls[-8:]:
+        args = json.dumps(call.get("args", {}), default=str)[:200]
+        lines.append(f"- {call.get('name')}({args}) -> {results.get(call.get('id', ''), '')[:400]}")
+    return "\n".join(lines)[-12000:]
+
+
+def _stopped_report(spec: Any, state: Any, why: str) -> Any:
+    """What the manager is told when a subagent is stopped: the subagent's own
+    report of what it found, written from its record. A bare "it was stopped"
+    threw away everything it had learned, and the manager sent another one
+    off to learn it again, six times in one study (shelf_demo_dafoam_20261011_1437)."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    name = spec["name"]
+    record = _record((state or {}).get("messages", []) if isinstance(state, dict) else [])
+    report = ""
+    model = spec.get("model") if isinstance(spec, dict) else None
+    try:
+        if model is None:
+            raise ValueError("the subagent has no model of its own")
+        reply = model.invoke([
+            SystemMessage(content=(
+                "You were working on the task below for another agent and were stopped "
+                f"({why}) before finishing. Write your report for that agent from the record "
+                "below: what you found, with the file paths and numbers that show it; what "
+                "you changed; what is still unknown; and the next step you would take. Only "
+                "what the record shows -- say where it shows nothing.")),
+            HumanMessage(content=record),
+        ])
+        report = _text(getattr(reply, "content", "")).strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [subagents] {name}: its report could not be written ({exc}); passing its record", flush=True)
     return AIMessage(content=(
-        f"The {name} subagent was stopped after {_SUBAGENT_STEP_LIMIT} steps without "
-        "finishing: it kept repeating the same actions. Nothing it did is lost. Read "
-        "its case/candidate directory to see how far it got, fix whatever blocked it "
-        "(for example run the mesh gate if a case run was refused for a missing "
-        "converged mesh), and only then launch it again."
+        f"The {name} subagent was stopped ({why}) before finishing. "
+        + (f"Its report, written when it was stopped:\n\n{report}" if report
+           else f"Its record:\n\n{record}")
+        + "\n\nIts files are in place. Decide the next step from this: launched again with "
+        "the same task, a subagent starts over from nothing."
     ))
 
 
@@ -37,17 +95,6 @@ def _stopped_message(name: str) -> Any:
 # run_case_native calls and 4,881 refused re-reads over twelve hours.
 _REFUSAL_STOP = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_REFUSALS") or 20)
 from cfd_langgraph.llm.caching import stuck  # noqa: E402
-
-
-def _refused_message(name: str) -> Any:
-    from langchain_core.messages import AIMessage
-
-    return AIMessage(content=(
-        f"The {name} subagent was stopped after {_REFUSAL_STOP} or more refused calls among its recent ones: "
-        "it kept making calls the tools would not run. Nothing it did is lost. Read its "
-        "case/candidate directory and the refusals' reasons, fix what blocked it, and only "
-        "then launch it again."
-    ))
 
 
 # The limit is set per call because a recursion_limit in the caller's config wins over
@@ -87,11 +134,11 @@ def _capped(spec: SubAgent, precheck: Optional[Callable[[], Optional[str]]] = No
                 for last in compiled.stream(state, _config(config), stream_mode="values"):
                     if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
                         print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
-                        return {"messages": [_refused_message(name)]}
+                        return {"messages": [_stopped_report(spec, last, f"{_REFUSAL_STOP} or more of its recent calls were refused")]}
                 return last
             except GraphRecursionError:
                 print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
-                return {"messages": [_stopped_message(name)]}
+                return {"messages": [_stopped_report(spec, last, f"at its {_SUBAGENT_STEP_LIMIT}-step limit")]}
 
         async def _arun(state: Any, config: Any = None) -> Any:
             refused = _refused_start()
@@ -102,11 +149,11 @@ def _capped(spec: SubAgent, precheck: Optional[Callable[[], Optional[str]]] = No
                 async for last in compiled.astream(state, _config(config), stream_mode="values"):
                     if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
                         print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
-                        return {"messages": [_refused_message(name)]}
+                        return {"messages": [_stopped_report(spec, last, f"{_REFUSAL_STOP} or more of its recent calls were refused")]}
                 return last
             except GraphRecursionError:
                 print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
-                return {"messages": [_stopped_message(name)]}
+                return {"messages": [_stopped_report(spec, last, f"at its {_SUBAGENT_STEP_LIMIT}-step limit")]}
 
         runnable = RunnableLambda(_run, afunc=_arun)
     except Exception as exc:  # pragma: no cover - depends on deepagents internals
@@ -160,6 +207,13 @@ If you need to inspect or redo only one step (e.g. the case seems mis-parsed, or
 want to regenerate a single file), call the individual stage tools instead:
 `foam_parse_requirement`, `foam_retrieve_references`, `foam_decompose_subtasks`,
 `foam_write_case_file`, `foam_generate_allrun`, `foam_review_errors`.
+
+run_case_native writes every file of the case from the requirement: the OpenFOAM
+dictionaries and, for a solver run by a script (such as DAFoam's runScript.py), that
+script, which runs from the case folder on as many ranks as system/decomposeParDict's
+numberOfSubdomains. A case file you write by hand is replaced on the next run, and a
+folder you make inside the case is never run. What the case must compute belongs in its
+requirement (or, for a flagged requirement, its clarification).
 
 If you write or compile anything yourself beyond what run_case_native produces — a
 custom-model source file, a scratch test of something before committing to it — it goes

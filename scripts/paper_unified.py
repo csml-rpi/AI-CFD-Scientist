@@ -33,11 +33,14 @@ def main() -> int:
     parser.add_argument("--review-output", required=True, type=str)
     parser.add_argument("--mesh-independence", default="", type=str)
     parser.add_argument("--template", default="neurips", choices=["neurips", "icml", "iclr", "nature"])
-    parser.add_argument("--max-review-loops", type=int, default=10)
+    # Each round rewrites a 25k-token figure script and re-checks every figure
+    # (~7 min); ten of each did not fit in the paper step's two hours
+    # (shelf_demo_hystrath_20261011_1602).
+    parser.add_argument("--max-review-loops", type=int, default=4)
     parser.add_argument(
         "--max-viz-inner-attempts",
         type=int,
-        default=10,
+        default=4,
         help="Max batch-script regen cycles per outer paper step (per-image VLM QA).",
     )
     parser.add_argument("--score-threshold", type=float, default=0.82)

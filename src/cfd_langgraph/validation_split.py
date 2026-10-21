@@ -248,6 +248,31 @@ def _npz_keys(path: Path) -> List[str]:
         return []
 
 
+def _npz_id_rows(path: Path, all_ids: Set[str], wanted: Set[str]) -> List[str]:
+    """Ids from ``wanted`` held as rows of an archive whose arrays are indexed by
+    sample: a 1-D array (sample, id, name) whose values cover at least half of
+    every declared id names the rows."""
+    import numpy as np
+
+    try:
+        with np.load(path, allow_pickle=False) as z:
+            for k in z.files:
+                arr = z[k]
+                if arr.ndim != 1 or arr.size == 0 or arr.size > 1_000_000:
+                    continue
+                values = set()
+                for v in arr.tolist():
+                    text = str(v).strip()
+                    values.add(str(int(float(text))) if text.replace(".", "", 1).lstrip("-").isdigit() else text)
+                norm_all = {str(int(i)) if i.lstrip("-").isdigit() else i for i in all_ids}
+                if norm_all and len(values & norm_all) >= 0.5 * len(norm_all):
+                    norm_wanted = {str(int(i)) if i.lstrip("-").isdigit() else i for i in wanted}
+                    return sorted(values & norm_wanted)
+    except Exception:  # noqa: BLE001
+        return []
+    return []
+
+
 def _csv_id_rows(path: Path, all_ids: Set[str], wanted: Set[str]) -> List[str]:
     """Ids from ``wanted`` that name a row of the table: the id column is one
     whose values cover at least half of every declared id."""
@@ -266,8 +291,32 @@ def _csv_id_rows(path: Path, all_ids: Set[str], wanted: Set[str]) -> List[str]:
     return []
 
 
+def _first_number(name: str) -> str:
+    """The first run of digits in a file name, as a number: "SurfSol_Sample007_0.2_..."
+    gives "7". Empty when the name has none."""
+    digits = ""
+    for ch in name:
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    return str(int(digits)) if digits else ""
+
+
+def _names_sample(name: str, stem: str, ids: Set[str], numeric: bool) -> bool:
+    """Whether a file or folder name identifies one of ``ids``: equal to it, or,
+    when the ids are sample numbers, carrying it as the first number in the
+    name (per-sample raw files such as SurfSol_Sample007_<parameters>.dat)."""
+    if name in ids or stem in ids:
+        return True
+    return numeric and _first_number(name) in ids
+
+
 def named_paths(root: Path, ids: Set[str], depth: int = 4) -> List[Path]:
-    """Files and folders inside ``root`` named by one of ``ids`` (by name or stem)."""
+    """Files and folders inside ``root`` named by one of ``ids`` (by name or
+    stem, or by sample number when the ids are numbers)."""
+    numeric = bool(ids) and all(i.lstrip("-").isdigit() for i in ids)
+    ids = {str(int(i)) for i in ids} if numeric else ids
     out: List[Path] = []
     stack: List[Tuple[Path, int]] = [(Path(root), 0)]
     while stack:
@@ -278,7 +327,7 @@ def named_paths(root: Path, ids: Set[str], depth: int = 4) -> List[Path]:
             continue
         for e in entries:
             p = Path(e.path)
-            if e.name in ids or p.stem in ids:
+            if _names_sample(e.name, p.stem, ids, numeric):
                 out.append(p)
                 continue
             if e.is_dir(follow_symlinks=False) and level + 1 < depth:
@@ -353,7 +402,7 @@ def check_copy(starter: Path, copy_dir: Path, test_manifest: Dict[str, Any]) -> 
         if not p.is_file() or p in replaced or _under(p, hidden_roots):
             continue
         if p.suffix == ".npz":
-            hit = sorted(set(_npz_keys(p)) & all_val)
+            hit = sorted(set(_npz_keys(p)) & all_val) or _npz_id_rows(p, train | all_val, all_val)
         elif p.suffix == ".csv":
             hit = _csv_id_rows(p, train | all_val, all_val)
         else:

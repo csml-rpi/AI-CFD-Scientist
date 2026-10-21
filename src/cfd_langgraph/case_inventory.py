@@ -34,7 +34,17 @@ class Inventory:
     def describe(self) -> str:
         """The inventory as text for a prompt, saying what exists and where."""
         axis_name = {0: "x", 1: "y", 2: "z"}.get(self.plane_axis or -1)
-        lines = [f"SOLVED TIMES: {', '.join(self.times) or 'none'}"]
+        # A long transient run writes hundreds of times; listed in full they
+        # filled the 6000 characters a prompt keeps, so a mesh gate saw no
+        # fields at all and chose no quantities (shelf_demo_olaflow_20261011_1242,
+        # 1200 times).
+        times = self.times
+        if len(times) > 12:
+            shown = (f"{len(times)} times from {times[0]} to {times[-1]}: "
+                     f"{', '.join(times[:3])}, ..., {', '.join(times[-5:])}")
+        else:
+            shown = ", ".join(times) or "none"
+        lines = [f"SOLVED TIMES: {shown}"]
         if self.bounds:
             lo, hi = self.bounds[0::2], self.bounds[1::2]
             lines.append("DOMAIN BOUNDS: x {:.4g}..{:.4g}, y {:.4g}..{:.4g}, z {:.4g}..{:.4g}".format(

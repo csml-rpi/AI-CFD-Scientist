@@ -27,7 +27,7 @@ def decompose_subtasks(
 ) -> List[Dict[str, str]]:
     """FoamAgent Stage 3 (verbatim prompt): break the requirement into
     (file_name, folder_name) subtasks — the OpenFOAM input files this case needs."""
-    system = P.DECOMPOSE_SYSTEM_PROMPT
+    system = P.with_version_facts(P.DECOMPOSE_SYSTEM_PROMPT)
     user = P.DECOMPOSE_USER_PROMPT.format(
         user_requirement=user_requirement, dir_structure=dir_structure, dir_counts_str=dir_counts_str,
     )

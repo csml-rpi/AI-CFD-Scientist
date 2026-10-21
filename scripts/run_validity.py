@@ -315,7 +315,8 @@ def _build_diagnostic_bundle(
         "allrun_path": str(allrun) if allrun.is_file() else "",
         "allrun_contents": allrun_text,
         "log_files_present": list(log_tails.keys()),
-        "log_simpleFoam_present": ("log.simpleFoam" in log_tails),
+        # Any solver's log: foamRun on openfoam.org 11+.
+        "log_simpleFoam_present": any(k in log_tails for k in ("log.simpleFoam", "log.foamRun")),
         "log_tails": log_tails,
         "case_dir_listing": _list_dir_compact(case_dir),
         "controldict_endtime": cd_endtime,

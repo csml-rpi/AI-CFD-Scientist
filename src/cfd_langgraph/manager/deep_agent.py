@@ -78,6 +78,11 @@ Sequence for a standard study:
    human approval before it executes — a person may approve it as-is, edit which
    candidate_ids are approved, or reject it and send you back to step 2/3 with feedback.
    Wait for that decision; do not try to work around it.
+   If the flow needs physics the installed OpenFOAM does not ship (water waves, melt
+   pools, solid mechanics or fluid-structure interaction, turbines, ...), call
+   `shelf_solvers` with the research topic. Use a third-party solver only if it reports
+   `usable: true`; one that matches but is not built can be built and validated with
+   `shelf_install`. A requirement that uses one names it.
 5. Call `generate_case_requirements` — turns every approved hypothesis's experiments
    into validated FoamAgent requirements (requirements.json). Use each requirement's
    `study_id` as its `physics_group` for the steps below, unless you have a reason to
@@ -199,11 +204,16 @@ selected case and cannot invent a separate baseline requirement:
      DEEPEN line says either that the last step improved (continue) or that the attempts
      since then did not beat it (try a different single change from the same parent).
      Follow the line you were given rather than a general rule.
-  c. Launch every returned candidate as a `task` call with subagent_type="oed-candidate-runner"
-     — a single message with one task call per candidate, concurrently, same as launching
-     cases in step 7. Give each one its full candidate spec from step b, including its
-     `strategy` — that is what fences its build agent's clock against other candidates of
-     the same kind rather than against the fastest strategy in the study.
+  c. Launch the returned candidates with `oed_launch_candidates(task_descriptions)`, one
+     description per candidate, each the full task for the oed-candidate-runner: its
+     candidate spec from step b, including its `strategy` — that is what fences its build
+     agent's clock against other candidates of the same kind rather than against the
+     fastest strategy in the study. It returns at once; each candidate is built and scored
+     by the oed-candidate-runner in the background, as many at a time as `build_slots`
+     allows. Then call `oed_wait_for_candidates()`: it returns each candidate's report as
+     soon as that candidate is done, while the others keep building. Do not wait for a
+     whole round: handle each finished report (c1, c2), record it (d), and propose and
+     launch more so that about `build_slots` candidates are always in flight.
   c1. If a candidate reports that its build agent did NOT finish cleanly, it hands you an
      `unclean_finish_diagnosis`. Act on that before anything else, because this failure
      mode does not produce a null score — it produces a plausible one. A build agent
@@ -239,14 +249,14 @@ selected case and cannot invent a separate baseline requirement:
      - If `may_repair` is true, carry out `repair_steps` with your file and shell tools,
        then call `oed_note_repair_attempt(candidate_dir, what_was_changed)` BEFORE
        re-running anything, so the attempt is counted even if the re-run dies. Then send
-       the candidate back to `oed-candidate-runner` to re-run
-       `oed_run_evaluation_cases` and `oed_score_candidate`.
+       the candidate back to the oed-candidate-runner (`oed_launch_candidates` with a task
+       to re-run `oed_run_evaluation_cases` and `oed_score_candidate` on it).
      - Two attempts per candidate, no more. `repair_attempts_remaining` tells you what is
        left. When it hits zero, or the verdict says not repairable, record the null score
        with its cause and spend the budget on a different mechanism instead — grinding a
        broken closure costs a new one its chance.
-  d. Once all of that round's candidates report back, call `oed_record_candidate_results`
-     with the list of candidate_dir paths they used (each subagent's own
+  d. As candidates report back from `oed_wait_for_candidates`, call
+     `oed_record_candidate_results` with the candidate_dir paths of the finished ones (each subagent's own
      oed_score_candidate call already wrote the real result to disk — you're just telling
      this tool where to find them, not re-typing scores). It returns budget_used,
      proceed_count, is_saturated, and the updated archive summary.
@@ -254,8 +264,7 @@ selected case and cannot invent a separate baseline requirement:
      Scoring always goes through the oed-candidate-runner. If a candidate has no score on
      disk — it is listed in `missing_candidate_records`, or a restart interrupted it — call
      `oed_candidate_status(candidate_dir)` and follow its next_step: a build that finished is
-     scored by launching the oed-candidate-runner with a task to score that existing
-     candidate_dir. Never re-propose it under the same variant_name to get it scored; an
+     scored by `oed_launch_candidates` with a task to score that existing candidate_dir. Never re-propose it under the same variant_name to get it scored; an
      existing variant_name is never rebuilt.
 
      Each candidate record carries a `run_window`: the start and end time the case was
@@ -332,11 +341,11 @@ _TOOLS_NOT_FOR_MODE = {
     "implementation": {
         "propose_and_rank_hypotheses", "advance_with_approved_hypotheses",
         "generate_case_requirements", "run_mesh_gate", "interpret_case", "analyze_all_cases",
-        "write_paper", "task",
+        "write_paper", "task", "shelf_solvers", "shelf_install",
     },
     "surrogate": _IMPL_TOOLS | {
         "generate_case_requirements", "run_mesh_gate", "oed_prepare_baseline",
-        "interpret_case", "analyze_all_cases", "write_paper",
+        "interpret_case", "analyze_all_cases", "write_paper", "shelf_solvers", "shelf_install",
     },
     "solver": set(_IMPL_TOOLS),
 }
@@ -443,6 +452,19 @@ def build_manager(
     oed_candidate_runner = build_oed_candidate_runner_subagent(
         oed_candidate_tools, oed_candidate_model, out_dir
     )
+    # Candidates run in the background through the same runner and are
+    # collected as they finish (see background.py). The runner then leaves the
+    # `task` list, so a round can no longer be fanned out as one blocking
+    # message whose results all wait for its slowest candidate.
+    background_tools = []
+    if isinstance(oed_candidate_runner, dict) and "runnable" in oed_candidate_runner:
+        from .background import build_background_candidate_tools
+        from .tools import _with_progress
+
+        background_tools = [_with_progress(f) for f in build_background_candidate_tools(
+            oed_candidate_runner, out_dir, built.get("coordinator"))]
+    general_purpose_tools = manager_tools
+    manager_tools = manager_tools + background_tools
 
     stack = contextlib.ExitStack()
     checkpointer: Any
@@ -468,9 +490,9 @@ def build_manager(
         tools=manager_tools,
         system_prompt=_build_manager_system_prompt(out_dir),
         subagents=[
-            case_runner, oed_candidate_runner,
+            case_runner, *([] if background_tools else [oed_candidate_runner]),
             build_general_purpose_subagent(
-                manager_tools,
+                general_purpose_tools,
                 create_langchain_llm(model=settings.model, temperature=0.0, agent="general-purpose"),
             ),
         ],

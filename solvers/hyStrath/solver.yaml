@@ -1,0 +1,60 @@
+name: hyStrath
+summary: >
+  Hypersonic and rarefied gas dynamics for atmospheric entry: hy2Foam, a
+  two-temperature (thermochemical non-equilibrium) reacting CFD solver with
+  MHD; dsmcFoam+, direct simulation Monte Carlo for rarefied flow; pdFoam,
+  hybrid particle-in-cell DSMC for plasmas.
+domains: [hypersonic, hypersonics, rarefied, rarefied gas, dsmc, direct simulation monte carlo,
+          atmospheric entry, reentry, re-entry, thermochemical non-equilibrium, nonequilibrium,
+          two-temperature, high-enthalpy, knudsen, plasma, particle-in-cell, mhd]
+repo: https://github.com/hystrath/hyStrath
+license: GPL-3.0
+runtime:
+  # hyStrath exists for OpenFOAM v1706 only (no port to a later version
+  # anywhere), so it brings its own: one build serves every installed
+  # version, and the installed OpenFOAM is never used by it.
+  kind: own_openfoam
+  openfoam: OpenFOAM-v1706
+  # A case whose controlDict names one of these programs runs every command
+  # inside the wrapper; `before` runs after meshing, before the solve.
+  # function_objects false: the framework adds no function objects to the
+  # case. Measured 2026-10-11: with the fieldAverage the mesh gate adds,
+  # hy2Foam finishes its run and then aborts at exit (malloc corruption, exit
+  # code 134); without it, it exits 0. In dsmcFoam+ and pdFoam runs the
+  # function-object libraries bring OpenFOAM's own liblagrangian, whose
+  # classes hyStrath's liblagrangian+ redefines (a double free at exit).
+  # log_end: the line a finished run's log ends with, when not "End".
+  wrapper: hystrath-run
+  programs:
+    hy2Foam: {function_objects: false}
+    hy2DyMFoam: {function_objects: false}
+    dsmcFoam+: {before: [dsmcInitialise+], function_objects: false, log_end: End main}
+    pdFoam: {before: [pdInitialise], function_objects: false}
+builds:
+  - fork: any
+    versions: [any]
+    key: own_openfoam-v1706
+    ref: 984e3000a5f8d2e47cee555ec466d58ea9a6315d
+    build: bash "$SHELF_RECIPE_DIR/build.sh"
+provides:
+  applications: [hystrath-run]
+  start:
+    hystrath-run: >-
+      hystrath-run bash -c "dsmcFoam+ -help > /dev/null && hy2Foam -help > /dev/null
+      && pdFoam -help > /dev/null && dsmcInitialise+ -help > /dev/null && echo ok"
+  libraries: []
+usage: >
+  Cases are OpenFOAM v1706 cases written from hyStrath's own tutorials
+  (run/hyStrath/<solver>/), not from the installed version's. The case's
+  controlDict names its program as the application (hy2Foam, dsmcFoam+,
+  pdFoam); every command of such a case then runs inside the wrapper
+  hystrath-run, which loads OpenFOAM v1706 with hyStrath in place of the
+  installed OpenFOAM, so its Allrun calls programs by name (blockMesh,
+  dsmcInitialise+, dsmcFoam+). By hand, run a command as
+  `hystrath-run <command>`. In dsmcFoam+ and pdFoam runs, load no
+  OpenFOAM library that brings OpenFOAM's own lagrangian library with it --
+  the probes function object (libsampling) does: hyStrath's liblagrangian+
+  redefines the same particle classes, and the two together end the run in
+  a double free after the results are written. Read DSMC results from the
+  fields it writes, or with hyStrath's own field measurements.
+tutorials: run/hyStrath

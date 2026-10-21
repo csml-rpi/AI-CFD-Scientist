@@ -1,0 +1,33 @@
+name: olaFlow
+summary: >
+  Two-phase (VoF) free-surface solver with wave generation and active wave
+  absorption at the boundaries, for coastal and offshore engineering: wave
+  flumes and basins, wave-structure interaction, porous breakwaters.
+domains: [waves, wave flume, wave basin, coastal engineering, offshore, breakwater,
+          porous structure, wave-structure interaction, free surface, sloshing]
+repo: https://github.com/phicau/olaFlow
+license: GPL-3.0
+builds:
+  # allMake picks the solver folder for the sourced version itself
+  # (solvers/olaFlowOF_org_latest for openfoam.org 10+, olaFlowOFv_com_latest
+  # for openfoam.com v2212+). Each binary goes to $FOAM_USER_APPBIN/LIBBIN.
+  - fork: openfoam.org
+    versions: ["10"]
+    ref: 9879096092a4fc13419a40bbe11c4bd1b87ddd1d
+    # build.sh: olaFlow's own copies of two stock OpenFOAM libraries are built
+    # under names of their own instead of overwriting the installation's.
+    build: bash "$SHELF_RECIPE_DIR/build.sh"
+  - fork: openfoam.com
+    versions: [v2212, v2306, v2312, v2406, v2412, v2506]
+    ref: 9879096092a4fc13419a40bbe11c4bd1b87ddd1d
+    build: bash "$SHELF_RECIPE_DIR/build.sh"
+provides:
+  applications: [olaFlow, setOla]
+  libraries: [libwaveGeneration, libwaveAbsorption, libolaFlow_incompressibleInterPhaseTransportModel, libolaFlow_VoFTurbulenceDamping]
+usage: >
+  Run the olaFlow application. Wave conditions are in constant/waveDict
+  (waveType, waveTheory, waveHeight, wavePeriod, ...); the generating and
+  absorbing patches use the olaFlow boundary conditions from
+  libwaveGeneration / libwaveAbsorption, loaded through controlDict libs. A
+  case that loads VoFTurbulenceDamping from olaFlow names libolaFlow_VoFTurbulenceDamping.so.
+tutorials: tutorials

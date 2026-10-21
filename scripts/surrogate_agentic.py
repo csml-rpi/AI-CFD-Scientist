@@ -302,7 +302,7 @@ def build_surrogate_prompt(
         )
     parts.append(
         "# Finish\n"
-        "When train.sh and predict.sh are in place and every seed is trained, call the done "
+        "When train.sh and predict.sh are in place and the seeds listed above are trained, call the done "
         "tool with a one-line summary, the seeds you trained, and your own validation score "
         "if you measured one (prediction_files may be empty). The framework runs predict.sh "
         "and scores what it writes; the score you report is informational.\n"
@@ -331,11 +331,55 @@ def validation_spec(run_dir: Optional[Path]) -> Dict[str, Any]:
     return {}
 
 
+def _gpu_use() -> Dict[str, str]:
+    """{nvidia-smi index: utilisation %} now, or {} when it cannot be read."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-gpu=index,utilization.gpu", "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return {}
+    pairs = [line.split(",") for line in out.splitlines()]
+    return {p[0].strip(): p[1].strip() for p in pairs if len(p) == 2}
+
+
+def _gpu_block(gpus: Dict[str, Tuple[float, float]], parallel_seeds: bool) -> str:
+    """What the build agent is told about the GPUs: every one it may use, how
+    free and how busy each is, and to spread its training over all of them.
+    Builds used to train on the first GPU only: six of eight concurrent
+    AirfRANS builds shared GPU 0 while GPUs 1 and 2 sat idle
+    (airfrans_codex_20261009, 2026-10-16)."""
+    if not gpus:
+        return ""
+    use = _gpu_use()
+    listing = "; ".join(f"GPU {k}: {(t - u) / 1024:.0f} GB free of {t / 1024:.0f} GB"
+                        + (f", {use[k]} % busy" if k in use else "")
+                        for k, (t, u) in sorted(gpus.items()))
+    if len(gpus) == 1:
+        return ("   Train them at the same time (start each train.sh in the background and wait for\n"
+                f"   all) when they fit on the GPU: {listing}.\n" if parallel_seeds else "")
+    default = (os.environ.get("CUDA_VISIBLE_DEVICES") or "").split(",")[0].strip()
+    return (
+        f"   GPUs you may use, shared with the study's other builds (now: {listing}).\n"
+        "   Use all of them, not just one: run independent trainings (seeds, trials) at the same\n"
+        "   time, each on its own GPU, by starting each with\n"
+        "   CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=<GPU number above>. Check nvidia-smi\n"
+        "   before each launch and put the run on the GPU with the most free memory and least use.\n"
+        + (f"   A run started without CUDA_VISIBLE_DEVICES goes to GPU {default}.\n" if default else "")
+    )
+
+
 def _pipeline_block(run_dir: Path, model_dir: Path, spec: Dict[str, Any]) -> str:
+    from cfd_langgraph import pipeline_contract
+
     pipe = run_dir / "pipeline"
     sets = ", ".join(str(s["name"]) for s in spec["sets"])
     files = "; ".join(f"{s['name']}: " + ", ".join(s["files"]) for s in spec["sets"])
-    seeds = ", ".join(str(k) for k in spec["seeds"])
+    screen = pipeline_contract.screen_seeds(spec)
+    seeds = ", ".join(str(k) for k in screen)
+    rest = [k for k in spec["seeds"] if int(k) not in screen]
+    gpus = pipeline_contract.visible_gpu_memory()
     timing = spec.get("timing")
     return (
         "# What you must produce\n"
@@ -355,11 +399,16 @@ def _pipeline_block(run_dir: Path, model_dir: Path, spec: Dict[str, Any]) -> str
         "   read data only from the starter folder, and never reuse predictions or arrays an\n"
         "   earlier run left behind. train.sh must not read the evaluation sets at all: when the\n"
         "   framework re-runs it, their files are hidden.\n"
-        f"3. Every seed ({seeds}) trained with your train.sh, each into\n"
-        f"   {pipe}/models/seed<SEED>/. Run predict.sh on one of them yourself to check it.\n"
+        f"3. Seeds {seeds} trained with your train.sh, each into {pipe}/models/seed<SEED>/.\n"
+        + _gpu_block(gpus, len(screen) > 1)
+        + "   Run predict.sh on one of them yourself to check it.\n"
         "   The framework scores this candidate by running predict.sh on those models for every\n"
         "   seed and set; prediction files you write yourself are not scored. Seeds whose\n"
         "   predictions are copies, or near-copies, of each other are rejected.\n"
+        + (f"   These are the screening seeds. If this candidate's score on them comes near the best\n"
+           f"   candidate's, the framework trains the other seeds ({', '.join(str(k) for k in rest)})\n"
+           "   itself with your train.sh and scores it on all of them, so train.sh must work for\n"
+           "   any seed number. Do not train those seeds yourself.\n" if rest else "")
     )
 
 
@@ -513,9 +562,13 @@ def run(
     if vspec:
         # Scored on the scripts and trained seeds it leaves, not on files it
         # wrote itself (cfd_langgraph.pipeline_contract).
-        from cfd_langgraph.pipeline_contract import missing_parts
+        from cfd_langgraph.pipeline_contract import missing_parts, screen_seeds, with_seeds
 
-        pipeline_missing = missing_parts(run_dir, vspec)
+        # The screening seeds only: the framework trains the others itself.
+        # Checked against every seed, each candidate that did as it was told
+        # was recorded FAILED, extended twice to train seeds it was told not
+        # to, and abandoned (airfrans_codex_20261009, ten candidates).
+        pipeline_missing = missing_parts(run_dir, with_seeds(vspec, screen_seeds(vspec)))
         produced = not pipeline_missing
     final_payload = loop.get("final_payload") or {}
     declared, has_declared = declared_submission_files(final_payload, run_dir)

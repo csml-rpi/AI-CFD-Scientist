@@ -195,6 +195,11 @@ def _handle_interrupt(
         # Still printed, because "which hypotheses became experiments" is a
         # fact about the study that has to be visible somewhere.
         print("\n-- hypothesis gate: auto-approving --")
+        # The approval tool records who approved: without this it wrote
+        # "human_review: approved" for every auto-approval, and a manager's
+        # own amendment, noted as "human-requested", stood in the record as a
+        # human decision (shelf_demo_dafoam_20261019_1057, 2026-10-20).
+        os.environ["CFD_SCIENTIST_HYPOTHESES_AUTO_APPROVED"] = "1"
         _describe_hypotheses(out_dir)
         for action in all_actions:
             if action.get("name") == _HYPOTHESIS_GATE_TOOL:
@@ -430,6 +435,13 @@ def _setup_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
     # its own status file's call (see _implementation_incomplete).
     if _study_mode_of(out_dir) == "implementation":
         return None
+    # Nor does a prescribed study: its setup ends when its cases are planned,
+    # and search_config.json is never written. Read as a search, every stop
+    # it ever made was "setup unfinished": the push sent a DAFoam study that
+    # had written its paper and reported its verdict back to work, ten times
+    # in four days (shelf_demo_dafoam_20261015_1318).
+    if _prescribed(out_dir) and (out_dir / "requirements.json").is_file():
+        return None
     disc = out_dir / "open_ended_discovery"
     if (disc / "search_config.json").is_file():
         return None
@@ -441,6 +453,15 @@ def _setup_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
     if not isinstance(state, dict) or state.get("status") != "running":
         return None
     return {"stage": state.get("current_stage") or "setup"}
+
+
+def _prescribed(out_dir: Path) -> bool:
+    """Whether the brief fixes the study's cases (prescribed_study.json), so it has no search."""
+    try:
+        doc = json.loads((out_dir / "prescribed_study.json").read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(doc, dict) and doc.get("prescribed") is True
 
 
 def _study_mode_of(out_dir: Path) -> str:
@@ -1086,6 +1107,17 @@ def main(argv: Optional[List[str]] = None) -> None:
     _install_sigint_handler()
     parser = build_parser()
     args = parser.parse_args(argv)
+    # A study never starts another study. Every process a study launches
+    # inherits this marker, so a script the manager runs cannot start the CLI:
+    # on shelf_demo_olaflow_20261010_1356 the manager, its own plan having gone
+    # wrong, scripted `cfd_cli.py run` into a sub-folder through run_python and
+    # had a second, nested study spending alongside the first.
+    inside = os.environ.get("CFD_SCIENTIST_INSIDE_STUDY", "").strip()
+    if inside:
+        print(f"refused: this process was started by the study in {inside}; a study may not "
+              "start or resume another study.", file=sys.stderr)
+        raise SystemExit(2)
+    os.environ["CFD_SCIENTIST_INSIDE_STUDY"] = str(getattr(args, "out_dir", "") or "a running study")
     # Opt back in to the human checkpoint. Set before the graph runs, since the
     # gate is consulted from inside the interrupt handler.
     global AUTO_APPROVE_HYPOTHESES

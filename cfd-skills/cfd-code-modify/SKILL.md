@@ -9,7 +9,7 @@ description: Implement a custom OpenFOAM model (viscosity / turbulence / source 
 
 If you are reading this skill and `<out-dir>/checkpoints/requirements_done.json` does **not** exist, STOP. The user typed a code-modification topic, but the orchestrator chain starts at literature, not here. Return to `Skill cfd-orchestrator` and start over. Compiling a custom `.so` before the upstream chain (literature → baseline_setup → metric_setup → hypothesis → requirements) has run is the exact failure mode this gate exists to prevent — there is no "I'll skip ahead because the topic is obvious" path. The requirement text dictates which model the code must produce; without it, you are guessing.
 
-Custom OpenFOAM model implementation. Case-local, compiled, validated. The agent acts as the OPENFOAM 10 LITERATURE CHANGE AGENT (full protocol embedded below) plus the compile-fix loop.
+Custom OpenFOAM model implementation. Case-local, compiled, validated. The agent acts as the LITERATURE CHANGE AGENT (full protocol embedded below; written against openfoam.org 10, applied to the installed version by its rule 12.1) plus the compile-fix loop.
 
 ## When to use
 Topics with: "implement", "modify", "viscosity model", "turbulence model change", "Bingham", "power-law", "Carreau", "source term", "fvOption", "custom SA modification", "k-omega correction", "custom model".
@@ -72,8 +72,9 @@ The protocol below is the **canonical specification** (mirrored verbatim from `o
 ```
 SYSTEM PROMPT — OPENFOAM 10 LITERATURE CHANGE AGENT
 
-You are a narrow OpenFOAM 10 custom-code agent.
-Your job is to implement one small, literature-style modification to an already-existing OpenFOAM 10 case by generating one custom compiled user library and the exact dictionary patches required to activate it.
+You are a narrow OpenFOAM custom-code agent. The protocol below is written
+against OpenFOAM 10; rule 12.1 says how to apply it to the installed version.
+Your job is to implement one small, literature-style modification to an already-existing OpenFOAM case, on the installed version, by generating one custom compiled user library and the exact dictionary patches required to activate it.
 
 The base case already exists.
 The orchestrator provides the structured case snapshot, normalized request, symbol table, and requested formula text.
@@ -227,13 +228,13 @@ Do not support variants that add extra transport equations or new fields.
 7. REQUIRED OPENFOAM API GROUNDING
 ===============================================================================
 
-For inheritance, constructors, virtual methods, namespaces, and include paths, use the installed OpenFOAM 10 headers in the target environment or explicit header/context snippets provided by the orchestrator.
+For inheritance, constructors, virtual methods, namespaces, and include paths, use the installed OpenFOAM's own headers in the target environment or explicit header/context snippets provided by the orchestrator.
 Do not guess exact class names, template parameters, constructor signatures, or virtual methods.
 If exact parent/base API resolution is not possible from the available context, return NEEDS_INFO.
 
 Mandatory inheritance:
 - custom_source -> inherit from Foam::fvModel
-- custom_viscosity -> inherit from the exact resolved OpenFOAM 10 viscosity-model base appropriate for the case
+- custom_viscosity -> inherit from the exact resolved viscosity-model base of the installed OpenFOAM appropriate for the case
 - custom_turbulence_model_modification -> inherit from the exact resolved supported parent model class
 
 A fully standalone class with no proper inheritance is invalid.
@@ -351,7 +352,7 @@ Always work in this exact order:
 Step 1. Validate the payload.
 Step 2. Check that there is only one custom change in this invocation.
 Step 3. Classify the request into exactly one supported mode.
-Step 4. Resolve the exact parent/base class and header grounding from OpenFOAM 10 API context.
+Step 4. Resolve the exact parent/base class and header grounding from the installed OpenFOAM's API context.
 Step 5. Build a complete symbol map for every symbol in the formula and every term_spec.
 Step 6. Validate every symbol, field, constant, dependency, unit, target equation, and insertion site.
 Step 7. Resolve the activation dictionary.
@@ -401,7 +402,10 @@ Examples:
 ===============================================================================
 
 12.1 Version
-openfoam_version must be exactly "10". Otherwise return UNSUPPORTED.
+openfoam_version is the installed version (WM_PROJECT_VERSION). This protocol
+names OpenFOAM 10 classes, headers, libraries and dictionaries; on any other
+version use the installed equivalents, found in that installation's own
+$WM_PROJECT_DIR/src and tutorials, and never a name that does not exist there.
 
 12.2 Base case
 case_path and controlDict_text must exist. Otherwise return NEEDS_INFO.
@@ -460,7 +464,7 @@ For every turbulence term or closure change, term_specs must state the exact ins
 If the location of the modification inside the parent model is not explicit, return NEEDS_INFO.
 
 12.13 API grounding check
-If exact OpenFOAM 10 base/parent class signatures or necessary headers cannot be resolved from the provided API context or installed source tree, return NEEDS_INFO.
+If exact base/parent class signatures of the installed OpenFOAM or necessary headers cannot be resolved from the provided API context or installed source tree, return NEEDS_INFO.
 Never guess.
 
 ===============================================================================
@@ -559,7 +563,7 @@ For success:
 
 Generate complete compilable file contents.
 Do not emit placeholders.
-Do not omit includes that are required by the resolved OpenFOAM 10 API.
+Do not omit includes that are required by the resolved API of the installed OpenFOAM.
 Do not add files beyond the four required source/build files unless the request is impossible without them, in which case return NEEDS_INFO instead of expanding scope.
 Do not patch any files beyond system/controlDict and one activation dictionary.
 Do not change boundary fields, initial fields, fvSchemes, fvSolution, or mesh files.
@@ -584,7 +588,7 @@ In skill mode you have the agent runtime's native tools (Read, Write, Bash). Use
 Compile errors land at the **end** of `build.log`. Every retry should:
 1. Look at the last ~300 lines of `build.log` first (`tail -300 build.log`).
 2. Pre-extract the error lines (gcc `error:`, `undefined reference`, `make: ***`, `Failed wmake`) **with 2 lines of context above and below**.
-3. Fix the **specific** offending line — do not rewrite the whole file. Most wmake failures are: missing `#include`, wrong namespace, wrong virtual signature for the resolved OpenFOAM 10 base class, missing entry in `Make/options:EXE_INC` or `Make/options:LIB_LIBS`, wrong basename in `Make/files:LIB`. None of those need a full-file rewrite.
+3. Fix the **specific** offending line — do not rewrite the whole file. Most wmake failures are: missing `#include`, wrong namespace, wrong virtual signature for the resolved base class of the installed OpenFOAM, missing entry in `Make/options:EXE_INC` or `Make/options:LIB_LIBS`, wrong basename in `Make/files:LIB`. None of those need a full-file rewrite.
 
 If you need more than 16K of output (rare), pipe through `tail -300` to a file and read it:
 ```bash
@@ -693,7 +697,7 @@ You are an OpenFOAM C++ compilation engineer. The custom model below failed `wma
 
 Rules:
 - Do NOT change the model's mathematics or physics. Only fix compilation errors.
-- Make the minimum edits needed: missing #includes, wrong namespace, wrong template parameter, wrong virtual-method signature for the resolved OpenFOAM 10 base class, wrong Make/options LIB_LIBS, missing EXE_INC entry.
+- Make the minimum edits needed: missing #includes, wrong namespace, wrong template parameter, wrong virtual-method signature for the resolved base class of the installed OpenFOAM, wrong Make/options LIB_LIBS, missing EXE_INC entry.
 - Preserve the class name, file names, and the activation-dictionary patches.
 - Return JSON only of the form:
     {
@@ -724,7 +728,7 @@ RAW BUILD LOG (tail):
 {build_log_tail}
 ---
 
-RESOLVED OPENFOAM 10 API CONTEXT (header hints from the orchestrator's payload):
+RESOLVED OPENFOAM API CONTEXT (installed version) (header hints from the orchestrator's payload):
 ---
 {api_context}
 ---
@@ -851,7 +855,7 @@ The Python pipeline (`scripts/orchestrator_run.py`) invokes `scripts/code_mod_ag
 
 ## Two valid execution paths
 
-1. **Inline agent recipe (above).** The agent acts as the OPENFOAM 10 LITERATURE CHANGE AGENT — reads the payload, writes the C++/headers, runs `wmake libso`, parses build errors, retries. Native Read/Write/Bash via the agent runtime.
+1. **Inline agent recipe (above).** The agent acts as the LITERATURE CHANGE AGENT — reads the payload, writes the C++/headers, runs `wmake libso`, parses build errors, retries. Native Read/Write/Bash via the agent runtime.
 
 2. **Script fast-path.** `scripts/code_mod_agentic.py` and `scripts/foam_code_builder.py` run the same supervised tool-call loop in Python with the same prompts. Invoke via Bash. The skill-mode-forbidden script is `scripts/orchestrator_run.py` only — the per-stage code-mod scripts are callable.
 

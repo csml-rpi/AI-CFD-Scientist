@@ -41,6 +41,22 @@ def extract_pdflatex_errors(log_content: str, max_errors: int = 5) -> str:
     return "PRIMARY ERRORS (fix these first):\n\n" + "\n\n---\n\n".join(errors)
 
 
+def _tex_search_env(paper_dir: Path) -> dict:
+    """pdflatex's environment with the paper's folder and the run folder
+    above it on its input search path, so a figure named relative to either
+    is found wherever pdflatex runs from. The paper pipeline names its figures
+    paper_figs/<name> (relative to the run folder) and compiles from the
+    repository; every figure was missing and the reviewer scored the paper 0
+    (shelf_demo_olaflow_20261011_1242)."""
+    import os
+
+    env = dict(os.environ)
+    dirs = [str(Path(paper_dir).resolve()), str(Path(paper_dir).resolve().parent)]
+    # Leading "." keeps the working folder first; the trailing ":" keeps TeX's defaults.
+    env["TEXINPUTS"] = ".:" + ":".join(dirs) + ":" + env.get("TEXINPUTS", "")
+    return env
+
+
 def compile_tex_to_pdf(
     tex_path: Path,
     work_dir: Path | None = None,
@@ -85,12 +101,17 @@ def compile_tex_to_pdf(
 
     err_parts: list[str] = []
     for _ in range(runs):
+        # pdflatex echoes the source's bytes in its own encoding: a curly
+        # apostrophe came back as 0xed, and decoding strictly ended a 52-min
+        # paper run (shelf_demo_olaflow_20261011_1242).
         proc = subprocess.run(
             cmd,
             cwd=cwd,
             capture_output=True,
             text=True,
+            errors="replace",
             timeout=600,
+            env=_tex_search_env(out_dir),
         )
         if proc.returncode != 0:
             # pdflatex usually puts error details in stdout (log); include both for reviewer

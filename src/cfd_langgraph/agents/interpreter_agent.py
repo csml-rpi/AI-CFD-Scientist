@@ -34,7 +34,25 @@ from cfd_langgraph.utils import extract_json_object, strip_json_fences
 from cfd_langgraph.viz_creator import viz_creator
 from cfd_langgraph.llm.reply import reply_text
 
-VIZ_MAX_RETRIES = 10
+# Each figure-script rewrite is a 15-25k-token reply of ~5 min; ten of them
+# filled the interpreter's hour (shelf_demo_olaflow_20261011_1242). The
+# figures only serve the decision, so four tries are enough.
+VIZ_MAX_RETRIES = int(__import__("os").environ.get("CFD_SCIENTIST_INTERPRET_VIZ_RETRIES") or 4)
+
+
+def _viz_deadline() -> Optional[float]:
+    """When figure attempts must stop: CFD_SCIENTIST_INTERPRET_BUDGET_S after
+    this process started, less ten minutes for the interpretation itself."""
+    import os
+
+    try:
+        budget = float(os.environ.get("CFD_SCIENTIST_INTERPRET_BUDGET_S") or 0)
+    except ValueError:
+        budget = 0.0
+    return _STARTED + budget - 600 if budget > 600 else None
+
+
+_STARTED = time.monotonic()
 
 
 def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
@@ -583,6 +601,7 @@ class ResultsInterpreterAgent:
             reference_viz_script=None,
             max_retries=VIZ_MAX_RETRIES,
             strict_quality=False,
+            deadline=_viz_deadline(),
         )
 
         image_paths: List[Path] = [Path(p) for p in viz_result.get("images", [])]
@@ -692,8 +711,22 @@ class ResultsInterpreterAgent:
         output_dir = self._extract_output_dir(experiment_result)
         if output_dir is None:
             return {"output_dir": None, "files": [], "tail_text": ""}
+        # The case's own application first: an olaFlow case logs to
+        # log.olaFlow, which neither the list below nor the "foam"-in-the-name
+        # fallback finds, so every finished case read as "no solver log" and
+        # was sent back to run again (shelf_demo_olaflow_20261011_1242).
+        application = ""
+        try:
+            for line in (output_dir / "system" / "controlDict").read_text(errors="ignore").splitlines():
+                words = line.replace(";", " ").split()
+                if len(words) >= 2 and words[0] == "application":
+                    application = words[1]
+                    break
+        except OSError:
+            pass
         preferred = [
-            "log.icoFoam", "log.pisoFoam", "log.pimpleFoam",
+            *([f"log.{application}"] if application else []),
+            "log.foamRun", "log.icoFoam", "log.pisoFoam", "log.pimpleFoam",
             "log.simpleFoam", "log.rhoPimpleFoam", "log.rhoSimpleFoam",
         ]
         files: List[Path] = []

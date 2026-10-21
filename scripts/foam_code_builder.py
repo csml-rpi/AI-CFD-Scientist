@@ -9,6 +9,24 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 
+
+def _version_profile() -> dict:
+    _src = str(Path(__file__).resolve().parents[1] / "src")
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+    from cfd_langgraph.openfoam_version import get_profile
+
+    return get_profile()
+
+
+def _version_label() -> str:
+    return _version_profile().get("label") or "OpenFOAM"
+
+
+def _role(role: str) -> str:
+    return (_version_profile().get("files") or {}).get(role, role)
+
+
 def bootstrap_paths() -> None:
     root = Path(__file__).resolve().parent.parent
     foam_src = root / "Foam-Agent" / "src"
@@ -84,11 +102,12 @@ def _llm_suggest_activation_dictionary_path(
         return ""
 
     sys_prompt = (
-        "You help wire OpenFOAM 10 case-local shared libraries (loaded via system/controlDict libs).\n"
+        f"You help wire {_version_label()} case-local shared libraries (loaded via system/controlDict libs).\n"
         "Return STRICT JSON only, no markdown: {\"path\": \"<exact match from list>\"} or {\"path\": null}\n"
         "Choose the single dictionary file (relative path) where this kind of change is normally activated.\n"
-        "Examples: constant/momentumTransport (transport/viscosity), constant/fvModels (sources), "
-        "constant/turbulenceProperties (RAS/LES), system/fvSchemes (numerics/flux), constant/boundary conditions live under 0/ not here.\n"
+        f"This installation's dictionaries: turbulence and generalised-Newtonian viscosity -> "
+        f"constant/{_role('turbulence')}, transport -> constant/{_role('transport')}, sources -> "
+        f"{_role('sources')}, numerics/flux -> system/fvSchemes; boundary conditions live under 0/, not here.\n"
         "If no path clearly fits, return null."
     )
     user_payload = {
@@ -148,15 +167,9 @@ def validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]],
             mode_candidate=diagnostics_mode,
             parent_model_candidate=diagnostics_parent,
         )
+    # Any installed version: the payload names the one it was prepared for,
+    # and the sources and dictionaries it carries were read from it.
     openfoam_version = str(ov)
-    if openfoam_version != "10":
-        return None, fail(
-            "UNSUPPORTED",
-            "Only OpenFOAM 10 payloads are supported",
-            ["openfoam_version must be exactly \"10\""],
-            mode_candidate=diagnostics_mode,
-            parent_model_candidate=diagnostics_parent,
-        )
 
     if not case_path or not isinstance(case_path, str):
         return None, fail(
@@ -315,7 +328,7 @@ def validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]],
         if parent not in valid_parents:
             return None, fail(
                 "UNSUPPORTED",
-                "parent_model_hint is not in the supported OpenFOAM 10 parent model list",
+                "parent_model_hint is not in the supported parent model list",
                 ["request.parent_model_hint"],
                 mode_candidate=mode,
                 parent_model_candidate=parent,
@@ -467,7 +480,7 @@ def validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]],
         if mode == "custom_viscosity":
             act_desc = (
                 f"In {act_rel}: laminar generalisedNewtonian with viscosityModel {class_name}; "
-                f"put {class_name}Coeffs inside the laminar{{}} block (OpenFOAM 10); "
+                f"put {class_name}Coeffs where this OpenFOAM reads the viscosity model's coefficients; "
                 "coefficient keywords must match the C++ read()."
             )
         elif mode == "custom_turbulence_model_modification":
@@ -476,7 +489,7 @@ def validate_payload(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]],
                 f"(replacing parent {parent}); preserve sub-dictionaries the C++ expects."
             )
         elif mode == "custom_source":
-            act_desc = f"In {act_rel}: add an fvModel entry activating {class_name} per OpenFOAM 10."
+            act_desc = f"In {act_rel}: add a source-term entry activating {class_name} in this OpenFOAM's syntax."
         else:
             act_desc = f"In {act_rel}: wire {class_name} per OpenFOAM rules for this change type."
         dict_patches.append({"path": act_rel, "description": act_desc})

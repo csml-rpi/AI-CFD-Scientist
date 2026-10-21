@@ -32,13 +32,30 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple, Type
 import requests
 from pydantic import BaseModel
 
-# Raised when the connection gives up, not when the request was wrong. A
-# high-effort turn streams for many minutes, which is ample time for anything
-# between here and the backend to drop it.
+try:
+    from langchain_core.exceptions import ContextOverflowError
+except ImportError:  # pragma: no cover - older langchain_core
+    class ContextOverflowError(Exception):  # type: ignore[no-redef]
+        pass
+
+
+class CodexResponseFailed(RuntimeError):
+    """A streamed `response.failed`: the backend accepted the request (a bad
+    request is refused up front with an HTTP 4xx) and then could not finish
+    it. The reason seen in practice is "Our servers are currently overloaded".
+    This used to be a plain RuntimeError, outside the retry ladder, so one
+    overloaded reply ended the call at once; on 2026-10-16 that threw away a
+    63-minute DAFoam case run and stalled the study for an hour."""
+
+
+# Raised when the connection or the backend gives up, not when the request was
+# wrong. A high-effort turn streams for many minutes, which is ample time for
+# anything between here and the backend to drop it.
 _TRANSIENT_ERRORS = (
     requests.exceptions.ChunkedEncodingError,
     requests.exceptions.ConnectionError,
     requests.exceptions.Timeout,
+    CodexResponseFailed,
 )
 
 _INSTRUCTIONS_PATH = Path(__file__).with_name("codex_instructions_default.txt")
@@ -382,6 +399,43 @@ class CodexResponsesWrapper:
                     texts.append(block["text"])
         return "\n".join(texts).strip()
 
+    # Longest text one input item may carry. The backend refuses a string over
+    # 10 MB with HTTP 400, which no retry fixes: a case-loop prompt that quoted a
+    # solver log holding a 6.6 MB line was 15 MB and ended a DAFoam case run
+    # after 42 min (shelf_demo_dafoam_20261019_1057, case_002, 2026-10-21).
+    _MAX_ITEM_TEXT = 4 * 1024 * 1024
+
+    @classmethod
+    def _bounded_input(cls, items: Any) -> Any:
+        """``items`` with any text longer than _MAX_ITEM_TEXT cut in the middle,
+        saying so, and the cut reported on the console."""
+        if not isinstance(items, list):
+            return items
+
+        def cut(text: str) -> str:
+            if not isinstance(text, str) or len(text) <= cls._MAX_ITEM_TEXT:
+                return text
+            half = cls._MAX_ITEM_TEXT // 2
+            print(f"[codex] an input text of {len(text)} characters was cut to {cls._MAX_ITEM_TEXT} "
+                  f"(it began: {text[:120]!r})", flush=True)
+            return (text[:half] + f"\n... [{len(text) - 2 * half} characters left out: the text was too long "
+                    "to send] ...\n" + text[-half:])
+
+        out = []
+        for item in items:
+            if isinstance(item, dict):
+                item = dict(item)
+                for key in ("output", "text", "content"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        item[key] = cut(value)
+                    elif isinstance(value, list):
+                        item[key] = [{**part, "text": cut(part["text"])}
+                                     if isinstance(part, dict) and isinstance(part.get("text"), str) else part
+                                     for part in value]
+            out.append(item)
+        return out
+
     def _build_payload(
         self,
         messages: Any,
@@ -395,7 +449,7 @@ class CodexResponsesWrapper:
             # `items` is the tool-calling path: already-built Responses input
             # items, which can include function_call / function_call_output
             # entries that the simple role/content mapping cannot express.
-            "input": items if items is not None else self._to_responses_input(messages),
+            "input": self._bounded_input(items if items is not None else self._to_responses_input(messages)),
         }
         is_chatgpt = "chatgpt.com" in self._base_url
         if not is_chatgpt:
@@ -429,8 +483,17 @@ class CodexResponsesWrapper:
         return payload
 
     @staticmethod
-    def _iter_sse_text(resp: requests.Response) -> Iterator[str]:
+    def _iter_sse_text(resp: requests.Response, deadline: Optional[float] = None) -> Iterator[str]:
         for raw in resp.iter_lines(decode_unicode=True):
+            # The read timeout is per byte, so a stream that keeps trickling
+            # bytes without ever finishing waits forever: a study sat 22 min
+            # and more on one call after a dropped connection
+            # (shelf_demo_hystrath_20261011_1602). The whole attempt has a
+            # deadline; passed, it is a timeout, and the retry ladder takes over.
+            if deadline is not None and time.monotonic() > deadline:
+                resp.close()
+                raise requests.exceptions.ReadTimeout(
+                    "the response did not finish within the attempt's deadline")
             if not raw:
                 continue
             if isinstance(raw, bytes):
@@ -500,6 +563,13 @@ class CodexResponsesWrapper:
         for attempt in range(1, self._MAX_ATTEMPTS + 1):
             try:
                 return self._attempt(url, headers, payload)
+            except ContextOverflowError:
+                # The same input fails the same way every time: not retried.
+                # Say what made it that big, so the caller that built it can
+                # be found from the log.
+                print(f"[codex] input too large for the model's context window: "
+                      f"{self._input_breakdown(payload)}", flush=True)
+                raise
             except _TRANSIENT_ERRORS as exc:
                 last_error = exc
             except requests.HTTPError as exc:
@@ -521,11 +591,16 @@ class CodexResponsesWrapper:
                     print("[codex] token had expired; reloaded credentials from disk "
                           "and retrying.", flush=True)
                     continue
-                if status not in self._RETRYABLE_STATUS:
+                # A 401 from the backend's own login service being busy is not
+                # about the token: "authentication failed (status=503): Too
+                # many concurrent requests" ended a DAFoam case run after 88 s
+                # (shelf_demo_dafoam_20261019_1057, 2026-10-20).
+                busy = status == 401 and self._login_service_busy(exc)
+                if status not in self._RETRYABLE_STATUS and not busy:
                     raise
                 from .retry import ProviderQuotaExhausted, describe_wait, provider_quota_reset_s
 
-                reset_s = provider_quota_reset_s(exc)
+                reset_s = None if busy else provider_quota_reset_s(exc)
                 if reset_s is not None:
                     # A usage limit that resets in hours or days: the five
                     # retries below would only spend ~7 minutes proving it.
@@ -548,6 +623,45 @@ class CodexResponsesWrapper:
         raise RuntimeError(
             f"Codex request failed after {self._MAX_ATTEMPTS} attempts: {last_error!r}"
         ) from last_error
+
+    @classmethod
+    def _login_service_busy(cls, exc: requests.HTTPError) -> bool:
+        """Whether a 401's body says the login service itself answered with a
+        retryable status or "Too many concurrent requests"."""
+        try:
+            text = str(exc.response.text).lower()
+        except Exception:  # noqa: BLE001
+            return False
+        if "too many concurrent requests" in text:
+            return True
+        return any(f"(status={code})" in text for code in cls._RETRYABLE_STATUS)
+
+    @staticmethod
+    def _is_context_overflow(body: Any) -> bool:
+        """A response.failed whose reason is an input larger than the model's
+        context window ("Your input exceeds the context window of this
+        model"). Sent as response.failed like an overloaded server, but
+        retrying it only repeats the refusal: measured on 2026-10-16, six
+        attempts over seven minutes, twice, inside one DAFoam case run."""
+        error = body.get("error") if isinstance(body, dict) else None
+        if not isinstance(error, dict):
+            return False
+        if str(error.get("code") or "") == "context_length_exceeded":
+            return True
+        return "context window" in str(error.get("message") or "").lower()
+
+    @staticmethod
+    def _input_breakdown(payload: Dict[str, Any]) -> str:
+        """Total input size and its three largest items, each with the start
+        of its text, for the log line of a context-window refusal."""
+        sized = []
+        for item in payload.get("input") or []:
+            text = json.dumps(item, ensure_ascii=False)
+            sized.append((len(text), str(item.get("role") or item.get("type") or "?"), text[:160]))
+        sized.sort(reverse=True)
+        total = sum(n for n, _, _ in sized) + len(str(payload.get("instructions") or ""))
+        top = "; ".join(f"{role} {n} chars: {head!r}" for n, role, head in sized[:3])
+        return f"{len(sized)} input items, {total} chars in all; largest: {top}"
 
     def _reload_token_if_stale(self) -> str:
         """The current token, re-read from disk when the file has changed.
@@ -591,6 +705,7 @@ class CodexResponsesWrapper:
 
     def _attempt(self, url: str, headers: Dict[str, str], payload: Dict[str, Any]) -> "CodexResponsesWrapper._Resp":
         """Send once and consume the whole response. Raises on any failure."""
+        deadline = time.monotonic() + float(os.environ.get("CFD_SCIENTIST_LLM_ATTEMPT_S") or 1800)
         resp = requests.post(
             url, headers=headers, json=payload, timeout=self._timeout, stream=bool(self._stream)
         )
@@ -615,14 +730,23 @@ class CodexResponsesWrapper:
         tool_calls: List[Dict[str, Any]] = []
         usage: Optional[Dict[str, Any]] = None
         response_id: Optional[str] = None
+        kinds: Dict[str, int] = {}  # event types seen, for the note on an empty reply
+        items_done: List[str] = []
+        unparsed: List[str] = []  # events of a type this parser does not read
         try:
-            for event in self._iter_sse_text(resp):
+            for event in self._iter_sse_text(resp, deadline):
                 try:
                     parsed = json.loads(event)
                 except Exception:
                     continue
                 if isinstance(parsed, dict):
                     kind = parsed.get("type")
+                    kinds[str(kind)] = kinds.get(str(kind), 0) + 1
+                    if kind == "response.metadata" or kind == "response.output_text.done":
+                        unparsed.append(event[:400])
+                    if kind == "response.output_item.done" and isinstance(parsed.get("item"), dict):
+                        item = parsed["item"]
+                        items_done.append(f"{item.get('type')}:{item.get('status', '')}")
                     if kind == "response.output_text.delta" and isinstance(parsed.get("delta"), str):
                         chunks.append(parsed["delta"])
                         continue
@@ -669,7 +793,11 @@ class CodexResponsesWrapper:
                                 if isinstance(detail, dict):
                                     reason = str(detail.get("reason") or detail.get("message") or "")
                             if not chunks and not tool_calls:
-                                raise RuntimeError(
+                                error = RuntimeError
+                                if kind == "response.failed":
+                                    error = (ContextOverflowError if self._is_context_overflow(body)
+                                             else CodexResponseFailed)
+                                raise error(
                                     f"Codex returned {kind}"
                                     + (f": {reason}" if reason else " with no content")
                                 )
@@ -679,7 +807,21 @@ class CodexResponsesWrapper:
                     chunks.append(fallback)
         finally:
             resp.close()
-        return self._Resp("".join(chunks).strip(), tool_calls, usage=usage, response_id=response_id)
+        text = "".join(chunks).strip()
+        if not text and not tool_calls:
+            # Said, not only retried: the caller retries an empty reply, and
+            # without this nothing showed what the provider had sent -- a
+            # DAFoam study got dozens of them while the same requests from
+            # another process got none (shelf_demo_dafoam_20261019_1057).
+            out_tokens = (usage or {}).get("output_tokens") if isinstance(usage, dict) else None
+            asked = ""
+            for item in reversed(payload.get("input") or []):
+                if isinstance(item, dict) and item.get("role") == "user":
+                    asked = json.dumps(item.get("content"), ensure_ascii=False)[:200]
+                    break
+            print(f"[codex] empty reply {response_id or ''}: items {items_done or 'none'}, "
+                  f"output tokens {out_tokens}, events {kinds}; {unparsed}; asked: {asked}", flush=True)
+        return self._Resp(text, tool_calls, usage=usage, response_id=response_id)
 
     @staticmethod
     def _decode_function_call(item: Dict[str, Any]) -> Dict[str, Any]:

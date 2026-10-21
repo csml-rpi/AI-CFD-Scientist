@@ -151,14 +151,15 @@ check("the subagent is compiled, not a raw spec", "runnable" in capped, True)
 out = capped["runnable"].invoke(start, {"recursion_limit": 9999})
 check("the limit holds when the caller passes a larger one", steps["n"] <= sa._SUBAGENT_STEP_LIMIT, True)
 text = out["messages"][0].content
-check("hitting the limit answers instead of raising", "was stopped after" in text, True)
-check("and says the work is not lost", "Nothing it did is lost" in text, True)
-check("and tells the manager what to do next", "mesh gate" in text, True)
+check("hitting the limit answers instead of raising", "was stopped (at its" in text, True)
+check("and says the work is not lost", "Its files are in place" in text, True)
+check("and hands back what it did, for the manager to decide",
+      ("TASK:\ngo" in text, "Decide the next step" in text), (True, True))
 
 graph, steps = _looping_graph('{"error": "Not run: this exact call has been made 9 times in a row"}')
 out = _capped_with(graph)["runnable"].invoke(start, {"recursion_limit": 9999})
 check("a run of refused calls stops it early", steps["n"] <= sa._REFUSAL_STOP + 1, True)
-check("and says why", "refused calls among its recent ones" in out["messages"][0].content, True)
+check("and says why", "of its recent calls were refused" in out["messages"][0].content, True)
 
 graph, steps = _looping_graph('{"ok": true}')
 out = _capped_with(graph, precheck=lambda: "Not started: no converged gate")["runnable"].invoke(start)
@@ -350,11 +351,119 @@ with tempfile.TemporaryDirectory() as tmp:
         check("a clarification on a passing requirement is refused", "only accepted" in r3.get("error", ""), True)
         r4 = run("case_002", ok_text, physics_group="g")
         check("a passing requirement reports no issues", "requirement_checker_issues" in r4, False)
-        run("case_002", "a paraphrase of the requirement", physics_group="g")
+        run("case_002", "a paraphrase of the requirement", physics_group="g", rerun_reason="test")
         check("a paraphrased requirement_text is not what runs: the approved text for the case_id is",
               seen[-1], ok_text)
         check("an unknown case_id is refused with the valid ones listed",
               "Valid case_ids" in run("case_999", "", physics_group="g").get("error", ""), True)
+
+        # A rerun keeps the last successful attempt apart from the others.
+        def writes(status, mark):
+            def fake_run(llm, case_dir, requirement, **kw):
+                Path(case_dir).mkdir(parents=True, exist_ok=True)
+                (Path(case_dir) / "mark").write_text(mark)
+                result = {"status": status, "success": status == "success"}
+                (Path(case_dir) / "run_result.json").write_text(json.dumps(result))
+                return result
+            return fake_run
+
+        attempts = out_dir / "previous_attempts"
+        for status, mark in (("success", "A"), ("failed", "B"), ("failed", "C")):
+            mt.foam_native.run_foam_case = writes(status, mark)
+            run("case_002", ok_text, physics_group="g", rerun_reason="test")
+        check("the successful attempt is kept after two failed reruns",
+              (attempts / "case_002_last_success" / "mark").read_text(), "A")
+        check("beside the last failed one", (attempts / "case_002" / "mark").read_text(), "B")
+
+        # A file the manager fixed after the last run is carried into the next.
+        import os as _os
+        case2 = out_dir / "cases" / "case_002"
+        (case2 / "runScript.py").write_text("fixed by the manager\n")
+        (case2 / "decision.json").write_text("{}")
+        later = (case2 / "run_result.json").stat().st_mtime + 5
+        for name in ("runScript.py", "decision.json"):
+            _os.utime(case2 / name, (later, later))
+        got: dict = {}
+
+        def keeps(llm, case_dir, requirement, **kw):
+            got.update(kw.get("carried_files") or {})
+            return {"status": "failed", "success": False}
+
+        mt.foam_native.run_foam_case = keeps
+        r5 = run("case_002", ok_text, physics_group="g", rerun_reason="test")
+        check("the manager's fixed script is carried into the new run", sorted(got), ["runScript.py"])
+        check("from the attempt moved aside, as the manager left it",
+              Path(got["runScript.py"]).read_text(), "fixed by the manager\n")
+        check("and the manager is told", "runScript.py" in r5.get("kept_your_edits", ""), True)
+        (case2 / "runScript.py").write_text("moved again\n")
+        later = (case2 / "run_result.json").stat().st_mtime + 5 if (case2 / "run_result.json").is_file() else None
+        if later is None:
+            (case2 / "run_result.json").write_text("{}")
+            later = (case2 / "run_result.json").stat().st_mtime + 5
+        _os.utime(case2 / "runScript.py", (later, later))
+        mt.foam_native.run_foam_case = lambda llm, case_dir, requirement, **kw: {
+            "status": "failed", "success": False,
+            "carried_changed_by_setup_check": [{"file": "runScript.py", "requirement": "Bump centre (0.60, 0.50, 0.50) m",
+                                                "found": "moved"}]}
+        r6 = run("case_002", ok_text, physics_group="g", rerun_reason="test")
+        check("and told when the setup check changed its edit back to the requirement",
+              "Bump centre (0.60, 0.50, 0.50) m" in r6.get("kept_your_edits", "")
+              and "only a changed requirement can" in r6.get("kept_your_edits", ""), True)
+        # A run stopped before it ended (a restart) carries its scripts.
+        from cfd_langgraph.manager.tools import _edited_since_run
+        cut = out_dir / "cut_case"
+        cut.mkdir()
+        (cut / ".foamagent_state.json").write_text("{}")
+        (cut / "runScript.py").write_text("x")
+        (cut / "notes.txt").write_text("y")
+        check("a run stopped before it ended carries its scripts", _edited_since_run(cut), ["runScript.py"])
+        (cut / ".foamagent_state.json").unlink()
+        check("a folder no run started in carries nothing", _edited_since_run(cut), [])
+
+        # A run stopped before it wrote anything does not replace the attempt before it.
+        prev2 = out_dir / "previous_attempts" / "case_002"
+        if prev2.exists():
+            import shutil as _sh
+            _sh.rmtree(prev2)
+        prev2.mkdir(parents=True)
+        (prev2 / "run_result.json").write_text("{}")
+        (prev2 / "runScript.py").write_text("the manager's fix\n")
+        later2 = (prev2 / "run_result.json").stat().st_mtime + 5
+        _os.utime(prev2 / "runScript.py", (later2, later2))
+        if case2.exists():
+            import shutil as _sh
+            _sh.rmtree(case2)
+        case2.mkdir(parents=True)
+        (case2 / ".foamagent_state.json").write_text("{}")
+        got.clear()
+        mt.foam_native.run_foam_case = keeps
+        run("case_002", ok_text, physics_group="g", rerun_reason="test")
+        check("after a run stopped before it wrote anything, the earlier attempt's fix is carried",
+              sorted(got), ["runScript.py"])
+        check("and that earlier attempt is not replaced", (prev2 / "runScript.py").read_text(), "the manager's fix\n")
+
+        # A success under a requirement since rewritten does not block a rerun.
+        import time as _time
+        from cfd_langgraph.manager.tools import _requirement_changed_since
+        case3 = out_dir / "cases" / "case_002"
+        case3.mkdir(parents=True, exist_ok=True)
+        (case3 / "run_result.json").write_text(json.dumps({"status": "success", "success": True}))
+        old_t = _time.time() - 100
+        _os.utime(case3 / "run_result.json", (old_t, old_t))
+        check("a success from before the requirements were written again is stale",
+              _requirement_changed_since({"status": "success"}, case3, "abc"), True)
+        check("a recorded hash decides when there is one",
+              (_requirement_changed_since({"requirement_sha256": "abc"}, case3, "abc"),
+               _requirement_changed_since({"requirement_sha256": "abc"}, case3, "xyz")), (False, True))
+        seen_runs = []
+        mt.foam_native.run_foam_case = lambda llm, case_dir, requirement, **kw: (
+            seen_runs.append(1) or {"status": "success", "success": True})
+        r7 = run("case_002", ok_text, physics_group="g")
+        check("so the stale success is run again without a rerun_reason",
+              (len(seen_runs), "rerun_because" in r7), (1, True))
+        rec = json.loads((out_dir / "cases" / "case_002" / "run_result.json").read_text()) \
+            if (out_dir / "cases" / "case_002" / "run_result.json").is_file() else r7
+        check("and the run records its requirement's hash", bool(r7.get("requirement_sha256")), True)
     finally:
         mt.foam_native.run_foam_case = real_run
 

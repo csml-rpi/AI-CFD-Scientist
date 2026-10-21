@@ -71,6 +71,25 @@ def _reference_data_file(ref_files, fallback=None):
     return fallback
 
 
+def _coded_source_note() -> str:
+    """Which coded source-term form the runtime applier writes on the installed
+    OpenFOAM (scripts/code_mod_runtime.py chooses it the same way)."""
+    try:
+        from cfd_langgraph.openfoam_version import get_profile
+
+        profile = get_profile()
+    except Exception:
+        profile = {}
+    label = profile.get("label") or "the installed OpenFOAM"
+    if profile.get("fork") == "openfoam.com":
+        form = ("the `type scalarCodedSource; fields (<name>);` form (vectorCodedSource for a vector "
+                "field) into fvOptions")
+    else:
+        form = "the `type coded; field <name>;` form into constant/fvModels"
+    return (f"      {label.upper()} NOTE: the runtime applier emits\n"
+            f"      {form}.\n")
+
+
 def _bootstrap(repo_root: Path) -> None:
     foam_src = repo_root / "Foam-Agent" / "src"
     lang_src = repo_root / "src"
@@ -154,16 +173,20 @@ def _try_float(x: Any) -> Optional[float]:
 
 
 def _parse_requested_model(case_dir: Path) -> str:
-    mt = case_dir / "constant" / "momentumTransport"
-    if not mt.is_file():
-        return ""
-    txt = mt.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"\bmodel\s+([A-Za-z0-9_]+)\s*;", txt)
-    return m.group(1).strip() if m else ""
+    from cfd_langgraph.openfoam_version import turbulence_model
+
+    return turbulence_model(case_dir).get("model", "")
+
+
+def _solver_log(case_dir: Path) -> Path:
+    """The solver log runApplication writes for this case's own solver."""
+    from cfd_langgraph.openfoam_version import case_solver
+
+    return case_dir / (case_solver(case_dir)["log"] or "log.simpleFoam")
 
 
 def _parse_selected_model_from_log(case_dir: Path) -> str:
-    logp = case_dir / "log.simpleFoam"
+    logp = _solver_log(case_dir)
     if not logp.is_file():
         return ""
     txt = logp.read_text(encoding="utf-8", errors="ignore")
@@ -234,7 +257,7 @@ def _evaluate_open_ended_case_contract(
         "case_dir": str(case_dir),
         "decision_json": str(case_dir / "decision.json"),
         "run_result_json": str(case_dir / "run_result.json"),
-        "log_simpleFoam": str(case_dir / "log.simpleFoam"),
+        "log_simpleFoam": str(_solver_log(case_dir)),
     }
 
     def add_check(name: str, ok: bool, detail: str) -> None:
@@ -1100,9 +1123,7 @@ def _llm_decide_next_action(
         "      \"eqn += fvm::Sp(scalar(0.1), eqn.psi());\"),\n"
         "      code_include (optional headers), coefficients (optional named scalars),\n"
         "      selection_mode ('all'|'cellSet'|'cellZone', default 'all').\n"
-        "      OPENFOAM 10 (org) NOTE: the runtime applier emits the modern\n"
-        "      `type coded; field <name>;` form into constant/fvModels (NOT the\n"
-        "      ESI `scalarCodedSource; fields (<name>)` form into fvOptions).\n"
+        + _coded_source_note() +
         "      Available hooks in code_add_sup body: `eqn` is the fvMatrix,\n"
         "      `eqn.psi()` is the field, `mesh()` is the fvMesh, `coeffs()` is\n"
         "      the dictionary for named scalars (use\n"
@@ -1238,7 +1259,7 @@ def _llm_decide_next_action(
             "IMPORTANT: Your `formula_or_modification` spec MUST align with these verified paths and "
             "class names. Do NOT reference headers, directories, or classes that are not listed here "
             "unless they are well-known OpenFOAM core primitives (e.g. fvMatrix, volScalarField). "
-            "This installation may differ from ESI / foam-extend / OpenFOAM-v24xx layouts you have "
+            "This installation may differ from other OpenFOAM versions' layouts you have "
             "seen in training data.\n\n"
         )
 
@@ -1417,7 +1438,9 @@ def _run_python_script_iteration(
     disc_dir_path = run_dir               # e.g. .../open_ended_discovery
     _eff_starter = starter_dir or Path(starter_understanding.get("starter_dir", "")) or (repo_root / "starter")
     starter_dir_str = str(_eff_starter)
-    of_dir = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam")
+    from cfd_langgraph.openfoam_version import find_installation
+
+    of_dir = find_installation() or "/opt/openfoam"
     preamble = (
         f"# ===== AUTO-INJECTED BY ORCHESTRATOR — USE THESE VARIABLES =====\n"
         f"# All key paths are already defined as pathlib.Path objects below.\n"
@@ -1530,8 +1553,8 @@ def _extract_case_metrics(
     if cf_metrics:
         parts.append(cf_metrics)
 
-    # 3. residual convergence tail from simpleFoam log
-    log = case_dir / "log.simpleFoam"
+    # 3. residual convergence tail from the solver's log
+    log = _solver_log(case_dir)
     if log.is_file():
         lines = log.read_text(errors="ignore").splitlines()
         # find last residual lines
@@ -2502,13 +2525,13 @@ def _run_runtime_code_mod_iteration(
             f"runtime modification already applied via OpenFOAM's coded* "
             f"infrastructure (codedFvOption / codedFixedValue / coded "
             f"functionObject / dictionary edit). DO NOT modify "
-            f"constant/momentumTransport. DO NOT generate a custom turbulence "
+            f"the turbulence dictionary. DO NOT generate a custom turbulence "
             f"model class. The standard built-in model is intentional; the "
-            f"modification lives in constant/fvOptions, 0/<field> BCs, or "
+            f"modification lives in the source-term dictionary, 0/<field> BCs, or "
             f"system/controlDict.functions. Just run the case to convergence "
             f"and report metrics."
         ),
-        model_name="(built-in; runtime modification in fvOptions/BCs/functions)",
+        model_name="(built-in; runtime modification in source terms/BCs/functions)",
         params=params,
         ref_info=ref_info,
         topic=topic,
@@ -3117,7 +3140,11 @@ def _run_experiment_iteration(
             # Patch fvModels coefficient values from action.parameters.
             # Generic: iterate every numeric key in action.parameters and
             # update its top-level entry inside constant/fvModels.
-            fvmodels = case_dir_resolved / "constant" / "fvModels"
+            # The source-term dictionary the case actually has: fvModels on
+            # openfoam.org, fvOptions on openfoam.com (constant/ or system/).
+            from cfd_langgraph.openfoam_version import case_file as _case_file
+
+            fvmodels = _case_file(case_dir_resolved, "sources") or case_dir_resolved / "constant" / "fvModels"
             if fvmodels.is_file():
                 txt = fvmodels.read_text(encoding="utf-8")
                 user_params = action.get("parameters", {}) or {}
@@ -3540,6 +3567,7 @@ def run_open_ended_discovery(
     multi_flow: bool = False,
     starter_dirs: Optional[List[Path]] = None,
     metric_aggregator: str = "llm_judge",  # llm_judge (default) | weighted_sum | min_improvement | pareto_rank (legacy)
+    evaluation_cases: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     baseline_metrics = baseline_metrics or {}
     baseline_score_value: Optional[float] = None
@@ -4040,6 +4068,9 @@ def run_open_ended_discovery(
                     ),
                     baseline_final_time=baseline_final_time,
                     topic=topic,
+                    # The study's declared cases: a comparator must score the
+                    # case it is given, which only a second case can show.
+                    probe_cases=[Path(c) for c in (evaluation_cases or [])] or None,
                 )
                 _write_json(disc_dir / "bound_comparators.json", bound)
                 ext_state["bound_comparators"] = bound
@@ -5404,6 +5435,8 @@ def main() -> int:
                              "Overrides starter_understanding['starter_dir'] if provided.")
     parser.add_argument("--literature", default="", type=str)
     parser.add_argument("--base-case-dir", default="", type=str)
+    parser.add_argument("--evaluation-case", action="append", default=[],
+                        help="a declared evaluation case of a multi-case study (repeatable)")
     parser.add_argument("--baseline-metrics", default="", type=str,
                         help="Path to baseline_metrics.json produced by baseline_setup. "
                              "Used to gate PROCEED on variant_score < baseline_score and "
@@ -5524,6 +5557,7 @@ def main() -> int:
         multi_flow=multi_flow_flag,
         starter_dirs=starter_dirs_paths or None,
         metric_aggregator=str(args.metric_aggregator),
+        evaluation_cases=list(args.evaluation_case or []),
     )
     print(json.dumps({"status": "ok", "summary": summary.get("best_model_description", "")}, indent=2))
     return 0

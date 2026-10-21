@@ -82,6 +82,7 @@ def run_propose_critique_rank(
                 research_topic=research_topic,
                 case_context=case_context,
                 study_mode=study_mode,
+                prescribed=prescribed,
             )
         except Exception as exc:
             # The call has already spent its own retries. Losing this one

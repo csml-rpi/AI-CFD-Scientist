@@ -108,6 +108,10 @@ class StarterBaseCases:
 
     starter_dir: Optional[Path]
 
+    originals: Optional[List[Path]] = None
+    """The starter's own case directories, where ``dirs`` holds copies
+    translated for the installed OpenFOAM (cfd_langgraph.case_translation)."""
+
     @property
     def primary(self) -> Optional[Path]:
         return self.dirs[0] if self.dirs else None
@@ -184,8 +188,22 @@ def resolve_starter_base_cases(understanding: Dict[str, Any]) -> StarterBaseCase
             dirs = found
             scanned = True
 
+    # A case the installed OpenFOAM could not run as shipped is replaced by
+    # the translated copy read_starter_folder made of it, so every consumer
+    # (requirements, the mesh gate, inherited function objects) gets a case
+    # that runs. A case that ran as it is, or one whose translation failed, is
+    # used as shipped.
+    translated = understanding.get("translated_cases") or {}
+    originals = list(dirs)
+    for i, case in enumerate(dirs):
+        entry = translated.get(str(case.resolve())) or {}
+        copy = Path(str(entry.get("path") or ""))
+        if entry.get("status") == "translated" and _is_case(copy):
+            dirs[i] = copy
+
     return StarterBaseCases(
-        declared=declared, dirs=dirs, scanned=scanned, starter_dir=starter_dir
+        declared=declared, dirs=dirs, scanned=scanned, starter_dir=starter_dir,
+        originals=originals,
     )
 
 

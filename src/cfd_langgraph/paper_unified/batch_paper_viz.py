@@ -255,10 +255,13 @@ def run_batch_paper_viz_loop(
     verbose: bool = True,
     previous_script: str = "",
     extra_feedback: str = "",
+    deadline: Optional[float] = None,
 ) -> Tuple[str, List[Path], Dict[str, Any]]:
     """
     Returns (final_script_text, list of png paths, meta dict with attempts, failures history).
     Each outer attempt: generate OR revise script → run → per-image VLM; on failures, next iteration revises.
+    No new attempt starts when another as long as the last would end past
+    ``deadline`` (time.monotonic()): the figures of the last attempt are kept.
     """
     llm = create_langchain_llm(model=model, temperature=0.0)
     paper_figs_dir = paper_figs_dir.resolve()
@@ -270,7 +273,16 @@ def run_batch_paper_viz_loop(
     pending_qa_block = ""  # if set, use SCRIPT_REVISE_USER
     run_log_tail = ""
 
+    last_took = 0.0
     for attempt in range(1, max(1, max_inner_attempts) + 1):
+        # A paper run killed at its time limit mid-attempt had deleted the
+        # last attempt's figures and saved nothing (shelf_demo_hystrath_20261011_1602).
+        if deadline is not None and attempt > 1 and time.monotonic() + last_took > deadline:
+            meta["stopped_for_time"] = True
+            if verbose:
+                print(f"[batch_paper_viz] stopping before attempt {attempt}: not enough time left")
+            break
+        started = time.monotonic()
         meta["inner_attempts"] = attempt
 
         if pending_qa_block:
@@ -301,6 +313,7 @@ def run_batch_paper_viz_loop(
             meta["failures_log"].append({"attempt": attempt, "phase": "llm", "error": str(e)})
             if verbose:
                 print(f"[batch_paper_viz] attempt {attempt}: LLM error {e}")
+            last_took = time.monotonic() - started
             time.sleep(min(2.0, 0.25 * (1 + random.random())))
             continue
 
@@ -332,6 +345,7 @@ def run_batch_paper_viz_loop(
             pending_qa_block = f"Script failed (exit {rc}) or produced no PNGs. Fix the script.\n{run_log_tail[:4000]}"
             if verbose:
                 print(f"[batch_paper_viz] attempt {attempt}: run failed rc={rc} pngs={len(pngs)}")
+            last_took = time.monotonic() - started
             time.sleep(min(2.0, 0.25 * (1 + random.random())))
             continue
 
@@ -361,6 +375,7 @@ def run_batch_paper_viz_loop(
         meta["failures_log"].append({"attempt": attempt, "phase": "qa", "failures": failures})
         if verbose:
             print(f"[batch_paper_viz] attempt {attempt}: {len(failures)} image(s) failed QA; will revise script")
+        last_took = time.monotonic() - started
         time.sleep(min(2.0, 0.25 * (1 + random.random())))
 
     pngs = sorted(paper_figs_dir.glob("*.png"))

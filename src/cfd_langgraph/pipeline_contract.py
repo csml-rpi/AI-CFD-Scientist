@@ -273,23 +273,184 @@ def run_predictions(*, sandbox: Any, run_dir: Path, spec: Dict[str, Any], models
     return {"ok": not errors, "errors": errors, "runs": runs, "hardware": hw}
 
 
+def screen_seeds(spec: Dict[str, Any]) -> List[int]:
+    """The seeds a candidate is first scored on during the search: the first
+    CFD_SCIENTIST_SCREEN_SEEDS (default 3) of the study's seeds. The rest are
+    trained only for a candidate whose score on these comes near the best
+    one's; ten seeds trained one after another took 6-9 h per candidate
+    (dlr_airfoil_codex_20261009)."""
+    seeds = [int(s) for s in spec.get("seeds") or []]
+    try:
+        n = int(os.environ.get("CFD_SCIENTIST_SCREEN_SEEDS") or 3)
+    except ValueError:
+        n = 3
+    return seeds[:n] if 0 < n < len(seeds) else seeds
+
+
+def with_seeds(spec: Dict[str, Any], seeds: List[int]) -> Dict[str, Any]:
+    return {**spec, "seeds": [int(s) for s in seeds]}
+
+
+def visible_gpu_memory() -> Dict[str, Tuple[float, float]]:
+    """{nvidia-smi index: (total MB, used MB)} for the GPUs this process may
+    use (CUDA_VISIBLE_DEVICES, read as nvidia-smi's numbering); empty without
+    a GPU, or when they are named some other way."""
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible is not None and not visible.strip():
+        return {}
+    try:
+        proc = subprocess.run(["nvidia-smi", "--query-gpu=index,memory.total,memory.used",
+                               "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20)
+    except Exception:  # noqa: BLE001
+        return {}
+    found: Dict[str, Tuple[float, float]] = {}
+    for line in proc.stdout.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        try:
+            found[parts[0]] = (float(parts[1]), float(parts[2]))
+        except (IndexError, ValueError):
+            continue
+    if visible:
+        keep = [v.strip() for v in visible.split(",")]
+        found = {k: v for k, v in found.items() if k in keep}
+    return found
+
+
+def gpu_processes() -> Dict[str, int]:
+    """{nvidia-smi index: compute processes on that GPU now}, or {} when it
+    cannot be read."""
+    try:
+        listed = subprocess.run(["nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader"],
+                                capture_output=True, text=True, timeout=20).stdout
+        apps = subprocess.run(["nvidia-smi", "--query-compute-apps=gpu_uuid", "--format=csv,noheader"],
+                              capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001
+        return {}
+    index: Dict[str, str] = {}
+    for line in listed.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) == 2:
+            index[parts[1]] = parts[0]
+    counts = {i: 0 for i in index.values()}
+    for line in apps.splitlines():
+        if line.strip() in index:
+            counts[index[line.strip()]] += 1
+    return counts
+
+
+def least_busy_gpu(gpus: Dict[str, Tuple[float, float]], procs: Optional[Dict[str, int]] = None) -> Optional[str]:
+    """Of ``gpus`` (visible_gpu_memory), the one with the fewest processes on
+    it now, then the least memory in use; None without a GPU."""
+    if not gpus:
+        return None
+    procs = gpu_processes() if procs is None else procs
+    return min(gpus, key=lambda g: (procs.get(g, 0), gpus[g][1], g))
+
+
+def _seed_slots(before: Dict[str, Tuple[float, float]], peak: Dict[str, float], n: int,
+                procs: Optional[Dict[str, int]] = None) -> List[str]:
+    """One GPU per seed that may train at once: as many as fit in 80% of each
+    visible GPU's free memory, at the memory one seed took, spread across the
+    GPUs, the least busy first (``procs``, gpu_processes), at most
+    CFD_SCIENTIST_PARALLEL_SEEDS (default 6) and ``n``."""
+    if not before or n <= 0:
+        return []
+    taken = max((peak.get(k, used) - used for k, (_, used) in before.items()), default=0.0)
+    per_seed = max(taken, 1024.0)
+    try:
+        cap = int(os.environ.get("CFD_SCIENTIST_PARALLEL_SEEDS") or 6)
+    except ValueError:
+        cap = 6
+    counts = {k: int(max(total - used, 0.0) * 0.8 // per_seed)
+              for k, (total, used) in (visible_gpu_memory() or before).items()}
+    slots: List[str] = []
+    while len(slots) < min(cap, n) and any(counts.values()):
+        for k in sorted(counts, key=lambda g: ((procs or {}).get(g, 0), -counts[g])):
+            if counts[k] > 0 and len(slots) < min(cap, n):
+                slots.append(k)
+                counts[k] -= 1
+    return slots
+
+
 def run_training(*, sandbox: Any, run_dir: Path, spec: Dict[str, Any], models_root: Path,
                  timeout_s: int) -> Dict[str, Any]:
+    """train.sh for every seed. The first trains alone while the GPU memory it
+    takes is measured; the rest then train side by side, as many at once as
+    the visible GPUs' free memory holds (_seed_slots). One after another, ten
+    seeds of a small model took 9.4 h on one GPU while it held 1-2 GB of 48
+    and a second GPU sat idle (dlr_airfoil_codex_20261009, final test).
+    Every seed is given a GPU, the least busy: run with none named, the first
+    seed and any trained alone went to GPU 0, so the framework's extra seeds
+    for AirfRANS candidates shared it with five other runs while GPUs 1 and 2
+    sat idle (airfrans_codex_20261009, 2026-10-19)."""
+    import queue
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     train, _ = scripts(run_dir)
-    runs, errors = [], []
-    for seed in spec["seeds"]:
+    seeds = [int(s) for s in spec["seeds"]]
+    runs: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    lock = threading.Lock()
+
+    def one(seed: int, gpu: Optional[str] = None) -> None:
         target = Path(models_root) / f"seed{seed}"
         shutil.rmtree(target, ignore_errors=True)
         target.mkdir(parents=True)
+        prefix = f"CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES={gpu} " if gpu is not None else ""
         started = time.monotonic()
-        res = sandbox.run_bash(f"bash {train} {seed} {target}", cwd=str(run_dir), timeout=timeout_s)
+        res = sandbox.run_bash(f"{prefix}bash {train} {seed} {target}", cwd=str(run_dir), timeout=timeout_s)
         took = time.monotonic() - started
         ok = not _failed(res) and any(f.is_file() for f in target.rglob("*"))
-        runs.append({"seed": seed, "seconds": round(took, 1), "ok": ok})
-        if not ok:
-            why = res.get("error") or ("timed out" if res.get("timeout") else
-                                       f"exit code {res.get('rc')}" if res.get("rc") else "wrote nothing")
-            errors.append(f"train.sh seed {seed}: {str(why)[:300]}; stderr: {_tail(res.get('stderr', ''), 800)}")
+        with lock:
+            runs.append({"seed": seed, "seconds": round(took, 1), "ok": ok,
+                         **({"gpu": gpu} if gpu is not None else {})})
+            if not ok:
+                why = res.get("error") or ("timed out" if res.get("timeout") else
+                                           f"exit code {res.get('rc')}" if res.get("rc") else "wrote nothing")
+                errors.append(f"train.sh seed {seed}: {str(why)[:300]}; "
+                              f"stderr: {_tail(res.get('stderr', ''), 800)}")
+
+    if not seeds:
+        return {"ok": True, "errors": [], "runs": []}
+    before = visible_gpu_memory() if len(seeds) > 1 else {}
+    peak: Dict[str, float] = {}
+    stop = threading.Event()
+
+    def sample() -> None:
+        while not stop.wait(5):
+            for k, (_, used) in visible_gpu_memory().items():
+                peak[k] = max(peak.get(k, 0.0), used)
+
+    sampler = threading.Thread(target=sample, daemon=True) if before else None
+    if sampler:
+        sampler.start()
+    one(seeds[0], least_busy_gpu(before or visible_gpu_memory()))
+    if sampler:
+        stop.set()
+        sampler.join()
+    rest = seeds[1:]
+    slots = _seed_slots(before, peak, len(rest), gpu_processes() if before else {})
+    if len(slots) > 1:
+        print(f"[pipeline] training seeds {rest} {len(slots)} at a time on GPU(s) "
+              f"{sorted(set(slots))}", flush=True)
+        free: "queue.Queue[str]" = queue.Queue()
+        for g in slots:
+            free.put(g)
+
+        def on_a_gpu(seed: int) -> None:
+            gpu = free.get()
+            try:
+                one(seed, gpu)
+            finally:
+                free.put(gpu)
+
+        with ThreadPoolExecutor(max_workers=len(slots)) as pool:
+            list(pool.map(on_a_gpu, rest))
+    else:
+        for seed in rest:
+            one(seed, least_busy_gpu(visible_gpu_memory()))
+    runs.sort(key=lambda r: seeds.index(r["seed"]))
     return {"ok": not errors, "errors": errors, "runs": runs}
 
 

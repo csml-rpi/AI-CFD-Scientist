@@ -888,6 +888,8 @@ def _token_counter_kwargs(model: Any) -> Dict[str, Any]:
 
 # Longest tool-error message the model is shown in full.
 _TOOL_ERROR_CHARS = int(os.getenv("CFD_SCIENTIST_TOOL_ERROR_CHARS") or 2000)
+# Largest tool result that enters the conversation whole, in characters.
+_TOOL_RESULT_CHARS = int(os.getenv("CFD_SCIENTIST_TOOL_RESULT_CHARS") or 200_000)
 
 
 def _tool_error_trim_middleware() -> Any:
@@ -906,13 +908,16 @@ def _tool_error_trim_middleware() -> Any:
 
     def _trim(message: Any) -> Any:
         content = getattr(message, "content", None)
-        if (
-            isinstance(message, ToolMessage)
-            and getattr(message, "status", None) == "error"
-            and isinstance(content, str)
-            and len(content) > _TOOL_ERROR_CHARS
-        ):
-            half = _TOOL_ERROR_CHARS // 2
+        if not (isinstance(message, ToolMessage) and isinstance(content, str)):
+            return message
+        # Any result, not only an error, has a ceiling. One grep of a JSON
+        # file holding a 157k-cell field on one line returned a 29.7 MB
+        # match; every later request was refused (the provider takes at most
+        # 10 MB per item) and the study stopped for good
+        # (shelf_demo_dafoam_20261015_1318, 2026-10-18).
+        limit = _TOOL_ERROR_CHARS if getattr(message, "status", None) == "error" else _TOOL_RESULT_CHARS
+        if len(content) > limit:
+            half = limit // 2
             omitted = len(content) - 2 * half
             return message.model_copy(update={
                 "content": content[:half] + f"\n…[{omitted} characters omitted]…\n" + content[-half:]

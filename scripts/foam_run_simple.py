@@ -42,6 +42,10 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 from typing import Any, Dict, List, Optional
 
 
@@ -120,7 +124,10 @@ def _ensure_allrun(case_dir: Path) -> Path:
     allrun = case_dir / "Allrun"
     if allrun.is_file():
         return allrun
-    app = _read_application_from_controldict(case_dir / "system" / "controlDict") or "simpleFoam"
+    from cfd_langgraph.openfoam_version import case_solver, get_profile, run_command
+
+    profile = get_profile()
+    app = case_solver(case_dir, profile)["application"] or run_command(profile, "simpleFoam")
     has_blockmesh = (case_dir / "system" / "blockMeshDict").is_file()
     body = "#!/usr/bin/env bash\n"
     body += "set -e\n"
@@ -180,14 +187,11 @@ def run(base_case: Path, output_dir: Path, openfoam_bashrc: Optional[Path] = Non
     bashrc_candidates = []
     if openfoam_bashrc:
         bashrc_candidates.append(str(openfoam_bashrc))
-    wm = os.environ.get("WM_PROJECT_DIR", "").strip()
-    if wm:
-        bashrc_candidates.append(f"{wm}/etc/bashrc")
-    bashrc_candidates += [
-        "/mnt/sda1/openfoam10/etc/bashrc",
-        "/opt/openfoam10/etc/bashrc",
-        "/usr/lib/openfoam/openfoam2306/etc/bashrc",
-    ]
+    from cfd_langgraph.openfoam_version import find_installation
+
+    install = find_installation()
+    if install:
+        bashrc_candidates.append(f"{install}/etc/bashrc")
     bashrc = next((p for p in bashrc_candidates if Path(p).is_file()), None)
     if bashrc is None:
         return {

@@ -2478,6 +2478,63 @@ def fabricated_coordinates(source: str, metric: Optional[Dict[str, Any]] = None)
     return bool(_COORD_SYNTHESIS_RE.search(source))
 
 
+def scores_whole_study(
+    *,
+    comparator: Path,
+    baseline_case_dir: Path,
+    baseline_value: Optional[float],
+    probe_cases: Optional[List[Path]],
+    reference_file: Path,
+    metric_name: str,
+) -> str:
+    """Why ``comparator`` cannot be a per-case scorer, or "" if nothing says so.
+
+    A study declared over several cases scores each case with the bound
+    comparator and averages the results itself. A comparator that instead
+    computes the whole study's figure -- walks every case and prints their
+    mean, whatever --case it is given -- returns the same number for every
+    case: the mean still comes out right, but every per-case score is that mean
+    copied, and the scorer runs N x N times. Measured on closure_20260826_codex:
+    all 32 per-case scores read 0.0739291 where the real ones span 0.015 to
+    0.133. The check runs it on up to two other declared cases and refuses it
+    when every value is the same non-integer number; a probe case that cannot
+    be scored leaves the check inconclusive rather than failing it.
+    """
+    if baseline_value is None or not probe_cases:
+        return ""
+    try:
+        base_resolved = Path(baseline_case_dir).resolve()
+    except OSError:
+        base_resolved = Path(baseline_case_dir)
+    others = []
+    for case in probe_cases:
+        try:
+            resolved = Path(case).resolve()
+        except OSError:
+            continue
+        if resolved != base_resolved and resolved.is_dir() and resolved not in others:
+            others.append(resolved)
+    others = others[:2]
+    if not others:
+        return ""
+    if float(baseline_value) == round(float(baseline_value)):
+        return ""   # a count or a pass/fail flag can legitimately repeat
+    for case in others:
+        st = _selftest_comparator_full(comparator=comparator, case_dir=case,
+                                       reference_file=reference_file, metric_name=metric_name)
+        if not st.get("ok") or st.get("value") is None:
+            return ""
+        if float(st["value"]) != float(baseline_value):
+            return ""
+    names = ", ".join(c.name for c in others)
+    return (
+        f"it returned exactly {baseline_value!r} for {Path(baseline_case_dir).name} and the same "
+        f"value for {names}: it ignores --case and scores the whole set of cases. This study is "
+        f"scored over {len(probe_cases)} cases and averages them itself, so the comparator must "
+        f"score only the one case passed as --case and print that case's {metric_name}."
+    )
+
+
 def author_and_selftest(
     metric: Dict[str, Any],
     *,
@@ -2494,6 +2551,7 @@ def author_and_selftest(
     exemplar_text: str = "",
     pyvista_after_attempt: int = 5,
     expected_value: Optional[float] = None,
+    probe_cases: Optional[List[Path]] = None,
 ) -> Dict[str, Any]:
     """Author + self-test a comparator with up to ``max_attempts`` retries.
 
@@ -2732,9 +2790,20 @@ def author_and_selftest(
                         f"baseline {metric_name} is {expected_value:.6g} — off by a factor "
                         f"of {ratio:.4g}. This is a normalisation or unit error, not a "
                         f"methodological difference. Re-derive the normalisation from the "
-                        f"case's own constant/transportProperties; do not hardcode 1.0."
+                        f"case's own transport-properties dictionary (constant/physicalProperties "
+                        f"or constant/transportProperties, whichever the case has); do not hardcode 1.0."
                     ),
                 }
+
+        # In a multi-case study it must score the case it is given, not the
+        # whole study (see scores_whole_study).
+        if st["ok"] and probe_cases:
+            whole = scores_whole_study(
+                comparator=cand_path, baseline_case_dir=baseline_case_dir,
+                baseline_value=st["value"], probe_cases=probe_cases,
+                reference_file=reference_file, metric_name=metric_name)
+            if whole:
+                st = {**st, "ok": False, "reason": whole}
 
         failure_mode = "ok" if st["ok"] else _classify_selftest_failure(
             stdout=st["stdout"], stderr=st["stderr"], value=st["value"],
@@ -2949,6 +3018,7 @@ def resolve_metric_comparators(
     topic: str = "",
     locked_comparator: Optional[Path] = None,
     cache_dirs: Optional[List[Path]] = None,
+    probe_cases: Optional[List[Path]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     For each metric:
@@ -2992,6 +3062,11 @@ def resolve_metric_comparators(
                 reference_file=reference_file, metric_name=name,
                 baseline_time=baseline_final_time,
             )
+            whole = scores_whole_study(
+                comparator=locked_path, baseline_case_dir=baseline_case_dir, baseline_value=val,
+                probe_cases=probe_cases, reference_file=reference_file, metric_name=name) if ok else ""
+            if whole:
+                ok, reason = False, whole
             if ok:
                 print(f"[OED-EXT][phase1] {name} bound to the study's own comparator "
                       f"{locked_path} (selftest {val})")
@@ -3010,6 +3085,11 @@ def resolve_metric_comparators(
                 reference_file=reference_file, metric_name=name,
                 baseline_time=baseline_final_time,
             )
+            whole = scores_whole_study(
+                comparator=Path(ep), baseline_case_dir=baseline_case_dir, baseline_value=val,
+                probe_cases=probe_cases, reference_file=reference_file, metric_name=name) if ok else ""
+            if whole:
+                ok, reason = False, whole
             if ok:
                 bound[name] = {"path": ep, "origin": "existing",
                                "selftest_ok": True, "selftest_value": val,
@@ -3057,6 +3137,7 @@ def resolve_metric_comparators(
             exemplar_text=exemplar_text,
             pyvista_after_attempt=5,
             expected_value=expectation_for_metric(name, expectations),
+            probe_cases=probe_cases,
         )
         bound[name] = result
         if not result.get("selftest_ok"):

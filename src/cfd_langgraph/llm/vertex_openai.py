@@ -184,13 +184,18 @@ def create_vertex_openai_chat_model(
     )
 
 # A self-hosted OpenAI-compatible server answers HTTP 400 "maximum context length"
-# instead, so the clip never fired (qwen_retest_20261005/slau_r4).
+# instead, so the clip never fired (qwen_retest_20261005/slau_r4). SGLang words
+# it "Input length (N tokens) exceeds the maximum allowed length (M tokens)",
+# which fell through as a plain failed step (qwen_retest_20261005/cavity_r14).
+_OVERFLOW_PHRASES = ("maximum context length", "context length", "exceeds the maximum allowed length")
+
+
 def _context_overflow(exc: BaseException) -> Optional[BaseException]:
     """The provider's "request too large" refusal as LangChain's
     ContextOverflowError, which the summariser's emergency clip catches, or None
     for any other error."""
     text = str(exc).lower()
-    if "maximum context length" not in text and "context length" not in text:
+    if not any(phrase in text for phrase in _OVERFLOW_PHRASES):
         return None
     try:
         from langchain_core.exceptions import ContextOverflowError

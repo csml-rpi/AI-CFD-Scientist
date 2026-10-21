@@ -234,11 +234,16 @@ def ensure_time_averaging(case: Path | str) -> bool:
 
     Averages start halfway through the run so start-up transients are excluded.
     Returns True if anything was added. A steady case, or one that already
-    averages, is left alone.
+    averages, is left alone, and so is a case whose solver forbids added
+    function objects (cfd_langgraph.solver_shelf.own_runtime).
     """
+    from cfd_langgraph.solver_shelf import own_runtime
+
     case = Path(case)
     cd = case / "system" / "controlDict"
     if not cd.is_file() or not is_transient(case):
+        return False
+    if own_runtime(case).get("function_objects") is False:
         return False
     text = cd.read_text(errors="ignore")
     if "fieldAverage" in text:
@@ -485,9 +490,11 @@ unconverged iterative solve, a setup error -- instead of calling the level adequ
 WHERE TO REFINE. If the level is not acceptable, decide from the flow field, the \
 geometry and the case parameters where the flow is under-resolved, and refine only \
 there -- the regions and the directions that need it, not the whole domain. A cell \
-count is a budget: one refinement step may produce a mesh with at most about twice the \
-cells of this one, so spend the added cells where they change the solution most. Say \
-which regions, in which directions, and roughly by how much.
+count is a budget: one refinement step may produce a mesh with at most the cells the \
+REFINEMENT BUDGET line allows, so spend the added cells where they change the solution \
+most. In a graded block, refine a direction by a whole factor (2, 3) rather than by a \
+fraction: a fractional count moves the graded cells, and some end up coarser than \
+before. Say which regions, in which directions, and roughly by how much.
 
 CHECK BEFORE YOU CONCLUDE. A figure can mislead: its orientation, its colour range or \
 the region it shows. Before you call anything in a figure wrong, check it with the tools: \
@@ -539,14 +546,45 @@ def _numbers_text(stats: List[SeriesStats], wall: Optional[Any]) -> str:
     return "\n".join(lines) or "  (no monitored histories were written)"
 
 
+# A case solved without function objects (by its own driver, as DAFoam's
+# runScript.py, or with added ones disabled, as for hyStrath) writes no
+# monitored histories, and the reviewer then saw no sign of convergence at all:
+# DAFoam's baseline met its residual tolerance and was still judged unsettled
+# (shelf_demo_dafoam_20261011_0054). The solver's own log is the evidence there.
+def _budget_text(case: Path) -> str:
+    """How many cells the next refinement step from this level may have, as
+    the code checks it (foam_native.loop._not_finer)."""
+    from cfd_langgraph.foam_native.loop import REFINE_FREE_CELLS, refine_budget
+
+    budget = refine_budget(case)
+    cells = _cell_count(case)
+    limit = f" ({int(budget * cells)} cells)" if cells else ""
+    return (f"the next level may have at most {budget:g} times this level's cells{limit}; "
+            f"a mesh of up to {REFINE_FREE_CELLS} cells is allowed whatever the step.")
+
+
+def _monitored_text(case: Path, stats: List[SeriesStats], wall: Optional[Any]) -> str:
+    from cfd_langgraph.openfoam_version import case_solver
+
+    text = _numbers_text(stats, wall)
+    if stats:
+        return text
+    name = case_solver(case)["log"] if (case / "system" / "controlDict").is_file() else ""
+    log = case / name if name else None
+    if log is None or not log.is_file():
+        return text
+    try:
+        tail = log.read_text(errors="ignore").splitlines()[-40:]
+    except OSError:
+        return text
+    shown = "\n".join(f"    {line}" for line in tail)[-4000:]
+    return f"{text}\n  The end of the solver's own log ({name}):\n{shown}"
+
+
 def _cell_count(case: Path) -> Optional[int]:
-    owner = Path(case) / "constant" / "polyMesh" / "owner"
-    if not owner.is_file():
-        return None
-    with owner.open(errors="ignore") as fh:
-        head = fh.read(2000)
-    m = re.search(r"nCells:\s*(\d+)", head)
-    return int(m.group(1)) if m else None
+    from cfd_langgraph.foam_native.loop import _n_cells
+
+    return _n_cells(Path(case))
 
 
 def case_parameters(case: Path | str) -> str:
@@ -563,14 +601,16 @@ def case_parameters(case: Path | str) -> str:
         p = case / rel
         return p.read_text(errors="ignore") if p.is_file() else ""
 
-    app = _re.search(r"\bapplication\s+(\w+)\s*;", read("system/controlDict"))
-    if app:
-        lines.append(f"solver: {app.group(1)}")
-    mt = read("constant/momentumTransport")
-    sim = _re.search(r"\bsimulationType\s+(\w+)\s*;", mt)
-    model = _re.search(r"\bmodel\s+(\w+)\s*;", mt)
-    if sim:
-        lines.append(f"turbulence treatment: {sim.group(1)}" + (f", model {model.group(1)}" if model else ""))
+    from cfd_langgraph.openfoam_version import case_solver, turbulence_model
+
+    solver = case_solver(case)
+    if solver["application"]:
+        lines.append("solver: " + (f"{solver['application']} -solver {solver['module']}"
+                                   if solver["module"] else solver["application"]))
+    turbulence = turbulence_model(case)
+    if turbulence.get("simulationType"):
+        lines.append(f"turbulence treatment: {turbulence['simulationType']}"
+                     + (f", model {turbulence['model']}" if turbulence.get("model") else ""))
     for name in ("physicalProperties", "transportProperties"):
         nu = _re.search(r"\bnu\b[^;]*?([-+0-9.eE]+)\s*;", read(f"constant/{name}"))
         if nu:
@@ -603,6 +643,21 @@ def case_parameters(case: Path | str) -> str:
         if inv.bounds:
             b = inv.bounds
             lines.append(f"domain extent: x {b[0]:.4g}..{b[1]:.4g}, y {b[2]:.4g}..{b[3]:.4g}, z {b[4]:.4g}..{b[5]:.4g}")
+    except Exception:  # noqa: BLE001
+        pass
+    # A case its solver runs by a script carries settings there that the
+    # dictionaries above do not show. DAFoam's runScript.py turns on wall
+    # functions, and without it five levels were rejected for an
+    # "unspecified wall treatment" (shelf_demo_dafoam_20261011_1437).
+    try:
+        from cfd_langgraph.solver_shelf import own_runtime
+
+        runtime = own_runtime(case)
+        if runtime.get("run"):
+            for name in runtime.get("inputs", []):
+                if (case / name).is_file():
+                    lines.append(f"the solver is run as `{runtime['run']}`; {name}, which sets the "
+                                 f"case's solver options:\n{read(name)[:4000]}")
     except Exception:  # noqa: BLE001
         pass
     return "\n".join(f"  {l}" for l in lines) or "  (not readable from the case)"
@@ -867,7 +922,8 @@ def assess_level(llm: Any, case: Path | str, *, case_description: str,
         f"TIME TREATMENT: {'transient -- figures of the flow are instantaneous at the latest time' if transient else 'steady'}\n\n"
         f"CASE PARAMETERS (read from the case):\n{case_parameters(case)}\n\n"
         f"THIS LEVEL: {_cell_count(case) or 'unknown'} cells\n"
-        f"MONITORED QUANTITIES:\n{_numbers_text(stats, wall)}\n\n"
+        f"REFINEMENT BUDGET: {_budget_text(case)}\n"
+        f"MONITORED QUANTITIES:\n{_monitored_text(case, stats, wall)}\n\n"
         + _earlier_text(earlier or [])
         + _measured_text(measured)
         + (f"ITERATIVE CONVERGENCE: {steady_note}\n\n" if (steady_note := steady_unsettled(case)) else "")
@@ -974,7 +1030,7 @@ def decide_start(llm: Any, case: Path | str, *, case_description: str, images: L
         f"TIME TREATMENT: {'transient' if is_transient(case) else 'steady'}\n"
         f"THIS LEVEL RAN FROM 0 TO t={final:g} (end time in its controlDict: {_end_time(case)})\n\n"
         f"CASE PARAMETERS (read from the case):\n{case_parameters(case)}\n\n"
-        f"MONITORED QUANTITIES:\n{_numbers_text(stats, None)}\n\n"
+        f"MONITORED QUANTITIES:\n{_monitored_text(case, stats, None)}\n\n"
         "The figures follow: the flow at the final time and the monitored histories. Check "
         "anything doubtful with the tools, then decide."
     )
@@ -1050,6 +1106,10 @@ def make_start_case(level: Path | str, dest: Path | str, decision: StartDecision
     for item in ("0", "constant", "system"):
         if (level / item).is_dir():
             shutil.copytree(level / item, dest / item)
+    # Whether the level ran its own Allrun: then its mesh is more than
+    # blockMeshDict makes, and a run from this case keeps it (foam_native.loop).
+    if (level / ".foamagent_state.json").is_file():
+        shutil.copy2(level / ".foamagent_state.json", dest / ".foamagent_state.json")
     from cfd_langgraph.foam_native.loop import drop_unread_transport_properties
 
     drop_unread_transport_properties(dest)
@@ -1168,11 +1228,14 @@ def _snake(name: str) -> str:
 def solution_quantities(llm: Any, *, metric_specs: List[Dict[str, Any]], case_description: str,
                         monitored: Optional[List[str]] = None,
                         transient: bool = False,
-                        inventory: str = "") -> List[Dict[str, str]]:
+                        inventory: str = "",
+                        reasons: Optional[List[str]] = None) -> List[Dict[str, str]]:
     """Study metrics translated into solution-only quantities, as metric-spec
     entries the existing extractor can compute. ``monitored`` names the history
     columns already measured, so they are not asked for twice. Empty list on
-    failure."""
+    failure, with why appended to ``reasons``: an empty answer gave the
+    manager nothing to act on but "call this again"
+    (shelf_demo_olaflow_20261011_1242)."""
     from langchain_core.messages import HumanMessage, SystemMessage
     from pydantic import BaseModel
 
@@ -1184,6 +1247,7 @@ def solution_quantities(llm: Any, *, metric_specs: List[Dict[str, Any]], case_de
 
     class _Qs(BaseModel):
         quantities: List[_Q]
+        why_none: str = ""
 
     metrics = "\n".join(
         f"- {m.get('name')}: {str(m.get('description', ''))[:300]} {str(m.get('computation_hint', ''))[:600]}"
@@ -1196,9 +1260,13 @@ def solution_quantities(llm: Any, *, metric_specs: List[Dict[str, Any]], case_de
                          + (f"WHAT THIS CASE WRITES:\n{inventory.strip()[:6000]}\n\n" if inventory else "")
                          + f"STUDY METRICS:\n{metrics}"
                          + ("\n\nALREADY MEASURED FROM MONITORED HISTORIES (do not repeat):\n"
-                            + "\n".join(f"- {m}" for m in monitored) if monitored else "")),
+                            + "\n".join(f"- {m}" for m in monitored) if monitored else "")
+                         + "\n\nIf no quantity can be defined from what this case writes, return none "
+                         "and say why in why_none."),
         ])
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if reasons is not None:
+            reasons.append(f"the call that chooses them failed: {type(exc).__name__}: {str(exc)[:200]}")
         return []
     specs = []
     for q in out.quantities[:8]:
@@ -1206,6 +1274,8 @@ def solution_quantities(llm: Any, *, metric_specs: List[Dict[str, Any]], case_de
         if name:
             specs.append(quantity_spec(name, q.definition, transient=transient,
                                        from_inventory=bool(inventory)))
+    if not specs and reasons is not None:
+        reasons.append(out.why_none.strip() or "none was chosen, and no reason was given")
     return specs
 
 

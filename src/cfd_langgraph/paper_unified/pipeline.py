@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -190,7 +192,50 @@ def run_unified_paper_pipeline(
     last_err = ""
     last_rev: Dict[str, Any] = {}
 
+    # The run is killed at the write_paper tool's time limit. Saved only at
+    # the end, a killed run kept no paper and no review although five review
+    # rounds had finished (shelf_demo_hystrath_20261011_1602): each reviewed
+    # version is now saved as it is reviewed, and no round starts that would
+    # not finish within CFD_SCIENTIST_PAPER_BUDGET_S.
+    try:
+        budget_s = float(os.environ.get("CFD_SCIENTIST_PAPER_BUDGET_S") or 0)
+    except ValueError:
+        budget_s = 0.0
+    deadline = time.monotonic() + budget_s if budget_s > 0 else None
+    last_round_s = 0.0
+
+    def _save_outputs() -> None:
+        main_tex = paper_dir / "main.tex"
+        main_tex.write_text(paper_tex, encoding="utf-8")
+        (paper_dir / "sections").mkdir(parents=True, exist_ok=True)
+        (paper_dir / "sections" / "body.tex").write_text(paper_tex, encoding="utf-8")
+        (paper_dir / "references.bib").write_text("", encoding="utf-8")
+        if last_pdf and Path(last_pdf).exists():
+            import shutil
+
+            shutil.copy2(last_pdf, paper_dir / "main.pdf")
+        rev = review_info["reviews"][-1] if review_info["reviews"] else {}
+        review_path.parent.mkdir(parents=True, exist_ok=True)
+        review_path.write_text(
+            json.dumps(
+                {
+                    "overall_score": float(rev.get("score", 0.0)),
+                    "major_issues": rev.get("recommendations", []),
+                    "raw": {"review_info": review_info, "last_review": rev},
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
     for outer in range(max(1, max_review_loops)):
+        if deadline is not None and outer > 0 and time.monotonic() + last_round_s > deadline:
+            review_info["stopped_for_time"] = True
+            if verbose:
+                print(f"[paper_unified] stopping before round {outer + 1}: not enough time left "
+                      f"(the last round took {last_round_s / 60:.0f} min)")
+            break
+        round_started = time.monotonic()
         review_info["tries"] = outer + 1
         regen_viz = outer == 0 or reviewer_requests_script_refresh(
             recs_prev,
@@ -213,6 +258,7 @@ def run_unified_paper_pipeline(
                 verbose=verbose,
                 previous_script=script_text,
                 extra_feedback=extra_script_feedback,
+                deadline=deadline,
             )
             review_info["viz_meta"].append(vmeta)
             extra_script_feedback = ""
@@ -352,6 +398,8 @@ def run_unified_paper_pipeline(
             and compile_ok
             and score >= float(score_threshold)
         )
+        _save_outputs()
+        last_round_s = time.monotonic() - round_started
         recs_prev = list(review.get("recommendations") or [])
         needs_viz_prev = bool(review.get("needs_additional_visualization", False))
         specs = list(review.get("additional_viz_specs") or [])
@@ -407,29 +455,8 @@ def run_unified_paper_pipeline(
             if compile_ok:
                 break
 
-    main_tex = paper_dir / "main.tex"
-    main_tex.write_text(paper_tex, encoding="utf-8")
-    (paper_dir / "sections").mkdir(parents=True, exist_ok=True)
-    (paper_dir / "sections" / "body.tex").write_text(paper_tex, encoding="utf-8")
-    (paper_dir / "references.bib").write_text("", encoding="utf-8")
-    if last_pdf and Path(last_pdf).exists():
-        import shutil
-
-        shutil.copy2(last_pdf, paper_dir / "main.pdf")
-
+    _save_outputs()
     last_rev = review_info["reviews"][-1] if review_info["reviews"] else {}
-    review_path.parent.mkdir(parents=True, exist_ok=True)
-    review_path.write_text(
-        json.dumps(
-            {
-                "overall_score": float(last_rev.get("score", 0.0)),
-                "major_issues": last_rev.get("recommendations", []),
-                "raw": {"review_info": review_info, "last_review": last_rev},
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
 
     return {
         "ok": bool(last_compile_ok),

@@ -80,7 +80,16 @@ def strip_latex_fences(text: str) -> str:
     text = text.strip()
     m = _LATEX_FENCE_RE.search(text)
     if m:
-        return m.group(1).strip()
+        text = m.group(1).strip()
+    # A whole paper that opens with the model's own remark ("I'm checking the
+    # supplied figures ...") before \documentclass does not compile
+    # (shelf_demo_olaflow_20261011_1242). Only comment and command lines may
+    # come before it; any other line there is dropped.
+    start = text.find("\\documentclass")
+    if start > 0:
+        kept = [line for line in text[:start].splitlines()
+                if line.strip().startswith(("%", "\\")) or not line.strip()]
+        text = ("\n".join(kept).strip() + "\n" + text[start:]).strip()
     return text
 
 

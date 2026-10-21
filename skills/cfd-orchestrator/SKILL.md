@@ -60,6 +60,47 @@ If activation fails because the env does not exist, stop and surface the one-tim
 
 `S2_API_KEY` should be set in the shell (Semantic Scholar). If it is not set, surface a one-line warning to the user — `cfd-literature` will still work on the public endpoint but is rate-limited.
 
+## Step 3b — Match the installed OpenFOAM
+
+The user may run any openfoam.org release (9–14) or openfoam.com release (v2006–v2512). Most examples in these skills use openfoam.org 10 names. Read what the installed version calls things before writing anything:
+
+```bash
+python -c "import sys; sys.path.insert(0, 'src'); from cfd_langgraph.openfoam_version import describe, get_profile; print(describe(get_profile()))"
+```
+
+It prints the version and fork, the turbulence / transport / source-term file names (`momentumTransport` or `turbulenceProperties`, `physicalProperties` or `transportProperties`, `fvModels` or `fvOptions`), whether solvers are standalone applications (`simpleFoam`, …) or modules run by `foamRun` with `solver <module>;` in controlDict (openfoam.org 11+), the post-processing command, and where the installation's own tutorials are. Every case, dictionary, Allrun and compiled library in this run follows those facts. Where they conflict with an example in a skill, the facts win.
+
+Every OpenFOAM case in the starter folder is tried on the installed version before anything uses it:
+
+```bash
+python scripts/translate_case.py --check --case <starter case>
+```
+
+If it does not print `"ok": true`, port a copy (never the starter itself) and use the copy from then on; its `TRANSLATION.md` lists every change:
+
+```bash
+python scripts/translate_case.py --case <starter case> --out <run_dir>/starter_translated/<name> \
+    --output <run_dir>/starter_translated/<name>.translation.json
+```
+
+The LangGraph pipeline does both automatically in `read_starter_folder`.
+
+## Step 3c — Third-party solvers, when the physics needs one
+
+When the flow needs physics the installed OpenFOAM does not ship (water waves, melt pools, solid mechanics or fluid-structure interaction, turbines, ...), check the solver shelf (`solvers/<name>/solver.yaml` describes each; builds live under `$CFD_SCIENTIST_SHELF`):
+
+```bash
+python -c "import sys; sys.path.insert(0, 'src'); from cfd_langgraph import solver_shelf as s; from cfd_langgraph.openfoam_version import get_profile; import json; print(json.dumps(s.status(get_profile(), '<topic>'), indent=1))"
+```
+
+Use a solver only when its status is `validated` on this installation. A matching one that is not built is built and validated with:
+
+```bash
+python scripts/shelf_install.py <name> && python scripts/shelf_validate.py <name>
+```
+
+Validation runs the solver's frozen checks (`solvers/<name>/checks.py`) and compares each number with a reference that does not come from the solver; a build that misses any check stays unusable. Write its cases from its own tutorials (the ported copies under the build's `tutorials_ported/` where the tutorial had to be ported), name it in every requirement that uses it, and run with its `bin/` and `lib/` on `PATH` / `LD_LIBRARY_PATH` — the LangGraph pipeline does this for every case automatically.
+
 ## Step 4 — Walk the deterministic skill sequence
 
 You invoke skills in the explicit ordered list below — not by chasing recursive `## Next` links through 8-12 markdown files. The ordered list survives long-context drift; recursive `## Next` chains do not, and **mesh-gate** (the most-skipped stage) gets buried as a 3-4 hop deep instruction. The list below is the authoritative skill order. Each row is a mandatory invocation when its `enter_if` condition is true.

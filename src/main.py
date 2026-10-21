@@ -23,6 +23,12 @@ DEFAULT_BEDROCK_MODEL = os.environ.get(
 )
 
 # Allow override via command-line argument
+
+def _installed_openfoam() -> str:
+    from cfd_langgraph.openfoam_version import find_installation
+
+    return find_installation()
+
 def parse_args():
     parser = argparse.ArgumentParser(description="CFD Scientist Main Runner")
     parser.add_argument('--model', type=str, default=DEFAULT_BEDROCK_MODEL, 
@@ -146,7 +152,7 @@ def run_foam(user_requirement: str, show_output: bool = False, run_index: int = 
     # Build command
     cmd = [
         "python", str(foam_bench),
-        "--openfoam_path", os.environ.get("WM_PROJECT_DIR", "/opt/openfoam10"),
+        "--openfoam_path", os.environ.get("WM_PROJECT_DIR") or _installed_openfoam(),
         "--output", str(output_dir),
         "--prompt_path", str(prompt_file),
     ]

@@ -67,10 +67,17 @@ def main() -> int:
     ap.add_argument("--train", action="store_true")
     ap.add_argument("--train-timeout", type=int, default=6 * 3600)
     ap.add_argument("--predict-timeout", type=int, default=2 * 3600)
+    ap.add_argument("--seeds", default="",
+                    help="comma-separated seeds to run instead of the spec's (a screening subset, or the rest)")
+    ap.add_argument("--train-in-view", action="store_true",
+                    help="train in --manifest as it is, the view the candidate trained its own seeds in, "
+                         "instead of the final re-run's view with the evaluation sets hidden")
     a = ap.parse_args()
 
     run_dir, starter, out = Path(a.run_dir).resolve(), Path(a.starter).resolve(), Path(a.out).resolve()
     spec = pc.load_spec(Path(a.spec))
+    if spec and a.seeds.strip():
+        spec = pc.with_seeds(spec, [int(s) for s in a.seeds.split(",") if s.strip()])
     models = Path(a.models).resolve() if a.models else run_dir / pc.PIPELINE_DIR / pc.MODELS_DIR
     result: dict = {"run_dir": str(run_dir), "manifest": a.manifest, "out": str(out), "models": str(models)}
     if not spec:
@@ -83,7 +90,10 @@ def main() -> int:
             ok = True
             if a.train:
                 with tempfile.TemporaryDirectory() as td:
-                    view = _training_view(a.manifest, Path(td))
+                    # The validation view replaces the training data itself
+                    # (training samples less the stand-ins); hidden as an
+                    # evaluation set, the other seeds trained on nothing.
+                    view = a.manifest if a.train_in_view else _training_view(a.manifest, Path(td))
                     sb = _sandbox(run_dir, starter, view, a.train_timeout)
                     result["training"] = pc.run_training(sandbox=sb, run_dir=run_dir, spec=spec,
                                                          models_root=models, timeout_s=a.train_timeout)

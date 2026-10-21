@@ -34,6 +34,7 @@ class HypothesisCritiqueAgent:
         research_topic: str = "",
         case_context: str = "",
         study_mode: str = "",
+        prescribed: bool = False,
     ) -> Dict[str, Any]:
         sys_t = self.prompts.get("critique_system_prompt", "")
         usr_t = self.prompts.get("critique_user_prompt", "")
@@ -55,6 +56,23 @@ class HypothesisCritiqueAgent:
                 "and `feasible_for_foamagent` means feasible to build, fit and score here. The "
                 "task's data and scoring:\n"
                 + (case_context or "(not recorded)").replace("{", "{{").replace("}", "}}")
+            )
+        elif prescribed:
+            # The brief already decides the study; the review checks the idea
+            # is that study. Framed as one fixed case to build on, a brief with
+            # a validation step on one setup and a sweep on another could only
+            # be met by dropping a step (shelf_demo_olaflow_20261010_1356).
+            sys_t = (
+                sys_t
+                + "\n\nTHE BRIEF PRESCRIBES THIS STUDY — the research topic fixes the cases, "
+                "values and comparisons. Judge whether the idea is exactly that study: every "
+                "step or phase the brief names (for example a validation step and then the "
+                "study), every case in each with the brief's values, and the comparisons it "
+                "asks for. Reject an idea that drops, adds or substitutes cases or steps. Do not "
+                "reject it for lacking novelty or for using several configurations the brief "
+                "names. Judge plausibility and implementability of the prescribed study itself."
+                + ("\nOne case the brief names, given as starting material:\n"
+                   + case_context.replace("{", "{{").replace("}", "}}") if case_context else "")
             )
         elif case_context:
             # The implementability criterion asks whether the idea specifies

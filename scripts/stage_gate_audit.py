@@ -162,6 +162,19 @@ VISION_KEYWORDS = (
 )
 
 
+def _final_review(rd: Any) -> Dict[str, Any]:
+    """The reviewer's own verdict from review.json. write_paper's unified
+    pipeline keeps it under raw.last_review, with only overall_score and
+    major_issues at the top; read at the top alone, every such review looked
+    schema-less with score 0 (shelf_demo_olaflow_20261011_1242)."""
+    if not isinstance(rd, dict):
+        return {}
+    last = (rd.get("raw") or {}).get("last_review") if isinstance(rd.get("raw"), dict) else None
+    if "score" not in rd and isinstance(last, dict):
+        return {**last, **{k: v for k, v in rd.items() if k != "raw"}}
+    return rd
+
+
 def _read_json(path: Path) -> Dict[str, Any]:
     try:
         return json.loads(path.read_text())
@@ -590,12 +603,25 @@ _MESH_LOG_TOKENS = (
 )
 
 
+# A FOAM FATAL notice the run carries on past (as foam_native.loop._NOT_FATAL):
+# pyDAFoam's second decomposePar of a case prints "Case is already decomposed"
+# and the run goes on (shelf_demo_dafoam_20261019_1057, case_003).
+_NOT_FATAL = ("already decomposed",)
+
+
 def _scan_log_for_fatal(log_path: Path) -> bool:
     try:
         txt = log_path.read_text(errors="replace")
     except Exception:
         return False
-    return any(mark in txt for mark in FATAL_LOG_MARKERS)
+    if not any(mark in txt for mark in FATAL_LOG_MARKERS):
+        return False
+    lines = txt.splitlines()
+    for i, line in enumerate(lines):
+        if any(mark in line for mark in FATAL_LOG_MARKERS):
+            if not any(note in " ".join(lines[i:i + 6]) for note in _NOT_FATAL):
+                return True
+    return False
 
 
 def _log_reached_end(log_path: Path) -> bool:
@@ -633,7 +659,17 @@ def _check_solver_logs(out_dir: Path, route: int) -> List[str]:
     failures: List[str] = []
     mg = out_dir / "mesh_gate"
     if mg.is_dir():
-        for log in sorted(mg.rglob("log.*")):
+        # Only the levels a selection rests on: the selected one and those it
+        # was compared with. Folders left by an abandoned earlier attempt are
+        # not the study's mesh, and one such crashed baseline failed a study
+        # whose selected level ran cleanly (shelf_demo_olaflow_20261011_1242).
+        level_dirs = []
+        for spec_path in sorted(mg.glob("*/selected_mesh_spec.json")):
+            spec = _read_json(spec_path)
+            for d in [spec.get("selected_level"), *(spec.get("levels") or [])]:
+                if d and Path(str(d)).is_dir() and Path(str(d)) not in level_dirs:
+                    level_dirs.append(Path(str(d)))
+        for log in [l for d in level_dirs for l in _solver_logs_in(d)]:
             if _scan_log_for_fatal(log):
                 failures.append(
                     f"mesh_gate: FOAM FATAL ERROR in "
@@ -1506,7 +1542,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
     # H13: figure physics correctness — LLM-authored in review.json#figure_physics_ok
     if review.is_file():
         try:
-            rd = json.loads(review.read_text())
+            rd = _final_review(json.loads(review.read_text()))
             v = rd.get("figure_physics_ok")
             if isinstance(v, bool):
                 audit["figure_physics_ok"] = v
@@ -1813,7 +1849,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
     audit["review_schema_ok"] = False
     if review.is_file():
         try:
-            rd = json.loads(review.read_text())
+            rd = _final_review(json.loads(review.read_text()))
             required = ["pass", "score", "recommendations", "formatting_ok",
                         "figures_ok", "content_ok", "summary"]
             audit["review_schema_ok"] = (
@@ -1833,8 +1869,10 @@ def _check_paper_stage(out_dir: Path, route: int) -> Tuple[List[str], List[str]]
     failures: List[str] = []
     warnings: List[str] = []
 
-    if not (out_dir / "paper_experiment_plan.json").is_file():
-        failures.append("paper/Stage 0 not run: paper_experiment_plan.json missing")
+    # write_paper's unified pipeline writes paper_unified_plan.json.
+    if not any((out_dir / name).is_file()
+               for name in ("paper_experiment_plan.json", "paper_unified_plan.json")):
+        failures.append("paper/Stage 0 not run: no paper_unified_plan.json (or paper_experiment_plan.json)")
 
     cea = out_dir / "cross_experiment_analysis"
     if not cea.is_dir():
@@ -1843,8 +1881,12 @@ def _check_paper_stage(out_dir: Path, route: int) -> Tuple[List[str], List[str]]
         png_count = len(list(cea.glob("*.png")))
         if png_count < 1:
             failures.append("cross_experiment_analysis/ has zero PNGs (no comparison figures)")
-        if not (cea / "aggregate.csv").is_file():
-            failures.append("cross_experiment_analysis/aggregate.csv missing")
+        # The cross-experiment step writes results.json and
+        # data_processing_report.md; nothing writes aggregate.csv any more.
+        if not any((cea / name).is_file()
+                   for name in ("aggregate.csv", "results.json", "data_processing_report.md")):
+            failures.append("cross_experiment_analysis/ has no results (results.json, "
+                            "data_processing_report.md or aggregate.csv)")
         if not (cea / "cross_experiment_interpretation.md").is_file():
             failures.append("cross_experiment_analysis/cross_experiment_interpretation.md missing")
 
@@ -2228,7 +2270,7 @@ def _check_paper_stage(out_dir: Path, route: int) -> Tuple[List[str], List[str]]
     if not review.is_file():
         failures.append("review.json missing (paper review never ran)")
     else:
-        rd = _read_json(review)
+        rd = _final_review(_read_json(review))
         # Cross-check reviewer's claimed booleans against deterministic audit.
         # If they disagree, the reviewer is lying — flag it.
         for key in ("length_ok", "word_density_ok", "cross_experiment_figures_ok"):
@@ -2321,12 +2363,13 @@ def _check_paper_numeric_consistency(out_dir: Path,
                 v = _num(m.group(0))
                 if v is not None:
                     artifact_numbers.append(abs(v))
-    agg = out_dir / "cross_experiment_analysis" / "aggregate.csv"
-    if agg.is_file():
-        for m in re.finditer(r"-?\d+\.?\d*", agg.read_text(errors="replace")):
-            v = _num(m.group(0))
-            if v is not None:
-                artifact_numbers.append(abs(v))
+    for agg in (out_dir / "cross_experiment_analysis" / "aggregate.csv",
+                out_dir / "cross_experiment_analysis" / "results.json"):
+        if agg.is_file():
+            for m in re.finditer(r"-?\d+\.?\d*", agg.read_text(errors="replace")):
+                v = _num(m.group(0))
+                if v is not None:
+                    artifact_numbers.append(abs(v))
     if artifact_numbers:
         claims = set()
         for m in re.finditer(r"([0-9]{1,3}(?:\.[0-9]+)?)\s*\\?%", body):
