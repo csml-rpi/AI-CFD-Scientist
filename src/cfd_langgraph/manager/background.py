@@ -118,15 +118,24 @@ class BackgroundCandidates:
                                  **({"error": job["error"]} if "error" in job else {"report": job.get("report", "")})})
             self._save()
             in_flight = self._in_flight()
+        slots = self._slots()
+        # Free slots must be said on a timed-out wait too. "Call wait again"
+        # alone kept sd7003_trial_3 waiting an hour-plus on one candidate with
+        # 13 of 14 slots idle.
+        free = slots - len(in_flight) if isinstance(slots, int) else 0
         return {
             "finished": finished,
             "in_flight": in_flight,
-            "build_slots": self._slots(),
+            "build_slots": slots,
             "next_step": (
                 "Act on each finished report as step c1/c2 say, then record the finished "
                 "candidates with oed_record_candidate_results. Keep about build_slots "
                 "candidates in flight: propose and launch more as they finish."
                 if finished else
+                f"Nothing finished within the wait, and {free} of {slots} build slots are "
+                "free. Propose and launch candidates to fill them, then call "
+                "oed_wait_for_candidates again."
+                if in_flight and free > 0 else
                 "Nothing finished within the wait. Call oed_wait_for_candidates again."
                 if in_flight else
                 "Nothing is in flight. Propose and launch candidates."),

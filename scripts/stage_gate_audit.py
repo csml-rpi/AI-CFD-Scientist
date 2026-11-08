@@ -114,6 +114,53 @@ PREFLIGHT_STAGE_NAMES = {
 TOLERANCE = 0.05  # 5%
 
 
+def _tex_text(tex: Path, depth: int = 0) -> str:
+    """The LaTeX source with every \\input{...} and \\include{...} replaced by
+    the file it names (relative to the file it is in; .tex added when the name
+    has no suffix). A manager rewrote main.tex as one \\input of
+    sections/body.tex, and every check that reads main.tex saw one line
+    (nn_in_solver_demo_20261022_1129)."""
+    text = Path(tex).read_text(errors="replace")
+    if depth >= 5:
+        return text
+    out: List[str] = []
+    pos = 0
+    while True:
+        starts = [i for i in (text.find("\\input{", pos), text.find("\\include{", pos)) if i >= 0]
+        if not starts:
+            out.append(text[pos:])
+            return "".join(out)
+        start = min(starts)
+        brace = text.index("{", start)
+        end = text.find("}", brace)
+        if end < 0:
+            out.append(text[pos:])
+            return "".join(out)
+        name = text[brace + 1:end].strip()
+        target = Path(tex).parent / name
+        if not target.suffix:
+            target = target.with_suffix(".tex")
+        out.append(text[pos:start])
+        out.append(_tex_text(target, depth + 1) if target.is_file() else text[start:end + 1])
+        pos = end + 1
+
+
+# H29: a per-case field render of at least 1200x600 pixels.
+_PER_CASE_PNG_MIN_PIXELS = 1200 * 600
+
+
+def _png_dimensions(path: Path) -> Tuple[int, int]:
+    """(width, height) from a PNG's IHDR chunk; (0, 0) if it is not a PNG."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(24)
+    except OSError:
+        return 0, 0
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n" or head[12:16] != b"IHDR":
+        return 0, 0
+    return int.from_bytes(head[16:20], "big"), int.from_bytes(head[20:24], "big")
+
+
 def _floor_status(val: float, floor: float, tol: float = TOLERANCE) -> str:
     """Return 'pass' (val >= floor), 'warn' (floor*(1-tol) <= val < floor),
     or 'fail' (val < floor*(1-tol)). For lower-bound checks."""
@@ -555,6 +602,12 @@ def _check_cases(out_dir: Path, route: int) -> List[str]:
                 or "max revisions" in dj_reason
                 or "max reruns" in dj_reason
                 or "retry budget" in dj_reason
+                # Its time is a budget too: a case the loop stopped at its time
+                # limit says so in run_result.json. Without this, a training
+                # case stopped at its 10 h cap after 4 of 10 runs failed the
+                # audit as "rerun budget not documented", four rounds of paper
+                # revision running (nn_airfoil_s814_20261026_1537, case_003).
+                or bool(rr_data.get("stopped_by_time_limit"))
             )
             if not retries_exhausted:
                 failures.append(
@@ -875,13 +928,31 @@ def _tex_word_count_main_body(tex: Path) -> int:
     """Fallback when pdftotext unavailable: count words in main.tex excluding LaTeX commands and Appendix."""
     if not tex.is_file():
         return -1
-    body = tex.read_text(errors="replace")
+    body = _tex_text(tex)
     # cut off everything from first \section{Appendix...} or \appendix
     body = re.split(r"\\appendix|\\section\{\s*Appendix", body, maxsplit=1)[0]
+    return _count_tex_words(body)
+
+
+def _count_tex_words(body: str) -> int:
+    """Words of LaTeX source, its commands and inline math left out."""
     body = re.sub(r"\\(?:label|cite|ref|includegraphics|begin|end)\{[^}]*\}", "", body)
     body = re.sub(r"\\[a-zA-Z]+\*?", "", body)
     body = re.sub(r"\$[^$]*\$", "", body)
     return len(re.findall(r"\b[A-Za-z][A-Za-z\-']{2,}\b", body))
+
+
+def _tex_word_count_appendix(tex: Path) -> int:
+    """Words after \\appendix (or the first Appendix section), up to the
+    bibliography, counted the way the main body is."""
+    if not tex.is_file():
+        return -1
+    parts = re.split(r"\\appendix|\\section\{\s*Appendix", _tex_text(tex), maxsplit=1)
+    if len(parts) < 2:
+        return 0
+    appendix = re.split(r"\\begin\{thebibliography\}|\\bibliography\{|\\printbibliography",
+                        parts[1], maxsplit=1)[0]
+    return _count_tex_words(appendix)
 
 
 PADDING_SECTION_PATTERNS = (
@@ -914,7 +985,7 @@ def _section_word_breakdown(tex: Path) -> Tuple[int, int, List[Tuple[str, str, i
     Excludes Appendix sections from word counts."""
     if not tex.is_file():
         return (0, 0, [])
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     text = re.split(r"\\appendix|\\section\{\s*Appendix", text, maxsplit=1)[0]
     parts = re.split(r"\\section\{([^}]*)\}", text)
     breakdown: List[Tuple[str, str, int]] = []
@@ -979,7 +1050,7 @@ def _find_duplicate_paragraphs(tex: Path) -> List[Tuple[str, int]]:
     """
     if not tex.is_file():
         return []
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     text = re.split(r"\\appendix|\\section\{\s*Appendix", text, maxsplit=1)[0]
     m = re.search(r"\\begin\{document\}", text)
     if m:
@@ -1013,7 +1084,7 @@ def _count_equation_blocks(tex: Path) -> int:
     """H20: count math display blocks: equation, align, gather, multline, and \\[...\\]."""
     if not tex.is_file():
         return 0
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     text = re.split(r"\\appendix|\\section\{\s*Appendix", text, maxsplit=1)[0]
     n = 0
     n += len(re.findall(r"\\begin\{equation\*?\}", text))
@@ -1044,7 +1115,7 @@ def _count_refs_bib_entries(out_dir: Path) -> Tuple[bool, int, bool]:
                 pass
     # Inline thebibliography in main.tex?
     if tex.is_file():
-        text = tex.read_text(errors="replace")
+        text = _tex_text(tex)
         if "\\begin{thebibliography}" in text:
             entries = len(re.findall(r"\\bibitem\s*(?:\[[^\]]*\])?\s*\{", text))
             if entries > 0:
@@ -1068,7 +1139,7 @@ def _check_meta_paragraph_refs(tex: Path) -> List[Tuple[int, str]]:
     if not tex.is_file():
         return []
     hits: List[Tuple[int, str]] = []
-    for i, line in enumerate(tex.read_text(errors="replace").splitlines(), 1):
+    for i, line in enumerate(_tex_text(tex).splitlines(), 1):
         s = line.strip()
         if s.startswith("%"):
             continue
@@ -1092,13 +1163,75 @@ def _section_bodies(tex_text: str) -> Dict[str, str]:
     return out
 
 
+def _cited_keys(tex_text: str) -> List[str]:
+    """Distinct keys cited by \\cite, \\citep, \\citet, ... (with optional
+    [..] notes), read by scanning. H10 counted \\cite{...} commands: a paper
+    citing 21 works in 7 commands, some \\citep, was held under 10
+    (shelf_demo_hystrath_20261022_1030)."""
+    keys: List[str] = []
+    i, n = 0, len(tex_text)
+    while True:
+        i = tex_text.find("\\cite", i)
+        if i < 0:
+            return list(dict.fromkeys(keys))
+        k = i + len("\\cite")
+        while k < n and (tex_text[k].isalpha() or tex_text[k] == "*"):
+            k += 1
+        while k < n and tex_text[k].isspace():
+            k += 1
+        while k < n and tex_text[k] == "[":
+            close = tex_text.find("]", k)
+            if close < 0:
+                break
+            k = close + 1
+            while k < n and tex_text[k].isspace():
+                k += 1
+        if k < n and tex_text[k] == "{":
+            close = tex_text.find("}", k)
+            if close > k:
+                keys.extend(x.strip() for x in tex_text[k + 1:close].split(",") if x.strip())
+                k = close + 1
+        i = max(k, i + 1)
+
+
+# Viscosity models with their own closure equations, beside RAS/LES turbulence.
+_NON_NEWTONIAN_MODELS = ("bingham", "carreau", "birdcarreau", "powerlaw", "herschelbulkley",
+                         "crosspowerlaw", "casson", "strainratefunction")
+
+
+def _closure_model_in_cases(out_dir: Path) -> Optional[bool]:
+    """True when some case declares a turbulence model (simulationType RAS or
+    LES) or a non-Newtonian viscosity model, False when the cases declare
+    neither, None when there are no cases to read. H25 asked every paper for a
+    turbulence-closure equation: a laminar continuum and DSMC study has none to
+    give (shelf_demo_hystrath_20261022_1030)."""
+    cases = sorted((out_dir / "cases").glob("*/constant")) if (out_dir / "cases").is_dir() else []
+    if not cases:
+        return None
+    for const in cases:
+        for f in const.iterdir():
+            if not f.is_file() or f.stat().st_size > 2_000_000:
+                continue
+            for line in f.read_text(errors="ignore").splitlines():
+                words = line.split("//")[0].replace(";", " ").split()
+                if len(words) < 2:
+                    continue
+                if words[0] == "simulationType" and words[1] in ("RAS", "LES", "RASModel", "LESModel"):
+                    return True
+                # exact names: hyStrath's gas law powerLawEucken is not power-law fluid
+                if words[0] in ("viscosityModel", "transportModel", "model") and \
+                        words[1].lower() in _NON_NEWTONIAN_MODELS:
+                    return True
+    return False
+
+
 def _check_citation_distribution(tex: Path) -> Tuple[bool, Dict[str, int]]:
     """H23: \\cite{} must appear in each of Introduction, Related Work, Methods, Discussion.
     A paper that dumps all citations at the end of one section is not citing — it's listing.
     Returns (ok, {section: cite_count})."""
     if not tex.is_file():
         return (False, {})
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     secs = _section_bodies(text)
     required = ["Introduction", "Related Work", "Methods", "Discussion"]
     counts: Dict[str, int] = {}
@@ -1154,7 +1287,7 @@ def _check_governing_and_closure_equations(tex: Path) -> Tuple[bool, bool, List[
     A paper with only Re/Cf/RMSE definitions is not enough."""
     if not tex.is_file():
         return (False, False, [])
-    t = tex.read_text(errors="replace")
+    t = _tex_text(tex)
     t = re.split(r"\\appendix|\\section\{\s*Appendix", t, maxsplit=1)[0]
     eq_blocks = re.findall(
         r"\\begin\{(?:equation|align|gather|multline)\*?\}.*?"
@@ -1189,6 +1322,15 @@ GEOMETRY_MARKERS = [
     r"Re_?h\s*=\s*\d",           r"Re_?\\tau\s*=\s*\d",
     r"x\s*/\s*h",                r"y\s*/\s*h",
     r"blockMesh",                r"\bbcs?\b.{0,40}(?:inlet|outlet|wall)",
+    # Any geometry, not only steps, hills and channels: a convergent channel's
+    # and a cylinder's Methods described their geometry fully and matched one
+    # marker, and the manager was left padding the text with keywords
+    # (nn_in_solver_demo_20261022_1129).
+    r"\b(?:diameter|radius|chord|span|thickness|width)\b",
+    r"\d\s*(?:\\,|~)?\s*(?:\\mathrm\{)?\s*(?:m|mm|cm)\b",
+    r"\b(?:inlet|outlet|far-?field|free-?stream)\b",
+    r"\b(?:wall|symmetry|periodic|no-slip)\b",
+    r"\b\d[\d,{}\\ ]*\s*cells?\b",
 ]
 
 
@@ -1197,7 +1339,7 @@ def _check_geometry_description(tex: Path) -> Tuple[bool, List[str]]:
     Reynolds number formula, etc.). Returns (ok, matched_markers)."""
     if not tex.is_file():
         return (False, [])
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     secs = _section_bodies(text)
     methods_body = ""
     for k, v in secs.items():
@@ -1218,7 +1360,7 @@ def _has_quantitative_results_table(tex: Path) -> Tuple[bool, int]:
     """
     if not tex.is_file():
         return (False, 0)
-    text = tex.read_text(errors="replace")
+    text = _tex_text(tex)
     text = re.split(r"\\appendix|\\section\{\s*Appendix", text, maxsplit=1)[0]
     tabulars = re.findall(
         r"\\begin\{tabular\*?\}.*?\\end\{tabular\*?\}",
@@ -1478,7 +1620,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
         audit["cross_experiment_richness_ok"] = (len(types_found) >= 2)
 
     if tex.is_file():
-        tex_text = tex.read_text(errors="replace")
+        tex_text = _tex_text(tex)
         cite_paths = re.findall(r"\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}", tex_text)
         audit["tex_cite_paths"] = cite_paths
         # H8: at least one \includegraphics must point at cross_experiment_analysis/
@@ -1490,7 +1632,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
             and audit["cross_experiment_pngs"] >= 1
         )
         # H10: citation density (\cite{} count vs lit.json record count)
-        n_cites = len(re.findall(r"\\cite\{[^}]+\}", tex_text))
+        n_cites = len(_cited_keys(tex_text))
         audit["n_citations"] = n_cites
         if lit.is_file():
             try:
@@ -1527,10 +1669,16 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
         if denom > 0:
             audit["padding_fraction"] = round(pad_w / denom, 3)
         # appendix_fraction = appendix_words_pdf / total_words_pdf  (estimate via tex word ratio)
-        if audit["total_pdf_words"] > 0 and audit["main_body_words"] > 0:
-            audit["appendix_fraction"] = round(
-                1.0 - audit["main_body_words"] / audit["total_pdf_words"], 3
-            )
+        # total_pdf_words is set only when main.pdf exists; a main.tex that
+        # never compiled raised KeyError here and the whole audit was lost.
+        # Both counted from the source: the PDF total also holds the
+        # references, captions and tables, so main/PDF words read a 4-of-16-page
+        # appendix as 37% of the paper, and the manager set out to drop the
+        # \appendix switch to get under the ceiling
+        # (nn_in_solver_demo_20261022_1129).
+        appendix_w = _tex_word_count_appendix(tex)
+        if audit["main_body_words"] > 0 and appendix_w >= 0:
+            audit["appendix_fraction"] = round(appendix_w / (audit["main_body_words"] + appendix_w), 3)
         else:
             audit["appendix_fraction"] = 0.0
         audit["section_concentration_status"] = _worst_status(
@@ -1552,7 +1700,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
     # Slice 16 — H14 mandatory journal section headers
     MANDATORY_SECTIONS = ["Introduction", "Related Work", "Methods", "Results", "Discussion", "Conclusion"]
     if tex.is_file():
-        tex_text_l = tex.read_text(errors="replace")
+        tex_text_l = _tex_text(tex)
         present, missing = [], []
         for sec in MANDATORY_SECTIONS:
             # accept exact section heading, case-insensitive; tolerate trailing space
@@ -1679,8 +1827,11 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
 
     # Slice 18.2 — H25 governing + closure equations (content, not just count)
     gov_ok, clo_ok, markers = _check_governing_and_closure_equations(tex)
+    closure_model = _closure_model_in_cases(out_dir)
+    audit["closure_model_in_cases"] = closure_model
     audit["governing_equations_ok"] = gov_ok if route in ROUTES_WITH_PAPER else True
-    audit["closure_equations_ok"] = clo_ok if route in ROUTES_WITH_PAPER else True
+    # no closure equation is owed when no case has a closure model
+    audit["closure_equations_ok"] = (clo_ok or closure_model is False) if route in ROUTES_WITH_PAPER else True
     audit["equation_markers_found"] = markers
 
     # Slice 18.2 — H26 geometry description in Methods
@@ -1695,7 +1846,7 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
     audit["mesh_gate_in_paper_ok"] = True
     audit["mesh_gate_paper_evidence"] = []
     if route in ROUTES_WITH_PAPER and tex.is_file():
-        text = tex.read_text(errors="replace")
+        text = _tex_text(tex)
         secs = _section_bodies(text)
         methods_body = ""
         for k, v in secs.items():
@@ -1806,9 +1957,12 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
                     )
                     audit["cross_script_ok"] = (audit["cross_script_status"] != "fail")
 
-    # Slice 19 — H29 per-case PNG size threshold (catches matplotlib placeholders
-    # masquerading as PyVista field renders). Real PyVista OpenFOAM contours at
-    # ≥ 1200x600 weigh > 80 KB; matplotlib synthetic-data placeholders are < 50 KB.
+    # Slice 19 — H29 per-case PNG resolution floor: a per-case field render of at
+    # least 1200x600 pixels. Measured in pixels, not bytes: a byte floor (80 KB)
+    # failed true PyVista contours of a 343-cell mesh, which compress to ~65 KB,
+    # and the manager enlarged the render window until the files grew
+    # (nn_in_solver_demo_20261022_1129). Whether a figure shows the case's real
+    # field is judged from the image itself (H13, figure_physics_ok).
     audit["per_case_png_size_ok"] = True
     audit["per_case_png_status"] = "pass"
     audit["per_case_png_undersized"] = []
@@ -1826,14 +1980,14 @@ def _compute_paper_audit(out_dir: Path, route: int = 0) -> Dict[str, Any]:
             leaf = Path(out_png).name
             pf = out_dir / "paper_figs" / leaf
             if pf.is_file():
-                sz = pf.stat().st_size
-                s = _floor_status(sz, 80_000)
+                width, height = _png_dimensions(pf)
+                s = _floor_status(width * height, _PER_CASE_PNG_MIN_PIXELS)
                 statuses.append(s)
                 entry = {
                     "case_id": j.get("case_id"),
                     "kind": kind,
                     "out_png": leaf,
-                    "bytes": sz,
+                    "pixels": f"{width}x{height}",
                 }
                 if s == "fail":
                     failed.append(entry)
@@ -2211,21 +2365,15 @@ def _check_paper_stage(out_dir: Path, route: int) -> Tuple[List[str], List[str]]
             under = audit["per_case_png_undersized"]
             failures.append(
                 f"H29 per_case_png_size_ok=false: {len(under)} per-case contour "
-                f"PNG(s) are < {int(80_000*(1-TOLERANCE))} bytes (80 KB - {int(TOLERANCE*100)}%). "
-                f"Real PyVista OpenFOAM field renders at 1200×600+ resolution weigh "
-                f"200-500 KB; matplotlib placeholders with sparse data weigh < 50 KB. The "
-                f"agent likely fell back to matplotlib synthetic-data plots instead of "
-                f"loading the OpenFOAM case via PyVista. Re-run Phase B using xvfb-run + "
-                f"PyVista's POpenFOAMReader on each case's .foam file (or write it first "
-                f"if absent), select the latest time, and render U-magnitude and p "
-                f"contours with proper colorbars. Undersized: "
-                f"{under[:6]}{'…' if len(under) > 6 else ''}"
+                f"PNG(s) are smaller than 1200x600 pixels. Render each case's field from "
+                f"its OpenFOAM case through PyVista at a paper resolution of at least "
+                f"1200x600. Undersized: {under[:6]}{'…' if len(under) > 6 else ''}"
             )
         elif pcs == "warn":
             warned = audit.get("per_case_png_warn", [])
             warnings.append(
                 f"H29 {len(warned)} per-case PNG(s) in tolerance band "
-                f"(floor 80000, within -{int(TOLERANCE*100)}%) — passes"
+                f"(floor 1200x600 pixels, within -{int(TOLERANCE*100)}%) — passes"
             )
         # Slice 19.2 — H32 mesh-gate evidence in Methods
         if not audit["mesh_gate_in_paper_ok"]:
@@ -2314,7 +2462,7 @@ def _check_paper_numeric_consistency(out_dir: Path,
     tex = out_dir / "paper" / "main.tex"
     if not tex.is_file():
         return failures, warnings
-    body = re.split(r"\\appendix", tex.read_text(errors="replace"), maxsplit=1)[0]
+    body = re.split(r"\\appendix", _tex_text(tex), maxsplit=1)[0]
 
     def _num(tok: str) -> Optional[float]:
         t = tok.replace(",", "").replace("{", "").replace("}", "").strip()
@@ -2370,6 +2518,34 @@ def _check_paper_numeric_consistency(out_dir: Path,
                 v = _num(m.group(0))
                 if v is not None:
                     artifact_numbers.append(abs(v))
+    # And every record a case's own run computed, from the study's file ledger
+    # (cfd_langgraph.file_ledger): runs, not tools, so a number a manager wrote
+    # into a file of its own is still not a computed one. Read from the four
+    # files above only, an S809 lift-gap closure of 78.73% that case_006's run
+    # wrote into its results.json was reported as untraced
+    # (nn_airfoil_s814_20261026_1537).
+    try:
+        src = str(Path(__file__).resolve().parents[1] / "src")
+        if src not in sys.path:
+            sys.path.insert(0, src)
+        from cfd_langgraph import file_ledger
+
+        seen = set()
+        for entry in file_ledger.entries(out_dir):
+            if (entry.get("source") != "run" or entry.get("event") not in ("created", "changed")
+                    or Path(str(entry.get("path", ""))).suffix not in (".json", ".csv")
+                    or "previous_attempts" in str(entry.get("path", ""))):
+                continue
+            p = out_dir / str(entry["path"])
+            if p in seen or len(seen) >= 5000 or not p.is_file() or p.stat().st_size > 20 * 1024 * 1024:
+                continue
+            seen.add(p)
+            for m in re.finditer(r"-?\d+\.?\d*", p.read_text(errors="replace")):
+                v = _num(m.group(0))
+                if v is not None:
+                    artifact_numbers.append(abs(v))
+    except Exception:
+        pass
     if artifact_numbers:
         claims = set()
         for m in re.finditer(r"([0-9]{1,3}(?:\.[0-9]+)?)\s*\\?%", body):

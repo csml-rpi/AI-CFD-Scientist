@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -53,25 +54,31 @@ class _SystemSampler:
     the study ran its builds three at a time on a machine 91% idle.
     """
 
-    def __init__(self, interval_s: float = 2.0):
+    def __init__(self, interval_s: float = 2.0, skip_sessions: Optional[set] = None):
         self.interval_s = interval_s
+        # Sessions already running when calibration began: other cases'
+        # (each runs its scripts in a session of its own) and this process's.
+        self.skip_sessions = set(skip_sessions or ())
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.mem_used_samples_mb: List[float] = []
         self.cpu_percent_samples: List[float] = []
 
-    @staticmethod
-    def _tree() -> Tuple[dict, float]:
-        """{pid: CPU seconds so far} and resident MB of this process's children."""
+    def _tree(self) -> Tuple[dict, float]:
+        """{pid: CPU seconds so far} and resident MB of this process's
+        children, but for those in a session in ``skip_sessions``."""
         cpu: dict = {}
         rss_mb = 0.0
         for proc in psutil.Process().children(recursive=True):
             try:
+                if self.skip_sessions and os.getsid(proc.pid) in self.skip_sessions:
+                    continue
                 with proc.oneshot():
                     times = proc.cpu_times()
                     cpu[proc.pid] = times.user + times.system
                     rss_mb += proc.memory_info().rss / (1024 * 1024)
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ProcessLookupError,
+                    PermissionError):
                 continue
         return cpu, rss_mb
 
@@ -123,6 +130,20 @@ def _profile_from(sampler: _SystemSampler, baseline_used_mb: float, wall_clock_s
     )
 
 
+def running_sessions() -> set:
+    """The sessions of this process and of its children now: what a
+    calibration starting now must not count. Each case runs its scripts in a
+    session of its own (foam_native.loop.run_script), so a case started after
+    this is told apart from the cases already running."""
+    sessions = {os.getsid(0)}
+    for proc in psutil.Process().children(recursive=True):
+        try:
+            sessions.add(os.getsid(proc.pid))
+        except (ProcessLookupError, PermissionError):
+            continue
+    return sessions
+
+
 def benchmark_case(
     run_fn: Callable[[], Any], *, sample_interval_s: float = 2.0,
     window_s: Optional[float] = None,
@@ -132,9 +153,9 @@ def benchmark_case(
 
     ``run_fn`` must be a blocking call that launches and waits for exactly one
     case (e.g. ``lambda: FoamAgentRunner(...).run(..., execute=True)``).
-    Call this only for the first case of a physics group / study — running it
-    alone, with nothing else competing for the machine, is what makes the
-    measurement meaningful.
+    Call this only for the first case of a physics group. Only processes in
+    sessions started after it begins are counted, so cases already running
+    are not part of the measurement.
 
     With ``window_s`` and ``on_window``, ``on_window`` is called once, from a
     timer thread, with the profile measured over the first ``window_s``
@@ -148,7 +169,7 @@ def benchmark_case(
     # The sampler measures this process's children only, which start at nothing.
     baseline_used_mb = 0.0
 
-    sampler = _SystemSampler(interval_s=sample_interval_s)
+    sampler = _SystemSampler(interval_s=sample_interval_s, skip_sessions=running_sessions())
     t0 = time.monotonic()
     timer: Optional[threading.Timer] = None
     with sampler:

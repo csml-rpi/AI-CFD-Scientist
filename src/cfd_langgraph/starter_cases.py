@@ -93,6 +93,18 @@ def _scan(starter_dir: Optional[Path]) -> List[Path]:
     return found
 
 
+def top_level_cases(starter_dir: Optional[Path]) -> List[Path]:
+    """The cases the starter folder holds at its top: the folder itself, or
+    its direct subfolders. Not cases nested deeper (a mesh study's levels, a
+    reference run), which are material, not cases to build from."""
+    if starter_dir is None or not Path(starter_dir).is_dir():
+        return []
+    starter_dir = Path(starter_dir)
+    if _is_case(starter_dir):
+        return [starter_dir]
+    return [p for p in sorted(starter_dir.iterdir()) if p.is_dir() and _is_case(p)]
+
+
 @dataclass(frozen=True)
 class StarterBaseCases:
     """What the starter says it ships, and what is actually on disk."""

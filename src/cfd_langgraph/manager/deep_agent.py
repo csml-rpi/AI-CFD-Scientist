@@ -22,6 +22,7 @@ from .control import (
 from .subagents import (
     build_case_runner_subagent,
     build_general_purpose_subagent,
+    build_nn_coupler_subagent,
     build_oed_candidate_runner_subagent,
 )
 
@@ -83,6 +84,22 @@ Sequence for a standard study:
    `shelf_solvers` with the research topic. Use a third-party solver only if it reports
    `usable: true`; one that matches but is not built can be built and validated with
    `shelf_install`. A requirement that uses one names it.
+   If the study puts a neural network inside the solver -- one trained through the
+   solver's adjoint (DAFoam's regressionModel) or a trained PyTorch network evaluated in a
+   case -- give the network's side to the `task` tool with subagent_type="nn-coupler":
+   its card (each input and its exact definition, the normalisation, output scaling and
+   bounds), its export and its checks. Do this before `generate_case_requirements`, and pass
+   what the nn-coupler fixed (the network's inputs and definitions, normalisation,
+   architecture, output mapping and bounds, the initial weight and options files, and
+   what each case must do with them) to it as `study_notes`: the requirement writer sees
+   nothing else of it. Cases still run through case-runner; the file the
+   nn-coupler writes for a case (the coded object that evaluates the network) goes to that
+   case with `given_files`, so it runs exactly as written. A network is used in a case only
+   after `nn_check_parity` passes, and a result of a case that used one counts only when
+   `nn_check_case` passes on that case. Those two tools are the checks: a case's
+   requirement asks it to run the network inside the solver and write the fields
+   nn_check_case reads, not to build its own parity program. One that was asked to spent
+   ten runs compiling a separate evaluator and never reached the solver.
 5. Call `generate_case_requirements` — turns every approved hypothesis's experiments
    into validated FoamAgent requirements (requirements.json). Use each requirement's
    `study_id` as its `physics_group` for the steps below, unless you have a reason to
@@ -341,11 +358,14 @@ _TOOLS_NOT_FOR_MODE = {
     "implementation": {
         "propose_and_rank_hypotheses", "advance_with_approved_hypotheses",
         "generate_case_requirements", "run_mesh_gate", "interpret_case", "analyze_all_cases",
-        "write_paper", "task", "shelf_solvers", "shelf_install",
+        "restore_last_success", "write_paper", "task", "shelf_solvers", "shelf_install",
+        "nn_export", "nn_from_dafoam", "nn_check_parity", "nn_check_case", "nn_coded_entries",
     },
     "surrogate": _IMPL_TOOLS | {
         "generate_case_requirements", "run_mesh_gate", "oed_prepare_baseline",
-        "interpret_case", "analyze_all_cases", "write_paper", "shelf_solvers", "shelf_install",
+        "interpret_case", "analyze_all_cases", "restore_last_success", "write_paper", "shelf_solvers",
+        "shelf_install",
+        "nn_export", "nn_from_dafoam", "nn_check_parity", "nn_check_case", "nn_coded_entries",
     },
     "solver": set(_IMPL_TOOLS),
 }
@@ -495,6 +515,10 @@ def build_manager(
                 general_purpose_tools,
                 create_langchain_llm(model=settings.model, temperature=0.0, agent="general-purpose"),
             ),
+            build_nn_coupler_subagent(
+                built["nn_coupler_tools"],
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="nn-coupler"),
+            ),
         ],
         # Blocks deepagents' own built-in ls/read_file/write_file/grep/etc —
         # they'd silently run against an empty virtual filesystem instead of
@@ -515,7 +539,7 @@ def build_manager(
         # means a result that somehow reaches this conversation from a
         # subagent tool is protected rather than silently discarded.
         + build_context_middleware(
-            model, manager_tools + case_runner_tools + oed_candidate_tools,
+            model, manager_tools + case_runner_tools + oed_candidate_tools + built["nn_coupler_tools"],
             refusal_stop=_MANAGER_REFUSAL_STOP, status_file=out_dir / "stuck.json",
         )
         + [build_study_mode_middleware(out_dir)],

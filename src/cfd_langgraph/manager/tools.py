@@ -8,6 +8,7 @@ import statistics
 import os
 import re
 import shutil
+import tempfile
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -29,9 +30,10 @@ from cfd_langgraph.scheduling import CaseCoordinator
 from cfd_langgraph.starter_cases import (
     match_reference_to_case,
     resolve_starter_base_cases,
+    top_level_cases,
     seed_dir_tag,
 )
-from cfd_langgraph import foam_native
+from cfd_langgraph import file_ledger, foam_native
 from cfd_langgraph.foam_native.openfoam_env import resolve_openfoam_env  # noqa: F401
 from cfd_langgraph.solver_shelf import run_env as case_env
 
@@ -70,6 +72,12 @@ _PROTECTED_ARTIFACT_NAMES = frozenset({
     "objective_contract.json",
     "oed_artifact.json",
     "paper_plan.json",
+    # The unified paper pipeline's plan and the audit's record: a manager
+    # replaced the plan with its own, without its figure jobs, and the audit's
+    # per-case figure checks then had nothing to check
+    # (nn_in_solver_demo_20261022_1129).
+    "paper_unified_plan.json",
+    "paper_audit.json",
     "proposals.json",
     "requirements.json",
     "requirements_draft.json",
@@ -116,7 +124,9 @@ def _is_protected_artifact(path: Path, rel_parts: tuple = ()) -> bool:
         if name.endswith(suffix) and name[: -len(suffix)] in _PROTECTED_ARTIFACT_NAMES:
             return True
     lowered_parts = {part.lower() for part in rel_parts}
-    return "checkpoints" in lowered_parts or "state" in lowered_parts
+    # The study's file ledger (file_ledger) is the framework's record of who
+    # wrote what; no model script may rewrite it.
+    return "checkpoints" in lowered_parts or "state" in lowered_parts or file_ledger.LEDGER_DIR in lowered_parts
 if str(_SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS_DIR))
 
@@ -264,6 +274,14 @@ _OED_BASELINE_RUN_TIMEOUT_S = 7200
 
 # Most refinement steps one mesh gate chain may take, across all calls.
 _GATE_MAX_REFINEMENTS = int(os.getenv("CFD_SCIENTIST_GATE_MAX_REFINEMENTS") or 5)
+
+# Unsettled levels in a row, none clearly calmer than the one before, after
+# which the gate stops refining and points at the solver settings instead.
+_GATE_UNSETTLED_LEVELS = 3
+
+# Percent change of a gate quantity between two settled levels above which its
+# measurement, not the mesh, is doubted first and the extractor written again.
+_GATE_DOUBT_PERCENT = 100.0
 
 # How many timed-out evaluation cases before a candidate is abandoned. Two, not
 # one: a single slow case can be the heaviest in the set rather than a verdict
@@ -733,25 +751,121 @@ def _requirement_changed_since(previous: Dict[str, Any], case_dir: Path, require
             and requirements.stat().st_mtime > record.stat().st_mtime + 1)
 
 
+# The case's scripts below its top level when its last run ended, written
+# beside run_result.json: a script there that changes afterwards is the
+# manager's fix, while one first written afterwards (an interpreter's plotting
+# script) is not.
+_CASE_SCRIPTS = ".case_scripts.json"
+_SCRIPT_SUFFIXES = (".py", ".sh", ".H", ".C")
+
+
+def _case_scripts(case_dir: Path) -> List[str]:
+    """The case's scripts one folder or more down (scripts/runCase.py), not
+    in its processor folders."""
+    found = []
+    for path in case_dir.rglob("*"):
+        rel = path.relative_to(case_dir)
+        if (path.is_file() and path.suffix in _SCRIPT_SUFFIXES and len(rel.parts) > 1
+                and not rel.parts[0].startswith("processor")):
+            found.append(str(rel))
+    return sorted(found)
+
+
+_RECORD_SUFFIXES = {".json", ".csv", ".dat", ".txt", ".md", ".npz", ".npy"}
+
+
+def _previous_attempt_records(out_dir: Path, case_id: str, *, max_files: int = 1000,
+                              max_bytes: int = 100 * 1024 * 1024, max_file_bytes: int = 5 * 1024 * 1024
+                              ) -> Dict[str, Path]:
+    """The small record files (results, checkpoints, histories) of a case's
+    earlier attempts under previous_attempts/, newest attempt first, as
+    case-relative paths previous_attempts/<attempt>/<path> -> source. Fields,
+    meshes, processor and time folders are left out. Their scripts too: a
+    requirement that went back to an earlier attempt's runScript.py named it,
+    and the run stopped on FileNotFoundError reading it
+    (nn_airfoil_s814_20261026_1537, case_003)."""
+    from cfd_langgraph.foam_native.case_clean import parse_time_dir
+
+    root = out_dir / "previous_attempts"
+    if not root.is_dir():
+        return {}
+    attempts = [d for d in root.iterdir() if d.is_dir() and not d.is_symlink()
+                and (d.name == case_id or d.name.startswith(case_id + ".") or d.name.startswith(case_id + "_"))]
+    attempts.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    out: Dict[str, Path] = {}
+    total = 0
+    for attempt in attempts:
+        for dirpath, dirnames, filenames in os.walk(attempt, followlinks=False):
+            here = Path(dirpath)
+            dirnames[:] = [n for n in dirnames if not (
+                n.startswith("processor") or n in {"constant", "system", "0", "postProcessing", "__pycache__",
+                                                   "previous_attempts"}
+                or parse_time_dir(n) is not None)]
+            for name in filenames:
+                path = here / name
+                if (path.suffix.lower() not in _RECORD_SUFFIXES | {".py"} and name != "Allrun.post") or path.is_symlink():
+                    continue
+                try:
+                    size = path.stat().st_size
+                except OSError:
+                    continue
+                if size > max_file_bytes or total + size > max_bytes or len(out) >= max_files:
+                    continue
+                rel = Path("previous_attempts") / attempt.name / path.relative_to(attempt)
+                out[str(rel)] = path
+                total += size
+    return out
+
+
+_CONFIG_SUFFIXES = {".json", ".yaml", ".yml", ".toml", ".cfg", ".ini"}
+
+
+def _script_configs(case_dir: Path) -> List[str]:
+    """The configuration files at the case's top level that its own scripts
+    name. Carried with the scripts: left behind, a training case's
+    campaign_config.json, which its controller reads at start, was missing
+    from the rerun after a restart (nn_airfoil_s814_20261026_1537, case_003)."""
+    framework = {"run_result.json", "setup_check.json", _CASE_SCRIPTS, "given_files.json"}
+    text = "\n".join(p.read_text(errors="ignore") for p in case_dir.glob("*.py") if p.is_file())
+    return sorted(p.name for p in case_dir.iterdir()
+                  if p.is_file() and p.suffix.lower() in _CONFIG_SUFFIXES and p.name not in framework
+                  and not p.name.startswith(".") and p.stat().st_size <= 5 * 1024 * 1024 and p.name in text)
+
+
 def _edited_since_run(case_dir: Path) -> List[str]:
-    """The case's input files (its top-level scripts and the files of 0/,
-    constant/ and system/, not the mesh, not Allrun) changed after its last
-    run ended, i.e. after run_result.json was written; for a run stopped
-    before it ended, its top-level scripts."""
+    """The case's input files (its top-level scripts, the files of 0/,
+    constant/ and system/, not the mesh, not Allrun, and the scripts further
+    down it had when the run ended) changed after its last run ended, i.e.
+    after run_result.json was written; for a run stopped before it ended, its
+    top-level scripts. Its scripts in a scripts/ folder were not carried, so a
+    fix the manager made to one would have been dropped by the next run
+    (nn_in_solver_demo_20261022_1129, case_006)."""
     record = case_dir / "run_result.json"
     if not record.is_file():
         # A run stopped before it ended (by a restart): its own scripts are the
         # case's newest, carried as they are.
         if not (case_dir / ".foamagent_state.json").is_file():
             return []
-        return sorted(p.name for p in case_dir.glob("*.py") if p.is_file())
+        # Its scripts further down too: stopped by a restart, an NN case lost
+        # the scripts/parity_check.py its run had just fixed, while the manager
+        # was told such scripts are carried (nn_in_solver_demo_20261022_1129).
+        return sorted({p.name for p in case_dir.glob("*.py") if p.is_file()} | set(_case_scripts(case_dir))
+                      | ({"Allrun.post"} if (case_dir / "Allrun.post").is_file() else set())
+                      | set(_script_configs(case_dir)))
     ended = record.stat().st_mtime
+    configs = set(_script_configs(case_dir))
+    listed = _read_json(case_dir / _CASE_SCRIPTS)
+    scripts_below = set(listed) if isinstance(listed, list) else set()
     found = []
     for path in case_dir.rglob("*"):
         rel = path.relative_to(case_dir)
         if not path.is_file() or rel.name == "Allrun" or "polyMesh" in rel.parts:
             continue
-        if not ((len(rel.parts) == 1 and path.suffix == ".py") or rel.parts[0] in ("0", "constant", "system")):
+        # Allrun.post too: it runs the case's post-processing after a fixed Allrun
+        if not ((len(rel.parts) == 1 and (path.suffix == ".py" or rel.name == "Allrun.post"
+                                          or rel.name in configs))
+                or rel.parts[0] in ("0", "constant", "system")
+                or str(rel) in scripts_below):
             continue
         if path.stat().st_mtime > ended + 1:
             found.append(str(rel))
@@ -2312,6 +2426,54 @@ def _reference_data_file(ref_files: List[Path]) -> Optional[Path]:
     return ref_files[0] if ref_files else None
 
 
+def _force_history(case_dir: Path) -> Dict[float, List[float]]:
+    """{iteration: [coefficients]} from a case's force-coefficient files
+    (postProcessing/**/forceCoeffs*.dat or coefficient*.dat); empty if none."""
+    rows: Dict[float, List[float]] = {}
+    post = Path(case_dir) / "postProcessing"
+    if not post.is_dir():
+        return rows
+    files = sorted(set(post.rglob("forceCoeffs*.dat")) | set(post.rglob("coefficient*.dat")))
+    for path in files:
+        try:
+            lines = path.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.split()
+            if not parts or parts[0].startswith("#"):
+                continue
+            try:
+                values = [float(p) for p in parts]
+            except ValueError:
+                continue
+            rows[values[0]] = values[1:]
+    return rows
+
+
+def _same_force_history(case_dir: Path, other_dir: Path) -> bool:
+    """Whether two cases computed the same flow: their force coefficients agree
+    to the files' printing precision (1e-8 relative) at three or more shared
+    iterations; an identical solve differs in about 1e-11 at a few rows. A model that never reaches
+    the solve reproduces the baseline run's history exactly; its score need not
+    match the baseline's to the digit, since the two may save different times
+    for the scorer to average. On SD7003 four candidates whose changes never
+    reached the solve scored 6.108% against the baseline's 6.117% with
+    identical force histories, passed as REVISE, and as the best scores so far
+    (sd7003lm_trial_1)."""
+    mine, theirs = _force_history(case_dir), _force_history(other_dir)
+    shared = sorted(set(mine) & set(theirs))
+    if len(shared) < 3:
+        return False
+    for t in shared:
+        a, b = mine[t], theirs[t]
+        if len(a) != len(b):
+            return False
+        if any(abs(x - y) > 1e-8 * max(1.0, abs(x), abs(y)) for x, y in zip(a, b)):
+            return False
+    return True
+
+
 def _run_window(case_dir: Path) -> Dict[str, Any]:
     """When this case was told to start and stop, and what it actually wrote.
 
@@ -2822,6 +2984,25 @@ def _literature_query(topic: str, llm: Any) -> Tuple[str, str]:
         return text, ""
 
 
+_IMPORTABLE: Dict[str, bool] = {}
+
+
+def _importable(module: str) -> bool:
+    """Whether ``module`` imports, tried once per session in a child
+    interpreter. Imported in the study's own worker thread, torch's triton
+    extension segfaulted and took the whole session with it, one second into
+    the first oed_propose_candidates (sd7003_trial_1, silently, at 01:40;
+    sd7003_trial_3 with a faulthandler trace)."""
+    if module not in _IMPORTABLE:
+        try:
+            _IMPORTABLE[module] = subprocess.run(
+                [sys.executable, "-c", f"import {module}"],
+                capture_output=True, timeout=300).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            _IMPORTABLE[module] = False
+    return _IMPORTABLE[module]
+
+
 def _study_resources(out_dir: Path, disc_dir: Optional[Path] = None) -> str:
     """What this study actually has to work with, as prompt text.
 
@@ -2861,18 +3042,13 @@ def _study_resources(out_dir: Path, disc_dir: Optional[Path] = None) -> str:
     # it the proposer plans against a dataset it has only seen by filename.
     layout = str(understanding.get("data_layout") or "").strip()
     if layout and layout.lower() not in {"null", "none"}:
-        lines.append(f"  data layout (from the starter's file headers; no values read): {layout[:1500]}")
+        lines.append(f"  data layout (from the starter's file headers; no values read): {_clip_words(layout, 1500)}")
 
     # Libraries a candidate can actually import inside run_bash. Probed, not
     # assumed: claiming a library that is absent sends a candidate down a path
     # that fails at import time and wastes its whole budget.
-    available: List[str] = []
-    for module in ("numpy", "scipy", "sklearn", "torch", "torch_geometric", "pandas", "pyvista"):
-        try:
-            __import__(module)
-            available.append(module)
-        except Exception:
-            continue
+    available = [module for module in ("numpy", "scipy", "sklearn", "torch", "torch_geometric", "pandas", "pyvista")
+                 if _importable(module)]
     lines.append(f"  python libraries importable in the candidate sandbox: {', '.join(available) or 'none'}")
     if "scipy" in available:
         lines.append(
@@ -3163,6 +3339,56 @@ def _next_step_for_mode(mode: Any) -> str:
     return _NEXT_STEP_BY_MODE.get(str(mode or "").strip().lower(), "")
 
 
+def _starter_docs(out_dir: Path, limit: int = 16000) -> str:
+    """The starter's own documentation, read from disk: its top-level README
+    and task files and the files its reading classed as the model spec.
+
+    The digest in _starter_case_context keeps the case's facts but not how
+    the case must be run. An NN airfoil study's requirements set every solve
+    to 3,000 iterations while the starter README measured 12,000 for settled
+    lift and 40,000 for gradients that finite differences confirm, and they
+    never saw its baseline lift table (nn_airfoil_s814_20261026_1450)."""
+    understanding = _read_json(out_dir / "starter_understanding.json")
+    if not isinstance(understanding, dict) or not understanding.get("starter_dir"):
+        return ""
+    starter = Path(str(understanding["starter_dir"]))
+    if not starter.is_dir():
+        return ""
+    names = [p.name for p in sorted(starter.iterdir()) if p.is_file()
+             and p.suffix.lower() in {".md", ".txt", ""} and p.stem.upper() in {"README", "TASK"}]
+    for rel, kind in (understanding.get("file_classifications") or {}).items():
+        if kind == "formula_spec" and rel not in names:
+            names.append(str(rel))
+    parts: List[str] = []
+    left = limit
+    for rel in names:
+        path = starter / rel
+        if not path.is_file() or left <= 0:
+            continue
+        try:
+            text = path.read_text(errors="ignore").strip()
+        except OSError:
+            continue
+        if not text or "\x00" in text[:2000]:
+            continue
+        piece = text[:left]
+        parts.append(f"--- {rel} ---\n{piece}" + ("\n[... cut]" if len(text) > left else ""))
+        left -= len(piece)
+    return "\n\n".join(parts)
+
+
+def _clip_words(text: str, limit: int) -> str:
+    """``text`` cut to at most ``limit`` characters at a space, marked when cut.
+    Cut at a character count, "freestream k = 1.5e-6" became "freestream
+    k = 1.", and the hypotheses and requirements of a whole study then fixed
+    k = 1 (sd7003_trial_2)."""
+    text = str(text)
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    return text[:cut if cut > 0 else limit].rstrip(" ,;:") + " [...]"
+
+
 def _starter_case_context(
     out_dir: Path, openfoam_path: str = "", *, include_scoring: bool = True
 ) -> str:
@@ -3198,57 +3424,89 @@ def _starter_case_context(
     # is a second case to run, and treating the whole answer as one path finds
     # neither: see cfd_langgraph.starter_cases.
     base_cases = resolve_starter_base_cases(understanding)
+    # Every case the starter folder holds at its top, the reading's first. A
+    # reading of a starter with one case per solver named only one of them,
+    # twice: hyStrath's (shelf_demo_hystrath_20261011_1602), and a DAFoam +
+    # OpenFOAM 10 starter whose DAFoam case was left out, so every DAFoam step
+    # was written as an OpenFOAM 10 job (nn_in_solver_demo_20261022_1129).
+    case_dirs = list(base_cases.dirs)
+    known = {Path(d).resolve() for d in case_dirs} | {Path(d).resolve() for d in (base_cases.originals or [])}
+    for extra in top_level_cases(base_cases.starter_dir):
+        if extra.resolve() not in known:
+            case_dirs.append(extra)
     # A case on a shelf solver that brings its own OpenFOAM runs on that one.
     # Told "use THIS version" of the installed OpenFOAM 10, DAFoam requirements
     # kept demanding an OpenFOAM 10 setup after the brief said otherwise
     # (shelf_demo_dafoam_20261015_1318).
     from cfd_langgraph import solver_shelf
 
-    own = next((r for r in (solver_shelf.own_runtime(Path(d), profile) for d in base_cases.dirs) if r), {})
-    if own:
-        own_openfoam = str(((solver_shelf.spec(own["solver"]).get("runtime") or {}).get("openfoam")) or "its own OpenFOAM")
-        lines.append(
-            f"  OpenFOAM version: this case runs on {own['solver']}'s own OpenFOAM ({own_openfoam}), "
-            f"through its wrapper {Path(own['wrapper']).name}; every file is in that version's syntax. "
-            f"The installed {profile.get('label', 'OpenFOAM')} is not used by it: do not name it."
-        )
+    def _own_line(own: Dict[str, Any]) -> str:
+        own_openfoam = str(((solver_shelf.spec(own["solver"]).get("runtime") or {}).get("openfoam"))
+                           or "its own OpenFOAM")
+        return (f"{own['solver']}'s own OpenFOAM ({own_openfoam}), through its wrapper "
+                f"{Path(own['wrapper']).name}; every file is in that version's syntax, and the installed "
+                f"{profile.get('label', 'OpenFOAM')} is not used by it")
+
+    runtimes = [(Path(d), solver_shelf.own_runtime(Path(d), profile)) for d in case_dirs]
+    owns = [r for _, r in runtimes if r]
+    if owns and len(owns) < len(runtimes):
+        # Cases of one starter on different OpenFOAMs: each is said, so neither
+        # is written for the other's.
+        lines.append("  OpenFOAM version, case by case (the starter's cases run on different "
+                     "OpenFOAMs; a case built from one runs on that one's, in its syntax):")
+        for case_dir, own in runtimes:
+            lines.append(f"    {case_dir.name}: " + (_own_line(own) if own else
+                         f"{profile.get('label', 'the installed OpenFOAM')}, installed at {openfoam_path}"))
+    elif owns:
+        lines.append(f"  OpenFOAM version: this case runs on {_own_line(owns[0])}: do not name it.")
     elif profile.get("ok"):
         lines.append(
             f"  OpenFOAM version: {profile['label']}, installed at {openfoam_path}. "
             "Use THIS version. Do not name any other."
         )
-    if base_cases.dirs:
-        if len(base_cases.dirs) == 1:
-            lines.append(f"  existing case directory: {base_cases.dirs[0]}")
+    if case_dirs:
+        if len(case_dirs) == 1:
+            lines.append(f"  existing case directory: {case_dirs[0]}")
         else:
             lines.append(
-                f"  existing case directories ({len(base_cases.dirs)}, each a complete "
+                f"  existing case directories ({len(case_dirs)}, each a complete "
                 "case in its own right): "
-                + ", ".join(str(d) for d in base_cases.dirs)
+                + ", ".join(str(d) for d in case_dirs)
             )
         # The case's real size, measured: a README that said "54 x 54 x 54
         # cells" became a 54 m channel in every requirement, and the study's
         # truth field was placed outside the 1 m case
         # (shelf_demo_dafoam_20261015_1214).
-        for case_dir in base_cases.dirs:
+        for case_dir in case_dirs:
             summary = foam_native.loop.mesh_summary(Path(case_dir))
             if summary:
                 lines.append(
                     f"  mesh of {Path(case_dir).name}: {summary}. These are the case's real "
                     "dimensions; use them, never sizes read from cell counts or names.")
         solvers = []
-        for case_dir in base_cases.dirs:
+        for case_dir, own in runtimes:
             # On openfoam.org 11+ the application is foamRun and the solver is
             # the module named beside it.
             info = case_solver(case_dir)
             solver = (f"{info['application']} -solver {info['module']}" if info["module"]
                       else info["application"])
+            if solver and own.get("run"):
+                # A case its own script solves: the controlDict entry is not
+                # the program that runs. Given as "solver: simpleDAFoam", the
+                # name DAFoam's own cases carry there, every requirement of an
+                # NN study named that solver, while runScript.py runs
+                # DASimpleFoam (nn_airfoil_s814_20261026_1450).
+                solver = (f"{own['solver']}: the case is solved by `{own['run']}` inside "
+                          f"{Path(own['wrapper']).name}, which sets the solver; controlDict's "
+                          f"application entry ({solver}) is not itself run")
             if solver and solver not in solvers:
                 solvers.append(solver)
         if len(solvers) == 1:
             lines.append(
-                f"  solver: {solvers[0]} (already configured in system/controlDict). "
-                "Do not clone or compile a different solver."
+                f"  solver: {solvers[0]}"
+                + ("" if any(own.get("run") for _, own in runtimes)
+                   else " (already configured in system/controlDict)")
+                + ". Do not clone or compile a different solver."
             )
         elif solvers:
             lines.append(
@@ -3267,9 +3525,9 @@ def _starter_case_context(
     # from file headers by the starter reader; no values.
     layout = str(understanding.get("data_layout") or "").strip()
     if layout and layout.lower() not in {"null", "none"}:
-        lines.append(f"  data layout (from the starter's file headers; no values read): {layout[:1500]}")
+        lines.append(f"  data layout (from the starter's file headers; no values read): {_clip_words(layout, 1500)}")
     if flow.get("geometry"):
-        lines.append(f"  geometry/mesh/BCs/solver: {str(flow['geometry'])[:900]}")
+        lines.append(f"  geometry/mesh/BCs/solver: {_clip_words(flow['geometry'], 900)}")
     if include_scoring:
         # How a finished run is *scored* belongs to the search layer
         # (oed_setup_search and its bound comparators), not to a FoamAgent case
@@ -3281,10 +3539,10 @@ def _starter_case_context(
         if reference.get("quantities"):
             lines.append(f"  reference data available: {', '.join(map(str, reference['quantities']))}")
         if reference.get("usage_guidance"):
-            lines.append(f"  how results are compared: {str(reference['usage_guidance'])[:400]}")
+            lines.append(f"  how results are compared: {_clip_words(reference['usage_guidance'], 1200)}")
     spec = str(understanding.get("formula_or_model_spec") or "")
     if spec and "NO EXPLICIT FORMULA" not in spec.upper():
-        lines.append(f"  model spec to implement: {spec[:600]}")
+        lines.append(f"  model spec to implement: {_clip_words(spec, 600)}")
     return "\n".join(lines)
 
 
@@ -3617,6 +3875,21 @@ def _read_json(path: Path) -> Optional[Any]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def _named_file_tokens(text: str) -> set:
+    """The words of ``text`` as file names: split on white space, with the
+    punctuation prose puts around a name taken off ("SHA256SUMS;",
+    "(network_card.json)", "`initial_parameters.json`"). A name counts only as a
+    whole word, so U.gz is not found inside flow_6000/U.gz's folder prose."""
+    words = set()
+    for word in text.split():
+        word = word.strip("`'\"()[]{}<>,;:!?*")
+        while word.endswith("."):
+            word = word[:-1]
+        if word:
+            words.add(word)
+    return words
 
 
 # Longest matched line grep_files returns whole, in characters.
@@ -4020,6 +4293,61 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "runs this group's solver and condition. The gate checks the mesh of that case."
         )
 
+    def _gate_condition(physics_group: str, seed: Optional[Path], case_id: str, requirement_text: str,
+                        mesh_as_given_quote: str = "") -> List[Dict[str, str]]:
+        """The physical conditions this group's requirement sets differently
+        from its starter case that change the scales the mesh must resolve
+        (review.condition_changes); the gate then checks the mesh at the
+        group's condition instead of the starter's. Asked once per group and
+        requirement (mesh_gate/<group>/condition.json). None for a mesh the
+        gate cannot refine or one the user asked to use as given.
+
+        Checked only at the starter's own condition, the selected mesh went to
+        every case of the group: hyStrath's DSMC cases at Knudsen 0.05 ran on
+        the mesh checked at the starter's 0.25, with cells several mean free
+        paths across, and Claude Code, which built a mesh per Knudsen number,
+        got the study right (shelf_demo_hystrath_20261011_1602,
+        claude_code_hystrath_20261015)."""
+        if (seed is None or str(mesh_as_given_quote or "").strip()
+                or os.environ.get("CFD_SCIENTIST_GATE_CONDITION", "1") == "0"
+                or foam_native.loop._prescribed_mesh(Path(seed))):
+            return []
+        text = requirement_text
+        if str(case_id or "").strip():
+            text, why_not = _canonical_requirement(_safe_variant_slug(case_id, "case"))
+            if why_not:
+                return []
+        if not str(text or "").strip():
+            return []
+        key = hashlib.sha256((_case_fingerprint(seed) + "\n" + text).encode()).hexdigest()
+        path = out_dir / "mesh_gate" / _safe_variant_slug(physics_group, "default") / "condition.json"
+        saved = _read_json(path) or {}
+        if saved.get("key") == key and isinstance(saved.get("items"), list):
+            return saved["items"]
+        from cfd_langgraph.foam_native import rag, review
+
+        try:
+            solver = foam_native.loop._read_solver_from_control_dict(Path(seed)) or ""
+            items = review.condition_changes(
+                foam_llm, foamfiles_xml=foam_native.loop._case_files_xml(Path(seed), given=set()),
+                user_requirement=text, solver_notes=rag.shelf_usage_notes(text, solver))
+        except Exception as exc:  # noqa: BLE001 -- unanswered, the gate checks the starter as before
+            print(f"[mesh-gate] {physics_group}: the requirement's condition could not be compared "
+                  f"with the starter case ({exc}); checking the starter's own condition", flush=True)
+            return []
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_json(path, {"key": key, "starter_case": str(seed), "items": items})
+        if items:
+            print(f"[mesh-gate] {physics_group}: the requirement runs the starter case at another condition ("
+                  + "; ".join(f"{i['quantity']} {i['required']}, starter {i['starter'] or '?'}" for i in items)
+                  + "); the mesh is checked at that condition", flush=True)
+        return items
+
+    def _condition_key(items: Any) -> List[List[str]]:
+        """A gate condition in a form two groups' conditions compare by."""
+        return sorted([str(i.get("quantity", "")).strip().casefold(), str(i.get("required", "")).strip().casefold()]
+                      for i in (items or []) if isinstance(i, dict))
+
     def _safe_case_path(case_id: str, folder_name: str = "", file_name: str = "") -> tuple[Path, Optional[str]]:
         case_dir = out_dir / "cases" / _safe_variant_slug(case_id, "case")
         rel = Path(folder_name) / file_name if file_name else Path(folder_name)
@@ -4076,8 +4404,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
     def _writable_path(path: str) -> tuple[Optional[Path], Optional[str]]:
         p = Path(path).expanduser()
+        # Relative to the study, the only place a write may go: taken from the
+        # repository, "cases/case_005/x.py" was refused as outside the study,
+        # and the manager wrote the same file three times to place it
+        # (shelf_demo_hystrath_20261022_1030).
         if not p.is_absolute():
-            p = (_REPO_ROOT / p).resolve()
+            p = (out_dir / p).resolve()
         else:
             p = p.resolve()
         try:
@@ -4626,6 +4958,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             return {"error": refusal}
         if not p.is_dir():
             return {"error": f"Not a directory: {p}"}
+        # A folder this study made is not its starter: pointed at a mesh-gate
+        # level, this rewrote the study's starter record (no base case, no
+        # reference data) and the requirements were then written against it
+        # (shelf_demo_hystrath_20261022_1030).
+        if p == out_dir.resolve() or out_dir.resolve() in p.parents:
+            return {"error": (f"{p} is inside this study's own folder, not a starter: "
+                              "starter_understanding.json describes the starter the study was "
+                              "given and is not rewritten from the study's own cases or mesh-gate "
+                              "levels. Read files there with read_text_file instead.")}
         out_path = out_dir / "starter_understanding.json"
 
         # Already characterised, same folder: return the record instead of
@@ -5005,17 +5346,39 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         _update_study_state(current_stage="hypothesis")
         return {"approved_count": len(approved), "path": str(out_dir / "hypotheses_approved.json")}
 
-    def generate_case_requirements(regenerate_reason: str = "") -> dict:
+    def generate_case_requirements(regenerate_reason: str = "", case_ids: Optional[List[str]] = None,
+                                   study_notes: str = "") -> dict:
         """Turn every approved hypothesis's experiments into validated,
         executable FoamAgent requirements and write requirements.json (same
         schema ``scripts/requirements.py`` produces: case_id,
         user_requirement_text, experiment_id, description, study_id).
+
+        ``study_notes``: what the study has already fixed that the
+        requirements must follow and that the approved hypotheses do not
+        hold -- above all the nn-coupler's network (inputs and their exact
+        definitions, normalisation, architecture, output mapping and bounds,
+        the initial weight file and the options file), stated in full. Not
+        how the framework applies edits or launches the case: written into a
+        requirement as "rewrite the whole script if a patch fails, record
+        pre- and post-installation hashes", it became a self-patching
+        installer the run script ran at startup, and seven runs of a DAFoam
+        training case stopped before their first evaluation
+        (nn_airfoil_s814_20261026_1537, case_003). Files
+        it names reach each case through run_case_native's given_files, so
+        the requirements name them by file name only. The requirement writer
+        sees only the hypotheses, the starter and these notes. Kept for later
+        regenerations; pass new notes to replace them.
 
         Once requirements.json exists it is kept. To write it again -- the
         user's brief changed, or the requirements carry something the brief
         now contradicts -- pass ``regenerate_reason``: the old file is kept
         as a backup and every requirement is written afresh. Cases already
         run were run on the old text.
+
+        To correct only some cases, pass their ids in ``case_ids`` with
+        ``regenerate_reason``: only those requirements are written again, and
+        every other one stays exactly as it is, so the cases already run on
+        them stay valid.
 
         Uses ``HypothesisAgent.generate_validated_requirement`` — the existing,
         tested LLM validate/repair loop — one experiment at a time, rather
@@ -5034,15 +5397,33 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # invalidates an already-converged mesh gate.
         existing_reqs = _read_json(out_dir / "requirements.json")
         regenerate_reason = str(regenerate_reason or "").strip()
+        # Only some cases: an NN case's requirement named a file that did not
+        # exist when it was written, and the only way to change it rewrote all
+        # six and made every finished case stale (nn_in_solver_demo_20261022_1129).
+        only = sorted({str(c).strip() for c in (case_ids or []) if str(c).strip()})
+        kept_reqs: Optional[List[Dict[str, Any]]] = None
+        if only:
+            if not (isinstance(existing_reqs, list) and existing_reqs and regenerate_reason):
+                return {"error": "case_ids rewrites some cases of an existing requirements.json: pass "
+                                 "regenerate_reason saying what those cases' requirements must change."}
+            known = {str(r.get("case_id")) for r in existing_reqs if isinstance(r, dict)}
+            unknown = [c for c in only if c not in known]
+            if unknown:
+                return {"error": f"case_ids not in requirements.json: {', '.join(unknown)}",
+                        "case_ids": sorted(known)}
+            kept_reqs = [r for r in existing_reqs if isinstance(r, dict)]
         if isinstance(existing_reqs, list) and existing_reqs and regenerate_reason:
             # Kept, not overwritten: a DAFoam study whose brief was corrected
             # could not regenerate at all, and its manager went reading the
             # framework's source for a way round (shelf_demo_dafoam_20261015_1318).
             backup = out_dir / f"requirements.before_regenerate_{time.strftime('%Y%m%d_%H%M%S')}.json"
-            (out_dir / "requirements.json").replace(backup)
+            # Copied, not moved: the old file stays until new ones are
+            # published. Moved, a regeneration that then failed left the study
+            # with no requirements at all (shelf_demo_hystrath_20261022_1030).
+            shutil.copy2(out_dir / "requirements.json", backup)
             with (out_dir / "requirements_regenerated.jsonl").open("a") as log:
                 log.write(json.dumps({"at": _now(), "reason": regenerate_reason,
-                                      "backup": str(backup)}) + "\n")
+                                      "backup": str(backup), **({"case_ids": only} if only else {})}) + "\n")
             existing_reqs = None
         if isinstance(existing_reqs, list) and existing_reqs:
             return {
@@ -5167,6 +5548,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             if not entry["requirement_valid"]:
                 issues = (result.get("final_verdict") or {}).get("issues") or []
                 entry["requirement_issues"] = [str(i) for i in issues][:8]
+                # Every round's objections, not only the last: with only the
+                # final verdict kept, nothing showed what the repair rounds had
+                # been asked to change (nn_airfoil_s814_20261026_1450).
+                entry["requirement_check_rounds"] = [
+                    [str(i) for i in ((h.get("verdict") or {}).get("issues") or [])][:8]
+                    for h in result.get("history") or []]
             return entry
 
         # These calls are independent — each turns one experiment into one
@@ -5189,16 +5576,105 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # study came back with the same stale reference folder and field
         # handling the manager had asked to be corrected
         # (shelf_demo_dafoam_20261015_1318).
-        if regenerate_reason:
-            correction = ("\n\nTHESE REQUIREMENTS ARE BEING WRITTEN AGAIN. The study's previous "
-                          "requirements were set aside for this reason, which the new ones must "
-                          "resolve:\n" + regenerate_reason)
+        # Every earlier reason too, not only this one: a hyStrath study's second
+        # regeneration set the DSMC time step to the validated 5e-7 s, its third
+        # reason did not repeat it, and the writer went back to an assumed
+        # 1e-7 s (shelf_demo_hystrath_20261022_1030).
+        reasons: List[str] = []
+        regen_log = out_dir / "requirements_regenerated.jsonl"
+        if regen_log.is_file():
+            for line in regen_log.read_text(errors="ignore").splitlines():
+                try:
+                    entry = json.loads(line)
+                    earlier = str(entry.get("reason") or "").strip()
+                    if earlier and entry.get("case_ids"):
+                        earlier = f"(for {', '.join(entry['case_ids'])} only) {earlier}"
+                except (ValueError, AttributeError, TypeError):
+                    continue
+                if earlier and earlier not in reasons:
+                    reasons.append(earlier)
+        current = f"(for {', '.join(only)} only) {regenerate_reason}" if only else regenerate_reason
+        if current and current not in reasons:
+            reasons.append(current)
+        if reasons:
+            correction = ("\n\nTHESE REQUIREMENTS ARE BEING WRITTEN AGAIN. The study's earlier "
+                          "requirements were set aside for these reasons, oldest first; the new ones "
+                          "must resolve all of them, and where two disagree the later one holds:\n"
+                          + "\n".join(f"{i}. {r}" for i, r in enumerate(reasons, 1)))
             case_context = (case_context or "") + correction
             validator_context = (validator_context or "") + correction
+        to_write = [j for j in jobs if not only or f"case_{j['index']:03d}" in only]
+        # The mesh each case already runs on: written again from the starter's
+        # description, two hy2Foam requirements gave the starter's native
+        # domain (x -0.34 to 0.75 m) while the mesh gate had built the study's
+        # (x -0.75 to 1 m), and every run of them was then rejected for a
+        # geometry mismatch (shelf_demo_hystrath_20261022_1030, case_001, case_005).
+        meshes = []
+        for job in to_write:
+            cid = f"case_{job['index']:03d}"
+            if (out_dir / "cases" / cid / "constant" / "polyMesh").is_dir():
+                try:
+                    meshes.append(f"{cid}: {foam_native.loop.mesh_summary(out_dir / 'cases' / cid)}")
+                except Exception:  # noqa: BLE001 - the summary is context, never required
+                    continue
+        if meshes:
+            mesh_note = ("\n\nTHE MESH EACH OF THESE CASES ALREADY RUNS ON (selected by the mesh gate; "
+                         "no case changes it). Describe each case's geometry, domain extents and cell "
+                         "counts as its mesh is, even where a starter's description differs:\n"
+                         + "\n".join(meshes))
+            case_context = (case_context or "") + mesh_note
+            validator_context = (validator_context or "") + mesh_note
+        docs = _starter_docs(out_dir)
+        if docs:
+            docs_note = ("\n\nTHE STARTER'S OWN DOCUMENTATION (how its cases are run, the settings they "
+                         "need and why, how long a solve must run, its measured baselines). A "
+                         "requirement follows it wherever it does not state otherwise, and takes run "
+                         "lengths, settings and baseline values from it, never invents them:\n" + docs)
+            case_context = (case_context or "") + docs_note
+            validator_context = (validator_context or "") + docs_note
+        # What the study fixed outside the hypotheses. The nn-coupler had chosen
+        # a 3-8-8-1 network with a symmetry-breaking initial weight file; the
+        # requirements, written from the hypotheses alone, asked for one hidden
+        # layer of 10 neurons started from all-zero weights, which no gradient
+        # can move (nn_airfoil_s814_20261026_1450).
+        notes_file = out_dir / "requirements_study_notes.txt"
+        study_notes = str(study_notes or "").strip()
+        # Notes passed replace the ones before, which are kept and handed back:
+        # replaced silently, a note that held a case's checks to the evidence
+        # present was dropped by the next regeneration, and the case went back
+        # to demanding a value no record stored (nn_airfoil_s814_20261026_1537,
+        # case_003).
+        replaced_notes = ""
+        if study_notes and notes_file.is_file():
+            replaced_notes = notes_file.read_text(errors="ignore").strip()
+            if replaced_notes and replaced_notes != study_notes:
+                with (out_dir / "requirements_study_notes_history.txt").open("a") as fh:
+                    fh.write(f"--- replaced {time.strftime('%Y-%m-%d %H:%M')} ---\n{replaced_notes}\n")
+            else:
+                replaced_notes = ""
+        if study_notes:
+            notes_file.write_text(study_notes + "\n")
+        elif notes_file.is_file():
+            study_notes = notes_file.read_text(errors="ignore").strip()
+        if study_notes:
+            notes_note = ("\n\nWHAT THIS STUDY HAS ALREADY FIXED (from its own earlier steps; every "
+                          "requirement uses these exactly, and where a hypothesis says otherwise these "
+                          "win; a file they name is given to the case, so a requirement names it by "
+                          "its file name only, never by folder or path, except a file of an earlier "
+                          "attempt, which it names by its full path under previous_attempts/: files of "
+                          "the same name sit in many attempts, and named by its name alone a training "
+                          "checkpoint was looked for in the wrong one (nn_airfoil_s814_20261026_1537, "
+                          "case_003). What they say about how the "
+                          "framework writes, edits or launches the case -- how edits are applied, "
+                          "patches or whole-file rewrites, hashes of edits, which wrapper runs it -- is "
+                          "the framework's business and goes into no requirement: a requirement states "
+                          "what the case solves, sets, runs and produces):\n" + study_notes)
+            case_context = (case_context or "") + notes_note
+            validator_context = (validator_context or "") + notes_note
         studies: Dict[str, List[Dict[str, Any]]] = {}
-        for job in jobs:
+        for job in to_write:
             studies.setdefault(job["study_id"], []).append(job)
-        print(f"  [requirements] generating {len(jobs)} requirements ({len(studies)} "
+        print(f"  [requirements] generating {len(to_write)} requirements ({len(studies)} "
               "stud(ies) at once, each study's in order)...", flush=True)
         started_all = time.monotonic()
         out: List[Dict[str, Any]] = []
@@ -5246,6 +5722,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # The repair loop still runs its full four rounds, so what is published
         # is the best text the loop could produce. `requirement_valid` records
         # the honest verdict for anything downstream that wants it.
+        if kept_reqs is not None:
+            # The cases not named keep their entries exactly as they were.
+            rewritten = {r["case_id"]: r for r in out}
+            out = [rewritten.get(str(r.get("case_id")), r) for r in kept_reqs]
         valid = [r for r in out if r.get("requirement_valid")]
         invalid = [r for r in out if not r.get("requirement_valid")]
         draft_path = out_dir / "requirements_draft.json"
@@ -5259,6 +5739,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         )
         _update_study_state(current_stage="requirements")
         result: Dict[str, Any] = {"num_requirements": len(out), "path": str(req_path)}
+        if replaced_notes:
+            result["replaced_study_notes"] = replaced_notes
+            result["replaced_study_notes_note"] = (
+                "The study_notes passed replaced these, which the requirements no longer follow. "
+                "If any of them still holds, pass it again together with the new notes. Earlier "
+                "notes are in requirements_study_notes_history.txt.")
         if invalid:
             print(
                 f"  [requirements] published {len(out)}/{len(out)}; "
@@ -5310,7 +5796,17 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         folder, relative to the starter folder) -- the case that runs this
         group's solver and condition. It is required when the starter lists
         several cases; without it a starter with one listed case uses that one.
-        Groups built from the same case share one gate: a later call reuses the
+
+        The mesh is checked at the condition of the requirement this is called
+        with (``case_id``). When that requirement sets the starter case to
+        another condition that changes the scales the mesh must resolve (a
+        density or pressure, a Reynolds, Mach or Knudsen number, a velocity,
+        the body's size), the baseline is the starter case set to that
+        condition, and its mesh, domain and time step may be sized for it; the
+        refinement starts from there. A mesh checked at one condition is
+        checked for cases at that condition: cases at a condition that changes
+        those scales belong in a group of their own. Groups built from the same
+        case at the same condition share one gate: a later call reuses the
         selection the first one made.
 
         Each level is judged twice. A reviewer looks at the flow figures and
@@ -5319,15 +5815,40 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         parent/child pair is compared on solution-only quantities (never
         against reference data) plus the settled statistics of the monitored
         histories. A level is selected only when the pair has settled and both
-        levels pass review.
+        levels pass review. With ``case_id`` the requirement is read from
+        requirements.json and ``requirement_text`` is not used; the gate takes
+        no other instructions.
         """
         seed, why_no_seed = _gate_seed(_starter_base_cases(), starter_case)
         if why_no_seed:
             return {"error": why_no_seed, "physics_group": physics_group}
+        # Known before the lock, so groups at different conditions of one
+        # starter case are not made to wait for each other. A group already
+        # converged returns its selection without being asked again.
+        done = _read_json(out_dir / "mesh_gate" / _safe_variant_slug(physics_group, "default")
+                          / "selected_mesh_spec.json") or {}
+        condition = ([] if done.get("converged")
+                     else _gate_condition(physics_group, seed, case_id, requirement_text, mesh_as_given_quote))
         key = _case_fingerprint(seed) if seed is not None else f"group:{physics_group}"
+        if condition:
+            key += "|" + json.dumps(_condition_key(condition))
         with _gate_seed_lock(key):
-            return _run_mesh_gate(physics_group, requirement_text, topic, metrics, max_refine_levels,
-                                  case_id, override_validation, starter_case, mesh_as_given_quote)
+            result = _run_mesh_gate(physics_group, requirement_text, topic, metrics, max_refine_levels,
+                                    case_id, override_validation, starter_case, mesh_as_given_quote,
+                                    condition=condition)
+        # Said, not dropped in silence: a manager wrote "finalize from the
+        # completed levels only, do not rebuild refined_3" as requirement_text
+        # with a case_id, and the gate built refined_3 again
+        # (shelf_demo_hystrath_20261022_1030, dsmcfoamplus_knD_0p01).
+        canonical = _canonical_requirement(_safe_variant_slug(case_id, "case"))[0] if str(case_id or "").strip() else ""
+        if (isinstance(result, dict) and canonical and str(requirement_text or "").strip()
+                and str(requirement_text).strip() != str(canonical).strip()):
+            result["requirement_text_not_used"] = (
+                "requirement_text was not used: case_id selects the approved requirement, and the "
+                "gate built and judged its levels against that. The gate takes no other instructions: "
+                "it refines until a parent/child pair settles and both levels pass review, or until "
+                "a level is stopped as too costly for the per-run cap.")
+        return result
 
     def _run_mesh_gate(
         physics_group: str,
@@ -5339,7 +5860,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         override_validation: bool,
         starter_case: str,
         mesh_as_given_quote: str = "",
+        condition: Optional[List[Dict[str, str]]] = None,
     ) -> dict:
+        condition = list(condition or [])
         refusal = _impl_refusal("run_mesh_gate")
         if refusal:
             return refusal
@@ -5374,6 +5897,56 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # checkpointed.
         existing_spec = _read_json(out_dir / "mesh_gate" / physics_group / "selected_mesh_spec.json") or {}
         if existing_spec.get("converged") and Path(str(existing_spec.get("selected_level", ""))).is_dir():
+            # A selection made before the rule picked the finer level of a
+            # settled pair when the coarser one's own review found it not
+            # adequate is brought up to that rule from the recorded reviews,
+            # without running anything: called again, a DSMC gate returned the
+            # cached baseline its review had called too coarse, and the manager
+            # was left to build a whole new group (shelf_demo_hystrath_20261022_1030).
+            reselected = ""
+            group_dir = out_dir / "mesh_gate" / physics_group
+            selected_name = Path(str(existing_spec["selected_level"])).name
+            reviews = existing_spec.get("reviews") or {}
+            parent_review = reviews.get(selected_name) or {}
+            parent_ok = all(parent_review.get(k) for k in
+                            ("physically_plausible", "numerically_adequate", "statistically_settled"))
+            from_rest = not (existing_spec.get("start_decision") or {}).get("from_settled_state")
+            for pair in existing_spec.get("pair_comparisons") or []:
+                child = str(pair.get("child") or "")
+                if (parent_review and not parent_ok and pair.get("parent") == selected_name
+                        and pair.get("converged") and pair.get("reviews_pass") and child
+                        and (group_dir / child).is_dir()):
+                    if not from_rest:
+                        existing_spec["selection_note"] = (
+                            f"{selected_name} was selected under an older rule although its review found it "
+                            f"not adequate; {child}, the finer level of that settled pair, would be selected "
+                            "now. Runs start from this group's settled flow, which was built on the old "
+                            "level, so the selection is left as it is: a new gate is needed to change it.")
+                        break
+                    from cfd_langgraph import mesh_assessment
+
+                    new_level = group_dir / child
+                    start_case = group_dir / "start_case"
+                    decision = mesh_assessment.StartDecision(
+                        False, reason=f"from rest, as for {selected_name}; re-selected {child} from the "
+                                      "recorded reviews")
+                    mesh_assessment.make_start_case(new_level, start_case, decision,
+                                                    env=case_env(settings.openfoam_path))
+                    existing_spec.update({
+                        "selected_level": str(new_level), "start_case": str(start_case),
+                        "start_decision": asdict(decision), "baseline_case": str(new_level),
+                        "reselected_from": str(group_dir / selected_name),
+                    })
+                    _write_json(group_dir / "selected_mesh_spec.json", existing_spec)
+                    aggregate = _read_json(out_dir / "selected_mesh_spec.json") or {}
+                    if isinstance(aggregate, dict) and isinstance(aggregate.get("groups"), dict):
+                        aggregate["groups"][physics_group] = existing_spec
+                        _write_json(out_dir / "selected_mesh_spec.json", aggregate)
+                    reselected = (f"Re-selected {child} in place of {selected_name}: the pair had settled, "
+                                  f"and {selected_name}'s own review found it not adequate. Cases of this "
+                                  "group now run on the finer level.")
+                    print(f"[mesh-gate] {physics_group}: {reselected}", flush=True)
+                    break
             return {
                 **existing_spec,
                 "physics_group": physics_group,
@@ -5381,6 +5954,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "note": (
                     "This physics group's mesh gate already converged; returning the existing "
                     "selection rather than re-running it. Proceed to the next step."
+                    + (f" {reselected}" if reselected else "")
                 ),
             }
 
@@ -5453,12 +6027,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         rendered: Dict[str, List[Path]] = {}
         missing_by_pair: Dict[str, Dict[str, Any]] = {}
 
-        def _assess(case_dir: Path, earlier: List[Path], extensions: int = 0) -> Optional[Any]:
+        def _assess(case_dir: Path, earlier: List[Path], extensions: int = 0,
+                    finer: str = "") -> Optional[Any]:
             """Review one level's flow figures and histories against the coarser
             levels before it; cached per level. A transient level whose
             histories have not settled is run longer on the same mesh and
-            reviewed again, up to twice."""
-            if case_dir.name in assessments:
+            reviewed again, up to twice. ``finer`` reviews it again, told of a
+            finer level run since."""
+            if case_dir.name in assessments and not finer:
                 return assessments[case_dir.name]
             try:
                 images = mesh_assessment.render_level(case_dir, mesh_dir / "assessment" / case_dir.name)
@@ -5484,6 +6060,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 earlier=earlier,
                 earlier_images=[p for p in previous if "disturbed_region" in p.name][:3],
                 measured=measured,
+                finer=finer,
             )
             # Whether a steady solve converged is measured, not judged: a
             # reviewer called every level of a 1,000-iteration cavity "settled".
@@ -5491,6 +6068,29 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             if verdict is not None and steady_note:
                 verdict.statistically_settled = False
                 verdict.issues = [steady_note, *verdict.issues]
+            # Both ways: a reviewer called SD7003's 100k level unsettled for Cl
+            # moving 0.3% between window halves, inside what the measurement
+            # accepts (sd7003_trial_3). Where the solve can be measured, the
+            # measurement decides.
+            elif (verdict is not None and not verdict.statistically_settled
+                  and mesh_assessment.steady_change(case_dir) is not None):
+                verdict.statistically_settled = True
+                verdict.issues = [
+                    "Settled by measurement: the velocity field or every monitored force history "
+                    "holds within the gate tolerance; the reviewer's own reading of settling is "
+                    "not used.", *verdict.issues]
+            # A steady solve is run longer only if its trend says the runs
+            # still allowed (each doubles it) would settle it; an oscillating
+            # or stalled one goes to the next level instead.
+            steady_stalled = bool(
+                verdict is not None and steady_note and extensions < 2
+                and not mesh_assessment.steady_will_settle(case_dir, 2.0 ** (2 - extensions)))
+            if steady_stalled:
+                verdict.issues = [
+                    "Not run longer: the change between saved iterations is not shrinking fast "
+                    "enough to settle within the iterations running longer would add, so this "
+                    "steady solve is oscillating or stalled rather than converging slowly.",
+                    *verdict.issues]
             # A transient level that records no histories cannot show it has
             # settled, however long it runs: the reviewer said so, and the gate
             # doubled a wave flume's run three times, 60 s to 480 s, for nothing
@@ -5520,14 +6120,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                    f"— {verdict.reason[:300]}"),
                 flush=True,
             )
-            if verdict is not None and not verdict.statistically_settled and extensions < 2:
+            if (verdict is not None and not verdict.statistically_settled and extensions < 2
+                    and not steady_stalled):
                 extended = coordinator.run_case(
                     f"meshgate::{physics_group}",
                     lambda: foam_native.extend_run(case_dir, openfoam_path=settings.openfoam_path),
                 )
                 if extended.get("status") == "success":
                     assessments.pop(case_dir.name, None)
-                    return _assess(case_dir, earlier, extensions + 1)
+                    return _assess(case_dir, earlier, extensions + 1, finer)
             return verdict
         skip_keys = {"mesh_n_cells", "mesh_n_points", "pyvista_time_used", "Umag_mean", "Umag_max"}
 
@@ -5546,6 +6147,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             digest = hashlib.sha256((spec + "|" + ",".join(mesh_metrics)).encode()).hexdigest()[:16]
             return f"{max(times) if times else 0}|{digest}"
 
+        measure_errors: Dict[str, str] = {}  # label -> how its last measuring script failed
+
         def _measure_levels(cases: List[Path], label: str, prior: str = "") -> tuple[Dict[str, dict], bool]:
             """({case: values}, whether any case was measured now). Each level
             is measured once: its values are kept, keyed by its latest solved
@@ -5553,6 +6156,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             not measure it again. The extraction script is kept too and rerun on
             each new level. A level just measured returns everything the
             extractor said, its reasons for missing values included."""
+            measure_errors.pop(label, None)
             values_path = mesh_dir / "level_values.json"
             values = _read_json(values_path) or {}
             # A prior failure means the measuring itself was wrong: every level
@@ -5594,6 +6198,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # — each presented identically as "the extractor returned nothing",
             # with the real reason sitting unread in a captured pipe.
             if proc is not None and proc.returncode != 0:
+                measure_errors[label] = (proc.stderr or "")[-1500:]
                 print(
                     f"[mesh-gate] analyze.py exited {proc.returncode} for {label}:\n"
                     f"{(proc.stderr or '')[-1500:]}",
@@ -5604,6 +6209,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 if "batch failed" in err_text:
                     # The reason follows the "batch failed" line; printing only
                     # matching lines dropped it.
+                    measure_errors[label] = err_text[-1500:]
                     print(f"[mesh-gate] analyze.py: the measuring script failed:\n{err_text[-2500:]}",
                           flush=True)
                 else:
@@ -5622,7 +6228,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             return ({str(c): dict(fresh.get(str(c)) or (values.get(str(c)) or {}).get("qoi") or {})
                      for c in cases}, bool(pending))
 
-        def _pair_qois(case_a: Path, case_b: Path, label: str, prior: str = "") -> tuple[dict, dict, dict]:
+        def _pair_qois(case_a: Path, case_b: Path, label: str, prior: str = "",
+                       rewrites: int = 0) -> tuple[dict, dict, dict]:
             by_case, pending = _measure_levels([case_a, case_b], label, prior)
             pair_out = mesh_dir / f"mesh_analysis_{label}.json"
             q_a, q_b = by_case[str(case_a)], by_case[str(case_b)]
@@ -5636,10 +6243,16 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # the run stopped at rather than on the mesh.
             q_a = {k: v for k, v in q_a.items() if k in mesh_metrics or k.startswith(tuple(f"{m}__" for m in mesh_metrics))}
             q_b = {k: v for k, v in q_b.items() if k in mesh_metrics or k.startswith(tuple(f"{m}__" for m in mesh_metrics))}
+            # A steady solve is compared on means only: the spread and frequency
+            # of its iteration histories are convergence noise, not flow. The
+            # quantity review usually drops them, but not always: SD7003's
+            # settled 60k and 135k levels failed on Cm fluctuation 2.4e-6 ->
+            # 3.0e-5 (1115%) (sd7003_trial_3).
             for case_dir, q in ((case_a, q_a), (case_b, q_b)):
                 q.update({k: v for k, v in mesh_assessment.history_quantities(
                     mesh_assessment.history_statistics(case_dir)).items()
-                    if not mesh_assessment.is_history_dropped(k, history_dropped)})
+                    if not mesh_assessment.is_history_dropped(k, history_dropped)
+                    and (transient_case or k.endswith(".mean"))})
             common = [
                 k for k in q_a
                 if k in q_b and k not in skip_keys
@@ -5675,7 +6288,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             if duplicated and not prior:
                 print(f"[mesh-gate] {label}: different quantities came back identical on both levels "
                       f"{duplicated}; writing the extractor again", flush=True)
-                return _pair_qois(case_a, case_b, label, prior=(
+                return _pair_qois(case_a, case_b, label, rewrites=rewrites + 1, prior=(
                     "An earlier script returned the identical value for different quantities on both "
                     "meshes, so it did not compute them as defined: " + "; ".join(
                         f"{', '.join(names)} all read {float(q_a[names[0]]):.6g} and {float(q_b[names[0]]):.6g}"
@@ -5706,13 +6319,20 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     # failed, and on qwen_retest_20261005/cavity sixteen gate
                     # calls in a row died here, each discarding up to an hour
                     # of solves.
-                    if pending and not prior:
+                    # And once more after a rewrite that itself failed, told
+                    # why: the script rewritten after a doubted jump crashed,
+                    # and the gate ended after 50 minutes of solved levels
+                    # (sd7003_trial_3).
+                    if pending and rewrites < 2:
                         print(f"[mesh-gate] {label}: the extractor returned none of the gate quantities; "
                               "writing it again from its own reasons", flush=True)
-                        return _pair_qois(case_a, case_b, label, prior=(
-                            "An earlier script for these metrics ran but returned none of them on these "
+                        failed_with = measure_errors.get(label, "")
+                        return _pair_qois(case_a, case_b, label, rewrites=rewrites + 1, prior=(
+                            (f"{prior}\n\n" if prior else "")
+                            + "An earlier script for these metrics ran but returned none of them on these "
                             f"cases. It produced only: {available[:25]}. Its own reason for each:\n  "
-                            + ("\n  ".join(why) if why else "(it gave no reason)")))
+                            + ("\n  ".join(why) if why else "(it gave no reason)")
+                            + (f"\nIt failed with:\n{failed_with}" if failed_with else "")))
                     raise RuntimeError(
                         "mesh gate cannot judge convergence: the QoI extractor returned none of the "
                         f"gate quantities {sorted(missing)}. Extractor produced: {available[:25]}"
@@ -5759,6 +6379,31 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         if why_no_seed:
             return {"error": why_no_seed, "physics_group": physics_group}
         seed_print = _case_fingerprint(starter_seed) if starter_seed is not None else ""
+        # Solved levels belong to a case and its condition, not to the name a caller
+        # gives the group: a group with no levels yet, seeded from the same starter
+        # case at the same condition as another group's levels, continues that
+        # group's chain. Resumed mid-gate, a manager named the group anew and every
+        # level from 19,800 to 222,640 cells was solved again (sd7003lm_trial_1).
+        # Linked, not copied: each level records its parent's path, and reuse
+        # checks it.
+        if (starter_seed is not None and mesh_dir.is_dir() and not mesh_dir.is_symlink()
+                and not any(p.is_dir() for p in mesh_dir.iterdir())):
+            for other_dir in sorted((out_dir / "mesh_gate").iterdir()):
+                if other_dir == mesh_dir or not other_dir.is_dir() or other_dir.is_symlink():
+                    continue
+                other_base = next((d for d in other_dir.glob("*baseline") if d.is_dir()), None)
+                other_state = _read_json(other_base / ".foamagent_state.json") if other_base else {}
+                other_src = str((other_state or {}).get("seed_source") or "")
+                if not other_src or Path(other_src).resolve() != Path(starter_seed).resolve():
+                    continue
+                other_condition = (_read_json(other_dir / "condition.json") or {}).get("items")
+                if _condition_key(other_condition) != _condition_key(condition):
+                    continue
+                shutil.rmtree(mesh_dir)
+                mesh_dir.symlink_to(other_dir.name)
+                print(f"[mesh-gate] {physics_group}: same case and condition as group "
+                      f"{other_dir.name}; continuing its levels", flush=True)
+                break
         # A mesh is converged for a case, not for a group name: another group
         # seeded from the identical case already settled this question, so
         # its selection is returned rather than solved again.
@@ -5779,10 +6424,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                         other_print = seed_print
                 if other_print != seed_print:
                     continue
+                # The same case at another condition is another mesh question.
+                if _condition_key(other.get("condition")) != _condition_key(condition):
+                    continue
                 reused = {
                     **other,
                     "physics_group": physics_group,
                     "seed_fingerprint": seed_print,
+                    "condition": condition,
                     "reused_from_group": other.get("physics_group") or other_spec_path.parent.name,
                     "note": (
                         "The same starter case already passed the mesh gate under group "
@@ -5798,14 +6447,29 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # Name the levels after the case they were seeded from: the starter's
         # directory name identifies the condition, and scoring uses it to pick
         # the reference file. A level called plain "baseline" cannot be scored.
-        seed_tag = seed_dir_tag(starter_seed)
+        # Set to another condition, the levels are not the starter's case,
+        # whose name would claim its condition: they are named after the group.
+        seed_tag = f"{physics_group}__" if condition else seed_dir_tag(starter_seed)
         baseline_dir = mesh_dir / f"{seed_tag}baseline"
         # The levels are the starter's case as it ships, whatever the requirement
         # describes; judged against the requirement, a case of another size was
         # rejected as "not the stated case" at every level, by every review, and
         # no refinement could change that (shelf_demo_olaflow_20261010_1613:
         # a 40 m flume against a 22.5 m requirement; shelf_demo_dafoam_20261011_0054).
-        if starter_seed is not None:
+        condition_text = "; ".join(
+            f"{i['quantity']} {i['required']} (the starter case has {i.get('starter') or 'another value'}"
+            + (f", in {i['file']}" if i.get("file") else "") + ")" for i in condition)
+        if starter_seed is not None and condition:
+            review_description = (
+                f"EVERY LEVEL IS THE STUDY'S STARTER CASE ({Path(starter_seed).name}) SET TO THIS GROUP'S "
+                f"CONDITION: {condition_text}. Only the mesh changes between levels. Judge it as that case "
+                "at that condition, including whether the mesh, the domain and the time step resolve the "
+                "flow there. Its geometry, boundary conditions and duration are otherwise the starter's "
+                "(see CASE PARAMETERS) and may differ from the requirement below, which describes the "
+                "study the selected mesh will serve; such a difference is not a fault of a level.\n\n"
+                f"THE STUDY'S REQUIREMENT (for which flow features and quantities matter):\n{requirement_text}"
+            )
+        elif starter_seed is not None:
             review_description = (
                 f"EVERY LEVEL IS A COPY OF THE STUDY'S STARTER CASE ({Path(starter_seed).name}), solved "
                 "as the starter ships it; only the mesh changes between levels. Judge it as that "
@@ -5846,18 +6510,31 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             print(f"[mesh-gate] reusing {case_dir.name}, solved by an earlier call", flush=True)
             return result
 
+        # At another condition than the starter's, the baseline is the
+        # starter case set to it, written like any case and checked against
+        # it before it runs; only what the condition changes is changed.
+        baseline_requirement = requirement_text if not condition else (
+            f"FIRST LEVEL OF THIS GROUP'S MESH CHECK. The study's starter case "
+            f"({Path(starter_seed).name}) is copied here. Set it to the condition this group's cases run "
+            f"at, which differs from the starter's in: {condition_text}. Change these values, and with "
+            "them what the condition sets the size of: the cell sizes of the mesh, the extent of the "
+            "domain and the time step, sized for the flow at this condition as the solver notes and the "
+            "solver's own practice require; the mesh check then refines the mesh from here. Keep "
+            "everything else as the starter case has it: its geometry, boundary conditions, models, "
+            "numerics and outputs.\n\nTHE REQUIREMENT OF A CASE OF THIS GROUP (for what the condition "
+            f"is; set only the condition from it):\n{requirement_text}")
         baseline_result = _solved_earlier(baseline_dir) or coordinator.run_case(
             f"meshgate::{physics_group}",
             lambda: foam_native.run_foam_case(
-                foam_llm, baseline_dir, requirement_text, openfoam_path=settings.openfoam_path,
+                foam_llm, baseline_dir, baseline_requirement, openfoam_path=settings.openfoam_path,
                 functions_seed_case_dir=starter_seed,
                 prepare=mesh_assessment.ensure_time_averaging,
-                # The gate's baseline level is the study's validated case,
-                # run as-is. Nothing is authored, so nothing can be
-                # mis-authored; the refinement chain then varies only the
-                # mesh from here.
+                # At the starter's own condition the gate's baseline level is
+                # the study's validated case, run as-is. Nothing is authored,
+                # so nothing can be mis-authored; the refinement chain then
+                # varies only the mesh from here.
                 base_case_seed_dir=starter_seed,
-                seed_only=starter_seed is not None,
+                seed_only=starter_seed is not None and not condition,
             ),
         )
 
@@ -5926,8 +6603,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         shipped_mesh = foam_native.loop._prescribed_mesh(baseline_dir)
         if _run_succeeded(baseline_result) and (shipped_mesh or mesh_as_given):
             why = (
-                "This case runs on a solver's own OpenFOAM with the mesh shipped with it "
-                "(constant/polyMesh, no blockMeshDict), which this gate cannot refine."
+                "This case's mesh is shipped with it (constant/polyMesh, no blockMeshDict), "
+                "which this gate cannot refine."
                 if shipped_mesh else
                 f"The user's brief asks for the mesh to be used as given: \"{mesh_as_given_quote.strip()}\""
             )
@@ -5942,6 +6619,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "levels": [str(baseline_dir)],
                 "metrics_used": [str(m["name"]) for m in metric_specs if m.get("name")],
                 "seed_fingerprint": seed_print,
+                "condition": condition,
                 "note": (
                     f"{why} The mesh is used as given: every case of this group runs on it, and the "
                     "study must report that its mesh independence was not checked here. Proceed to "
@@ -5964,6 +6642,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "converged": False,
                 "levels": [str(baseline_dir)],
                 "refine_failed_at": "baseline",
+                "condition": condition,
                 "metrics_used": [],
                 "error": "Baseline mesh-gate case failed; no mesh was selected.",
             }
@@ -6060,6 +6739,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             }
         levels = [baseline_dir]
         refine_failed: Optional[str] = None
+        refine_failed_reason = ""
         unsettled_stop = ""
         converged = False
         selected = baseline_dir
@@ -6071,22 +6751,138 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # 16k to 4.8M cells.
         max_refine_levels = min(max(1, int(max_refine_levels)), _GATE_MAX_REFINEMENTS)
 
+        def _prefetch_ladder() -> Dict[str, Any]:
+            """Solve and review the first levels of the even ladder side by side,
+            ahead of the loop below, which then finds them solved and reviewed and
+            decides exactly as it would have. One after another the cores sat
+            mostly idle -- SD7003's 27k and 60k levels ran on 3 and 7 of 16 --
+            and every review waited for its solve. Levels are taken, in order,
+            while the MPI ranks each would get alone fit the cores this run has.
+            {level name: future}; empty when there is nothing to gain."""
+            from cfd_langgraph.foam_native import allrun as allrun_mod
+            from cfd_langgraph.foam_native.loop import refine_budget
+
+            first = mesh_dir / (f"{seed_tag}refined")
+            cells = mesh_assessment._cell_count(baseline_dir)
+            if (first.exists() or not cells or coordinator.busy()
+                    or (baseline_dir / ".foamagent_state.json").is_file()
+                    and (_read_json(baseline_dir / ".foamagent_state.json") or {}).get("own_allrun")):
+                return {}
+            cores = len(os.sched_getaffinity(0)) or 1
+            ranks: List[int] = []
+            size = float(cells)
+            for _ in range(max_refine_levels):
+                size *= refine_budget(baseline_dir)
+                need = max(1, min(allrun_mod.MAX_PROCS, int(size // allrun_mod.CELLS_PER_PROC)))
+                if sum(ranks) + need > cores:
+                    break
+                ranks.append(need)
+            if len(ranks) < 2:
+                return {}
+            names = [f"{seed_tag}refined" if k == 0 else f"{seed_tag}refined_{k + 1}"
+                     for k in range(len(ranks))]
+            print(f"[mesh-gate] solving {', '.join(names)} side by side on {ranks} MPI ranks "
+                  f"of {cores} cores", flush=True)
+            meshed = [threading.Event() for _ in ranks]
+            reviewed = [threading.Event() for _ in ranks]
+            pool = ThreadPoolExecutor(max_workers=len(ranks))
+            futures: Dict[str, Any] = {}
+
+            def _level(k: int) -> None:
+                parent = baseline_dir if k == 0 else mesh_dir / names[k - 1]
+                case = mesh_dir / names[k]
+                instruction = (
+                    f"Refine this blockMeshDict so the total cell count grows by at most "
+                    f"{refine_budget(parent):g} times: multiply the cell count of every block, in each "
+                    "direction that has more than one cell, by the same factor, keeping domain size, "
+                    "block topology, grading character and patch names identical. This is a "
+                    "resolution change only.")
+
+                def _meshed() -> None:
+                    # The next level copies this one's files, so it starts once
+                    # this mesh is written and this one solves once it has copied.
+                    if k + 1 < len(ranks):
+                        futures[names[k + 1]] = pool.submit(_level, k + 1)
+                        meshed[k + 1].wait(1800)
+                    meshed[k].set()
+
+                try:
+                    result = foam_native.refine_mesh_from_parent(
+                        foam_llm, case, parent, instruction,
+                        case_solver=case_solver, openfoam_path=settings.openfoam_path,
+                        mesh_review=lambda child: mesh_assessment.review_refinement(
+                            llm, parent=parent, child=child, instruction=instruction),
+                        uniform=True, max_procs=ranks[k], on_meshed=_meshed)
+                    if k:
+                        reviewed[k - 1].wait()
+                    if result.get("status") == "success":
+                        _assess(case, [baseline_dir, *[mesh_dir / n for n in names[:k]]])
+                finally:
+                    meshed[k].set()
+                    reviewed[k].set()
+
+            futures[names[0]] = pool.submit(_level, 0)
+            meshed[-1].wait(3600)
+            pool.shutdown(wait=False)
+            return futures
+
+        prefetched = _prefetch_ladder()
+
+        def _await_prefetched(name: str) -> None:
+            pending = prefetched.get(name)
+            if pending is not None:
+                try:
+                    pending.result()
+                except Exception as exc:  # noqa: BLE001 - the loop solves it itself
+                    print(f"[mesh-gate] {name}, solved side by side, failed: {exc!r}; "
+                          "solving it in order instead", flush=True)
+
+        unsettled_before = 0  # unsettled levels in a row ending at levels[-2]
         for level in range(1, max_refine_levels + 1):
             parent = levels[-1]
             ref_name = f"{seed_tag}refined" if level == 1 else f"{seed_tag}refined_{level}"
             ref_dir = mesh_dir / ref_name
+            _await_prefetched(parent.name)
             parent_review = _assess(parent, levels[:-1])
-            if parent_review is not None and not parent_review.statistically_settled:
-                # Still unsettled after running longer: a finer mesh needs more
-                # of whatever this one lacked, so refining cannot help.
-                unsettled_stop = (
-                    f"{parent.name} did not settle even after running longer, so refining further "
-                    "cannot help. " + "; ".join(parent_review.issues[:2])
-                )
-                print(f"[mesh-gate] stopping: {unsettled_stop[:300]}", flush=True)
-                break
-            targeted = parent_review.refinement_instruction() if parent_review is not None else ""
-            refine_instruction = targeted or (
+            parent_unsettled = parent_review is not None and not parent_review.statistically_settled
+            # Still unsettled after running longer. The mesh itself can be why:
+            # SD7003's 12k-cell starter mesh kept oscillating through 640,000
+            # steady iterations while 48k and 141k cells converged, and the gate
+            # stopped there saying refining could not help (sd7003_trial_1). So
+            # a finer level is tried, and refining goes on while each unsettled
+            # steady level is clearly calmer than the one before: 27k cells still
+            # oscillated, by 9% of the field per save against the 12k level's 13%
+            # (sd7003_trial_1). Two levels are too few to call: in a repeat the
+            # 27k level oscillated a little more than the 12k one (13.3% against
+            # 12.4%) and the gate stopped, though 60k settles (sd7003_trial_2).
+            # So the stop needs _GATE_UNSETTLED_LEVELS unsettled levels in a row.
+            if parent_unsettled and unsettled_before >= _GATE_UNSETTLED_LEVELS - 1:
+                before = mesh_assessment.steady_change(levels[-2])
+                now = mesh_assessment.steady_change(parent)
+                if before is not None and now is not None and now <= mesh_assessment.STEADY_IMPROVING * before:
+                    print(f"[mesh-gate] {parent.name} did not settle either, but changes {now:.2%} of "
+                          f"its field per save against {levels[-2].name}'s {before:.2%}, so refining "
+                          "is calming it; refinement continues.", flush=True)
+                else:
+                    unsettled_stop = (
+                        f"{levels[-2].name} and {parent.name} both did not settle, so refining is not "
+                        "making the solve settle"
+                        + (f" (change per save {before:.2%} then {now:.2%}). " if before is not None
+                           and now is not None else ". ")
+                        + "; ".join(parent_review.issues[:2])
+                    )
+                    print(f"[mesh-gate] stopping: {unsettled_stop[:300]}", flush=True)
+                    break
+            # Every level is the parent refined by one factor in every direction,
+            # in code: a mesh study needs systematic refinement. Refined where
+            # the review asked (2x along the upper surface, the wall-normal
+            # direction and lower surface behind), SD7003's levels never settled
+            # -- 45k, 100k and 226k cells changed 5.3%, 2.5% and 0.7% of the field
+            # per save and the bubble broke into pieces -- while the starter
+            # refined evenly to 99,936 cells settled to 0.02% with one clean
+            # bubble (sd7003_trial_3). The model writes the mesh only when the
+            # code cannot, and then to the same rule.
+            refine_instruction = (
                 f"Refine this blockMeshDict so the total cell count grows by at most "
                 f"{refine_budget(parent):g} times: multiply the cell count of every block, in each "
                 "direction that has more than one cell, by the same factor, keeping domain size, "
@@ -6099,6 +6895,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # used to provide (that path is currently broken — a version mismatch
             # against the vendored Foam-Agent's LLMService — so this replaces it
             # rather than depending on it).
+            _await_prefetched(ref_name)
             ref_result = _solved_earlier(ref_dir, parent) or coordinator.run_case(
                 f"meshgate::{physics_group}",
                 lambda: foam_native.refine_mesh_from_parent(
@@ -6106,23 +6903,82 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     case_solver=case_solver, openfoam_path=settings.openfoam_path,
                     mesh_review=lambda child: mesh_assessment.review_refinement(
                         llm, parent=parent, child=child, instruction=refine_instruction),
-                    uniform=not targeted,
+                    uniform=True,
                 ),
             )
             if ref_result.get("status") != "success":
                 refine_failed = ref_name
+                # Why, beside which: a level that built and ran but costs more
+                # than a run may take was reported as one "that could not be
+                # built" (shelf_demo_hystrath_20261022_1030).
+                refine_failed_reason = (ref_result.get("too_costly")
+                                        or ref_result.get("mesh_check_failed")
+                                        or "; ".join(str(e) for e in ref_result.get("error_logs") or [])[:1500])
                 break
             levels.append(ref_dir)
             # Reviewed first: a level that has not settled in time is run
             # longer before it is compared with anything.
             _assess(ref_dir, levels[:-1])
+            unsettled_before = unsettled_before + 1 if parent_unsettled else 0
+            if parent_unsettled:
+                # An unsettled level's values are not final, so nothing is
+                # compared with them; the chain restarts from the finer level.
+                print(f"[mesh-gate] {parent.name} did not settle, so {ref_name} is not compared "
+                      f"with it; refinement continues from {ref_name}.", flush=True)
+                continue
 
             label = f"{parent.name}_vs_{ref_name}"
             pct_changes, q_a, q_b = _pair_qois(parent, ref_dir, label)
+            # Two settled levels whose gate quantity more than doubles were
+            # probably measured wrongly, not resolved differently: on SD7003 the
+            # extractor took the first tiny sign flip of the wall shear for
+            # separation and reattachment (0.016 -> 0.205, 1183%), while the
+            # bubble itself moved from 0.205-0.711 to 0.200-0.713
+            # (sd7003_trial_1). So the extractor is written again once, told of
+            # the jump, and the pair measured again.
+            child_settled = (assessments.get(ref_dir.name) is not None
+                             and assessments[ref_dir.name].statistically_settled)
+            # Either way: a change measured against the coarser level can never
+            # exceed 100% when the value falls, so separation 0.671 -> 0.030
+            # (95.5%) passed as an ordinary refinement change (sd7003_trial_2).
+            # The ratio of the two sizes is compared instead.
+            factor = 1.0 + _GATE_DOUBT_PERCENT / 100.0
+            jumps = {k: p for k, p in pct_changes.items() if k in mesh_metrics and (
+                p > _GATE_DOUBT_PERCENT
+                or max(abs(q_a[k]), abs(q_b[k])) > factor * min(abs(q_a[k]), abs(q_b[k])))}
+            if jumps and child_settled:
+                doubt = (
+                    "On two levels that both settled, these quantities changed far more than a mesh "
+                    "refinement moves them, so the script probably did not measure them as defined: "
+                    + "; ".join(f"{k} {q_a[k]:.6g} -> {q_b[k]:.6g} ({p:.0f}%)" for k, p in jumps.items())
+                    + ". Check that each value is the feature the definition names on these fields, "
+                    "robust to small local fluctuations (for example a sign change of a near-zero "
+                    "quantity), not the first point that happens to meet a threshold.")
+                print(f"[mesh-gate] {label}: {doubt[:300]}; writing the extractor again", flush=True)
+                pct_changes, q_a, q_b = _pair_qois(parent, ref_dir, label, prior=doubt, rewrites=1)
             # Decided in code from the reviewed quantities. An empty comparison
             # is not converged: "nothing changed" and "nothing was measured"
             # look the same, and only one of them means converged.
             decision = mesh_assessment.pair_verdict(pct_changes, q_a, q_b)
+            # A settled pair kept apart only by gate quantities is measured once
+            # more before refining further, as for a jump: on SD7003 from the 6k
+            # starter, 99k and 223k cells both settled with the same bubble, but
+            # the extractor read a short secondary reverse-flow patch's end as
+            # reattachment on one level (0.520 -> 0.718, 38%, under the doubling
+            # test), and the gate went on to a 500k-cell level (sd7003lm_trial_1).
+            over = [k for k in decision.get("over_tolerance") or [] if k in mesh_metrics]
+            if over and child_settled and not jumps:
+                doubt = (
+                    f"On two levels that both settled, these quantities changed by more than the "
+                    f"{decision['tolerance_percent']:g}% tolerance: "
+                    + "; ".join(f"{k} {q_a[k]:.6g} -> {q_b[k]:.6g} ({pct_changes[k]:.0f}%)" for k in over)
+                    + ". Before the mesh is refined further, check that each value is the feature the "
+                    "definition names on these fields, robust to small local fluctuations (for example "
+                    "a short sign change of a near-zero quantity), not the first point that happens to "
+                    "meet a threshold. If it already is, measure it the same way.")
+                print(f"[mesh-gate] {label}: {doubt[:300]}; writing the extractor again", flush=True)
+                pct_changes, q_a, q_b = _pair_qois(parent, ref_dir, label, prior=doubt, rewrites=1)
+                decision = mesh_assessment.pair_verdict(pct_changes, q_a, q_b)
             print(f"[mesh-gate] {label}: converged={decision['converged']} — {decision['reason'][:400]}",
                   flush=True)
 
@@ -6133,8 +6989,27 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 parent_review is not None and parent_review.physically_plausible
                 and child_review is not None and child_review.acceptable
             )
+            # Measurement overrules the finer level's review here as it does for
+            # settling: when both levels are plausible and measured settled and every
+            # quantity agrees within tolerance, a review calling the finer level
+            # unresolved contradicts what was measured. From SD7003's 6k starter,
+            # 222,640 and 500,940 cells agreed on all 11 quantities within 5%, both
+            # settled, while the 500k review said its wake and forces "change
+            # appreciably"; three gate calls in a row ended unconverged on it
+            # (sd7003lm_trial_1).
+            overruled = bool(
+                decision.get("converged") and not reviews_pass and child_settled
+                and parent_review is not None and parent_review.physically_plausible
+                and parent_review.statistically_settled
+                and child_review is not None and child_review.physically_plausible)
+            if overruled:
+                print(f"[mesh-gate] {parent.name} vs {ref_name}: every quantity agrees within the "
+                      f"tolerance on two settled, plausible levels; {ref_name}'s review "
+                      "rejection is overruled by that measurement.", flush=True)
+                reviews_pass = True
             pair_records.append({
                 "parent": parent.name, "child": ref_name, **decision,
+                **({"review_overruled_by_measurement": True} if overruled else {}),
                 "parent_values": {k: q_a[k] for k in decision["changes_percent"]},
                 "child_values": {k: q_b[k] for k in decision["changes_percent"]},
                 **({"not_measured": missing_by_pair[label]} if label in missing_by_pair else {}),
@@ -6147,12 +7022,86 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     flush=True,
                 )
             if decision.get("converged") and reviews_pass:
-                selected = parent
+                # The coarser of the pair, unless its own review found it not
+                # resolved enough: a DSMC gate at Knudsen 0.05 settled between
+                # a baseline its review called too coarse for the mean free
+                # path and an acceptable refined level, and selected the
+                # baseline (shelf_demo_hystrath_20261022_1030).
+                # That review was written before the finer level existed, so it
+                # judged mesh dependence only from the coarser levels: on SD7003
+                # it rejected 60,480 cells for its large change from a 27,000-cell
+                # level that had not settled, and 135,744 cells was selected
+                # though the pair agreed within 5% (sd7003_trial_1). A rejected
+                # parent is reviewed again, told of the finer level.
+                if not parent_review.acceptable:
+                    unsettled = [lvl.name for lvl in levels[:levels.index(parent)]
+                                 if assessments.get(lvl.name) is not None
+                                 and not assessments[lvl.name].statistically_settled]
+                    finer = (
+                        f"FINER LEVEL RUN SINCE: {ref_name}, "
+                        f"{mesh_assessment._cell_count(ref_dir) or 'unknown'} cells, settled and "
+                        "reviewed acceptable. Gate quantities, this level -> it: "
+                        + "; ".join(f"{k} {q_a[k]:.6g} -> {q_b[k]:.6g} ({p:.1f}%)"
+                                    for k, p in decision["changes_percent"].items())
+                        + f". Verdict of the comparison: {decision['reason']}"
+                        + (f" Coarser levels that did not settle in time, so were not compared with "
+                           f"anything: {', '.join(unsettled)}." if unsettled else ""))
+                    print(f"[mesh-gate] {parent.name} vs {ref_name} settled, but {parent.name}'s "
+                          "review rejected it before the finer level existed; reviewing it again.",
+                          flush=True)
+                    parent_review = _assess(parent, levels[:levels.index(parent)], finer=finer) or parent_review
+                selected = parent if parent_review.acceptable else ref_dir
                 converged = True
                 break
 
+        # A level solved ahead and not needed still holds cores: wait for it
+        # rather than leave it running under the study's next cases.
+        for name in prefetched:
+            _await_prefetched(name)
+
+        levels_used_up = ""
         if not converged:
-            selected = levels[-1]
+            # The finest level its review found physically plausible, not simply
+            # the last: from SD7003's 6k-cell starter no level settled, and the
+            # fifth, 333,776 cells, went unstable (Cl 1.21 -> -0.47 across its
+            # window, reviewed implausible) while 148,830 cells was plausible and
+            # the calmest (sd7003lm_trial_1). The last level only if none passed.
+            plausible = [lvl for lvl in levels if assessments.get(lvl.name) is not None
+                         and assessments[lvl.name].physically_plausible]
+            selected = plausible[-1] if plausible else levels[-1]
+            # Unless a pair's quantities converged: then the mesh converged there, and
+            # its coarser level is taken when it is plausible and measured settled,
+            # whatever the finer level's review said of its own last window. From
+            # SD7003's 6k starter, 222,640 and 500,940 cells agreed on all ten
+            # quantities within 5%, both settled by measurement, but the 500k review
+            # called its final window drifting, so refinement "continued" past the
+            # last level and the 500k mesh was selected for discovery
+            # (sd7003lm_trial_1).
+            by_name = {lvl.name: lvl for lvl in levels}
+            for rec in reversed(pair_records):
+                parent_lvl = by_name.get(str(rec.get("parent")))
+                verdict = assessments.get(parent_lvl.name) if parent_lvl is not None else None
+                if (rec.get("converged") and verdict is not None and verdict.physically_plausible
+                        and verdict.statistically_settled):
+                    selected = parent_lvl
+                    break
+            # Said, so the limit is not taken for a verdict: a DSMC gate ended
+            # after refined_3 with only the generic next steps
+            # (shelf_demo_hystrath_20261022_1030, dsmcfoamplus_knD_0p01).
+            if not unsettled_stop and not refine_failed:
+                levels_used_up = (
+                    f"All {max_refine_levels} refinement levels this call allows were used "
+                    f"(max_refine_levels, at most {_GATE_MAX_REFINEMENTS}) without a pair that "
+                    "settled with both levels passing review.")
+            if selected != levels[-1]:
+                pair = next((r for r in reversed(pair_records)
+                             if r.get("converged") and str(r.get("parent")) == selected.name), None)
+                levels_used_up = (levels_used_up + " " if levels_used_up else "") + (
+                    f"{selected.name} is selected: its pair with {pair['child']} converged on every "
+                    "quantity and it is plausible and settled; the finer level's review rejected "
+                    "that level's own solve, not the mesh." if pair else
+                    f"{selected.name} is selected: the finest level its review found physically "
+                    f"plausible ({levels[-1].name}'s review did not).")
 
         def _prepare_start(level: Path) -> Dict[str, Any]:
             """How every later run of this group starts, decided by looking at
@@ -6222,9 +7171,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             "selected_level": str(selected),
             "converged": converged,
             **start_info,
-            **({"stopped_because": unsettled_stop} if unsettled_stop else {}),
+            **({"stopped_because": unsettled_stop or levels_used_up} if unsettled_stop or levels_used_up else {}),
             **({} if converged else {"next_steps": (
-                ("A level did not settle in time or iterations, so the gate stopped instead of "
+                (f"{_GATE_UNSETTLED_LEVELS} levels in a row did not settle in time or iterations, so the gate stopped "
                  "refining; see stopped_because. Fix why the solve does not converge (iteration "
                  "count, schemes, relaxation) before calling it again. " if unsettled_stop else "")
                 + "Not converged, so no case of this physics group can run yet. pair_comparisons "
@@ -6238,9 +7187,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "another case_id or physics_group, repeats the same result from scratch.")}),
             "levels": [str(p) for p in levels],
             "refine_failed_at": refine_failed,
+            **({"refine_failed_reason": refine_failed_reason} if refine_failed and refine_failed_reason else {}),
             "metrics_used": mesh_metrics,
             "gate_quantities": str(gate_spec_path),
             "seed_fingerprint": seed_print,
+            "condition": condition,
             "quantities_missing": missing_by_pair,
             "quantity_review": {k: v for k, v in review_record.items() if k != "requested"},
             "pair_comparisons": pair_records,
@@ -6257,6 +7208,36 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         if converged:
             _record_converged(spec, selected, levels, mesh_metrics)
         return spec
+
+    def restore_last_success(case_id: str) -> dict:
+        """Put a case's last successful run back in its folder: the run now in
+        cases/<case_id> is kept in previous_attempts/<case_id>.<n>, and the one
+        kept in previous_attempts/<case_id>_last_success is copied back, as it
+        was. For a case whose good run was followed by a rerun that failed or
+        was not wanted; nothing is deleted. Call interpret_case on it after."""
+        # A rerun meant to redo only post-processing reran an NN study's whole
+        # training and failed, leaving the good run where no other tool reads it
+        # (nn_in_solver_demo_20261022_1129, case_005).
+        cid = _safe_variant_slug(case_id, "case")
+        case_dir = out_dir / "cases" / cid
+        good = out_dir / "previous_attempts" / f"{cid}_last_success"
+        if not good.is_dir():
+            return {"error": f"No successful run of {cid} is kept ({good} does not exist).", "case_id": cid}
+        if not _run_succeeded(_read_json(good / "run_result.json") or {}):
+            return {"error": f"{good} does not hold a successful run.", "case_id": cid}
+        moved_to = ""
+        if case_dir.is_dir():
+            n = 1
+            while (out_dir / "previous_attempts" / f"{cid}.{n}").exists():
+                n += 1
+            target = out_dir / "previous_attempts" / f"{cid}.{n}"
+            case_dir.rename(target)
+            file_ledger.moved(out_dir, case_dir, target, "manager: restore_last_success")
+            moved_to = str(target)
+        shutil.copytree(good, case_dir, symlinks=True)
+        return {"ok": True, "case_id": cid, "restored_from": str(good),
+                **({"run_moved_to": moved_to} if moved_to else {}),
+                "next": f"call interpret_case('{cid}') on the restored run"}
 
     def interpret_case(case_id: str) -> dict:
         """Generate diagnostic figures and an interpreter decision for one
@@ -6285,8 +7266,22 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # A cap that stops a working interpretation halfway is worse than no
         # cap: it costs the full runtime and returns nothing. One hour is
         # generous against the observed loop and still bounds a hang.
+        # The case's requirement and what its last run wrote. Given neither, the
+        # interpreter judged a DAFoam gradient check by generic flow plots
+        # ("no more specific requested geometry or flow scenario was stated")
+        # and sent a completed check back to run again for blank temperature
+        # and porosity maps (shelf_demo_dafoam_20261019_1057, case_006).
+        requirement, _ = _canonical_requirement(case_id, "")
+        first_log = case_dir / "log.blockMesh"
+        outputs = foam_native.loop._run_outputs(
+            case_dir, first_log.stat().st_mtime if first_log.is_file() else 0.0)
+        interpret_requirement = requirement + (
+            "\n\nRESULTS THE CASE'S LAST RUN WROTE (judge the case against its requirement by these "
+            "as well as by the figures; a figure of a field the requirement does not ask about is not "
+            "evidence against it):\n" + "\n".join(outputs) if outputs else "")
         interp_proc = _run_script(
-            ["scripts/interpret.py", "--case", str(case_dir), "--figs", str(figs_dir), "--output", str(decision_path)],
+            ["scripts/interpret.py", "--case", str(case_dir), "--figs", str(figs_dir), "--output", str(decision_path)]
+            + (["--requirement", interpret_requirement] if interpret_requirement.strip() else []),
             timeout=3600,
             # Figure attempts stop in time for the interpretation itself
             # (interpreter_agent._viz_deadline).
@@ -6326,10 +7321,19 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             result["path"] = None
         return result
 
-    def analyze_all_cases(case_ids: List[str], metrics: str = "Cd,Cl,y_plus") -> dict:
+    def analyze_all_cases(case_ids: List[str], metrics: str = "Cd,Cl,y_plus",
+                          include_despite_verdict: Optional[Dict[str, str]] = None) -> dict:
         """Cross-case QoI comparison and discussion, across every finished case.
         ``metrics`` names the quantities to compare, comma-separated (for
-        example "Kr,Kt,wave_height"); it is not a place for instructions."""
+        example "Kr,Kt,wave_height"); it is not a place for instructions.
+
+        A case is analyzed when its run succeeded and its interpreter decision
+        is PROCEED. A case whose run succeeded but whose decision is RERUN or
+        REVISE for something that does not change its solution (a missing
+        record or plot) can be included by naming it in
+        ``include_despite_verdict`` as {case_id: why its solution is still
+        valid}; the analysis records each such case with its verdict and that
+        reason, and the paper reports it so."""
         # Names only. Passed as free text it reached the analysis agent's
         # prompt, and a manager used it to have the agent replace analysis.json
         # with an object the manager had written ("PROMOTE EXACT EMBEDDED
@@ -6347,16 +7351,46 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         if not clean_ids:
             return {"error": "No case IDs supplied for analysis."}
         missing = []
+        # Included on a stated reason: an NN study's training case, whose solve
+        # was valid but whose verdict was RERUN for its y+ and line-sampling
+        # records, could otherwise only be left out of the analysis or rerun
+        # unchanged (nn_in_solver_demo_20261022_1129, case_005).
+        reasons = {str(k).strip(): str(v).strip() for k, v in (include_despite_verdict or {}).items()
+                   if str(k).strip() and str(v).strip()}
+        included: Dict[str, Dict[str, str]] = {}
         for cid in clean_ids:
             case_dir = out_dir / "cases" / cid
             rr = _read_json(case_dir / "run_result.json") or {}
             dj = _read_json(case_dir / "decision.json") or {}
-            if not _run_succeeded(rr) or dj.get("status") != "PROCEED":
+            status = str(dj.get("status") or "")
+            if _run_succeeded(rr) and status in ("RERUN", "REVISE") and cid in reasons:
+                included[cid] = {"verdict": f"{status}: {str(dj.get('reason', ''))[:600]}",
+                                 "included_because": reasons[cid][:1000]}
+                continue
+            if not _run_succeeded(rr) or status != "PROCEED":
                 missing.append(cid)
         if missing:
+            # With the way on said: refused with only the list, a manager whose
+            # interpreter had rejected eight of ten cases (some on a results file
+            # its own script had left incomplete) ended the study there, with no
+            # analysis and no paper (shelf_demo_dafoam_20261019_1057).
+            verdicts = {}
+            for cid in missing:
+                dj = _read_json(out_dir / "cases" / cid / "decision.json") or {}
+                verdicts[cid] = (f"{dj.get('status', 'not run successfully')}: {str(dj.get('reason', ''))[:240]}"
+                                 if dj else "no interpreter decision, or the run did not succeed")
             return {
                 "error": "Analysis accepts only successfully run cases whose interpreter decision is PROCEED.",
                 "incomplete_or_rejected_case_ids": missing,
+                "their_verdicts": verdicts,
+                "what_you_can_do": (
+                    "For each listed case: fix what its verdict found (its full reason is in the case's "
+                    "decision.json) and call interpret_case on it again, or rerun it. A case whose run "
+                    "succeeded and whose RERUN or REVISE verdict is about records or plots, not about its "
+                    "solution, can be included as it is by naming it in include_despite_verdict with why its "
+                    "solution is still valid. Or call this tool with only the cases that have PROCEED and "
+                    "report the others in the study as not analyzed, with why. A study is not finished "
+                    "without its analysis and its paper."),
             }
         case_dirs = [str(out_dir / "cases" / cid) for cid in clean_ids]
         _write_checkpoint("experiments_done", {"case_ids": clean_ids, "num_cases": len(clean_ids)})
@@ -6375,17 +7409,66 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         )
         ok = proc.returncode == 0 and analysis_path.is_file()
         if ok:
-            _write_checkpoint("analysis_done", {"path": str(analysis_path), "case_ids": clean_ids})
+            if included:
+                analysis = _read_json(analysis_path)
+                if isinstance(analysis, dict):
+                    analysis["included_despite_verdict"] = included
+                    _write_json(analysis_path, analysis)
+            _write_checkpoint("analysis_done", {"path": str(analysis_path), "case_ids": clean_ids,
+                                                **({"included_despite_verdict": included} if included else {})})
             _update_study_state(current_stage="analysis")
-        return {"ok": ok, "path": str(analysis_path), "stderr_tail": proc.stderr[-1500:]}
+        return {"ok": ok, "path": str(analysis_path), "stderr_tail": proc.stderr[-1500:],
+                **({"included_despite_verdict": sorted(included)} if included else {})}
 
-    def write_paper(template: str = "neurips") -> dict:
+    def write_paper(template: str = "neurips", revise_current: bool = False,
+                    results_files: Optional[List[str]] = None) -> dict:
         """Draft the LaTeX paper, generate figures, and run the reviewer loop.
 
         Requires lit.json (fetch_literature), analysis.json
         (analyze_all_cases), and requirements.json (generate_case_requirements)
         to already exist.
+
+        ``revise_current=True`` starts from paper/main.tex as it stands (with
+        the files it \\inputs) instead of a new draft: its figures are
+        checked, it is compiled and reviewed as it is, and later rounds revise
+        it. review.json then reviews that paper. Without it, a new draft
+        replaces any edits made to the paper since the last write_paper.
+
+        Every call redraws the planned per-case figures under paper_figs/
+        (the case_*_contour.png files): it runs paper_figs/paper_viz_batch.py
+        as it stands, and a figure agent rewrites that script when it fails or
+        the reviewer asks for different figures. An edit made to those PNGs
+        directly is overwritten; make it in paper_viz_batch.py. Figures
+        elsewhere in the study, such as those named in ``results_files``, are
+        not redrawn.
+
+        ``results_files`` names study-level result data the writer is given
+        beside the analysis and each case's own records: JSON or CSV files in
+        this study folder that a script computed from the cases (for example
+        the totals and comparisons a study-level script wrote), and PNG
+        figures such a script drew, which the writer may use beside the
+        planned ones. Data and figures only: text and reports are not accepted.
         """
+        if revise_current and not (out_dir / "paper" / "main.tex").is_file():
+            return {"ok": False, "error": "revise_current: paper/main.tex does not exist yet; call write_paper first."}
+        # Study-level results the writer could not see: a hyStrath manager's
+        # study_results.json, computed from the audited case records, never
+        # reached the paper, whose reviewer then asked for exactly that file
+        # (shelf_demo_hystrath_20261022_1030).
+        result_args: List[str] = []
+        for raw in results_files or []:
+            rp = Path(str(raw)).expanduser()
+            rp = (out_dir / rp).resolve() if not rp.is_absolute() else rp.resolve()
+            try:
+                rp.relative_to(out_dir.resolve())
+            except ValueError:
+                return {"ok": False, "error": f"results_files: {raw} is not inside this study folder."}
+            if rp.suffix.lower() not in (".json", ".csv", ".png") or not rp.is_file():
+                return {"ok": False, "error": f"results_files: {raw} is not a JSON, CSV or PNG file in this study."}
+            if _is_protected_artifact(rp, rp.relative_to(out_dir.resolve()).parts):
+                return {"ok": False, "error": f"results_files: {raw} is a workflow record, read by the paper "
+                        "already where it applies."}
+            result_args += ["--results-file", str(rp)]
         ranked = _read_json(out_dir / "hypotheses_ranked.json") or {}
         topic = ranked.get("research_topic", "")
 
@@ -6400,7 +7483,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             for case_dir in sorted(cases_root.glob("case_*")):
                 run_result = _read_json(case_dir / "run_result.json") or {}
                 decision = _read_json(case_dir / "decision.json") or {}
-                status = "success" if _run_succeeded(run_result) and decision.get("status") == "PROCEED" else "failed"
+                # A case the analysis included on a stated reason despite its
+                # verdict is the paper's too (analyze_all_cases).
+                included = (_read_json(out_dir / "analysis.json") or {}).get("included_despite_verdict") or {}
+                status = ("success" if _run_succeeded(run_result)
+                          and (decision.get("status") == "PROCEED" or case_dir.name in included) else "failed")
                 cases_entries.append(
                     {"case_id": case_dir.name, "case_path": str(case_dir.resolve()), "status": status}
                 )
@@ -6445,7 +7532,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "--literature", str(out_dir / "lit.json"),
                 "--review-output", str(review_path),
                 "--template", template,
-            ] + (
+            ] + (["--start-from-current"] if revise_current else []) + result_args + (
                 ["--mesh-independence", str(out_dir / "mesh_independence_context.json")]
                 if (out_dir / "mesh_independence_context.json").is_file() else []
             ),
@@ -6465,7 +7552,9 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             and any((cross_dir / name).is_file()
                     for name in ("aggregate.csv", "results.json", "data_processing_report.md"))
             and (cross_dir / "cross_experiment_interpretation.md").is_file()
-            and bool(list(cross_dir.glob("*.png")))
+            # No figure required: the analysis makes plots only when it has
+            # something to plot, and a finished DAFoam paper was reported
+            # failed twice for having none (shelf_demo_dafoam_20261019_1057).
         )
         saved = (paper_dir / "main.pdf").is_file() and review_path.is_file()
         ok = (
@@ -6483,10 +7572,26 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             _write_checkpoint("cross_experiment_analysis_done", {"path": str(cross_dir)})
             _write_checkpoint("paper_review_done", {"paper": str(paper_dir / "main.pdf"), "review": str(review_path)})
             _update_study_state(current_stage="paper_review")
+        # Which part is missing, so a failed result says why: with main.pdf and
+        # review.json written but no cross-case figure, the manager got only
+        # ok false and an empty stderr (shelf_demo_dafoam_20261019_1057).
+        not_done = [] if ok else [message for done, message in (
+            (proc.returncode == 0, f"scripts/paper_unified.py exited with code {proc.returncode}"),
+            ((paper_dir / "main.pdf").is_file(), f"no {paper_dir / 'main.pdf'} was written"),
+            (review_path.is_file(), f"no {review_path} was written"),
+            (plan_path.is_file(), f"no {plan_path} was written"),
+            (cross_dir.is_dir(), f"no {cross_dir} was written"),
+            (not cross_dir.is_dir() or any((cross_dir / name).is_file() for name in
+                                           ("aggregate.csv", "results.json", "data_processing_report.md")),
+             f"{cross_dir} has no results.json, aggregate.csv or data_processing_report.md"),
+            (not cross_dir.is_dir() or (cross_dir / "cross_experiment_interpretation.md").is_file(),
+             f"{cross_dir} has no cross_experiment_interpretation.md"),
+        ) if not done]
         return {
             "ok": ok,
             "paper_dir": str(paper_dir),
             "review_path": str(review_path),
+            **({"not_done": not_done} if not_done else {}),
             "stderr_tail": proc.stderr[-1500:],
         }
 
@@ -6885,6 +7990,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "scripts from those two places can be run.")}
         if not script_path.is_file() or script_path.suffix != ".py":
             return {"ok": False, "error": f"{script_path} is not a Python script."}
+        # A case's own scripts run in its runs. Run from here (an audit asked
+        # for --help), one ran the whole workflow and rewrote the case's files,
+        # which the next run then carried in as the manager's fixes
+        # (nn_in_solver_demo_20261022_1129, case_006).
+        if (out_dir / "cases").resolve() in script_path.parents:
+            return {"ok": False, "error": (
+                f"{script_path} belongs to a case: a case's scripts run in its runs "
+                "(run_case_native), not from here. To look at a finished case, read its files, "
+                "or write a script in the study folder that reads them.")}
         argv = [str(a) for a in (script_args or [])]
         # A script asked to write into the study folder may not create the
         # folder itself.
@@ -6907,36 +8021,231 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                *[arg for p in protected for arg in ("--ro-bind", str(p), str(p))],
                "--proc", "/proc", "--dev", "/dev",
                "--chdir", str(out_dir), sys.executable, str(script_path), *argv]
-        started = time.time()
+        skip = tuple(file_ledger.running_under(out_dir))
+        before = file_ledger.snapshot(out_dir, skip)
+        # The framework's own modules importable, as in a case's Allrun.post:
+        # a script tested here that imports cfd_langgraph.foam_load must not
+        # fail here and work after the solve.
+        py_env = case_env(settings.openfoam_path)
+        py_env["PYTHONPATH"] = os.pathsep.join(
+            p for p in (str(_REPO_ROOT / "src"), py_env.get("PYTHONPATH", "")) if p)
         returncode, out, err, timed_out = foam_native.loop.run_script(
-            cmd, out_dir, case_env(settings.openfoam_path), max(30, min(int(timeout_s), 7200)))
+            cmd, out_dir, py_env, max(30, min(int(timeout_s), 7200)))
         refused = []
         for p in _protected_files(out_dir):
             if p not in protected:  # created by the script under a workflow-owned name
                 p.unlink(missing_ok=True)
                 refused.append(str(p))
-        written = []
-        for path in out_dir.rglob("*"):
-            if len(written) >= 40:
-                break
-            if "processor" in path.parts or not path.is_file():
-                continue
-            try:
-                if path.stat().st_mtime >= started:
-                    written.append(str(path))
-            except OSError:
-                continue
+        # What the script wrote, from the study folder before and after it
+        # (field data left out): by modification time alone, a file it copied
+        # keeping its old time was not among them.
+        diff = file_ledger.changes(before, file_ledger.snapshot(out_dir, skip))
+        made = [str(out_dir / r) for r in diff["created"] + diff["changed"] if not file_ledger.is_field(r)]
+        written = made[:40] + ([f"... and {len(made) - 40} more"] if len(made) > 40 else [])
+        # Kept whole when it is long: only its last 6000 characters came back,
+        # and an NN manager wrote one smaller script after another to see the
+        # start of a summary it had printed (nn_in_solver_demo_20261022_1129).
+        long_out: Dict[str, Any] = {}
+        if len(out) > 6000:
+            log_dir = out_dir / "scratch" / "run_python_output"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            out_file = log_dir / f"{script_path.stem}_{time.strftime('%Y%m%d_%H%M%S')}.stdout.txt"
+            out_file.write_text(out, encoding="utf-8")
+            long_out = {"stdout_head": out[:3000], "stdout_chars": len(out), "stdout_file": str(out_file),
+                        "stdout_note": "stdout was longer than shown: all of it is in stdout_file."}
         return {
             "ok": returncode == 0 and not timed_out,
             "returncode": returncode,
             "timed_out": timed_out,
             "stdout_tail": out[-6000:],
+            **long_out,
             "stderr_tail": err[-3000:],
             "files_written": written,
             **({"refused_workflow_files": refused,
                 "note": ("These are the workflow's own records; a script may not create or change "
                          "them, so they were removed.")} if refused else {}),
         }
+
+    def _nn_path(value: str, *, readable_outside: bool = False) -> tuple[Optional[Path], Optional[str]]:
+        """A path for the nn_ tools: in this study's folder (a relative path is
+        read from it), or for reading also in the starter folder."""
+        path = Path(str(value or "")).expanduser()
+        if not path.is_absolute():
+            path = out_dir / path
+        path = path.resolve()
+        roots = [out_dir.resolve()]
+        starter_root = _starter_root_on_record() if readable_outside else None
+        if starter_root is not None:
+            roots.append(starter_root.resolve())
+        if not any(path == r or r in path.parents for r in roots):
+            return None, f"{path} is not inside this study's folder" + (
+                " or the starter folder" if readable_outside else "")
+        return path, None
+
+    def _nn_cli(argv: List[str], card: Optional[Path] = None, timeout_s: int = 1800) -> dict:
+        """One `python -m cfd_langgraph.nn_coupling` command in run_python's
+        sandbox (only the study folder writable), its JSON result; a check's
+        result is also kept beside the card it checked (checks.jsonl)."""
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            return {"ok": False, "error": "bubblewrap is required to run the nn tools in a sandbox."}
+        protected = _protected_files(out_dir)
+        src_root = str(Path(__file__).resolve().parents[2])
+        env = dict(case_env(settings.openfoam_path))
+        env["PYTHONPATH"] = src_root + (":" + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+        env["OMP_NUM_THREADS"] = "1"
+        cmd = [bwrap, "--die-with-parent", "--new-session", "--unshare-pid",
+               "--ro-bind", "/", "/", "--tmpfs", "/tmp",
+               "--bind", str(out_dir), str(out_dir),
+               *[arg for p in protected for arg in ("--ro-bind", str(p), str(p))],
+               "--proc", "/proc", "--dev", "/dev",
+               "--chdir", str(out_dir), sys.executable, "-m", "cfd_langgraph.nn_coupling", *argv]
+        returncode, out, err, timed_out = foam_native.loop.run_script(cmd, out_dir, env, timeout_s)
+        try:
+            result = json.loads(out[out.index("{"):])
+        except ValueError:
+            result = {"ok": False, "error": ("timed out: " if timed_out else "") + (out + err)[-4000:]}
+        # The export's own checks too (its formula and the DAFoam case it was
+        # checked on), each record with the hash of the card it is about and of
+        # the weights exported. Kept only in the manager's tool results, an S809
+        # case asked to require "case_003's completed checks" before running
+        # found no record of any, and refused ten runs running
+        # (nn_airfoil_s814_20261026_1537, case_006).
+        if argv and argv[0] in ("export", "from-dafoam") and result.get("ok") and "--out" in argv:
+            made = Path(argv[argv.index("--out") + 1])
+            if (made / "model.pt").is_file():
+                file_ledger.note(out_dir, made / "model.pt", f"manager: nn {argv[0]}",
+                                 about=[made / "card.json"], what="the network the card describes")
+        if card is not None and argv and (argv[0].startswith("check") or argv[0] == "from-dafoam"):
+            # What the record is about first, its result last: after a
+            # 1,500-character result, the hashes at the end of the line were
+            # looked for inside the result (nn_airfoil_s814_20261026_1537, case_006).
+            entry: Dict[str, Any] = {"check": argv[0], "ok": bool(result.get("ok")),
+                                     "at": datetime.now(timezone.utc).isoformat()}
+            if card.is_file():
+                entry["card_sha256"] = hashlib.sha256(card.read_bytes()).hexdigest()
+            if argv[0] == "from-dafoam":
+                weights = Path(argv[argv.index("--parameters") + 1])
+                if weights.is_file():
+                    entry["parameters"] = str(weights)
+                    entry["parameters_sha256"] = hashlib.sha256(weights.read_bytes()).hexdigest()
+            entry.update({"args": argv[1:], "result": result})
+            if card.parent.is_dir():
+                with open(card.parent / "checks.jsonl", "a") as log:
+                    log.write(json.dumps(entry) + "\n")
+                # About the card in the study's ledger: a case given the card
+                # is given its checks with it (run_case_native).
+                file_ledger.note(out_dir, card.parent / "checks.jsonl", f"manager: nn {argv[0]}",
+                                 about=[card], what="the nn tools' checks of this card")
+        return result
+
+    def nn_export(model_script: str, card: str, out_folder: str, sample: str = "") -> dict:
+        """Package a trained PyTorch network for use inside OpenFOAM: one
+        TorchScript file that carries the network's input normalisation, output
+        scaling and bounds, beside its card. OpenFOAM then gives it raw features.
+
+        model_script: a .py defining build_model() (returns the trained
+          torch.nn.Module, weights loaded) and sample_inputs() (at least 8 rows
+          of RAW inputs from the training data, inputs in the network's order).
+        card: a JSON card: name; inputs, in the network's input order, each
+          {"name", "definition" (exactly how training computed it), "units"};
+          output (the field or quantity it gives) and output_meaning;
+          input_shift and input_scale, one per input, in the convention
+          normalised = (raw + shift) * scale (for mean/std standardisation:
+          shift = -mean, scale = 1/std); output_shift and output_scale, with
+          output = output_scale * (net + output_shift); lower_bound,
+          upper_bound and default_value (for a non-finite output); and
+          training_range, one [min, max] of each raw input over the training
+          data.
+        out_folder: where card.json and model.pt are written (study folder).
+        sample: optionally a text file of raw rows instead of sample_inputs()."""
+        script, why = _nn_path(model_script, readable_outside=True)
+        card_in, why_card = _nn_path(card, readable_outside=True)
+        dest, why_out = _nn_path(out_folder)
+        if why or why_card or why_out:
+            return {"ok": False, "error": why or why_card or why_out}
+        argv = ["export", "--model-script", str(script), "--card", str(card_in), "--out", str(dest)]
+        if sample:
+            rows, why_sample = _nn_path(sample, readable_outside=True)
+            if why_sample:
+                return {"ok": False, "error": why_sample}
+            argv += ["--sample", str(rows)]
+        return _nn_cli(argv)
+
+    def nn_from_dafoam(name: str, options: str, parameters: str, out_folder: str, dafoam_case: str = "",
+                       time: str = "", definitions: str = "") -> dict:
+        """Turn a network DAFoam trained through its adjoint (regressionModel,
+        modelType neuralNetwork) into the identical PyTorch network and card.
+
+        options: JSON file of daOptions["regressionModel"][name] as trained.
+        parameters: JSON file holding only a bare list of numbers: the trained
+          weight vector in DAFoam's order (prob.get_val(name) after the
+          optimisation), not an object wrapping it.
+        dafoam_case, time: the DAFoam case and time folder where it wrote its
+          features (writeFeatures True) and its output field: the export is
+          then checked cell by cell against what DAFoam computed in the
+          solver, and the card's training range read from those features.
+        definitions: JSON {input name: definition} for inputs that are not
+          DAFoam's own features.
+        This export's checks, and every later nn_check_parity / nn_check_case of
+        the card, are kept in checks.jsonl beside it, each with the card's and
+        the weights' sha256; a case given the card gets that record with it."""
+        paths = {}
+        for key, value in (("options", options), ("parameters", parameters), ("out", out_folder)):
+            paths[key], why = _nn_path(value)
+            if why:
+                return {"ok": False, "error": why}
+        argv = ["from-dafoam", "--name", name, "--options", str(paths["options"]),
+                "--parameters", str(paths["parameters"]), "--out", str(paths["out"])]
+        if dafoam_case:
+            case_path, why = _nn_path(dafoam_case if "/" in dafoam_case else f"cases/{dafoam_case}")
+            if why:
+                return {"ok": False, "error": why}
+            argv += ["--case", str(case_path), "--time", str(time)]
+        if definitions:
+            defs, why = _nn_path(definitions)
+            if why:
+                return {"ok": False, "error": why}
+            argv += ["--definitions", str(defs)]
+        return _nn_cli(argv, card=paths["out"] / "card.json")
+
+    def nn_check_parity(card: str) -> dict:
+        """Build the card's network against this study's OpenFOAM, the way a case
+        compiles it, and check it reproduces the outputs stored in the card. A
+        network may be used in a case only after this passes."""
+        card_path, why = _nn_path(card)
+        if why:
+            return {"ok": False, "error": why}
+        return _nn_cli(["check-parity", "--card", str(card_path), "--build-root",
+                        str(out_dir / "nn_build")], card=card_path)
+
+    def nn_check_case(case: str, card: str, time: str = "", prefix: str = "nn_", output_field: str = "",
+                      features_normalised: bool = False) -> dict:
+        """Check a case that evaluated the card's network: the features it wrote
+        (fields prefix + each input name) and the output field it used must
+        agree with the card's network evaluated on those features. A result of
+        a case that uses a network counts only when this passes. Also says how
+        many cells lie outside the training range. case: a case_id or a folder;
+        features_normalised for DAFoam's written features (already scaled)."""
+        card_path, why = _nn_path(card)
+        case_path, why_case = _nn_path(case if "/" in case else f"cases/{case}")
+        if why or why_case:
+            return {"ok": False, "error": why or why_case}
+        argv = ["check-case", "--case", str(case_path), "--card", str(card_path), "--time", str(time),
+                "--prefix", prefix, "--output-field", output_field]
+        return _nn_cli(argv + (["--normalised"] if features_normalised else []), card=card_path)
+
+    def nn_coded_entries(helper_folder: str) -> dict:
+        """The codeOptions, codeLibs and codeInclude entries (and nnModel.H, written
+        into helper_folder) that let a coded OpenFOAM object (coded function
+        object, coded fvModel) evaluate a card's network:
+        `static nnModel model("<card folder>/model.pt", <number of inputs>);` then
+        `model.evaluate(features)`, features a List<const scalarField*> of the RAW
+        inputs in the card's order; it returns the card's output per cell."""
+        folder, why = _nn_path(helper_folder)
+        if why:
+            return {"ok": False, "error": why}
+        return _nn_cli(["coded-entries", "--dir", str(folder)])
 
     def impl_verify() -> dict:
         """Check an implementation study's result the way a reviewer would.
@@ -9415,7 +10724,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         case_id: str, requirement_text: str = "", physics_group: str = "default",
         mesh_type: str = "standard_mesh", max_loop: int = 10, clarification: str = "",
         given_files: Optional[Dict[str, str]] = None, rerun_reason: str = "",
-        time_limit_hours: float = 6.0,
+        time_limit_hours: float = 6.0, post_only: bool = False, start_from: str = "",
     ) -> dict:
         """Run one OpenFOAM case entirely through this workflow's own
         FoamAgent port (parse -> RAG -> decompose -> write -> Allrun -> run
@@ -9449,16 +10758,41 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         path -> source file, for example {"constant/waveDict": "<the study's
         reference waveDict>"}: a file the study supplies whose values cannot be
         derived, such as tabulated coefficients. They are copied after the case
-        is seeded and are never rewritten by the writer or the reviewer.
+        is seeded and are never rewritten by the writer or the reviewer. A
+        case keeps the files given to it: a later run of it called without
+        given_files, or with {}, gets them again; new given_files are added to
+        them, and a case path given an empty value ("") is taken away.
 
         A case whose last run succeeded is not run again unless the
         interpreter asked for it (RERUN or REVISE) or ``rerun_reason`` says
-        why: running it again first deletes the results it has.
+        why: running it again first deletes the results it has. rerun_reason
+        only unlocks the rerun; it is not given to the case, which runs again
+        through its whole approved requirement (its solve included).
+
+        ``post_only=True`` runs only the case's Allrun.post (the post-processing
+        a case on a solver's own Allrun runs after its solve) on the case's
+        finished solve, as the case folder now is: the solve is not repeated.
+        For a case whose run succeeded and whose post-processing failed, after
+        its scripts are fixed. A failed Allrun.post is reviewed, only its
+        scripts are fixed, and it runs again, up to two times, as after a full
+        run. The outcome goes into run_result.json under
+        post_processing; call interpret_case next. For a case with no
+        Allrun.post, redo post-processing with a script in the study folder
+        run by run_python.
 
         Each run starts from a fresh case folder; the previous one is kept in
-        previous_attempts/. A case file you changed after the case's last run
+        previous_attempts/ (<case_id>_last_success for the last successful
+        run, <case_id> for the last failed one, <case_id>.1, .2, ... for
+        failed ones before it). A case file you changed after the case's last run
         (a script or dictionary you fixed) is carried into the new run as you
         left it, and the result lists it under ``kept_your_edits``.
+
+        ``start_from`` names an earlier attempt of this case in
+        previous_attempts/ (for example "case_003.2"): the new run starts with
+        that attempt's scripts (its top-level .py files, Allrun.post and the
+        scripts in its subfolders) instead of the last run's, which are then
+        not carried. To go back to scripts that worked when later attempts
+        broke them.
 
         ``time_limit_hours`` (default 6, at most 72) is the case's whole time,
         all its runs together. A run that uses it up is stopped there and the
@@ -9470,6 +10804,40 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
 
         case_id = _safe_variant_slug(case_id, "case")
         physics_group = _safe_variant_slug(physics_group, "default")
+        start_from = str(start_from or "").strip()
+        if start_from:
+            attempts_root = out_dir / "previous_attempts"
+            names = sorted(d.name for d in attempts_root.iterdir()
+                           if d.is_dir() and (d.name == case_id or d.name.startswith((case_id + ".", case_id + "_")))
+                           ) if attempts_root.is_dir() else []
+            if start_from not in names and not (start_from == case_id and (out_dir / "cases" / case_id).is_dir()):
+                return {"case_id": case_id, "error": f"start_from: {start_from!r} is not an earlier attempt of "
+                        f"{case_id}; its attempts in previous_attempts/ are: {', '.join(names) or 'none'}."}
+        # Post-processing alone, on the finished solve: rerun whole, a DSMC
+        # case whose Allrun.post had failed on a guessed reader marker would
+        # have solved again for 2.5 h (shelf_demo_hystrath_20261022_1030, case_004).
+        if post_only:
+            post_case = out_dir / "cases" / case_id
+            post_record = _read_json(post_case / "run_result.json") or {}
+            if not _run_succeeded(post_record):
+                return {"case_id": case_id, "error": "post_only runs Allrun.post on a finished solve: this "
+                        "case's last run did not succeed, so run it whole (without post_only)."}
+            if not (post_case / "Allrun.post").is_file():
+                return {"case_id": case_id, "error": "post_only: this case has no Allrun.post. Redo its "
+                        "post-processing with a script in the study folder run by run_python."}
+            post = foam_native.loop.run_post_with_repairs(
+                foam_llm, post_case, _canonical_requirement(case_id)[0], case_env(settings.openfoam_path), 3600)
+            post_record["post_processing"] = {**post, "post_only": True}
+            # The record keeps the time the run ended: what was changed after
+            # that is carried into the next run (_edited_since_run), and an
+            # Allrun.post fixed before a post-only call was left out of the
+            # rerun that followed (shelf_demo_hystrath_20261022_1030, case_005).
+            ended = (post_case / "run_result.json").stat()
+            _write_json(post_case / "run_result.json", post_record)
+            os.utime(post_case / "run_result.json", ns=(ended.st_atime_ns, ended.st_mtime_ns))
+            return {"case_id": case_id, "status": post_record.get("status"), "post_processing": post,
+                    "note": "Only Allrun.post ran, on the finished solve; the solve was not repeated. "
+                            "Call interpret_case next."}
         # Every case here starts from the mesh gate's selected mesh, which the
         # case loop applies only as a standard mesh: any other value failed
         # the case at once with "Selected mesh cannot be applied" (a DAFoam
@@ -9485,27 +10853,46 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         flagged, checker_issues = _requirement_issues(case_id)
         clarification = str(clarification or "").strip()
         writer_requirement = canonical_requirement
+        # A case whose last run found its requirement could not be met
+        # (foam_native.loop's requirement_unmeetable) may be clarified too: a
+        # passed requirement asking for a value no file held left the study no
+        # way to resolve it short of rewriting it (nn_airfoil_s814_20261026_1537).
+        unmeetable = str((_read_json(out_dir / "cases" / case_id / "run_result.json") or {})
+                         .get("requirement_unmeetable") or "")
         if clarification:
-            if not flagged:
+            if not flagged and not unmeetable:
                 return {
                     "error": "clarification is only accepted for a requirement the requirement "
-                             "checker flagged; this one passed, so run it as written.",
+                             "checker flagged, or one the case's last run could not meet; this one "
+                             "passed, so run it as written.",
                     "case_id": case_id,
                 }
             writer_requirement = (
                 f"{canonical_requirement}\n\nClarification for this case ({case_id}), added "
-                f"because the requirement checker flagged the requirement above. Where they "
+                f"because the requirement checker flagged the requirement above, or the case's "
+                f"last run could not meet it. Where they "
                 f"differ, this wins:\n{clarification}"
             )
         mesh_spec = _read_json(out_dir / "mesh_gate" / physics_group / "selected_mesh_spec.json") or {}
         selected_level = Path(str(mesh_spec.get("selected_level", "")))
         if not mesh_spec.get("converged") or not selected_level.is_dir():
+            # The groups that can run, and the one this case ran in: a DAFoam
+            # manager rerunning case_008 named a group no gate had
+            # ("dafoam-convergent-channel-twin-field-inversion") and was told
+            # only that it was blocked (shelf_demo_dafoam_20261019_1057).
+            gated = sorted(p.parent.name for p in (out_dir / "mesh_gate").glob("*/selected_mesh_spec.json")
+                           if (_read_json(p) or {}).get("converged"))
+            last_group = str((_read_json(out_dir / "cases" / case_id / "run_result.json") or {})
+                             .get("physics_group") or "")
             return {
                 "error": (
                     f"Blocked: physics group {physics_group!r} has no converged mesh-gate selection, "
                     "so no case of it can run. Only the manager can run run_mesh_gate; a case-runner "
                     "cannot, and no argument of this tool gets around it. If you are a case-runner, "
                     "stop now and report this back as your final message."
+                    + (f" Groups with a converged gate: {', '.join(gated)}." if gated else "")
+                    + (f" {case_id} last ran in {last_group!r}." if last_group and last_group != physics_group
+                       else "")
                 ),
                 "physics_group": physics_group,
                 "mesh_spec": str(out_dir / "mesh_gate" / physics_group / "selected_mesh_spec.json"),
@@ -9538,6 +10925,32 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "case_id": case_id,
                 "previous_run": str(case_dir / "run_result.json"),
             }
+        # Given files are checked before the case folder is moved aside: checked
+        # after, a call refused for a mistyped given file had already moved the
+        # case's scripts into previous_attempts/, and the next call started
+        # without them (nn_airfoil_s814_20261026_1537, case_003).
+        for rel, src in (given_files or {}).items():
+            try:
+                foam_native.loop._safe_case_relative_path("", str(rel))
+            except ValueError as exc:
+                return {"error": f"given_files: {exc}", "case_id": case_id}
+            if src not in (None, "") and not Path(str(src)).is_file():
+                return {"error": f"given_files: {src} is not a file.", "case_id": case_id}
+        # start_from's scripts are read now, before the move below renumbers the
+        # attempts: previous_attempts/<case_id> is renamed <case_id>.<n> by it.
+        start_files: Dict[str, Path] = {}
+        if start_from:
+            base = out_dir / "previous_attempts" / start_from
+            if start_from == case_id and not base.is_dir():
+                base = case_dir
+            snapshot = Path(tempfile.mkdtemp(prefix=f"start_from_{case_id}_"))
+            for rel in sorted({p.name for p in base.glob("*.py") if p.is_file()}
+                              | {r for r in _case_scripts(base) if not r.startswith("previous_attempts/")}
+                              | ({"Allrun.post"} if (base / "Allrun.post").is_file() else set())
+                              | set(_script_configs(base))):
+                (snapshot / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(base / rel, snapshot / rel)
+                start_files[rel] = snapshot / rel
         # Each run starts from a clean case folder; the last one is kept
         # outside cases/ rather than deleted. Reused, a DAFoam case carried the
         # scripts and dictionaries of its failed attempts (beta_preflight.py,
@@ -9552,6 +10965,17 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # are: started from a clean folder, case_007's script lost the four
         # repairs the manager had just made to it (shelf_demo_dafoam_20261019_1057).
         edited = _edited_since_run(case_dir)
+        # After a failed run its scripts are all carried, not only those changed
+        # after it ended: the scripts its own fixes built during the run went
+        # with it, and a DAFoam training case lost the controller, helpers and
+        # launcher of its parallel run, keeping one worker the manager had
+        # touched (nn_airfoil_s814_20261026_1537, case_003).
+        if (case_dir / "run_result.json").is_file() and not _run_succeeded(
+                _read_json(case_dir / "run_result.json") or {}):
+            edited = sorted(set(edited) | {p.name for p in case_dir.glob("*.py") if p.is_file()}
+                            | {r for r in _case_scripts(case_dir) if not r.startswith("previous_attempts/")}
+                            | ({"Allrun.post"} if (case_dir / "Allrun.post").is_file() else set())
+                            | set(_script_configs(case_dir)))
         carried: Dict[str, Path] = {}
         kept = out_dir / "previous_attempts" / case_id
         if (case_dir.is_dir() and kept.is_dir()
@@ -9565,10 +10989,30 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         if case_dir.is_dir() and any(case_dir.iterdir()):
             succeeded = _run_succeeded(_read_json(case_dir / "run_result.json") or {})
             previous = out_dir / "previous_attempts" / (f"{case_id}_last_success" if succeeded else case_id)
+            if not succeeded and previous.is_dir():
+                # The failed attempt before it is kept, numbered: deleted, a
+                # DAFoam inversion whose optimiser had converged (only its
+                # script's parser failed) would have gone with the next rerun
+                # (shelf_demo_dafoam_20261019_1057, case_009).
+                n = 1
+                while previous.with_name(f"{case_id}.{n}").exists():
+                    n += 1
+                previous.rename(previous.with_name(f"{case_id}.{n}"))
+                # Recorded, so a path into an attempt still leads to it after
+                # it is renumbered (file_ledger.current_path).
+                file_ledger.moved(out_dir, previous, previous.with_name(f"{case_id}.{n}"),
+                                  f"manager: run_case_native({case_id})")
             shutil.rmtree(previous, ignore_errors=True)
             previous.parent.mkdir(parents=True, exist_ok=True)
             case_dir.rename(previous)
+            file_ledger.moved(out_dir, case_dir, previous, f"manager: run_case_native({case_id})")
             carried = {rel: previous / rel for rel in edited}
+        if start_from:
+            # The manager went back to scripts that had worked, and said so in
+            # the requirement; the run still carried the 337 KB script of the
+            # attempt it had stopped, and went on from that
+            # (nn_airfoil_s814_20261026_1537, case_003).
+            carried = dict(start_files)
         # A file still as the seed has it was not changed by anyone: carried,
         # it would keep the writer from writing it for the requirement.
         carried = {rel: src for rel, src in carried.items()
@@ -9578,15 +11022,234 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         # Fenton coefficients) cannot be written from prose: asked to, the
         # writer set uMean 0 and invented coefficient keys, and every run
         # stopped at "Check uMean value" (shelf_demo_olaflow_20261011_1242).
+        # The files a case was given stay with it. Relaunched after a restart
+        # without them, an NN gradient-check case lost the network's weight and
+        # options files it had been given, and kept only the run script that
+        # reads them (nn_airfoil_s814_20261026_1537, case_001).
+        given_record = out_dir / "given_files.json"
+        given_by_case = _read_json(given_record)
+        given_by_case = given_by_case if isinstance(given_by_case, dict) else {}
+        # An empty map keeps them too: passed {} on a rerun, meaning nothing
+        # more, the same NN case lost its 13 network files and started without
+        # the weights it is defined by (nn_airfoil_s814_20261026_1537, case_001).
+        if not given_files and isinstance(given_by_case.get(case_id), dict):
+            given_files = dict(given_by_case[case_id])
+            if given_files:
+                print(f"[run_case_native] {case_id}: given the {len(given_files)} file(s) it was "
+                      "given before", flush=True)
+        elif given_files:
+            # Added to the files given before, not put in their place; a path
+            # given an empty value is dropped. Replaced, a call that gave a
+            # training case one config file took away the 15 network files it
+            # had been given, and the run stopped on the missing regression
+            # options (nn_airfoil_s814_20261026_1537, case_003).
+            merged = dict(given_by_case.get(case_id) or {}) if isinstance(given_by_case.get(case_id), dict) else {}
+            for k, v in given_files.items():
+                if v in (None, ""):
+                    merged.pop(str(k), None)
+                else:
+                    merged[str(k)] = str(v)
+            given_files = merged
+            given_by_case[case_id] = merged
+            given_record.write_text(json.dumps(given_by_case, indent=1))
+        # A file the study's notes or this case's requirement name, given to
+        # another case of the study, is given to this one too: the requirement
+        # writer is told that a file the notes name is given to the case, but
+        # only the manager's call gave it, and the training case of
+        # nn_cbfs_les_v2_20261107_2238 (case_003) ran without the initial weights
+        # and checksum list cases 002 and 004 had been given; its script stopped.
+        notes_path = out_dir / "requirements_study_notes.txt"
+        named = _named_file_tokens(
+            (notes_path.read_text(errors="ignore") if notes_path.is_file() else "")
+            + "\n" + canonical_requirement)
+        from_siblings: Dict[str, str] = {}
+        for other, files in given_by_case.items():
+            if other == case_id or not isinstance(files, dict):
+                continue
+            for rel, src in files.items():
+                if (Path(str(rel)).parts[:1] != ("previous_attempts",)
+                        and str(rel) not in (given_files or {})
+                        and (str(rel) in named or Path(str(rel)).name in named)):
+                    from_siblings.setdefault(str(rel), str(src))
+        if from_siblings:
+            given_files = {**(given_files or {}), **from_siblings}
+            given_by_case[case_id] = dict(given_files)
+            given_record.write_text(json.dumps(given_by_case, indent=1))
+            print(f"[run_case_native] {case_id}: given {len(from_siblings)} file(s) the study's notes "
+                  f"or its requirement name, as other cases were: {', '.join(sorted(from_siblings))}",
+                  flush=True)
         given: Dict[str, Path] = {}
         for rel, src in (given_files or {}).items():
             try:
                 rel_path = foam_native.loop._safe_case_relative_path("", str(rel))
             except ValueError as exc:
                 return {"error": f"given_files: {exc}", "case_id": case_id}
-            if not Path(str(src)).is_file():
-                return {"error": f"given_files: {src} is not a file.", "case_id": case_id}
-            given[str(rel_path)] = Path(str(src))
+            source = Path(str(src))
+            if not source.is_file():
+                # A file of an attempt renumbered since its path was taken is
+                # found where the study's ledger says it went: the manager's
+                # paths into previous_attempts/case_003 went stale each time a
+                # rerun renumbered it (nn_airfoil_s814_20261026_1537).
+                moved_to = file_ledger.current_path(out_dir, source)
+                if moved_to is None or not moved_to.is_file():
+                    return {"error": f"given_files: {src} is not a file.", "case_id": case_id}
+                print(f"[run_case_native] {case_id}: given file {src} is now at {moved_to}", flush=True)
+                source = moved_to
+            given[str(rel_path)] = source
+        # A file goes with the files the study's ledger records as being about
+        # it, beside it in the case as they are beside it in the study: given
+        # only a network's card.json, an S809 case that was to require the
+        # network's completed checks had no record of them and refused ten runs
+        # running (nn_airfoil_s814_20261026_1537, case_006).
+        for rel, src in list(given.items()):
+            for extra in file_ledger.about(out_dir, src):
+                try:
+                    beside = str(Path(rel).parent / extra.relative_to(src.parent))
+                except ValueError:
+                    beside = str(Path(rel).parent / extra.name)
+                if beside not in given:
+                    given[beside] = extra
+        # The starter's reference data goes into every case. Not given, a case
+        # asked to compare with "the Delft measurements" could not see the
+        # starter's data/ folder, and its writer typed a smooth made-up lift
+        # curve into data/S809_Delft_lift.csv and scored the run against it
+        # (nn_airfoil_s809_20261025_1712, case_005).
+        su_record = _read_json(out_dir / "starter_understanding.json") or {}
+        starter_root = Path(str(su_record.get("starter_dir") or "")).resolve()
+        reference_given = []
+        ref_names = (su_record.get("reference_data") or {}).get("files") if isinstance(
+            su_record.get("reference_data"), dict) else None
+        ref_names = list(ref_names) if isinstance(ref_names, list) else []
+        # The starter's own documentation too: requirements follow it (see
+        # _starter_docs), and a training script that read the README for its
+        # run settings stopped at once because no case held one
+        # (nn_airfoil_s814_20261026_1537, case_003).
+        if str(su_record.get("starter_dir") or "").strip() and starter_root.is_dir():
+            ref_names += [p.name for p in sorted(starter_root.iterdir()) if p.is_file()
+                          and p.suffix.lower() in {".md", ".txt", ""} and p.stem.upper() in {"README", "TASK"}]
+            ref_names += [str(rel) for rel, kind in (su_record.get("file_classifications") or {}).items()
+                          if kind == "formula_spec"]
+        if str(su_record.get("starter_dir") or "").strip() and starter_root.is_dir():
+            for name in dict.fromkeys(ref_names):
+                src = (starter_root / str(name)).resolve()
+                if (not src.is_file() or starter_root not in src.parents
+                        or src.stat().st_size > 20 * 1024 * 1024):
+                    continue
+                try:
+                    rel_path = foam_native.loop._safe_case_relative_path(
+                        "reference_data", str(src.relative_to(starter_root)))
+                except ValueError:
+                    continue
+                if str(rel_path) not in given and src not in {p.resolve() for p in given.values()}:
+                    given[str(rel_path)] = src
+                    reference_given.append(str(rel_path))
+        if reference_given:
+            writer_requirement += (
+                "\n\nThe study's reference data, from its starter, is in this case at: "
+                + ", ".join(reference_given) + ". Measured or reference values are read from these "
+                "files; never write measured or reference values of your own into a file. If a "
+                "comparison needs data that is not among them, say so instead.")
+        # What this case's earlier attempts produced. Each run starts from a
+        # clean folder and the attempt before it is moved to previous_attempts/,
+        # carrying only its edited scripts: a training rerun told to continue
+        # from its best checkpoint (best_feasible_weights.json) searched its own
+        # folder, found none of its earlier results, and stopped on missing
+        # file after missing file (nn_airfoil_s814_20261026_1537, case_003).
+        earlier_records = _previous_attempt_records(out_dir, case_id)
+        earlier_given = []
+        for rel, src in earlier_records.items():
+            if rel not in given:
+                given[rel] = src
+                earlier_given.append(rel)
+        if earlier_given:
+            attempts = sorted({Path(r).parts[1] for r in earlier_given})
+            writer_requirement += (
+                "\n\nThis case has run before. The records of its earlier attempts (results, "
+                "checkpoints, histories and other small output files, as each attempt left them) "
+                "are in this case under previous_attempts/<attempt>/ for: " + ", ".join(attempts)
+                + ". Anything the requirement says to continue from or reuse from an earlier run is "
+                "read from there; do not look for it elsewhere or expect it at the case's top level.")
+        # Where each given file is in the case, beside where it came from: a
+        # requirement named the files by their study paths (nn_export/model.pt)
+        # while the manager gave them at constant/network/, and the writer,
+        # told nothing joining the two, looked for nn_export/ in the case and
+        # stopped on a missing model (nn_in_solver_demo_20261022_1129, case_006).
+        # Not the earlier attempts' records, which the sentence above places:
+        # listed one by one, 413 of them made the requirement 100 KB longer and
+        # had every record shown whole in each prompt
+        # (nn_airfoil_s814_20261026_1537, case_003).
+        listed_given = {rel: src for rel, src in given.items() if rel not in earlier_given}
+        if listed_given:
+            def _shown(src: Path) -> str:
+                try:
+                    return str(src.resolve().relative_to(out_dir.resolve()))
+                except ValueError:
+                    return str(src)
+            writer_requirement += (
+                "\n\nFiles given to this case as they are (copied in before it is written, never "
+                "rewritten): " + "; ".join(f"{rel} in the case is the given copy of {_shown(src)}"
+                                          for rel, src in sorted(listed_given.items()))
+                + ". Where this requirement names one of these files, by that source path or by its "
+                "name, it means the copy at the path given here, and the case uses it from there.")
+            # How to build against a given network header here: told nothing, a
+            # writer's Make/options used $(TORCH_ROOT), which nothing sets, left
+            # out -std=c++17, and the helper failed to build with an empty log
+            # (nn_in_solver_demo_20261022_1129, case_006).
+            from cfd_langgraph.nn_coupling import openfoam as nn_openfoam
+            for rel in sorted(given):
+                if Path(rel).name != nn_openfoam.HELPER:
+                    continue
+                try:
+                    compile_flags = nn_openfoam.compile_flags(case_dir / Path(rel).parent)
+                    link_flags = nn_openfoam.link_flags()
+                except Exception as exc:  # noqa: BLE001 - a missing torch is reported, not fatal
+                    writer_requirement += (f"\n\nCode that includes {rel} cannot be built here: "
+                                           f"PyTorch's C++ library was not found ({exc}).")
+                    continue
+                writer_requirement += (
+                    f"\n\nBuilding code that includes {rel} on this machine (no variable such as "
+                    f"TORCH_ROOT is set; use these exact flags): compile flags `{compile_flags}`; "
+                    f"link flags `{link_flags}`. In wmake's Make/options the compile flags go in "
+                    "EXE_INC, for a library too (wmake reads no LIB_INC), and the link flags in "
+                    "EXE_LIBS for a program or LIB_LIBS for a library; in a "
+                    "coded object they go in codeOptions and codeLibs. Beside them, code that includes "
+                    "fvCFD.H needs -I$(LIB_SRC)/finiteVolume/lnInclude and -I$(LIB_SRC)/meshTools/lnInclude "
+                    "with -lfiniteVolume -lmeshTools, like any OpenFOAM application. The header's own "
+                    "comments give its interface.")
+                # The installed OpenFOAM's own word on adding a source term: the
+                # case's writer and review cannot read its headers, and an NN
+                # case's compiled fvModel guessed addSup's arguments wrong round
+                # after round (nn_in_solver_demo_20261022_1129, case_006).
+                foam_src = Path(settings.openfoam_path or os.environ.get("WM_PROJECT_DIR", "")) / "src"
+                coded = foam_src / "fvModels" / "general" / "codedFvModel" / "codedFvModel.H"
+                macros = foam_src / "finiteVolume" / "cfdTools" / "general" / "fvModels" / "fvModelM.H"
+                if coded.is_file():
+                    text = coded.read_text(errors="ignore")
+                    usage = text[text.find("Usage"):text.find("SourceFiles")] if "Usage" in text else ""
+                    if usage.strip():
+                        writer_requirement += (
+                            "\n\nTo add the network's output to a transport equation, this OpenFOAM's coded "
+                            "fvModel (constant/fvModels) needs no separate library; its codeOptions and "
+                            "codeLibs take the flags above and its codeInclude the header. The installed "
+                            f"{coded.name} documents it as:\n{usage.strip()}")
+                if macros.is_file():
+                    lines = macros.read_text(errors="ignore").splitlines()
+                    start = next((i for i, ln in enumerate(lines) if "define DEFINE_FV_MODEL_ADD_SUP" in ln), None)
+                    if start is not None:
+                        writer_requirement += (
+                            "\n\nA compiled fvModel of this OpenFOAM declares its source function as "
+                            "(from fvModelM.H):\n" + "\n".join(lines[start:start + 6])
+                            + "\nand must also define movePoints, topoChange, mapMesh and distribute.")
+        # The starter's function objects only for a case on the same OpenFOAM:
+        # a starter holding a DAFoam (v2506) case and an OpenFOAM 10 case would
+        # otherwise give the DAFoam cases the OpenFOAM 10 case's function
+        # objects (nn_in_solver_demo_20261022_1129).
+        from cfd_langgraph.solver_shelf import own_runtime
+
+        functions_seed = _starter_base_case_dir()
+        if functions_seed is not None and (own_runtime(Path(functions_seed)).get("solver")
+                                           != own_runtime(Path(selected_level)).get("solver")):
+            functions_seed = None
         result = coordinator.run_case(
             physics_group,
             lambda: foam_native.run_foam_case(
@@ -9595,7 +11258,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 max_time_limit_s=int(min(max(float(time_limit_hours or 6.0), 0.25), 72.0) * 3600),
                 openfoam_path=settings.openfoam_path,
                 mesh_seed_case_dir=selected_level,
-                functions_seed_case_dir=_starter_base_case_dir(),
+                functions_seed_case_dir=functions_seed,
                 # The gate's selected level is itself a converged, validated
                 # case carrying the locked mesh, so it — not prose — is the
                 # starting point for every experiment case. mesh_seed_case_dir
@@ -9619,8 +11282,10 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                                        "run, so that run's results were for a different requirement")
         if carried:
             result["kept_your_edits"] = (
-                f"{', '.join(sorted(carried))}: changed after the case's last run, so this run started from "
-                "them as you left them; the writer did not rewrite them (the review may still change them).")
+                f"{', '.join(sorted(carried))}: " + (
+                    f"from previous_attempts/{start_from} (start_from), so this run started from them"
+                    if start_from else "changed after the case's last run, so this run started from them "
+                    "as you left them") + "; the writer did not rewrite them (the review may still change them).")
             overridden = result.get("carried_changed_by_setup_check") or []
             if overridden:
                 result["kept_your_edits"] += (
@@ -9628,6 +11293,18 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                     "approved requirement: " + "; ".join(f"{c['file']}: {c['requirement']}" for c in overridden[:8])
                     + ". The requirement decides these; editing the files cannot change them, only a changed "
                     "requirement can.")
+            # Which of them the run itself went on to change: told only that the
+            # review "may" change them, a manager read its helper, grown from 417
+            # to 920 lines over ten runs, as the harness corrupting a fixed file
+            # (shelf_demo_dafoam_20261019_1057, case_010).
+            rewritten = sorted(rel for rel, src in carried.items()
+                               if (case_dir / rel).is_file() and Path(src).is_file()
+                               and (case_dir / rel).read_bytes() != Path(src).read_bytes())
+            if rewritten:
+                result["kept_your_edits"] += (
+                    f" By the end of the run the writer, setup check or review had changed {', '.join(rewritten)} "
+                    "from how you left them. A file that must stay exactly as it is goes in given_files: it is "
+                    "copied as it is and never rewritten.")
         # A steady case that stopped at its iteration count before converging
         # is run on, as the mesh gate does for its levels. On
         # qwen_retest_20261005/cavity_r11 two cases stopped at 1,000 iterations
@@ -9677,6 +11354,28 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             result["clarification"] = clarification
         if mesh_note:
             result["mesh_type_note"] = mesh_note
+        # Said, not dropped in silence: a manager put the corrected inlet value
+        # in requirement_text, the approved requirement ran instead, and the
+        # setup check put its earlier value back into the script
+        # (nn_in_solver_demo_20261022_1129, case_003).
+        if str(requirement_text or "").strip() and str(requirement_text).strip() != canonical_requirement.strip():
+            result["requirement_text_not_used"] = (
+                "requirement_text was not used: case_id selects the approved requirement, and that "
+                "ran as written. A correction it lacks reaches the case only as a file given with "
+                "given_files (copied as it is and never rewritten), as clarification for a "
+                "requirement the checker flagged, or by regenerating this case's requirement "
+                f"(generate_case_requirements with case_ids=['{case_id}'] and regenerate_reason).")
+        # Said, as for requirement_text: an NN manager wrote "post-processing
+        # only, do not rerun the optimization" as rerun_reason, and the case ran
+        # its whole training again (nn_in_solver_demo_20261022_1129, case_005).
+        if str(rerun_reason or "").strip():
+            result["rerun_reason_note"] = (
+                "rerun_reason unlocked this rerun but was not given to the case: it ran from a fresh "
+                "folder through its whole approved requirement, its solve included. To redo only the "
+                "post-processing of a finished case, write a script in the study folder that reads the "
+                "case's files and writes the new outputs, run it with run_python, then call "
+                "interpret_case again.")
+        _write_json(case_dir / _CASE_SCRIPTS, _case_scripts(case_dir))
         _write_json(case_dir / "run_result.json", result)
         return result
 
@@ -11709,6 +13408,74 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             and baseline_value is not None
             and float(score_value) == float(baseline_value)
         )
+        # Or the same flow as the baseline run, whatever the two scores say.
+        if (not no_op and valid_case and score_value is not None and not case_dirs
+                and baseline.get("case_dir") and Path(str(baseline["case_dir"])).is_dir()):
+            try:
+                no_op = _same_force_history(case_path, Path(str(baseline["case_dir"])))
+            except Exception:  # noqa: BLE001
+                no_op = False
+        # Or the same flow as an earlier candidate of another variant: two different
+        # models compute the same flow only if neither acts. The baseline can differ
+        # from an unchanged model run another way: on SD7003 the baseline ran on 16
+        # processors and candidates on one, a 6e-4 difference in drag, so four inert
+        # candidates matched each other exactly (6.136%) but not the baseline
+        # (6.117%) (sd7003lm_trial_1).
+        # Another family only: a refinement that lands on its parent's coefficients
+        # reproduces the parent's flow, which is a repeat, not an inert model
+        # (gamma_dest_sep_shield_local_refine = gamma_destruction_sep_shield, 6.088%).
+        same_flow_as = None
+        if not no_op and valid_case and score_value is not None and not case_dirs:
+            this_family = (((_read_json(disc_dir / "proposals.json") or {}).get(
+                _safe_variant_slug(variant_name, "candidate")) or {}).get("target_family")
+                or target_family or "")
+            for earlier in _read_json(disc_dir / "history.json") or []:
+                other = Path(str(earlier.get("case_dir") or ""))
+                if (earlier.get("variant_name") in (None, "", variant_name) or not other.is_dir()
+                        or other.resolve() == case_path.resolve()
+                        or (this_family and earlier.get("family") == this_family)):
+                    continue
+                try:
+                    if _same_force_history(case_path, other):
+                        no_op, same_flow_as = True, str(earlier.get("variant_name"))
+                        break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        # A steady solve that has not settled is measured as the mesh gate measures
+        # a level: its score is a sample of an oscillation, not a result. On SD7003
+        # a candidate started from rest ran 5,000 iterations, drag still swinging
+        # 0.0197-0.0245 and lift 0.55-0.60, and the scorer's two saved snapshots
+        # happened to land near the reference: 0.603% against the baseline's 6.1%,
+        # marked PROCEED (sd7003lm_trial_1, cand_pg_transition_length_fit).
+        unsettled = None
+        if execution_ok and score_value is not None and not case_dirs:
+            try:
+                from cfd_langgraph import mesh_assessment
+                unsettled = mesh_assessment.steady_unsettled(case_path)
+            except Exception:  # noqa: BLE001
+                unsettled = None
+            # A run continued from the group's settled flow is scored only once it
+            # has run the length every run of the group gets: cut short, it is still
+            # close to the flow it was handed. On SD7003 candidates stopped at 1,000
+            # of 5,000 iterations and four different models all scored 6.222% against
+            # the baseline's 6.117%; a strong change (SST a1 0.31 -> 0.25) moved the
+            # score 42% of its settled way by 1,000 iterations and 78% by 5,000
+            # (sd7003lm_trial_1, sd7003_relax_test).
+            if not unsettled:
+                decision = _read_json(case_path / "start_decision.json") or {}
+                run_length = decision.get("run_length")
+                latest = _latest_solved_time(case_path)
+                try:
+                    short = (decision.get("from_settled_state") and run_length
+                             and latest is not None and float(latest) < 0.95 * float(run_length))
+                except (TypeError, ValueError):
+                    short = False
+                if short:
+                    unsettled = (
+                        f"This case continues the group's settled flow, and every such run "
+                        f"runs {float(run_length):g} iterations; it was scored at iteration "
+                        f"{float(latest):g}, so it is still close to the flow it was given.")
 
         if not execution_ok:
             status = "FAILED"
@@ -11721,6 +13488,8 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # laundered into a comparable number — see the metric guard above.
             status = "INDETERMINATE" if score_error else "FAILED"
         elif not baseline_verified:
+            status = "INDETERMINATE"
+        elif unsettled:
             status = "INDETERMINATE"
         else:
             status = "PROCEED" if target_met else "REVISE"
@@ -11874,6 +13643,15 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 flush=True,
             )
         record["run_window"] = _window
+        if same_flow_as:
+            record["same_flow_as"] = (
+                f"Force history identical to candidate {same_flow_as}'s: two different models "
+                "compute the same flow only if neither changes the solution.")
+        if unsettled:
+            record["unsettled"] = (
+                f"{unsettled} The score is not comparable: run this candidate until it settles "
+                "(from the settled start case, as given) and score it again.")
+            print(f"[oed] {candidate_path.name}: scored case has not settled; INDETERMINATE", flush=True)
         # A null score always carries a reason.
         #
         # It used to be recorded as bare FAILED with score=None, which is a
@@ -12020,8 +13798,69 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                            for c in rec.get("checks") or []],
                 "steps": steps}
 
+    # Every file a manager tool writes goes into the study's file ledger
+    # (file_ledger), so it can be found by who wrote it and what it is about,
+    # not by guessing its name and place: the study folder before and after the
+    # call, folders being run left out (the case loop records a run's files).
+    # Tools that only read record nothing; tools that run cases are recorded by
+    # the case loop; a file tool records the one file it wrote.
+    file_ledger.ensure(out_dir)
+    ledger_skip = ("checkpoints", "state", "llm_token_usage.json", "llm_token_usage.json.lock",
+                   "llm_token_usage_calls.jsonl")
+    reads_only = {"list_directory", "directory_tree", "find_files", "read_text_file", "grep_files",
+                  "read_starter_folder", "impl_status", "shelf_solvers", "oed_candidate_status",
+                  "file_history", "foam_parse_requirement", "foam_retrieve_references",
+                  "foam_decompose_subtasks"}
+    runs_cases = {"run_case_native", "run_mesh_gate"}
+
+    def _recorded(fn):
+        import functools
+
+        name = fn.__name__
+        if name in reads_only or name in runs_cases:
+            return fn
+
+        @functools.wraps(fn)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            if name in ("write_text_file", "edit_text_file"):
+                result = fn(*args, **kwargs)
+                if isinstance(result, dict) and result.get("path") and not result.get("error"):
+                    file_ledger.note(out_dir, Path(result["path"]), f"manager: {name}")
+                return result
+            skip = ledger_skip + tuple(file_ledger.running_under(out_dir))
+            before = file_ledger.snapshot(out_dir, skip)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                file_ledger.record_changes(out_dir, out_dir, before, file_ledger.snapshot(out_dir, skip),
+                                           f"manager: {name}", "tool")
+        return wrapper
+
+    def file_history(path: str) -> dict:
+        """Where a file of this study is now and how it got there, from the
+        study's file ledger (the framework records every file as it is
+        written: by each case run, the framework's own steps, and each tool).
+
+        path: the file's path, absolute or relative to the study folder; an
+          old path (a case folder since moved into previous_attempts/ and
+          renumbered) is followed to where the file is now.
+        Returns the current path, every record of it (when, by whom: a case
+        run, the framework, or a tool; created, changed, moved), and the
+        files recorded as being about it (a network card's checks)."""
+        asked = Path(str(path or "")).expanduser()
+        full = asked if asked.is_absolute() else out_dir / asked
+        now = file_ledger.current_path(out_dir, full)
+        names = {file_ledger.rel(out_dir, full)} | ({file_ledger.rel(out_dir, now)} if now else set())
+        history = [e for e in file_ledger.entries(out_dir)
+                   if e.get("path") in names or e.get("from") in names]
+        return {"path": str(now) if now else None,
+                **({} if now else {"note": "No file is at this path now, and no recorded move leads from it."}),
+                "history": history[-40:], "records": len(history),
+                "about_it": [str(a) for a in file_ledger.about(out_dir, now or full)]}
+
     return {
-        "manager_tools": [_with_progress(f) for f in [
+        "manager_tools": [_with_progress(_recorded(f)) for f in [
+            file_history,
             list_directory,
             directory_tree,
             make_directory,
@@ -12041,6 +13880,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             advance_with_approved_hypotheses,
             generate_case_requirements,
             run_mesh_gate,
+            restore_last_success,
             interpret_case,
             analyze_all_cases,
             write_paper,
@@ -12063,8 +13903,32 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             oed_apply_repair,
             oed_extend_candidate,
             run_audit_and_record,
+            nn_export,
+            nn_from_dafoam,
+            nn_check_parity,
+            nn_check_case,
+            nn_coded_entries,
         ]],
-        "case_runner_tools": [_with_progress(f) for f in [
+        # The nn-coupler subagent: a network's own side of using it inside a
+        # case (its card, its export, the checks); the case runs through the
+        # case runner like any other.
+        "nn_coupler_tools": [_with_progress(_recorded(f)) for f in [
+            list_directory,
+            directory_tree,
+            make_directory,
+            find_files,
+            read_text_file,
+            write_text_file,
+            edit_text_file,
+            grep_files,
+            run_python,
+            nn_export,
+            nn_from_dafoam,
+            nn_check_parity,
+            nn_check_case,
+            nn_coded_entries,
+        ]],
+        "case_runner_tools": [_with_progress(_recorded(f)) for f in [
             # General file access, e.g. a reference tutorial or a log file
             # beyond what run_case_native's own error handling surfaces, or a
             # manual fix beyond what the reviewer/rewrite loop attempted.
@@ -12088,7 +13952,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # is the vendored-Foam-Agent fallback (see its own docstring).
             run_case_native,
         ]],
-        "oed_candidate_tools": [_with_progress(f) for f in [
+        "oed_candidate_tools": [_with_progress(_recorded(f)) for f in [
             # Same general file access as case_runner_tools, for the same
             # reason (inspect a log, a manual fix beyond what the agentic
             # code-mod runner's own retry loop attempted).

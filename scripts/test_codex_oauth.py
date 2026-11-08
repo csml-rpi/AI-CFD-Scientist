@@ -537,6 +537,68 @@ def test_an_overloaded_response_is_retried() -> None:
         codex_oauth.time.sleep = real_sleep
 
 
+def test_a_commentary_preamble_is_not_part_of_the_answer() -> None:
+    """Regression, 2026-10-22: gpt-5.6-sol sends "I'll inspect ..." as a
+    message of phase "commentary" before its answer of phase "final_answer".
+    The deltas of both were joined, so a written runScript.py began with the
+    preamble and did not compile, and two sentences ran together across the
+    join (shelf_demo_dafoam_20261019_1057)."""
+    import requests
+
+    from cfd_langgraph.llm.codex_oauth import CodexResponsesWrapper
+
+    def line(payload: dict) -> bytes:
+        return b"data: " + json.dumps(payload).encode()
+
+    def message(phase, text: str) -> list:
+        item = {"type": "message", "content": [{"type": "output_text", "text": text}]}
+        if phase:
+            item["phase"] = phase
+        return [line({"type": "response.output_text.delta", "delta": text}),
+                line({"type": "response.output_item.done", "item": item})]
+
+    class _Resp:
+        status_code = 200
+        ok = True
+        text = ""
+
+        def __init__(self, lines: list) -> None:
+            self._lines = lines
+
+        def iter_lines(self, decode_unicode: bool = False):
+            yield from self._lines
+
+        def close(self):
+            pass
+
+    wrapper = CodexResponsesWrapper(token="t", model="m", stream=True)
+    done = line({"type": "response.completed", "response": {"output": []}})
+    real_post = requests.post
+    try:
+        requests.post = lambda *_a, **_k: _Resp(
+            message("commentary", "I’ll check the file first.") + message("final_answer", "import os\n") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("a streamed reply keeps only its final_answer", got == "import os", detail=repr(got))
+
+        requests.post = lambda *_a, **_k: _Resp(
+            message("commentary", "Reading it.") + message("commentary", "Now the log.") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("commentary alone is kept, its messages apart",
+              got == "Reading it.\n\nNow the log.", detail=repr(got))
+
+        requests.post = lambda *_a, **_k: _Resp(message(None, "plain") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("a message without a phase is kept as before", got == "plain", detail=repr(got))
+    finally:
+        requests.post = real_post
+
+    body = {"output": [
+        {"type": "message", "phase": "commentary", "content": [{"type": "output_text", "text": "First, x."}]},
+        {"type": "message", "phase": "final_answer", "content": [{"type": "output_text", "text": "answer"}]}]}
+    got = CodexResponsesWrapper._extract_output_text(body)
+    check("a whole response body keeps only its final_answer", got == "answer", detail=repr(got))
+
+
 def main() -> int:
     tests = (
         test_codex_cli_nested_shape,
@@ -553,6 +615,7 @@ def main() -> int:
         test_terminal_event_content_is_not_discarded,
         test_streamed_text_is_not_duplicated_by_the_terminal_event,
         test_a_failed_response_reports_its_reason,
+        test_a_commentary_preamble_is_not_part_of_the_answer,
     )
     for test in tests:
         # A raising test is a failing test, not an aborted suite. Without this

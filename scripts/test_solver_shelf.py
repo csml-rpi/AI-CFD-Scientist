@@ -268,7 +268,10 @@ def test_cases_on_a_solvers_own_openfoam() -> None:
 
     assert loop._prescribed_mesh(script) and not loop._prescribed_mesh(particle)
     stock_shipped = _case(root / "shipped", "simpleFoam", block_mesh=False)
-    assert not loop._prescribed_mesh(stock_shipped), "only a solver's own case takes its mesh as given"
+    # A stock case shipped with its mesh and no blockMeshDict takes it as given
+    # too: refused, its cases stopped on "expected standard-mesh blockMeshDict"
+    # (nn_in_solver_demo_20261022_1129, case_002).
+    assert loop._prescribed_mesh(stock_shipped), "a stock case's shipped mesh is taken as given"
 
     assert mesh_assessment.ensure_time_averaging(stock)
     assert not mesh_assessment.ensure_time_averaging(particle), "this solver forbids added function objects"

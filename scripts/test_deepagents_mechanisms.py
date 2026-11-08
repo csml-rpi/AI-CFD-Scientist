@@ -268,6 +268,59 @@ def test_study_wide_concurrency_and_exclusive_calibration() -> None:
         coordinator_module.benchmark_case = original_benchmark
     check("first-case calibrations for different groups run exclusively", peak == 1)
 
+    # A new group's calibration does not wait for a running case of another
+    # group to finish (shelf_demo_hystrath_20261022_1030: case_006 waited 2.5 h
+    # behind case_004 after a restart).
+    started = threading.Event()
+    overlap = {"seen": False}
+
+    def long_case():
+        started.set()
+        time.sleep(0.6)
+        return True
+
+    def second_case():
+        overlap["seen"] = not done.is_set()
+        return True
+
+    done = threading.Event()
+
+    def fake_window_benchmark(fn, on_window=None, **_kwargs):
+        profile = ResourceProfile(0.04, 256.0, 1.0, 64)
+        if on_window is not None:
+            threading.Timer(0.05, lambda: on_window(profile)).start()
+        return fn(), profile
+
+    try:
+        coordinator_module.benchmark_case = fake_window_benchmark
+        mixed = CaseCoordinator(calibration_window_s=0.05)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(lambda: (mixed.run_case("a", long_case), done.set()))
+            started.wait(2)
+            time.sleep(0.2)  # a's calibration window has passed; a is still running
+            second = pool.submit(lambda: mixed.run_case("b", second_case))
+            second.result(5)
+            first.result(5)
+    finally:
+        coordinator_module.benchmark_case = original_benchmark
+    check("a new group calibrates while another group's case is still running", overlap["seen"])
+
+    from cfd_langgraph.scheduling import resource_probe as rp
+    import subprocess as _sp
+    before = _sp.Popen(["sleep", "2"], start_new_session=True)
+    try:
+        skip = rp.running_sessions()
+        sampler = rp._SystemSampler(skip_sessions=skip)
+        later = _sp.Popen(["sleep", "2"], start_new_session=True)
+        try:
+            seen, _ = sampler._tree()
+            check("a case already running is not counted", before.pid not in seen)
+            check("a process the calibrating case starts is", later.pid in seen)
+        finally:
+            later.kill()
+    finally:
+        before.kill()
+
 
 def test_manager_write_scope_and_protected_artifacts() -> None:
     with tempfile.TemporaryDirectory() as tmp:

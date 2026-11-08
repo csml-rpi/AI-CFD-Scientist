@@ -51,37 +51,63 @@ def marker_for(case: Path | str) -> Path:
     return marker
 
 
-def solved_times(case: Path | str) -> List[float]:
-    """Times the solver wrote. 0 is the initial condition and is excluded."""
+def _reader(marker: Path, decomposed: bool = False):
+    """An OpenFOAM reader of the case, of its processor*/ folders when
+    ``decomposed``."""
     pv = _pyvista()
+    if not decomposed:
+        return pv.OpenFOAMReader(str(marker))
+    reader = pv.POpenFOAMReader(str(marker))
+    reader.case_type = "decomposed"
+    return reader
+
+
+def _decomposed_times(marker: Path) -> List[float]:
+    """Times written only in processor*/ folders, if the case has them."""
+    if not (marker.parent / "processor0").is_dir():
+        return []
+    try:
+        return [float(t) for t in (_reader(marker, decomposed=True).time_values or [])]
+    except Exception:  # noqa: BLE001 - a decomposed read is extra, never required
+        return []
+
+
+def solved_times(case: Path | str) -> List[float]:
+    """Times the solver wrote, reconstructed or only in processor*/ folders.
+    0 is the initial condition and is excluded."""
     marker = marker_for(case)
-    reader = pv.OpenFOAMReader(str(marker))
-    return [float(t) for t in (reader.time_values or []) if float(t) > 0.0]
+    times = {float(t) for t in (_reader(marker).time_values or [])} | set(_decomposed_times(marker))
+    return sorted(t for t in times if t > 0.0)
 
 
 def load_case(case: Path | str, time: Optional[float] = None):
     """The internal mesh at one time, fields available as point data.
 
-    ``time`` defaults to the latest solved time.
+    ``time`` defaults to the latest solved time. A time written only in the
+    case's processor*/ folders (a run that reconstructed its last time alone)
+    is read from them: a DSMC case's convergence history could not be read
+    from its intermediate times (shelf_demo_hystrath_20261022_1030, case_006).
     """
-    pv = _pyvista()
     marker = marker_for(case)
     try:
-        reader = pv.OpenFOAMReader(str(marker))
+        reader = _reader(marker)
     except Exception as exc:  # noqa: BLE001
         raise FoamLoadError(f"could not open {marker}: {type(exc).__name__}: {exc}") from exc
 
     times = [float(t) for t in (reader.time_values or [])]
+    split = [t for t in _decomposed_times(marker) if t not in times]
     if time is None:
-        positive = [t for t in times if t > 0.0]
+        positive = [t for t in times + split if t > 0.0]
         if not positive:
             raise FoamLoadError(
                 f"{marker.parent.name} has no solved time (times={times or 'none'}); "
                 "the case did not advance past its initial condition"
             )
         time = max(positive)
+    if float(time) not in times and float(time) in split:
+        reader = _reader(marker, decomposed=True)
     elif float(time) not in times:
-        raise FoamLoadError(f"time {time} not among {times}")
+        raise FoamLoadError(f"time {time} not among {sorted(set(times + split))}")
 
     reader.set_active_time_value(float(time))
     try:
@@ -219,24 +245,57 @@ def empty_axis(case: Path | str) -> Optional[int]:
     return None
 
 
-def cut_plane(case: Path | str, time: Optional[float] = None):
+def _least_flow_axis(mesh) -> Optional[int]:
+    """The axis with the smallest mean velocity component, so a plane normal
+    to it contains the flow; None without a velocity field."""
+    import numpy as np
+
+    for data in (mesh.cell_data, mesh.point_data):
+        if "U" in data.keys():
+            u = np.asarray(data["U"])
+            if u.ndim == 2 and u.shape[1] == 3 and u.size:
+                mean = np.abs(u).mean(axis=0)
+                if mean.max() > 0:
+                    return int(np.argmin(mean))
+    return None
+
+
+def cut_plane(case: Path | str, time: Optional[float] = None, normal_axis: Optional[int] = None):
     """The mesh reduced to the plane the flow actually lives in.
 
     For a 2-D case that is a slice through the one cell, so the geometry shows
-    as it is rather than edge-on. For a 3-D case it is the mid-plane of the
-    thinnest direction. Plot the result directly.
+    as it is rather than edge-on. For a 3-D case it is the mid-plane normal to
+    the axis the flow moves least along, so the plane contains the flow;
+    without a velocity field, the mid-plane of the thinnest direction.
+    ``normal_axis`` (0, 1, 2 for x, y, z) chooses the plane instead. The axis
+    used is in the result's ``field_data["cut_normal_axis"]``; face_camera()
+    turns a plotter to face it. Plot the result directly.
     """
     import numpy as np
 
     mesh = load_case(case, time=time)
-    axis = empty_axis(case)
+    axis = normal_axis if normal_axis in (0, 1, 2) else empty_axis(case)
+    if axis is None:
+        # Not the thinnest direction alone: a 3-D channel meshed in a unit
+        # cube ties on every extent, the tie went to x, and the plots showed a
+        # cross-section labelled as the streamwise velocity
+        # (nn_in_solver_demo_20261022_1129).
+        axis = _least_flow_axis(mesh)
     if axis is None:
         bounds = np.asarray(mesh.bounds).reshape(3, 2)
         axis = int(np.argmin(bounds[:, 1] - bounds[:, 0]))
     normal = [0.0, 0.0, 0.0]
     normal[axis] = 1.0
     sliced = mesh.slice(normal=normal, origin=mesh.center)
-    return sliced if getattr(sliced, "n_points", 0) > 0 else mesh
+    out = sliced if getattr(sliced, "n_points", 0) > 0 else mesh
+    out.field_data["cut_normal_axis"] = [axis]
+    return out
+
+
+def face_camera(plotter, plane) -> None:
+    """Turn ``plotter`` to look straight at a cut_plane() result."""
+    axis = int(plane.field_data["cut_normal_axis"][0]) if "cut_normal_axis" in plane.field_data.keys() else 2
+    (plotter.view_yz, plotter.view_xz, plotter.view_xy)[axis]()
 
 
 def new_plotter(window_size: Sequence[int] = (1200, 800), **kwargs):
@@ -327,6 +386,66 @@ def wall_shear(case: Path | str, time: Optional[float] = None, velocity: str = "
         patch.cell_data["wallDistance"] = d
         out[name] = patch
     return out
+
+
+def main_reverse_flow_region(position: Sequence[float], shear: Sequence[float],
+                             min_fraction: float = 0.05) -> dict:
+    """The main region of reversed wall shear along one wall.
+
+    ``position``: where each wall value is, along the wall (x or arc length), in
+    any order; ``shear``: the signed tangential wall shear there, positive where
+    the near-wall flow moves downstream. Sign changes are located by linear
+    interpolation; attached gaps shorter than ``min_fraction`` of the wall's span
+    are merged into the reversed regions around them, reversed patches shorter
+    than that are dropped, and the longest region left is returned:
+    {'start', 'end', 'length', 'regions'} (start/end None and length 0 if there
+    is none). Its start and end are the separation and reattachment points.
+
+    A first sign change is not one: a refined mesh resolves short secondary
+    patches inside a bubble, and the first crossing jumps between them. On
+    SD7003 an extractor read the end of such a patch (x/c 0.52) as reattachment
+    on one level and the bubble's real end (0.72) on the next, and three mesh
+    levels never converged on paper (sd7003lm_trial_1).
+    """
+    import numpy as np
+
+    s = np.asarray(position, dtype=float).ravel()
+    t = np.asarray(shear, dtype=float).ravel()
+    none = {"start": None, "end": None, "length": 0.0, "regions": 0}
+    if s.size < 3 or s.size != t.size:
+        return none
+    order = np.argsort(s)
+    s, t = s[order], t[order]
+    n = s.size
+    min_len = float(min_fraction) * float(s[-1] - s[0])
+
+    def crossing(i: int, j: int) -> float:
+        return float(s[i] + (s[j] - s[i]) * t[i] / (t[i] - t[j])) if t[i] != t[j] else float(s[i])
+
+    regions = []
+    i = 0
+    while i < n:
+        if t[i] < 0:
+            j = i
+            while j + 1 < n and t[j + 1] < 0:
+                j += 1
+            start = float(s[0]) if i == 0 else crossing(i - 1, i)
+            end = float(s[-1]) if j == n - 1 else crossing(j, j + 1)
+            regions.append([start, end])
+            i = j + 1
+        else:
+            i += 1
+    merged = []
+    for r in regions:
+        if merged and r[0] - merged[-1][1] < min_len:
+            merged[-1][1] = r[1]
+        else:
+            merged.append(list(r))
+    kept = [r for r in merged if r[1] - r[0] >= min_len]
+    if not kept:
+        return none
+    main = max(kept, key=lambda r: r[1] - r[0])
+    return {"start": main[0], "end": main[1], "length": main[1] - main[0], "regions": len(kept)}
 
 
 def install_beside(script_dir: Path | str) -> Optional[Path]:

@@ -384,20 +384,38 @@ class CodexResponsesWrapper:
         ]
 
     @staticmethod
-    def _extract_output_text(resp_json: Any) -> str:
+    def _message_text(item: Any) -> str:
+        """The text of one output message item."""
+        return "\n".join(
+            block["text"] for block in (item.get("content", []) if isinstance(item, dict) else [])
+            if isinstance(block, dict) and block.get("type") in {"output_text", "text"}
+            and isinstance(block.get("text"), str))
+
+    @staticmethod
+    def _answer_text(messages: List[Tuple[Optional[str], str]]) -> str:
+        """The reply's text from its (phase, text) message items: the
+        final_answer ones when it has any, else all of them, apart.
+
+        A model that first says what it is about to do sends that as a message
+        of phase "commentary" and its answer as one of phase "final_answer".
+        Run together they made "I'll inspect ..." the first line of a written
+        runScript.py ("invalid character '’' (U+2019), line 1") and glued
+        sentences across the join ("a missing artifact.The case fails")
+        (shelf_demo_dafoam_20261019_1057, 2026-10-22)."""
+        finals = [text for phase, text in messages if phase == "final_answer"]
+        kept = finals or [text for _phase, text in messages]
+        return "\n\n".join(text for text in kept if text.strip()).strip()
+
+    @classmethod
+    def _extract_output_text(cls, resp_json: Any) -> str:
+        items = resp_json.get("output", []) if isinstance(resp_json, dict) else []
+        text = cls._answer_text([(item.get("phase"), cls._message_text(item))
+                                 for item in items if isinstance(item, dict)])
+        if text:
+            return text
         if isinstance(resp_json, dict) and isinstance(resp_json.get("output_text"), str):
             return resp_json["output_text"]
-        texts: List[str] = []
-        items = resp_json.get("output", []) if isinstance(resp_json, dict) else []
-        for item in items:
-            for block in item.get("content", []) if isinstance(item, dict) else []:
-                if (
-                    isinstance(block, dict)
-                    and block.get("type") in {"output_text", "text"}
-                    and isinstance(block.get("text"), str)
-                ):
-                    texts.append(block["text"])
-        return "\n".join(texts).strip()
+        return ""
 
     # Longest text one input item may carry. The backend refuses a string over
     # 10 MB with HTTP 400, which no retry fixes: a case-loop prompt that quoted a
@@ -727,6 +745,9 @@ class CodexResponsesWrapper:
             )
 
         chunks: List[str] = []
+        # Each finished message item as (phase, text), so a commentary
+        # preamble is told from the answer (_answer_text).
+        messages: List[Tuple[Optional[str], str]] = []
         tool_calls: List[Dict[str, Any]] = []
         usage: Optional[Dict[str, Any]] = None
         response_id: Optional[str] = None
@@ -761,6 +782,8 @@ class CodexResponsesWrapper:
                         item = parsed.get("item")
                         if isinstance(item, dict) and item.get("type") == "function_call":
                             tool_calls.append(self._decode_function_call(item))
+                        if isinstance(item, dict) and item.get("type") == "message":
+                            messages.append((item.get("phase"), self._message_text(item)))
                         continue
 
                     # A terminal event carries the whole response nested under
@@ -807,7 +830,7 @@ class CodexResponsesWrapper:
                     chunks.append(fallback)
         finally:
             resp.close()
-        text = "".join(chunks).strip()
+        text = self._answer_text(messages) or "".join(chunks).strip()
         if not text and not tool_calls:
             # Said, not only retried: the caller retries an empty reply, and
             # without this nothing showed what the provider had sent -- a

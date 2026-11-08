@@ -354,6 +354,12 @@ def _collect_files(starter_dir: Path) -> List[Dict[str, Any]]:
                 continue
         return False
 
+    # A mesh shipped as constant/polyMesh is shown as one measured summary,
+    # not read: its points/faces/owner/neighbour lists are numbers only, and
+    # at 10,000 characters each they used 40,000 of the 60,000 budget on
+    # nn_airfoil_s809_20261025_1323 -- fvSolution and a measured-lift file were
+    # never shown, and the model reported them as missing.
+    mesh_dirs: List[Path] = []
     for fp in sorted(starter_dir.rglob("*")):
         if not fp.is_file():
             continue
@@ -361,7 +367,25 @@ def _collect_files(starter_dir: Path) -> List[Dict[str, Any]]:
             continue
         if _is_solved_time(fp):
             continue
+        if fp.parent.name == "polyMesh":
+            if fp.parent not in mesh_dirs:
+                mesh_dirs.append(fp.parent)
+            continue
         by_dir.setdefault(_bucket(fp), []).append(fp)
+
+    for mesh_dir in mesh_dirs:
+        try:
+            from cfd_langgraph.foam_native.loop import mesh_summary  # type: ignore
+            summary = mesh_summary(mesh_dir.parent.parent)
+        except Exception as exc:  # noqa: BLE001
+            summary = f"(could not be measured: {type(exc).__name__})"
+        try:
+            rel = str(mesh_dir.relative_to(starter_dir))
+        except ValueError:
+            rel = str(mesh_dir)
+        chunk = f"[OpenFOAM mesh, shown as measured, not as file contents] {summary}"
+        entries.append({"rel_path": rel, "content": chunk})
+        total_chars += len(chunk)
 
     ordered: List[Path] = []
     for tier in (0, 1):
@@ -413,7 +437,9 @@ scripts that read data, etc.), PDFs, and other supporting files.
 
 Your job is to read EVERY file provided and produce a single JSON object that \
 classifies and extracts the key information. Do not guess — base your answers \
-only on the file contents shown.
+only on the file contents shown. A file named in the closing list of all files \
+exists even when its content is not shown (the message has a size limit): never \
+describe it as missing or absent.
 
 Some entries, in a section of their own, describe DATA FILES by structure only: \
 array names, shapes, dtypes, table columns and row counts, read from the file \
@@ -475,6 +501,15 @@ def understand_starter_folder(
     # Text is capped before the data section is added, so a starter full of
     # prose can never push the data summaries out of the message.
     text_part = "".join(parts)[:_MAX_TOTAL_CHARS + 2000]  # slight headroom for header
+    # Every file by name, so one whose content did not fit is not taken for
+    # missing (nn_airfoil_s809_20261025_1323: "data/s814_delft_re2e6_cl.dat ...
+    # is not" present, and no base case, from a listing cut by the budget).
+    names = sorted(
+        str(fp.relative_to(starter_dir)) for fp in starter_dir.rglob("*")
+        if fp.is_file() and not any(_should_skip_dir(part) for part in fp.parts))
+    shown = ", ".join(names[:400]) + (f", ... {len(names) - 400} more" if len(names) > 400 else "")
+    text_part += (f"\n\nALL FILES IN THE STARTER FOLDER ({len(names)}) -- every one exists, "
+                  f"whether or not its content is shown above:\n{shown}\n")
     data_parts = []
     if data_entries:
         data_parts.append(

@@ -85,6 +85,15 @@ def _physical_parameters(parameters: Any) -> Any:
 # prompts. Both used to carry the literal text ' + repr(CTX) + ' there.
 _CASE_CONTEXT_HEADING = "\n\nTHE CASE THIS STUDY RUNS (already fixed):\n"
 
+
+def _as_template_text(text: str) -> str:
+    """``text`` for a prompt template, read as it is: its braces are not
+    template fields. Unescaped, a starter summary holding a "{" and a
+    regeneration reason with "10^{-7}" made every requirement fail with
+    "unmatched '{' in format spec" after the old requirements had been set
+    aside (shelf_demo_hystrath_20261022_1030)."""
+    return text.replace("{", "{{").replace("}", "}}")
+
 # Stems of the words a visualization instruction uses; a requirement with none
 # of them has nothing for _strip_visualization_mentions to remove.
 _VISUAL_WORDS = ("visuali", "plot", "contour", "streamline", "figure", "image", "picture",
@@ -128,7 +137,7 @@ class HypothesisAgent:
             # paths that do not exist. 13 of 17 requirements failed validation
             # for exactly that, so requirements.json was never published and
             # the manager re-ran the stage forever.
-            sys_t = sys_t + _CASE_CONTEXT_HEADING + case_context
+            sys_t = sys_t + _CASE_CONTEXT_HEADING + _as_template_text(case_context)
         if not sys_t or not usr_t:
             raise ValueError("Missing HypothesisAgent prompts")
 
@@ -183,7 +192,7 @@ class HypothesisAgent:
                 # The validator has to judge against the same reality the
                 # generator writes for, or it rejects correct requirements and
                 # accepts ones that name a case that does not exist.
-                _CASE_CONTEXT_HEADING + case_context + "\n\n" if case_context else ""
+                _CASE_CONTEXT_HEADING + _as_template_text(case_context) + "\n\n" if case_context else ""
             )
             + "You are a strict CFD QA checker for Foam-Agent prompts. "
             "Decide whether this requirement is logically consistent and executable by Foam-Agent. "
@@ -292,13 +301,24 @@ class HypothesisAgent:
         all_experiment_ideas: str = "",
         current_experiment_idea: str = "",
         previous_requirement: str = "",
+        case_context: str = "",
     ) -> str:
+        # The case the study runs, as the writer and the checker see it. Without
+        # it the repair answered each objection by inventing the missing
+        # setting -- a density, a reference area, a CFL limit for a steady
+        # solve -- where the starter case already fixed them
+        # (nn_airfoil_s814_20261026_1450).
         system = (
-            "You repair CFD prompts for Foam-Agent. "
+            (_CASE_CONTEXT_HEADING + _as_template_text(case_context) + "\n\n" if case_context else "")
+            + "You repair CFD prompts for Foam-Agent. "
             "The repaired requirement must remain a single, executable paragraph that is logically coherent: "
             "include solver, geometry/domain, mesh, boundary conditions, and time controls consistent with the study and topic constraints, in SI units, "
             "and do NOT add any visualization or plotting instructions. "
-            "Output exactly one corrected plain-English requirement paragraph."
+            + ("Where the case above already fixes a setting, the requirement keeps it as the case "
+               "has it, or refers to it as the case's own; never answer an issue by inventing a value "
+               "the case or the study does not give. "
+               if case_context else "")
+            + "Output exactly one corrected plain-English requirement paragraph."
         )
         user = (
             "Requirement:\n{req}\n\n"
@@ -404,6 +424,17 @@ class HypothesisAgent:
             )
         )
         history: List[Dict[str, Any]] = []
+        # A value can appear in the text by coincidence (another quantity of
+        # 0.25), so the checker also compares by name.
+        params = _physical_parameters(simulation.get("parameter_value") or {}) or {}
+        params_note = (
+            "\n\nTHIS CASE'S PARAMETERS (the requirement must use exactly these values "
+            "for these quantities, not the starter's or another case's; if it states a "
+            "different value for any of them, it is invalid):\n"
+            # Its braces are escaped with the rest of case_context.
+            + json.dumps(params, indent=1)[:4000]
+        ) if params else ""
+        checker_context = (validator_context or case_context or "") + params_note
 
         for attempt in range(max(1, max_retries + 1)):
             if verbose and attempt > 0:
@@ -434,20 +465,7 @@ class HypothesisAgent:
                 if verbose:
                     print(f"[Hypothesis] requirement leaves out this case's {unstated}", flush=True)
             else:
-                # A value can appear in the text by coincidence (another
-                # quantity of 0.25), so the checker also compares by name.
-                params = _physical_parameters(simulation.get("parameter_value") or {}) or {}
-                params_note = (
-                    "\n\nTHIS CASE'S PARAMETERS (the requirement must use exactly these values "
-                    "for these quantities, not the starter's or another case's; if it states a "
-                    "different value for any of them, it is invalid):\n"
-                    # Braces escaped: the checker's prompt is a template.
-                    + json.dumps(params, indent=1)[:4000].replace("{", "{{").replace("}", "}}")
-                ) if params else ""
-                verdict = self.llm_validate_requirement(
-                    req, verbose=verbose,
-                    case_context=(validator_context or case_context or "") + params_note
-                )
+                verdict = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
             if not verdict.get("valid", False) and not unstated:
                 # Confirm before rejecting. This validator is non-deterministic
                 # by design, and it was measured contradicting itself: a
@@ -457,10 +475,7 @@ class HypothesisAgent:
                 # blocks the entire study and the stage silently re-runs for
                 # ever. A genuinely bad requirement fails both times, so the
                 # gate still catches what it is for.
-                second = self.llm_validate_requirement(
-                    req, verbose=verbose,
-                    case_context=(validator_context or case_context or "") + params_note
-                )
+                second = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
                 if second.get("valid", False):
                     verdict = second
                     if verbose:
@@ -490,12 +505,18 @@ class HypothesisAgent:
                 all_experiment_ideas=all_experiment_ideas,
                 current_experiment_idea=current_experiment_idea,
                 previous_requirement=previous_requirement,
+                case_context=case_context,
             )
             req = self._strip_visualization_mentions(req)
 
         if verbose:
             print("[Hypothesis] Final validation...", flush=True)
-        final_verdict = self.llm_validate_requirement(req, verbose=verbose)
+        # With the same case and parameters as every check above. Without them
+        # the last check, the one whose issues are published, faulted an NN
+        # requirement for not supplying DAFoam's regressionModel, the starter's
+        # paths and its boundary conditions -- all fixed by the starter case
+        # (nn_airfoil_s814_20261026_1450).
+        final_verdict = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
         return {
             "requirement": self._strip_visualization_mentions(req),
             "valid": bool(final_verdict.get("valid", False)),

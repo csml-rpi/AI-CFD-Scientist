@@ -47,6 +47,10 @@ def main() -> int:
     parser.add_argument("--model", default="", type=str)
     parser.add_argument("--starter-understanding", default="", type=str,
                         help="Path to starter_understanding.json for flow params, formula, reference data context")
+    parser.add_argument("--results-file", action="append", default=[],
+                        help="A study-level JSON or CSV result file given to the writer (repeatable).")
+    parser.add_argument("--start-from-current", action="store_true",
+                        help="Start from paper/main.tex as it stands (review it, then revise) instead of a new draft.")
     args = parser.parse_args()
 
     from cfd_langgraph.config import get_settings
@@ -77,6 +81,8 @@ def main() -> int:
         max_viz_inner_attempts=max(1, int(args.max_viz_inner_attempts)),
         score_threshold=float(args.score_threshold),
         verbose=True,
+        start_from_current=bool(args.start_from_current),
+        results_files=[Path(f) for f in args.results_file],
     )
     print(json.dumps(out, indent=2))
     return 0

@@ -10,11 +10,16 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from . import prompts as P
 from cfd_langgraph.llm.reply import reply_text
 
+# No renumberMesh: it reorders the cells, and data indexed by cell then no longer
+# line up with the mesh. A DAFoam case's own 0/UData was renumbered with it, but the
+# LES given beside it under reference_data/ was not, so the case's own check of its
+# objective against that LES came out 137x off (nn_cbfs_les_20261106_2049, case_001).
 _DEFAULT_COMMANDS = [
     "blockMesh", "snappyHexMesh", "checkMesh", "decomposePar", "reconstructPar",
-    "renumberMesh", "foamDictionary", "surfaceFeatureExtract", "topoSet",
+    "foamDictionary", "surfaceFeatureExtract", "topoSet",
     "setFields", "gmshToFoam",
 ]
+_NEVER_RUN = {"renumberMesh"}
 
 
 def generate_allrun_commands(
@@ -141,6 +146,9 @@ def build_allrun_script(command_list_text: str, case_solver: str = "", *,
     # A shell variable is not an application: `runApplication $application`
     # left an empty log file named "log." and ran nothing.
     commands = [c for c in parse_command_list(command_list_text) if "$" not in c]
+    # Dropped even when the model names it (see _DEFAULT_COMMANDS).
+    commands = [c for c in commands
+                if not ({w for w in c.split()[:2]} & _NEVER_RUN)]
     # The whole Allrun runs inside the solver's wrapper (run_script), so a
     # command naming the wrapper again is reduced to the program. Left in,
     # runApplication logged every step as log.hystrath-run and skipped all but
@@ -288,12 +296,26 @@ def _script_solve(runtime: Dict[str, Any], np: int) -> List[str]:
         # reconstructPar's "No times selected" exit failed every such DAFoam
         # gradient check that had completed (shelf_demo_dafoam_20261019_1057,
         # case_004). A failed solve is still told by its log's missing "End".
-        "if [ -d processor0 ]; then runApplication reconstructPar || "
+        # A steady case's time folders are iterations, and only the last is
+        # the result: a script writing wall shear every iteration left 10,001
+        # of them, and reconstructing them all would have taken about 7 hours
+        # (nn_airfoil_s809_20261025_1859, case_005). Transient cases keep all.
+        "if [ -d processor0 ]; then rflag=''; "
+        "if foamDictionary -entry ddtSchemes/default -value system/fvSchemes 2>/dev/null "
+        "| grep -q steadyState; then rflag='-latestTime'; fi; "
+        "runApplication reconstructPar $rflag || "
         "echo 'reconstructPar had nothing to reconstruct (see log.reconstructPar)'; fi",
     ]
 
 
-def build_mesh_and_solve_allrun(case_solver: str, *, max_procs: int = 16, cells_per_proc: int = 8000,
+# MPI ranks a generated Allrun gives a case: one per CELLS_PER_PROC cells, at most
+# MAX_PROCS. The mesh gate plans the levels it solves side by side with these.
+MAX_PROCS = 16
+CELLS_PER_PROC = 8000
+
+
+def build_mesh_and_solve_allrun(case_solver: str, *, max_procs: int = MAX_PROCS,
+                                cells_per_proc: int = CELLS_PER_PROC,
                                 case_dir: Optional[Path] = None, mesh_given: bool = False) -> str:
     """Allrun for a case whose dictionaries are already complete: mesh it,
     check the mesh, then solve -- in parallel when the mesh is large enough to

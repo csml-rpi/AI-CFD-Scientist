@@ -7,6 +7,34 @@ from pathlib import Path
 from typing import Tuple
 
 
+def expand_tex_inputs(tex: Path, depth: int = 0) -> str:
+    """The LaTeX source with every \\input{...} and \\include{...} replaced by
+    the file it names (relative to the file it is in; .tex added when the name
+    has no suffix), so a paper split over files reads as one."""
+    text = Path(tex).read_text(errors="replace")
+    if depth >= 5:
+        return text
+    out = []
+    pos = 0
+    while True:
+        starts = [i for i in (text.find("\\input{", pos), text.find("\\include{", pos)) if i >= 0]
+        if not starts:
+            out.append(text[pos:])
+            return "".join(out)
+        start = min(starts)
+        brace = text.index("{", start)
+        end = text.find("}", brace)
+        if end < 0:
+            out.append(text[pos:])
+            return "".join(out)
+        target = Path(tex).parent / text[brace + 1:end].strip()
+        if not target.suffix:
+            target = target.with_suffix(".tex")
+        out.append(text[pos:start])
+        out.append(expand_tex_inputs(target, depth + 1) if target.is_file() else text[start:end + 1])
+        pos = end + 1
+
+
 def extract_pdflatex_errors(log_content: str, max_errors: int = 5) -> str:
     """
     Extract the key error messages from a pdflatex log for the reviewer.
@@ -57,6 +85,24 @@ def _tex_search_env(paper_dir: Path) -> dict:
     return env
 
 
+def _graphics_found(tex_path: Path, cwd: Path) -> int:
+    """How many of the paper's \\includegraphics files exist from ``cwd``."""
+    text = Path(tex_path).read_text(errors="replace")
+    found = 0
+    pos = text.find("\\includegraphics")
+    while pos >= 0:
+        start = text.find("{", pos)
+        end = text.find("}", start)
+        if start < 0 or end < 0:
+            break
+        name = text[start + 1:end].strip()
+        target = Path(name) if Path(name).is_absolute() else Path(cwd) / name
+        if any(c.is_file() for c in (target, target.with_name(target.name + ".png"))):
+            found += 1
+        pos = text.find("\\includegraphics", end)
+    return found
+
+
 def compile_tex_to_pdf(
     tex_path: Path,
     work_dir: Path | None = None,
@@ -81,6 +127,12 @@ def compile_tex_to_pdf(
 
     out_dir = tex_path.parent
     cwd = Path(work_dir).resolve() if work_dir else out_dir
+    # Where its figures are: a paper whose \includegraphics paths are relative
+    # to its own folder ("../paper_figs/...") compiled from the repo root found
+    # none of them, since LaTeX does not search for a path starting with ../
+    # (nn_in_solver_demo_20261022_1129).
+    if cwd != out_dir and _graphics_found(tex_path, out_dir) > _graphics_found(tex_path, cwd):
+        cwd = out_dir
 
     # pdflatex -output-directory puts aux/log/pdf in out_dir
     # Run from cwd so \includegraphics paths (e.g. runs/...) are relative to cwd

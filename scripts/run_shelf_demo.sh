@@ -3,6 +3,7 @@
 #
 #   bash scripts/run_shelf_demo.sh olaflow|additivefoam|solids4foam|turbinesfoam|dafoam|hystrath
 #   bash scripts/run_shelf_demo.sh <name> --resume <run dir>    (then type 'continue' in the session)
+#   CFD_SCIENTIST_MAX_RUN_HOURS=2 bash scripts/run_shelf_demo.sh <name>   (no run of a case past 2 h)
 #
 # Each study runs from this repository (it has the shelf integration), with the
 # OpenFOAM the solver's shelf build needs loaded: v2512 for solids4foam and
@@ -36,5 +37,6 @@ tmux new-session -d -s "$session" -c "$REPO" \
    && set +u && source $of/etc/bashrc; set -u; \
    export CFD_SCIENTIST_SHELF=/mnt/sda1/cfd_solver_shelf \
           CFD_SCIENTIST_LLM_PROVIDER=openai-codex CFD_SCIENTIST_MODEL=gpt-5.6-sol CFD_SCIENTIST_EFFORT=high \
+          CFD_SCIENTIST_MAX_RUN_HOURS=${CFD_SCIENTIST_MAX_RUN_HOURS:-} \
    && python scripts/cfd_cli.py $cli 2>&1 | tee -a $out.log; sleep infinity"
 echo "launched $name: tmux $session, run dir $out"

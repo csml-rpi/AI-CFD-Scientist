@@ -79,7 +79,7 @@ with tempfile.TemporaryDirectory() as tmp:
     check("and the whole file stays small", len(xml) < 8000)
     check("a given file is marked", "given by the study" in xml.split("waveDict")[1][:200])
     check("the study's mesh is marked", "selected mesh" in xml.split("blockMeshDict")[1][:200])
-    check("the mesh itself is not shown", "polyMesh" in xml, False)
+    check("the mesh itself is not shown", "<folder_name>constant/polyMesh</folder_name>" in xml, False)
     check("logs are not shown", "log.simpleFoam" in xml, False)
 
 print("== 2. check, fix, check")
@@ -137,6 +137,48 @@ try:
         check("the edit was refused into the history", any("gives as it is" in h for h in history))
         check("bounded: two fixes, three checks", calls["check"], 3)
         check("what still differs is returned", [i["requirement"] for i in out["remaining"]], ["wave height 0.15 m"])
+
+        # Only what changes the run is fixed before it; record-keeping is reported
+        # (nn_airfoil_s814_20261026_1537, case_003: 45 minutes of setup).
+        calls["check"] = 0
+        planned: list = []
+        review.check_setup = lambda llm, **kw: (calls.__setitem__("check", calls["check"] + 1) or [
+            {"requirement": "record each run's hash", "file": "runScript.py", "found": "nothing",
+             "status": "missing", "fix": "write a hash", "effect": "record"}])
+        review.plan_rewrite = lambda llm, **kw: planned.append(kw) or []
+        history.clear()
+        out = loop._setup_check(None, case, "record each run's hash", files_xml=lambda: "",
+                                apply=lambda targets: 0, history=history)
+        check("a record-keeping gap is not fixed before the run", (calls["check"], len(planned)), (1, 0))
+        check("but it is reported", [i["requirement"] for i in out["remaining"]], ["record each run's hash"])
+
+        # A later fix round is told what an earlier round fixed, so its edit
+        # keeps it (shelf_demo_hystrath_20261022_1030, case_004: a second round
+        # undid the first round's span fix). Each round words its items anew.
+        rounds_seen = {"n": 0}
+        analyses: list[str] = []
+
+        def worded_anew(llm, **kw):
+            rounds_seen["n"] += 1
+            if rounds_seen["n"] == 1:
+                return [{"requirement": "Cd uses the 0.001 m span", "file": "constant/transportProperties",
+                         "found": "0.01 m", "status": "mismatch", "fix": "span 0.001"}]
+            return [{"requirement": "Coefficients from the physical span", "file": "constant/transportProperties",
+                     "found": "0.001 m", "status": "match", "fix": ""},
+                    {"requirement": "Cd reference 1.414", "file": "constant/transportProperties",
+                     "found": "14.14", "status": "mismatch", "fix": "reference 1.414"}]
+
+        review.check_setup = worded_anew
+        review.plan_rewrite = lambda llm, **kw: (analyses.append(kw["review_analysis"]) or [])
+        history.clear()
+        loop._setup_check(None, case, "span 0.001 m, Cd reference 1.414",
+                          files_xml=lambda: loop._case_files_xml(case, given=set()),
+                          apply=lambda targets: 0, history=history, rounds=2)
+        check("the first fix round has nothing to keep", "already corrected these" not in analyses[0])
+        check("the second fix round is told to keep the first round's fix",
+              "already corrected these" in analyses[1] and "Cd uses the 0.001 m span" in analyses[1])
+        check("an item still differing is not listed as kept",
+              "Cd reference 1.414" not in analyses[1].split("already corrected these")[1])
 
     print("== 3. a compressed field is edited as plain text")
     with tempfile.TemporaryDirectory() as tmp:

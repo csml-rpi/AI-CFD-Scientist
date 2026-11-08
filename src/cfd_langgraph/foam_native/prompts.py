@@ -245,11 +245,47 @@ Rules:
    A case run by a script (such as a runScript.py) may set values or write files when it runs:
    a field it computes and writes, a reference data file it creates, a value it passes to the
    solver. Such an item is set by that script: judge it from the script's code, and never ask
-   for a file to be written by hand with what the script writes when it runs."""
+   for a file to be written by hand with what the script writes when it runs.
+8) effect says what an item changes. run: left as it is, the run would stop, or solve or compute
+   something other than the requirement asks (a physical value, a condition, a model, a boundary
+   condition, the equations, the solver's settings, the quantity computed or optimized, the data it
+   is compared with, the starting values). record: it concerns only what the run records,
+   reports, logs, hashes or checks about itself, and the run computes the same either way. Only
+   run items are fixed before the case runs; record items are reported with its results."""
 
 SETUP_CHECK_USER_PROMPT = """<user_requirement>{user_requirement}</user_requirement>
 <solver_notes>{solver_notes}</solver_notes>
 <foamfiles>{foamfiles_xml}</foamfiles>
+Return JSON with key items only."""
+
+# Not FoamAgent's: asked by the mesh-independence check before its first
+# level. The check used to solve the starter case as shipped and give its mesh
+# to every case of the group, so DSMC cases at Knudsen 0.05 ran on a mesh
+# checked at the starter's 0.25, five times coarser than their mean free path
+# needs (shelf_demo_hystrath_20261011_1602).
+CONDITION_CHECK_SYSTEM_PROMPT = """You compare a study's starter case with the condition one group of the study's cases runs at, before the study checks its mesh.
+The mesh check refines the mesh of one case until the solution stops changing, and every case of
+the group then runs on the mesh it selects. A mesh that resolves the flow at one condition may not
+resolve it at another, so the check has to run at the group's condition.
+You get the requirement of one case of the group and every file of the starter case.
+List each physical condition the requirement sets to a value other than the starter's that changes
+the length or time scales the mesh, the domain or the time step must resolve: for example the gas
+density or pressure (and with them a mean free path and a Knudsen number), a Reynolds, Mach or
+Knudsen number, the free-stream velocity or temperature, the viscosity, the size of the body or of
+the domain.
+Rules:
+1) A value may be set in an equivalent form: work it out before you compare (a Knudsen number from
+   a number density and a molecular diameter, a Reynolds number from velocity, length and
+   viscosity). Agreement within rounding is no change.
+2) Do not list what leaves those scales as they are: outputs, written fields, run length, write
+   intervals, processor counts, how the case is launched, solver and scheme settings, wording.
+3) List only values the requirement states. starter is the starter's value and the file that
+   sets it; required is the requirement's value.
+4) Return no items when the requirement runs the starter's own condition."""
+
+CONDITION_CHECK_USER_PROMPT = """<user_requirement>{user_requirement}</user_requirement>
+<solver_notes>{solver_notes}</solver_notes>
+<starter_files>{foamfiles_xml}</starter_files>
 Return JSON with key items only."""
 
 # Default case_domain/category/solver lists for Stage 1, used only when the

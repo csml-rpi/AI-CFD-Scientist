@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
@@ -15,6 +16,7 @@ from . import allrun as allrun_mod
 from . import decomposer, parser, rag, review, writer
 from .case_clean import parse_time_dir, remove_stale_time_dirs
 from .openfoam_env import resolve_openfoam_env  # noqa: F401  (re-exported)
+from cfd_langgraph import file_ledger
 from cfd_langgraph.solver_shelf import run_env as case_env
 
 _CASE_FILE_DIRS = ("0", "constant", "system")
@@ -62,11 +64,23 @@ _RUN_SCRIPT_RULES = (
     "checks of the environment, the folder or the case files: the framework starts it "
     "in the case folder with the solver's environment loaded. Do not catch errors to "
     "abort or exit: let them raise, so the error and its traceback reach the log the "
-    "run is reviewed from. Do not write files named run_result.json, setup_check.json, "
+    "run is reviewed from. A result the run measured is not an error, even one that "
+    "misses its target or fails a check the requirement sets (a gradient check outside "
+    "its tolerance, a value far from a reference): write it to the results with what "
+    "failed and end normally. Raise only when the run could not do what was asked. "
+    "Raised, a gradient check that had measured its disagreement was taken for a crash "
+    "and run again, 1.5 h each time (nn_airfoil_s814_20261026_1537, case_001). "
+    "Do not write files named run_result.json, setup_check.json, "
     "Allrun or Allrun.out, or any log.* file: the framework writes those, and a script's "
     "own file under one of these names replaces the framework's record of the run. Give "
     "every file the script writes a plain name, not one starting with a dot: its results, "
-    "reports and diagnostics are read by name between runs."
+    "reports and diagnostics are read by name between runs. "
+    "A run that fails is run again in the same case folder once it is fixed: before it the "
+    "framework removes the log.* files, processor* folders, postProcessing/ and time "
+    "folders, and keeps every other file the earlier run wrote. The script must run with "
+    "its own earlier outputs present: replace them, or write each run into a new folder. "
+    "Refusing to overwrite them, a training script's second run stopped on \"immutable "
+    "weight artifact already exists\" (nn_airfoil_s814_20261026_1537, case_003)."
 )
 
 
@@ -231,16 +245,51 @@ def _json_outline(value: Any, max_lines: int = 150) -> str:
     return "\n".join(lines)
 
 
+def _line_kinds(lines: List[Any], most: int = 30) -> str:
+    """What a long list of text lines holds, by the leading word of each line
+    that names a value ("CL: 0.84" -> CL), with counts. Shown only a log's
+    first and last lines, a script looked for betaDeparture values in a saved
+    DAFoam log whose only function lines were CL and CD
+    (nn_airfoil_s814_20261026_1537, case_003)."""
+    from collections import Counter
+
+    kinds: Counter = Counter()
+    example: Dict[str, str] = {}
+    for line in lines:
+        if not isinstance(line, str) or ":" not in line:
+            continue
+        head = line.split(":", 1)[0].strip()
+        if head and len(head) <= 40 and not any(c in head for c in "{}[]\"'"):
+            kinds[head] += 1
+            example.setdefault(head, line.strip()[:120])
+    if not kinds:
+        return "no line in it names a value before a colon"
+    # With one line of each, as it is written: told only that a log held
+    # 'U0 initRes' lines, a script parsed them as OpenFOAM's "Solving for Ux,
+    # Initial residual = " and found none (nn_airfoil_s814_20261026_1537, case_003).
+    shown = ", ".join(f"{k!r} x{n} (e.g. {example[k]!r})" for k, n in kinds.most_common(most))
+    return (f"the lines naming a value, by the words before their first colon, with counts: {shown}"
+            + (f", and {len(kinds) - most} other kinds" if len(kinds) > most else ""))
+
+
 def _compact_json(value: Any) -> Any:
     """``value`` with its bulk left out: a list of more than six numbers (or
     of lists of numbers) becomes a note of its length and first value, a
-    longer list keeps its first ten items, a long string its first 300
-    characters. Keys, checks and messages stay as they are."""
+    longer list keeps its first ten items (a list of strings, such as a
+    log's lines, its last ten too), a long string its first 300 characters.
+    Keys, checks and messages stay as they are. Shown only its first ten, a
+    22,000-line DAFoam log kept in a record hid how each solve ended, and a
+    script's parser of it required a line no solve had printed
+    (nn_airfoil_s814_20261026_1537, case_003)."""
     if isinstance(value, dict):
         return {k: _compact_json(x) for k, x in value.items()}
     if isinstance(value, list):
         if len(value) > 6 and all(isinstance(x, (int, float, list)) and not isinstance(x, bool) for x in value[:6]):
             return f"<{len(value)} values, first {json.dumps(value[0])[:60]}>"
+        if len(value) > 24 and all(isinstance(x, str) for x in value[:10] + value[-10:]):
+            return ([_compact_json(x) for x in value[:10]]
+                    + [f"<{len(value) - 20} more; {_line_kinds(value)}>"]
+                    + [_compact_json(x) for x in value[-10:]])
         if len(value) > 12:
             return [_compact_json(x) for x in value[:10]] + [f"<{len(value) - 10} more>"]
         return [_compact_json(x) for x in value]
@@ -274,14 +323,24 @@ def _file_view(path: Path, text: str, limit: int) -> str:
     return text[:limit] + "\n... [truncated]"
 
 
-def _foamfiles_xml(case_dir: Path, subtasks: List[Dict[str, str]], max_file_kb: int = 30, max_total_kb: int = 300) -> str:
+# A case's Python scripts are shown whole up to this size. Cut at 30 KB like a
+# dictionary, a 103 KB DAFoam training script was judged and edited from its
+# first third: the setup check reported as missing what the rest of it held,
+# its edits could not be applied, and the case ran unchanged
+# (nn_airfoil_s814_20261026_1537, case_003). At 200 KB the same script,
+# grown to 247 KB, was again past the limit.
+_SCRIPT_VIEW_KB = 600
+
+
+def _foamfiles_xml(case_dir: Path, subtasks: List[Dict[str, str]], max_file_kb: int = 30, max_total_kb: int = 1000) -> str:
     parts: List[str] = []
     total = 0
     for st in subtasks:
         p = case_dir / st["folder_name"] / st["file_name"]
         if not p.is_file():
             continue
-        text = _file_view(p, p.read_text(encoding="utf-8", errors="ignore"), max_file_kb * 1024)
+        cap_kb = max(max_file_kb, _SCRIPT_VIEW_KB) if p.suffix == ".py" else max_file_kb
+        text = _file_view(p, p.read_text(encoding="utf-8", errors="ignore"), cap_kb * 1024)
         if total + len(text) > max_total_kb * 1024:
             break
         total += len(text)
@@ -298,10 +357,24 @@ def _written_files_ctx(case_dir: Path, subtasks: List[Dict[str, str]], upto_inde
     for st in subtasks[:upto_index]:
         p = case_dir / st["folder_name"] / st["file_name"]
         if p.is_file():
-            parts.append(
-                f"{st['folder_name']}/{st['file_name']}:\n"
-                + _file_view(p, p.read_text(encoding="utf-8", errors="ignore"), 2000)
-            )
+            name = f"{st['folder_name']}/{st['file_name']}".lstrip("/")
+            raw = p.read_bytes()
+            if b"\x00" in raw[:4096]:
+                parts.append(f"{name}: a binary file of {len(raw)} bytes, in the case as it is")
+                continue
+            # A file the study gives is what the others are written against (a
+            # network's card and the header that evaluates it): cut at 2000
+            # characters, or not shown at all when it came last, a writer made
+            # up its own reader of the card ten runs running
+            # (nn_in_solver_demo_20261022_1129, case_006).
+            # A Python script whole: cut at 2000 characters, the edit of a
+            # training controller saw 2 KB of the 135 KB worker it launches,
+            # passed the weights hash under a name the worker did not define,
+            # and the run stopped at once (nn_airfoil_s814_20261026_1537, case_003).
+            limit = (_SCRIPT_VIEW_KB * 1024 if p.suffix == ".py"
+                     else 12000 if st.get("given") else 2000)
+            parts.append(f"{name}" + (" (given by the study, as it is)" if st.get("given") else "") + ":\n"
+                         + _file_view(p, raw.decode("utf-8", errors="ignore"), limit))
     return "\n\n".join(parts)
 
 
@@ -344,39 +417,162 @@ def _mesh_check_lines(case_dir: Path) -> List[str]:
 
 # What a run may write that tells why it failed, besides its logs: a run
 # script's own report of its checks.
-_RUN_OUTPUT_SUFFIXES = (".json", ".txt", ".csv", ".dat", ".md", ".yaml", ".yml")
+# .jsonl too, shown by its last lines: a training controller appended why it
+# rejected a worker ("smoke setup markers are not identical ...") to
+# failures.jsonl, and the review saw only "incomplete smoke batch"
+# (nn_airfoil_s814_20261026_1537, case_003).
+_RUN_OUTPUT_SUFFIXES = (".json", ".jsonl", ".txt", ".csv", ".dat", ".md", ".yaml", ".yml")
 # Written by the harness, not by the run.
 _HARNESS_FILES = ("Allrun.out", "run_result.json", "setup_check.json", ".foamagent_state.json")
 
 
+_FAILURE_KEYS = {"message", "error", "errors", "problems", "reason", "failure", "failures", "exception",
+                 "stop_reason", "status"}
+
+
+def _failure_fields(value: Any, where: str = "") -> List[Tuple[str, str]]:
+    """The non-empty fields of a JSON value that say what failed and why
+    (message, errors, problems, reason, ...), with the path to each. A
+    controller's 273 KB failure record held its one-line reason under
+    details.summaries[0].problems, among hundreds of hashes."""
+    found: List[Tuple[str, str]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = f"{where}.{key}" if where else str(key)
+            if str(key).lower() in _FAILURE_KEYS and item not in (None, "", [], {}):
+                if isinstance(item, (str, int, float, bool)) or (
+                        isinstance(item, list) and all(isinstance(x, str) for x in item)):
+                    # Whole up to 4000 characters: cut at 400, a message saying two
+                    # records differed showed only the start of the first, never the
+                    # second, which held the same values in another key order
+                    # (nn_airfoil_s814_20261026_1537, case_003).
+                    found.append((path, json.dumps(item)[:4000]))
+                    continue
+            found += _failure_fields(item, path)
+    elif isinstance(value, list):
+        for i, item in enumerate(value[:50]):
+            found += _failure_fields(item, f"{where}[{i}]")
+    return found
+
+
+def _jsonl_tail(text: str, limit: int) -> str:
+    """The last records of a JSON-lines file within ``limit`` characters, the
+    newest last, each with long lists shortened (_compact_json): its lines can
+    be tens of KB each, and the last characters of the file alone held no
+    record's message."""
+    shown: List[str] = []
+    used = 0
+    for line in reversed([ln for ln in text.splitlines() if ln.strip()]):
+        try:
+            record = json.loads(line)
+            item = json.dumps(_compact_json(record), separators=(",", ":"))
+        except ValueError:
+            record, item = None, line
+        if len(item) > limit // 2:
+            # Too long whole: what in it says why, each with where it sits.
+            reasons = _failure_fields(record) if record is not None else []
+            listed = "\n".join(f"  {where}: {what}" for where, what in reasons[:40])
+            item = ("[a " + f"{len(line)}-character record; its failure fields]\n" + listed[:limit // 2]
+                    if reasons else item[:limit // 2] + " ...[cut]")
+        if used + len(item) > limit:
+            break
+        shown.append(item)
+        used += len(item) + 1
+    skipped = len([ln for ln in text.splitlines() if ln.strip()]) - len(shown)
+    return (f"... [{skipped} earlier records]\n" if skipped else "") + "\n".join(reversed(shown))
+
+
+class _CaseLedger:
+    """Records in the study's file ledger (file_ledger) what the harness wrote
+    into a case before each run and what each run wrote, from the case folder
+    before and after. Readers then take a run's files from the ledger instead
+    of guessing their names and places."""
+
+    def __init__(self, case_dir: Path) -> None:
+        self.case_dir = Path(case_dir)
+        self.root = file_ledger.root_of(self.case_dir)
+        self.label = file_ledger.rel(self.root, self.case_dir) if self.root else self.case_dir.name
+        self.last = file_ledger.snapshot(self.case_dir)
+
+    def _record(self, by: str, source: str) -> Dict[str, Any]:
+        now = file_ledger.snapshot(self.case_dir)
+        written: Dict[str, Any] = {}
+        if self.root is not None:
+            written = file_ledger.record_changes(self.root, self.case_dir, self.last, now,
+                                                 f"{self.label}: {by}", source)
+        self.last = now
+        return written
+
+    def before_run(self, n: int, what: str = "run") -> None:
+        self._record(f"harness, before {what} {n}", "harness")
+        file_ledger.running(self.case_dir, True)
+
+    def after_run(self, n: int, what: str = "run") -> Dict[str, Any]:
+        file_ledger.running(self.case_dir, False)
+        written = self._record(f"{what} {n}", "run")
+        if self.root is not None:
+            file_ledger.keep_run_logs(self.root, self.case_dir, f"{what.replace(' ', '_')}_{n}")
+        return written
+
+
+def _written(case_dir: Path, since: float) -> List[Path]:
+    """The files (case-relative, field data left out) the run that started at
+    ``since`` wrote and that are still there: from the study's ledger, or,
+    for a case outside a study, every file created or changed since then."""
+    root = file_ledger.root_of(case_dir)
+    if root is not None:
+        found = file_ledger.run_writes(root, case_dir, since)
+        if found is not None:
+            return [Path(p) for p in found]
+    # With 20 ms of grace: file times come from the kernel's coarse clock, and
+    # a file written just after the run started can read a few ms before it.
+    start_ns = since * 1e9 - 2e7
+    return [Path(rel) for rel, (_, mtime, ctime) in file_ledger.snapshot(case_dir).items()
+            if not file_ledger.is_field(rel) and max(mtime, ctime) >= start_ns]
+
+
+def _written_listing(case_dir: Path, since: float, most: int = 150) -> str:
+    """The names and sizes of every file the run wrote, so none is out of the
+    review's sight: a file shown no part of is still named here."""
+    written = _written(case_dir, since)
+    if not written:
+        return ""
+    sizes = []
+    for rel in sorted(written, key=lambda p: (len(p.parts), str(p))):
+        try:
+            sizes.append(f"{rel} ({(case_dir / rel).stat().st_size} B)")
+        except OSError:
+            continue
+    shown = sizes[:most]
+    more = f"\n... and {len(sizes) - most} more" if len(sizes) > most else ""
+    return (f"--- every file this run wrote ({len(sizes)}, OpenFOAM field data left out) ---\n"
+            + "\n".join(shown) + more)
+
+
 def _run_outputs(case_dir: Path, since: float, per_file: int = 12000, total: int = 24000) -> List[str]:
-    """The small text files a run wrote into the case (changed at or after
-    ``since``), outside its dictionaries, fields, mesh, logs and results
-    folders, the latest first. A DAFoam script that stopped itself on a
+    """The small text records a run wrote anywhere in the case (_written), the
+    shallowest and latest first. A DAFoam script that stopped itself on a
     failed check wrote which check and why into results.json; the review saw
     only "validation failed" in the log and the file's name, and the case
     failed ten runs in a row (shelf_demo_dafoam_20261019_1057, case_008)."""
     found = []
-    for path in case_dir.rglob("*"):
-        rel = path.relative_to(case_dir)
-        top = rel.parts[0]
-        if (len(rel.parts) > 2 or not path.is_file() or path.suffix not in _RUN_OUTPUT_SUFFIXES
-                # A hidden report is shown (a DAFoam script's log pointed to
-                # .synthetic_truth.coordinator.failure.json for its diagnostics);
-                # hidden folders (.openmdao_out, caches) are not.
-                or str(rel) in _HARNESS_FILES or any(part.startswith(".") for part in rel.parts[:-1])
-                or top in ("0", "constant", "system", "postProcessing", "dynamicCode")
-                or top.startswith(("processor", "log.")) or _is_number(top)):
+    for rel in _written(case_dir, since):
+        path = case_dir / rel
+        # The case's own dictionaries are its inputs, shown in the case view;
+        # every file is still named in _written_listing.
+        if (path.suffix not in _RUN_OUTPUT_SUFFIXES or str(rel) in _HARNESS_FILES
+                or rel.parts[0] in ("0", "0.orig", "0.org", "constant", "system")):
             continue
         try:
             stat = path.stat()
         except OSError:
             continue
-        if stat.st_mtime >= since:
-            found.append((len(rel.parts), -stat.st_mtime, rel, stat.st_size))
+        # Reports in hidden folders (caches, .openmdao_out) after the rest.
+        hidden = any(part.startswith(".") for part in rel.parts[:-1])
+        found.append((hidden, len(rel.parts), -stat.st_mtime, rel, stat.st_size))
     parts: List[str] = []
     left = total
-    for _, _, rel, size in sorted(found):
+    for _, _, _, rel, size in sorted(found):
         if left <= 0:
             break
         text = (case_dir / rel).read_text(encoding="utf-8", errors="ignore")
@@ -388,6 +584,8 @@ def _run_outputs(case_dir: Path, since: float, per_file: int = 12000, total: int
         # (shelf_demo_dafoam_20261019_1057, case_007).
         if rel.suffix == ".json" and len(text) > per_file:
             shown = _file_view(rel, text, left)
+        elif rel.suffix == ".jsonl" and len(text) > min(per_file, left):
+            shown = _jsonl_tail(text, min(per_file, left))
         else:
             shown = text[:min(per_file, left)]
             if len(shown) < len(text):
@@ -433,6 +631,11 @@ def collect_error_logs(case_dir: Path, max_lines: int = 200, since: Optional[flo
             "nothing was solved. Check startTime, endTime, deltaT and stopAt in "
             "system/controlDict: endTime must be later than startTime."
         )
+    # An error above the shown tail comes first. A script's child run died on
+    # its own guard 340 lines from the end of log.DASimpleFoam; the last 200
+    # lines were eight ranks of the parent's "child returned 1"
+    # (nn_airfoil_s814_20261026_1537, case_003).
+    parts += [text for _, i, count, text in _error_excerpts(case_dir) if i < count - max_lines]
     candidates = sorted(case_dir.glob("log.*")) + [case_dir / "Allrun.out"]
     for log_path in candidates:
         if log_path.is_file():
@@ -441,11 +644,151 @@ def collect_error_logs(case_dir: Path, max_lines: int = 200, since: Optional[flo
                          + _bounded_tail(lines[-max_lines:]))
     if since is not None:
         parts += _run_outputs(case_dir, since)
+        parts += _run_logs(case_dir, since)
+        listing = _written_listing(case_dir, since)
+        if listing:
+            parts.append(listing)
     return "\n\n".join(parts)
+
+
+def _run_logs(case_dir: Path, since: float, lines: int = 60, most: int = 4) -> List[str]:
+    """The ends of the .log files a run wrote below the case's top level,
+    hidden folders too, newest first. An NN case's script built its network
+    helper with wmake and logged the compiler's error to
+    .deployment/logs/build_nnHelperEval.log; the review saw only "failed to
+    build" and three runs failed the same way unfixed
+    (nn_in_solver_demo_20261022_1129, case_006). Other text outputs too: a
+    training script's worker wrote its usage error to a ..._output.txt, and
+    the review saw only "worker process failed" (nn_airfoil_s814_20261026_1537,
+    case_003)."""
+    found = []
+    # Every log the run wrote (_written) but the top-level log.* and
+    # Allrun.out, which collect_error_logs shows whole; its text records are
+    # _run_outputs'.
+    for rel in _written(case_dir, since):
+        if file_ledger.kind(str(rel)) != "log" or (len(rel.parts) == 1 and (
+                rel.name.startswith("log.") or str(rel) in _HARNESS_FILES)):
+            continue
+        try:
+            found.append((-(case_dir / rel).stat().st_mtime, rel))
+        except OSError:
+            continue
+    parts: List[str] = []
+    for _, rel in sorted(found)[:most]:
+        text = (case_dir / rel).read_text(encoding="utf-8", errors="ignore").splitlines()
+        # The first fatal error above the tail too: shown its last 60 lines, a
+        # training worker's log held only the segfault and MPI_ABORT that
+        # followed OpenFOAM's "failed lookup of chiSA" 250 lines up
+        # (nn_airfoil_s814_20261026_1537, case_003).
+        first = next((i for i, line in enumerate(text[:max(0, len(text) - lines)])
+                      if "FOAM FATAL" in line or "Traceback (most recent call last)" in line), None)
+        if first is not None:
+            parts.append(f"--- {rel}, written by this run, its first error (line {first + 1}) ---\n"
+                         + _bounded_tail(text[max(0, first - 3):first + 25]))
+        parts.append(f"--- {rel}, written by this run (last {min(len(text), lines)} lines) ---\n"
+                     + _bounded_tail(text[-lines:]))
+    return parts
 
 
 
 _ERROR_MARKS = ("FOAM FATAL", "Traceback (most recent call last)", "ERROR", "Error:")
+
+
+def _reap_case_processes(case_dir: Path) -> List[int]:
+    """Stop this user's processes still working inside the case folder once
+    its run has ended. A case script launched its own solver runs in new
+    sessions; when the script failed they kept running, 8 ranks each, with
+    their parent gone, while the next attempt started in the same folder
+    (nn_airfoil_s814_20261026_1537, case_001)."""
+    root = str(Path(case_dir).resolve())
+    me = {os.getpid(), os.getppid()}
+    left: List[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit() or int(entry.name) in me:
+            continue
+        try:
+            if entry.stat().st_uid != os.getuid():
+                continue
+            cwd = os.path.realpath(entry / "cwd")
+        except OSError:
+            continue
+        if cwd == root or cwd.startswith(root + os.sep):
+            left.append(int(entry.name))
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in left:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        if sig == signal.SIGTERM and left:
+            time.sleep(3)
+    if left:
+        print(f"[foam-native] {Path(case_dir).name}: stopped {len(left)} process(es) the run left "
+              "running in the case folder", flush=True)
+    return left
+
+
+def _failure_line(case_dir: Path, since: Optional[float] = None) -> str:
+    """The last error line of the case's logs, to tell one failure from
+    another: the same line two runs running is the same failure. With
+    ``since``, also the failure fields of the reports the run wrote: a training
+    controller's two runs both ended on the same "CalledProcessError ...
+    returned non-zero exit status 1" line for different causes its
+    failures.jsonl named, and the case was stopped as failing the same way
+    (nn_airfoil_s814_20261026_1537, case_003)."""
+    last = ""
+    for log_path in sorted((q for q in case_dir.glob("log.*") if q.is_file()), key=lambda q: q.stat().st_mtime):
+        try:
+            text = log_path.read_text(errors="ignore")[-200_000:]
+        except OSError:
+            continue
+        for line in text.splitlines():
+            if "Error:" in line or "FATAL ERROR" in line or "error:" in line:
+                last = line.strip()
+    if since is not None:
+        reasons: List[str] = []
+        for record in _run_reports(case_dir, since):
+            reasons += [what for where, what in _failure_fields(record)
+                        if not where.endswith("status") and "traceback" not in where.lower()]
+        if reasons:
+            last += " | " + "; ".join(sorted(set(reasons)))[:2000]
+    return last
+
+
+def _run_reports(case_dir: Path, since: float) -> List[Any]:
+    """The JSON records the run that started at ``since`` wrote anywhere in
+    the case (_written; the last three lines of a .jsonl)."""
+    records: List[Any] = []
+    for rel in sorted(_written(case_dir, since)):
+        path = case_dir / rel
+        if path.suffix not in (".json", ".jsonl") or str(rel) in _HARNESS_FILES:
+            continue
+        try:
+            if path.stat().st_size > 20 * 1024 * 1024:
+                continue
+            text = path.read_text(errors="ignore")
+            records += ([json.loads(ln) for ln in text.splitlines()[-3:] if ln.strip()]
+                        if path.suffix == ".jsonl" else [json.loads(text)])
+        except (OSError, ValueError):
+            continue
+    return records
+
+
+def _run_verdicts(case_dir: Path, since: float) -> List[str]:
+    """The outcomes a run's own reports named in their status fields, when they
+    name one (more than one word: "production_rejected_failed_preproduction_checks",
+    not "failed"). The same verdict two runs running is the same failure even
+    when the reasons were reworded: a case's gate refused, ten runs running,
+    the same missing evidence from another case, its reasons rephrased by each
+    rewrite, and the case was never stopped as unable to meet its requirement
+    (nn_airfoil_s814_20261026_1537, case_006)."""
+    verdicts = set()
+    for record in _run_reports(case_dir, since):
+        for where, what in _failure_fields(record):
+            value = what.strip('"')
+            if where.endswith("status") and any(sep in value for sep in ("_", "-", " ")):
+                verdicts.add(value)
+    return sorted(verdicts)
 
 
 def error_summary(case_dir: Path, limit: int = 3000) -> str:
@@ -454,8 +797,20 @@ def error_summary(case_dir: Path, limit: int = 3000) -> str:
     last 3000 characters of every log joined in name order, so a DAFoam case's
     "Unknown RAS model type" in log.DASimpleFoam never reached the manager,
     only the tails of the logs after it (shelf_demo_dafoam_20261011_1437)."""
+    parts = [text for _, _, _, text in _error_excerpts(case_dir)]
+    out = case_dir / "Allrun.out"
+    if out.is_file():
+        parts.append("--- Allrun.out (end) ---\n"
+                     + "\n".join(out.read_text(encoding="utf-8", errors="ignore").splitlines()[-8:]))
+    text = "\n\n".join(parts) or collect_error_logs(case_dir)
+    return text[:limit] if len(text) > limit else text
+
+
+def _error_excerpts(case_dir: Path) -> List[Tuple[str, int, int, str]]:
+    """Up to three error excerpts from the case's logs, as (log name, line
+    index, the log's line count, excerpt)."""
     logs = sorted((q for q in case_dir.glob("log.*") if q.is_file()), key=lambda q: q.stat().st_mtime)
-    parts: List[str] = []
+    excerpts: List[Tuple[str, int, int, str]] = []
     # Up to three excerpts, bad input and tracebacks first: the first error in
     # that log was a notice DAFoam carries on past ("already decomposed"); the
     # cause was a FOAM FATAL IO ERROR further down.
@@ -488,13 +843,9 @@ def error_summary(case_dir: Path, limit: int = 3000) -> str:
             continue
         said.append(message)
         taken.append((name, i))
-        parts.append(f"--- {name}, line {i + 1} ---\n" + "\n".join(lines[max(0, i - 3):i + 15]))
-    out = case_dir / "Allrun.out"
-    if out.is_file():
-        parts.append("--- Allrun.out (end) ---\n"
-                     + "\n".join(out.read_text(encoding="utf-8", errors="ignore").splitlines()[-8:]))
-    text = "\n\n".join(parts) or collect_error_logs(case_dir)
-    return text[:limit] if len(text) > limit else text
+        excerpts.append((name, i, len(lines),
+                         f"--- {name}, line {i + 1} ---\n" + "\n".join(lines[max(0, i - 3):i + 15])))
+    return excerpts
 
 
 # What a FOAM FATAL notice says when the run it is in carries on: pyDAFoam
@@ -554,6 +905,36 @@ def _solver_ran_no_steps(case_dir: Path, solver: str) -> bool:
     text = log_path.read_text(encoding="utf-8", errors="ignore")
     return "\nTime = " not in text and text.rstrip().endswith(("End", "Finalising parallel run",
                                                                 _log_end(case_dir)))
+
+
+def _solved_in_written_logs(case_dir: Path, since: float) -> bool:
+    """Whether the run that started at ``since`` solved in logs of its own:
+    a case whose script runs the solver in worker processes leaves the
+    solver's log holding only the Allrun's "End". Solved when some log the run
+    wrote (_written) shows a solver iterating -- at least two "Time =" and two
+    "ExecutionTime =" lines, which a utility such as decomposePar does not
+    print -- and every such log ends cleanly with no fatal error. Read only as
+    the solver's log, an S814 held-out run that had finished all 18 of its
+    conditions, each in a worker writing its own log, was judged to have
+    solved nothing and run again (nn_airfoil_s814_20261026_1537, case_004)."""
+    solved = False
+    for rel in _written(case_dir, since):
+        path = case_dir / rel
+        try:
+            if not path.is_file() or path.stat().st_size > 200 * 1024 * 1024:
+                continue
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if "\x00" in text[:4096] or text.count("\nTime = ") < 2 or text.count("\nExecutionTime = ") < 2:
+            continue
+        if ("FOAM FATAL ERROR" in text or "FOAM FATAL IO ERROR" in text) and _fatal_blocks(text.splitlines()):
+            return False
+        tail = text[-2000:].rstrip()
+        if not tail.endswith(("End", "Finalising parallel run", _log_end(case_dir))):
+            return False
+        solved = True
+    return solved
 
 
 def _log_end(case_dir: Path) -> str:
@@ -815,20 +1196,86 @@ def _newest_change(case_dir: Path) -> float:
     return latest
 
 
-def _simulated_progress(case_dir: Path) -> Optional[Tuple[float, float]]:
-    """(latest simulated time in the newest solver log, controlDict endTime),
-    or None when either is not there to read."""
-    end = None
+def _top_entry(path: Path, key: str) -> Optional[str]:
+    """The value of a ``key value;`` entry of an OpenFOAM dictionary, as written,
+    or None when the file or the entry is not there."""
     try:
-        for line in (case_dir / "system" / "controlDict").read_text(errors="ignore").splitlines():
-            words = line.replace(";", " ").split()
-            if len(words) >= 2 and words[0] == "endTime":
-                end = float(words[1])
-                break
-    except (OSError, ValueError):
+        lines = path.read_text(errors="ignore").splitlines()
+    except OSError:
         return None
+    for line in lines:
+        words = line.replace(";", " ").split()
+        if len(words) >= 2 and words[0] == key:
+            return words[1]
+    return None
+
+
+# What one run costs depends on, where a case can differ from the validated
+# case it was seeded from.
+_COST_ENTRIES = (("system/controlDict", "deltaT"), ("system/controlDict", "endTime"),
+                 ("system/decomposeParDict", "numberOfSubdomains"))
+
+
+def _cost_differences(case_dir: Path, seed_dir: Optional[Path]) -> str:
+    """Where the case's run costs other than its validated seed's, as a sentence
+    for a case sent back as too slow; empty when nothing differs. hyStrath's
+    DSMC case ran deltaT 1e-7 from its requirement's assumed value where the
+    mesh check's case at the same condition ran 5e-7, and was told only to be
+    made cheaper or left out (shelf_demo_hystrath_20261022_1030, case_006)."""
+    if seed_dir is None or not Path(seed_dir).is_dir():
+        return ""
+    seed_dir = Path(seed_dir)
+    differences = []
+    for rel, key in _COST_ENTRIES:
+        here, there = _top_entry(case_dir / rel, key), _top_entry(seed_dir / rel, key)
+        if here is None or there is None:
+            continue
+        try:
+            same = float(here) == float(there)
+        except ValueError:
+            same = here == there
+        if not same:
+            differences.append(f"{key} {there} there, {here} here")
+    cells_here, cells_there = _n_cells(case_dir), _n_cells(seed_dir)
+    if cells_here is not None and cells_there is not None and cells_here != cells_there:
+        differences.append(f"{cells_there} cells there, {cells_here} here")
+    if not differences:
+        return ""
+    return (f" It differs from the validated case it started from ({seed_dir}) in what a run costs: "
+            + "; ".join(differences) + ". A value the requirement fixes is put back by the setup check "
+            "before every run, so the case cannot change it itself: only a changed requirement, or the "
+            "file given to the case to be used as it is, can.")
+
+
+def _simulated_progress(case_dir: Path, since: float = 0.0) -> Optional[Tuple[float, float]]:
+    """(latest simulated time in the newest solver log, controlDict endTime),
+    or None when either is not there to read.
+
+    endTime is the largest of controlDict's and of any copy of it the run made
+    (system/controlDict.*, written after ``since``): hyStrath's DSMC Allrun
+    ran a startup stage with endTime cut to 5e-4 and the real 0.006 kept in
+    controlDict.full, so a run 6 h from its end looked on time and ended
+    itself after 30 min, uncounted as slow (shelf_demo_hystrath_20261022_1030,
+    case_006)."""
+    system = case_dir / "system"
+    try:
+        end_entry = _top_entry(system / "controlDict", "endTime")
+        if end_entry is None:
+            return None
+        end = float(end_entry)
+    except ValueError:
+        return None
+    for copy in system.glob("controlDict.*"):
+        try:
+            if copy.stat().st_mtime < since:
+                continue
+            entry = _top_entry(copy, "endTime")
+            if entry is not None:
+                end = max(end, float(entry))
+        except (OSError, ValueError):
+            continue
     logs = [q for q in case_dir.glob("log.*") if q.is_file()]
-    if end is None or not logs:
+    if not logs:
         return None
     newest = max(logs, key=lambda q: q.stat().st_mtime)
     try:
@@ -852,7 +1299,24 @@ def _simulated_progress(case_dir: Path) -> Optional[Tuple[float, float]]:
 # Review rounds after a failed run before the case stops for want of any change.
 _REVIEW_ROUNDS = 2
 TIME_LIMIT_NOTE = "Stopped: the run used up the case's time limit"
+# How run_script says a run was stopped for not fitting the time it has.
+PACE_NOTE = "[harness] Stopped: at the pace of the last"
+CAP_NOTE = "this study allows one run at most"
+# Runs of one case stopped for that before it goes back to the study, which
+# knows its brief's time rules: a reviewer that changed nothing a run's cost
+# depends on had hyStrath's DSMC case stopped the same way every 15 min, with
+# ten attempts allowed (shelf_demo_hystrath_20261022_1030).
+_SLOW_STOPS = 2
 _MIN_RUN_S = 600
+
+
+def _max_run_s() -> float:
+    """The longest one run may take, from CFD_SCIENTIST_MAX_RUN_HOURS; 0 when
+    the study sets no such limit."""
+    try:
+        return max(0.0, float(os.environ.get("CFD_SCIENTIST_MAX_RUN_HOURS") or 0) * 3600)
+    except ValueError:
+        return 0.0
 
 
 def _stall_limit_s(case_dir: Path) -> float:
@@ -931,6 +1395,67 @@ def _where_waiting(stack: str, case_dir: Path) -> str:
     return f"{name} line {number} in {func}"
 
 
+def _serial_program_busy(proc: subprocess.Popen) -> bool:
+    """Whether the run is a single program working on its own: no MPI launcher
+    in its process group, and a program in it other than a shell or Python
+    running on a CPU. Such a run is working, though it writes nothing: a
+    DSMC case's dsmcInitialise+ seeded particles for 45 min at full CPU and
+    was stopped as stuck (shelf_demo_hystrath_20261022_1030). Ranks that
+    deadlock spin too, so a run with an MPI launcher is not judged this way."""
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return False
+    busy = False
+    for stat in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            text = stat.read_text()
+        except OSError:
+            continue
+        # comm is in parentheses and may hold spaces; the fields after it are
+        # state, ppid, pgrp.
+        name = text[text.find("(") + 1:text.rfind(")")]
+        fields = text[text.rfind(")") + 2:].split()
+        if len(fields) < 3 or fields[2] != str(pgid):
+            continue
+        if name in ("mpirun", "orterun", "mpiexec", "orted", "hydra_pmi_proxy"):
+            return False
+        if fields[0] == "R" and name not in ("bash", "sh", "python", "python3", "tee", "timeout"):
+            busy = True
+    return busy
+
+
+def _gdb_python_stack(pid: int, path: Path) -> None:
+    """Write a Python process's stack to ``path`` in faulthandler's layout
+    through gdb, for a process the stack hook did not reach. A training
+    script's condition workers were started through the solver's wrapper,
+    which starts from an empty environment: eight ranks deadlocked in three
+    places and the stuck-run report could show only the parent waiting
+    (nn_airfoil_s814_20261026_1537, case_003). Nothing is written when gdb is
+    missing, the process is not Python, or gdb may not attach."""
+    gdb = shutil.which("gdb")
+    try:
+        if not gdb or "python" not in Path(f"/proc/{pid}/comm").read_text():
+            return
+    except OSError:
+        return
+    code = ("import sys\n"
+            f"f=open({str(path)!r},'w')\n"
+            "for fr in sys._current_frames().values():\n"
+            "    while fr is not None:\n"
+            "        f.write('  File \"%s\", line %d in %s\\n' % "
+            "(fr.f_code.co_filename, fr.f_lineno, fr.f_code.co_name))\n"
+            "        fr = fr.f_back\n"
+            "f.close()\n")
+    try:
+        subprocess.run([gdb, "-p", str(pid), "-batch", "-ex", "call (int)PyGILState_Ensure()",
+                        "-ex", f"call (int)PyRun_SimpleString({json.dumps(code)})"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def _process_stacks(proc: subprocess.Popen, stack_dir: Path, case_dir: Path) -> str:
     """Where each Python process of a stuck run was waiting, from the stacks
     stack_hook/sitecustomize.py has them write on SIGWINCH (a process without
@@ -942,6 +1467,9 @@ def _process_stacks(proc: subprocess.Popen, stack_dir: Path, case_dir: Path) -> 
         except OSError:
             pass
     time.sleep(2.0)
+    for pid, _ in procs:
+        if not (stack_dir / f"stack.{pid}").is_file():
+            _gdb_python_stack(pid, stack_dir / f"stack.{pid}")
     where: Dict[str, List[Tuple[int, str]]] = {}
     for pid, rank in procs:
         try:
@@ -991,6 +1519,7 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
     if stack_dir is not None:
         cmd = ["bash", "-c", 'export PYTHONPATH="$1${PYTHONPATH:+:$PYTHONPATH}" CFD_SCIENTIST_STACK_DIR="$2"; '
                'shift 2; exec "$@"', "with-stacks", str(_STACK_HOOK), str(stack_dir), *cmd]
+    started_wall = time.time()
     proc = subprocess.Popen(in_runtime(cmd, Path(cwd)), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             start_new_session=True)
@@ -999,6 +1528,14 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
     # held its cores until the 45-min stall limit
     # (shelf_demo_dafoam_20261015_1318, case_003).
     crash_quiet_s = (float(os.environ.get("CFD_SCIENTIST_CRASH_QUIET_S") or 300) if stall_s > 0 else 0.0)
+    # The longest one run of a case may take, when the study sets one: told
+    # to skip any run projected past 2 h, Claude Code timed its DSMC case
+    # first and left it out, while CFD Scientist held 16 cores for hours on
+    # runs that could not finish (shelf_demo_hystrath_20261011_1602).
+    run_cap_s = _max_run_s() if stall_s > 0 else 0.0
+    capped = bool(run_cap_s) and (not timeout or timeout > run_cap_s)
+    if capped:
+        timeout = run_cap_s
     deadline = time.monotonic() + timeout if timeout else None
     mark, changed_at = _newest_change(Path(cwd)), time.monotonic()
     # A run that cannot reach its endTime in the time it has is stopped once
@@ -1011,6 +1548,7 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
     # average since the start still looked fine
     # (shelf_demo_olaflow_20261011_1242, case_002).
     samples: List[Tuple[float, float]] = []  # (wall, simulated time)
+    pace_stage = ""  # the log the samples were read from
     pace_window_s = float(os.environ.get("CFD_SCIENTIST_PACE_WINDOW_S") or 900)
     hopeless = ""
     try:
@@ -1021,17 +1559,25 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
             except subprocess.TimeoutExpired:
                 now = time.monotonic()
                 latest = _newest_change(Path(cwd))
-                if latest != mark:
+                if latest != mark or (stall_s > 0 and now - changed_at > stall_s / 2
+                                      and _serial_program_busy(proc)):
                     mark, changed_at = latest, now
                 stalled = stall_s > 0 and now - changed_at > stall_s
                 crashed = (not stalled and crash_quiet_s > 0 and now - changed_at > crash_quiet_s
                            and _crash_in_logs(Path(cwd)))
                 if stall_s > 0 and deadline is not None and not stalled:
-                    progress = _simulated_progress(Path(cwd))
+                    progress = _simulated_progress(Path(cwd), since=started_wall)
                     if progress is not None:
                         sim, end = progress
-                        if samples and sim < samples[-1][1]:
-                            samples.clear()  # a new run started in the same case
+                        # A new stage writes a new log (a balanced restart after
+                        # a short startup run): its pace is not the last one's,
+                        # which ran on an unbalanced split
+                        # (shelf_demo_hystrath_20261022_1030).
+                        logs = [q for q in Path(cwd).glob("log.*") if q.is_file()]
+                        stage = max(logs, key=lambda q: q.stat().st_mtime).name if logs else ""
+                        if samples and (sim < samples[-1][1] or stage != pace_stage):
+                            samples.clear()  # a new run or stage started in the same case
+                        pace_stage = stage
                         samples.append((now, sim))
                         while len(samples) > 1 and now - samples[1][0] >= pace_window_s:
                             samples.pop(0)
@@ -1040,14 +1586,17 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
                             rate = (sim - s0) / (now - w0)
                             needed = (end - sim) / rate if rate > 0 else float("inf")
                             left = deadline - now
-                            if needed > max(3 * left, 3600):
+                            # Under the study's cap a run that will not finish
+                            # in it is not let run to it.
+                            if needed > (1.5 * left if capped else max(3 * left, 3600)):
                                 hopeless = (
                                     f"\n[harness] Stopped: at the pace of the last {(now - w0) / 60:.0f} min "
                                     f"(simulated time {s0:g} to {sim:g}), reaching endTime {end:g} would "
                                     + (f"take about {needed / 3600:.0f} h more" if rate > 0 else "never happen")
                                     + f", against {left / 3600:.1f} h left for this run. If the time step "
                                     "collapsed, the solution is blowing up; otherwise shorten endTime, "
-                                    "enlarge deltaT, or make each step cheaper.")
+                                    "enlarge deltaT, or make each step cheaper (fewer cells or "
+                                    "particles where the case allows it).")
                 if not stalled and not crashed and not hopeless and (deadline is None or now < deadline):
                     continue
                 stacks = _process_stacks(proc, stack_dir, Path(cwd)) if stalled and stack_dir else ""
@@ -1061,8 +1610,14 @@ def run_script(cmd: List[str], cwd: Path | str, env: Optional[Dict[str, str]],
                        f"changed for {crash_quiet_s / 60:.0f} min after it, so the run was over; the "
                        "processes left were waiting on the one that failed."
                        if crashed else hopeless or
-                       f"\n[harness] {TIME_LIMIT_NOTE} ({timeout / 3600:.1f} h) while it was still "
-                       "running; it was not stuck or crashed.")
+                       (f"\n[harness] Stopped: this study allows one run at most {timeout / 3600:g} h, "
+                        "and the run was still going then; it was not stuck or crashed. A run that "
+                        "needs longer costs more than the study allows: make it cheaper (a shorter "
+                        "endTime, a larger time step, fewer cells or particles where the case allows "
+                        "it) or leave it out."
+                        if capped else
+                        f"\n[harness] {TIME_LIMIT_NOTE} ({timeout / 3600:.1f} h) while it was still "
+                        "running; it was not stuck or crashed."))
                 return -1, out or "", (err or "") + why, True
     except BaseException:
         _stop_group(proc)
@@ -1178,6 +1733,7 @@ def _run_seeded_case(
     """Copy a validated case and run it. No LLM calls at all. ``prepare``, if
     given, may add output-only settings (extra function objects) to the copy
     before it runs; it must not change the physics or the mesh."""
+    ledger = _CaseLedger(case_dir)
     _copy_case_files(base_case_seed_dir, case_dir)
     own_allrun = _copy_own_allrun(base_case_seed_dir, case_dir)
     # A start case made from a level that ran its own Allrun carries that
@@ -1209,9 +1765,11 @@ def _run_seeded_case(
     _clean_stale_run_artifacts(case_dir)
 
     remaining = max(60, max_time_limit_s - int(time.monotonic() - t0))
+    ledger.before_run(1)
     returncode, out, err, _ = run_script(["./Allrun"], case_dir, allrun_env, remaining)
     allrun_out = out + "\n" + err
     (case_dir / "Allrun.out").write_text(allrun_out)
+    ledger.after_run(1)
 
     mesh_errors = mesh_check_errors(case_dir)
     success = (
@@ -1295,6 +1853,19 @@ def _apply_start_case(case_dir: Path, start_case: Path, seed_case: Path,
     return f"from the settled flow and runs {length:g}"
 
 
+def _nested_seed_file(case_dir: Path, out_path: Path) -> Optional[Path]:
+    """The case's own file that a file in a copy of the case inside it stands
+    for: timing_case/constant/transportProperties -> constant/transportProperties.
+    The longest trailing part of the path, of at least folder + file, that is a
+    file in the case; None when there is none."""
+    parts = out_path.relative_to(case_dir).parts
+    for start in range(1, len(parts) - 1):
+        candidate = case_dir.joinpath(*parts[start:])
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def _not_a_dictionary(folder_name: str, file_name: str, content: str, before: str = "") -> bool:
     """True when what a writer returned for an OpenFOAM dictionary (a file
     without an extension under 0/, constant/ or system/) has no FoamFile
@@ -1352,10 +1923,42 @@ def _other_cases_note(case_dir: Path, user_requirement: str, max_files: int = 40
             except (OSError, ValueError):
                 continue
             lines.append(f"  {other}/{data.name}, its layout:\n" + "\n".join("    " + x for x in outline.splitlines()))
+        # Its NumPy archives too, by their array names: shown only by name and
+        # size, network_parity.npz's raw_VoS and raw_chiSA were looked for under
+        # guessed keys and the NN case's parity check stopped on "could not
+        # identify the raw pairs" (nn_in_solver_demo_20261022_1129, case_006).
+        for arrays in sorted(p for p in folder.iterdir() if p.is_file() and p.suffix in (".npz", ".npy")):
+            layout = _array_layout(arrays)
+            if layout:
+                lines.append(f"  {other}/{arrays.name}, its arrays: {layout}")
     if not lines:
         return ""
     return ("\n\nFILES OF THE OTHER CASES THIS REQUIREMENT NAMES (what is there now; read a case's "
             "results from these files, by these names):\n" + "\n".join(lines))
+
+
+def _array_layout(path: Path, most: int = 40) -> str:
+    """The arrays of a .npz or .npy file as "name shape dtype", read from
+    their headers only; empty when the file cannot be read."""
+    import numpy as np
+
+    try:
+        if path.suffix == ".npy":
+            data = np.load(path, mmap_mode="r", allow_pickle=False)
+            return f"{tuple(data.shape)} {data.dtype}"
+        with np.load(path, allow_pickle=False) as archive:
+            names = list(archive.files)
+            shown = []
+            for name in names[:most]:
+                with archive.zip.open(name + ".npy") as fh:
+                    version = np.lib.format.read_magic(fh)
+                    read_header = (np.lib.format.read_array_header_1_0 if version == (1, 0)
+                                   else np.lib.format.read_array_header_2_0)
+                    shape, _, dtype = read_header(fh)
+                shown.append(f"{name} {tuple(shape)} {dtype}")
+            return ", ".join(shown) + (f", ... {len(names) - most} more" if len(names) > most else "")
+    except Exception:  # noqa: BLE001 - a layout is extra context, never required
+        return ""
 
 
 def _notes_block(notes: str) -> str:
@@ -1393,8 +1996,53 @@ def _abbreviated_field(text: str, keep: int = 2000) -> str:
             + (text[end:] if end > 0 else ""))
 
 
+def _named(text: str, word: str) -> bool:
+    """Whether ``text`` names ``word`` as a whole name: case_003.1 is not
+    named by case_003.10, nor weights.json by best_weights.json."""
+    start = 0
+    while (i := text.find(word, start)) >= 0:
+        before, after = text[i - 1:i] if i else "", text[i + len(word):i + len(word) + 2]
+        if not (before.isalnum() or before in ("_", "-", ".")
+                or after[:1].isalnum() or after[:1] in ("_", "-") or (after[:1] == "." and after[1:2].isalnum())):
+            return True
+        start = i + 1
+    return False
+
+
+def _earlier_attempt_shown(rel: str, requirement: str, scripts: str = "") -> bool:
+    """Whether an earlier attempt's file given to a rerun case is shown in
+    its view: when the requirement names it, or its attempt's folder or a
+    folder of it; or when the case's own scripts name both its attempt and
+    its file name, as a script reading it does. All shown, the 413 record
+    files of ten attempts made a setup check's prompt 679,000 tokens; shown
+    only as the requirement named them, a script's check of
+    previous_attempts/case_003.2/results.json expected evaluations in a
+    history the file holds empty (nn_airfoil_s814_20261026_1537, case_003)."""
+    parts = Path(rel).parts
+    if parts[:1] != ("previous_attempts",):
+        return True
+    if Path(rel).suffix == ".py" or Path(rel).name == "Allrun.post":
+        return False
+    if scripts and len(parts) > 2 and _named(scripts, parts[1]) and _named(scripts, parts[-1]):
+        return True
+    # A requirement names a given file by its name alone (generate_case_requirements).
+    candidates = ["/".join(parts[:n]) for n in range(len(parts), 1, -1)] + [parts[-1]]
+    for prefix in candidates:
+        start = 0
+        while (i := requirement.find(prefix, start)) >= 0:
+            after = requirement[i + len(prefix):i + len(prefix) + 2]
+            before = requirement[i - 1:i] if i else ""
+            # previous_attempts/case_003.1 does not name case_003.10 or case_003.1_x,
+            # nor weights.json best_weights.json
+            if not (after[:1].isalnum() or after[:1] in ("_", "-") or (after[:1] == "." and after[1:2].isalnum())
+                    or (prefix == parts[-1] and (before.isalnum() or before in ("_", "-", ".")))):
+                return True
+            start = i + 1
+    return False
+
+
 def _case_files_xml(case_dir: Path, *, given: set, zero_template: str = "", mesh_fixed: bool = False,
-                    max_file_kb: int = 30, max_total_kb: int = 300) -> str:
+                    max_file_kb: int = 30, max_total_kb: int = 1000, requirement: str = "") -> str:
     """Every dictionary of the case, seeded or written, for the setup check:
     system/controlDict, constant/, the initial fields, the rest of system/,
     and the case's own Python scripts. The reviewer's view
@@ -1407,8 +2055,51 @@ def _case_files_xml(case_dir: Path, *, given: set, zero_template: str = "", mesh
         d = case_dir / folder if folder else case_dir
         return sorted(p for p in d.iterdir() if p.is_file() and p.name.endswith(suffix)) if d.is_dir() else []
 
-    ordered = ([case_dir / "system" / "controlDict"] + files("constant") + files(zero_template or "0")
-               + files("system") + files("", ".py"))
+    def nested(folder: str) -> List[Path]:
+        """The small files in ``folder``'s subfolders, such as the dictionaries
+        its files #include. A hyStrath starter sets its free-stream pressure
+        in 0/include/initialConditions; shown only by name, it left the
+        checks blind to it, and a requirement at Knudsen 0.05 was judged the
+        Knudsen 0.01 starter's own condition (gate_condition_trial_20261022).
+        Not the mesh, and not large data (surfaces, boundary data)."""
+        d = case_dir / folder
+        if not d.is_dir():
+            return []
+        return sorted(p for p in d.rglob("*") if p.is_file() and p.parent != d
+                      and not _in_a_mesh(p.relative_to(case_dir)) and p.stat().st_size <= max_file_kb * 1024)
+
+    zero = zero_template or "0"
+    scripts_text = "\n".join(p.read_text(encoding="utf-8", errors="ignore")
+                             for p in sorted(case_dir.glob("*.py")) + [case_dir / "Allrun.post"] if p.is_file())
+    # The scripts that run the case, too: not shown its Allrun, the check
+    # called the wall-shear and shock-standoff outputs of a hyStrath case
+    # "unclear" ("the hidden Allrun is needed"), so nothing was fixed and the
+    # run made none of them (shelf_demo_hystrath_20261022_1030, case_001).
+    run_scripts = [case_dir / n for n in ("Allrun", "Allrun.pre", "Allrun.post")] + files("", ".sh")
+    ordered = ([case_dir / "system" / "controlDict"] + files("constant") + nested("constant") + files(zero)
+               + nested(zero) + files("system") + nested("system") + files("", ".py") + run_scripts
+               # The case's scripts further down too: named only, a stale
+               # timing/runScript.py that the training script launched went
+               # unseen, and it stopped looking for files of an attempt long
+               # gone (nn_airfoil_s814_20261026_1537, case_003).
+               + sorted(p for p in case_dir.rglob("*.py") if p.is_file() and len(p.relative_to(case_dir).parts) > 1
+                        and not p.relative_to(case_dir).parts[0].startswith(("processor", "previous_attempts"))
+                        and p.relative_to(case_dir).parts[0] not in ("postProcessing", "dynamicCode")
+                        and not _is_number(p.relative_to(case_dir).parts[0]))
+               # Files the study gives, wherever they sit: listed by name only,
+               # a network's card and header were judged unseen
+               # (nn_in_solver_demo_20261022_1129, case_006).
+               # An earlier attempt's scripts are named, not shown: shown whole,
+               # ten 100-300 KB scripts would fill the view.
+               + [case_dir / rel for rel in sorted(given) if _earlier_attempt_shown(rel, requirement, scripts_text)])
+    from cfd_langgraph.solver_shelf import own_runtime
+
+    runtime = own_runtime(case_dir)
+    fixed_allrun = bool(runtime)
+    # hyStrath runs no added function objects and its Allrun is fixed: a value
+    # it does not write itself (a shock stand-off, a sampled line) is worked
+    # out from its written fields at analysis, not made by editing the case.
+    no_function_objects = runtime.get("function_objects") is False
     summary = mesh_summary(case_dir)
     parts: List[str] = [f"<mesh>{summary}</mesh>"] if summary else []
     left_out: List[str] = []
@@ -1433,10 +2124,16 @@ def _case_files_xml(case_dir: Path, *, given: set, zero_template: str = "", mesh
         except OSError:
             continue
         if "\x00" in text[:4096]:
-            continue
+            # Named, not dropped: a given TorchScript model was otherwise in
+            # neither this view nor the list of other files.
+            text = f"(a binary file of {path.stat().st_size} bytes)"
         text = _abbreviated_field(text)
-        if len(text) > max_file_kb * 1024:
-            text = text[: max_file_kb * 1024] + "\n... [truncated]"
+        cap_kb = max(max_file_kb, _SCRIPT_VIEW_KB) if path.suffix == ".py" else max_file_kb
+        # A long JSON file as its outline, not its first 30 KB: cut, an earlier
+        # attempt's 1.5 MB evaluation record showed only raw log lines, never
+        # its "blocks" member, and the script's checks of it failed three runs
+        # (nn_airfoil_s814_20261026_1537, case_003).
+        text = _file_view(path, text, cap_kb * 1024)
         if total + len(text) > max_total_kb * 1024:
             left_out.append(str(rel))
             continue
@@ -1446,11 +2143,27 @@ def _case_files_xml(case_dir: Path, *, given: set, zero_template: str = "", mesh
             note = "<note>given by the study: stays as it is</note>"
         elif mesh_fixed and path.name == "blockMeshDict":
             note = "<note>the study's selected mesh: stays as it is</note>"
+        elif fixed_allrun and str(rel) == "Allrun" and no_function_objects:
+            note = ("<note>runs the case and stays as it is, and this solver runs no added function "
+                    "objects: a quantity the requirement asks for that the solver does not write as a "
+                    "field (a profile, a sampled line, a derived number) is made from the written fields "
+                    "by the case's Allrun.post, which runs after the Allrun finishes cleanly, or else "
+                    "worked out when the study analyses the results. Check that the fields it needs are "
+                    "written.</note>")
+        elif fixed_allrun and str(rel) == "Allrun":
+            note = ("<note>runs the case and stays as it is: what the run must produce besides the solve "
+                    "is set in the case's dictionaries (function objects) or made by the case's "
+                    "Allrun.post, which runs after the Allrun finishes cleanly</note>")
         parts.append(f"<foamfile><file_name>{path.name}</file_name>"
                      f"<folder_name>{str(rel.parent).strip('.')}</folder_name>{note}"
                      f"<content>{text}</content></foamfile>")
     if left_out:
         parts.append(f"<!-- not shown, too large: {', '.join(left_out)} -->")
+    earlier = [rel for rel in sorted(given) if not _earlier_attempt_shown(rel, requirement, scripts_text)
+               and (case_dir / rel).is_file()]
+    if earlier:
+        parts.append("<!-- in the case, not shown (earlier attempts' files the requirement does not name, "
+                     f"given as they were): {', '.join(earlier)} -->")
     # Every other file of the case, by name: shown only the dictionaries and
     # top-level scripts, the check reported FFD/bumpFFD.xyz "absent" round
     # after round while it sat in the case (shelf_demo_dafoam_20261019_1057).
@@ -1476,6 +2189,49 @@ def _is_number(name: str) -> bool:
     except ValueError:
         return False
     return True
+
+
+def _earlier_files_ctx(case_dir: Path, given: set, changes: str, content: str, budget: int = 200_000) -> str:
+    """The earlier attempts' files an edit's change or its file names, as the
+    edit is shown them. Shown only to the check that planned it, a change to
+    validate an earlier attempt's evaluation records was written blind: the
+    script called .get on its weight vectors and looked for keys the records
+    do not have (nn_airfoil_s814_20261026_1537, case_003)."""
+    parts: List[str] = []
+    total = 0
+    for rel in sorted(given):
+        if Path(rel).parts[:1] != ("previous_attempts",) or Path(rel).suffix == ".py":
+            continue
+        if not (_earlier_attempt_shown(rel, changes) or _earlier_attempt_shown(rel, "", content)):
+            continue
+        path = case_dir / rel
+        if not path.is_file():
+            continue
+        view = _file_view(path, path.read_text(encoding="utf-8", errors="ignore"), 30 * 1024)
+        if total + len(view) > budget:
+            parts.append(f"{rel}: not shown, too large for what is left")
+            continue
+        total += len(view)
+        parts.append(f"{rel} (an earlier attempt's file, given as it is):\n{view}")
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+def _made_when_run(rel: Path) -> str:
+    """What a new file at ``rel`` would be, when it is something the run
+    script of a script-run case makes as it runs, else "". A setup-check fix
+    wrote a DAFoam case's continuation records and five per-angle case
+    folders by hand, file by file, one record a summary declaring itself
+    validated and a 1.5 MB evaluation record retyped as 4.5 KB
+    (nn_airfoil_s814_20261026_1537, case_003)."""
+    # In a subfolder only: a file at the case's top level is the case's own
+    # input, such as the configuration its scripts read. Refused there too, a
+    # training case's campaign_config.json could not be written and its run
+    # stopped on FileNotFoundError (nn_airfoil_s814_20261026_1537, case_003).
+    if len(rel.parts) > 1 and rel.suffix.lower() in (".json", ".csv", ".dat", ".npz", ".npy"):
+        return "record"
+    if len(rel.parts) > 2 and rel.parts[-2] in ("0", "constant", "system"):
+        return f"copy of the case ({rel.parts[-2]}/ of a case folder inside the case)"
+    return ""
 
 
 def _apply_edits(
@@ -1520,7 +2276,11 @@ def _apply_edits(
                 "Fix the case files instead. That Allrun meshes the case, then runs its solver "
                 "or run script on the number of MPI ranks set by numberOfSubdomains in "
                 "system/decomposeParDict, read at each run: to change the rank count, edit that "
-                "file (or what the script expects).")
+                "file (or what the script expects). Anything else the run needs done before it "
+                "starts (files to copy, generate or install into the case) goes into the run "
+                "script, which runs in the case folder: proposed again for Allrun, a DAFoam "
+                "case's step installing its reference data was refused twice and the case "
+                "stopped unchanged (shelf_demo_dafoam_20261019_1057, case_001).")
             continue
         if _in_a_mesh(rel):
             # The mesh itself, made by the meshing tools or given with the
@@ -1563,6 +2323,15 @@ def _apply_edits(
             history.append(f"Reviewer proposed editing {rel}, which is a folder; rejected. "
                            "Name the files inside it.")
             continue
+        if run_script_name and not t.get("delete") and not target_path.is_file() and not gz_path.is_file():
+            made = _made_when_run(rel)
+            if made:
+                history.append(
+                    f"Reviewer proposed writing {rel}, a new {made}, by hand; rejected. In a case run by "
+                    f"{run_script_name}, what the run needs copied or made (records, imported checkpoints, a "
+                    "case folder per condition) is copied or made by that script when it runs. Written "
+                    "here it holds what was typed, not what was given or computed. Change the script.")
+                continue
         if t.get("delete"):
             if rel == Path("Allrun"):
                 history.append("Reviewer proposed removing Allrun, which runs the case; rejected.")
@@ -1597,20 +2366,45 @@ def _apply_edits(
                 "rejected. Change what writes this file, or change it with the case's own script.")
             edit_failures += 1
             continue
+        edit_kwargs = dict(
+            file_name=file_name, folder_name=folder_name,
+            changes=(f"{t['changes']}\n\n{_RUN_SCRIPT_RULES}" + solver_notes + _examples_note(script_examples)
+                     if run_script_name and file_name == run_script_name and not folder_name
+                     else t["changes"] + solver_notes),
+            current_content=current_content,
+            written_files_ctx=_written_files_ctx(case_dir, subtasks, len(subtasks))
+            + _earlier_files_ctx(case_dir, given, t["changes"], current_content)
+            + _patch_note(case_dir, folder_name),
+            case_solver=case_solver,
+        )
         try:
             # Long files are changed by exact replacements, not sent back whole.
-            edit = writer.edit_file_by_patches if len(current_content) > _PATCH_EDIT_CHARS else writer.edit_file
-            new_content = edit(
-                llm,
-                file_name=file_name, folder_name=folder_name,
-                changes=(f"{t['changes']}\n\n{_RUN_SCRIPT_RULES}" + solver_notes + _examples_note(script_examples)
-                         if run_script_name and file_name == run_script_name and not folder_name
-                         else t["changes"] + solver_notes),
-                current_content=current_content,
-                written_files_ctx=_written_files_ctx(case_dir, subtasks, len(subtasks))
-                + _patch_note(case_dir, folder_name),
-                case_solver=case_solver,
-            )
+            if len(current_content) > _PATCH_EDIT_CHARS:
+                try:
+                    new_content = writer.edit_file_by_patches(llm, **edit_kwargs)
+                except Exception as patch_exc:
+                    # A script whose replacements would not apply is rewritten
+                    # whole instead. Left as it was, a 133 KB DAFoam training
+                    # script kept the startup deadlock every check had asked
+                    # to remove, and ran it again (nn_airfoil_s814_20261026_1537,
+                    # case_003).
+                    if not (file_name.endswith(".py") and len(current_content) <= _SCRIPT_VIEW_KB * 1024):
+                        raise
+                    print(f"[foam-native] {case_dir.name}: {rel} could not be patched ({patch_exc}); "
+                          "rewriting it whole", flush=True)
+                    new_content = writer.edit_file(llm, **edit_kwargs)
+                    # Rewritten whole, a 103 KB DAFoam script came back as an
+                    # 18 KB wrapper that ran the unchanged original from
+                    # previous_attempts/, so none of the changes were made
+                    # (nn_airfoil_s814_20261026_1537, case_003).
+                    if len(new_content) < len(current_content) // 2 and "remov" not in t["changes"].lower():
+                        raise ValueError(
+                            f"rewritten whole, the {len(current_content)}-character script came back "
+                            f"{len(new_content)} characters long; a rewrite asked for these changes keeps "
+                            "the rest of the script. Make the changes by exact replacements in the script "
+                            "itself.")
+            else:
+                new_content = writer.edit_file(llm, **edit_kwargs)
         except Exception as exc:
             # One file's edit failing (the model returning nothing for a
             # file it meant to remove, five times) ended the whole case
@@ -1679,14 +2473,31 @@ def _setup_check(llm: Any, case_dir: Path, user_requirement: str, *, files_xml: 
                                    solver_notes=solver_notes)
         entry: Dict[str, Any] = {"items": items}
         record["rounds"].append(entry)
-        problems = [i for i in items if i["status"] in review.SETUP_PROBLEMS]
+        # Only what changes the run is fixed before it: fixing every record-keeping
+        # item too, a DAFoam training case spent 45 minutes and some 30 model
+        # calls in setup before its first run (nn_airfoil_s814_20261026_1537,
+        # case_003). Record-keeping items are reported with the results.
+        problems = [i for i in items if i["status"] in review.SETUP_PROBLEMS and i.get("effect") != "record"]
         if not problems or attempt == rounds:
             break
+        # What an earlier round fixed and now matches, so this round's edit
+        # keeps it: a second round set a comparison value, also "applied" the
+        # other case's normalization to the same file, and undid the first
+        # round's span fix (shelf_demo_hystrath_20261022_1030, case_004).
+        # Listed as the earlier round worded them: each round's check words its
+        # items anew, so the same requirement does not match by its text.
+        now_problem = {p["requirement"] for p in problems}
+        keep = list({p["requirement"]: p for r in record["rounds"][:-1] for p in r["items"]
+                     if p["status"] in review.SETUP_PROBLEMS and p["requirement"] not in now_problem}.values())
         analysis = (
             "The case has not run yet. Its files were checked against the requirement and these "
             "differ from it. Fix exactly these, and change nothing else:\n" + "\n".join(
                 f"- {p['requirement']}: {p['status']} in {p['file'] or 'the case'} "
-                f"(found: {p['found'] or 'nothing'}). Fix: {p['fix']}" for p in problems)) + solver_notes
+                f"(found: {p['found'] or 'nothing'}). Fix: {p['fix']}" for p in problems)
+            + ("\n\nAn earlier fix in this check already corrected these. Keep them as they are "
+               "now (an edit for the items above must not change them back):\n" + "\n".join(
+                   f"- {k['requirement']} in {k['file'] or 'the case'} (before that fix: {k['found'] or 'missing'})"
+                   for k in keep) if keep else "")) + solver_notes
         targets = review.plan_rewrite(llm, foamfiles_xml=files_xml(), error_logs="(the case has not run yet)",
                                       review_analysis=analysis, user_requirement=user_requirement)
         entry["edits"] = targets
@@ -1711,8 +2522,10 @@ def _setup_check(llm: Any, case_dir: Path, user_requirement: str, *, files_xml: 
             earlier = []
     (case_dir / "setup_check.json").write_text(json.dumps({**record, "earlier": earlier}, indent=2))
     for item in record["remaining"]:
+        kind = ("record-keeping only, not fixed before the run"
+                if item.get("effect") == "record" else item["status"])
         print(f"[foam-native] {case_dir.name}: setup still differs from the requirement: "
-              f"{item['requirement']} ({item['status']}, found {item['found'] or 'nothing'})", flush=True)
+              f"{item['requirement']} ({kind}, found {item['found'] or 'nothing'})", flush=True)
     return {k: record[k] for k in ("checked", "fix_rounds", "remaining", "unclear")}
 
 
@@ -1752,6 +2565,9 @@ def run_foam_case(
     t0 = time.monotonic()
     case_dir = Path(case_dir)
     case_dir.mkdir(parents=True, exist_ok=True)
+    # What the harness writes and what each run writes, for the study's file
+    # ledger (a seeded case keeps its own).
+    ledger = _CaseLedger(case_dir)
 
     # ``seed_only``: the validated base case IS the case to run, so nothing is
     # authored — no parse, no RAG, no decompose, no per-file write, and no
@@ -1775,6 +2591,15 @@ def run_foam_case(
     # requirement written from the starter can name another. Every DAFoam case
     # asked for the starter's 8000 cells, ran on the selected 58835, and its own
     # script stopped on the mismatch (shelf_demo_dafoam_20261011_1437).
+    # The study's limit on one run, said before the case is written: told only
+    # once a run was stopped, a DSMC case's writer had set its run up at six
+    # times what a run may take (shelf_demo_hystrath_20261022_1030).
+    if _max_run_s():
+        user_requirement = (
+            f"{user_requirement}\n\nRUN TIME: this study allows one run of a case at most "
+            f"{_max_run_s() / 3600:g} h, on the cores system/decomposeParDict gives it. Set the run up to "
+            "finish within that: its endTime, time step and number of cells or particles decide what it "
+            "costs. A run that cannot finish in it is stopped once its pace shows that.")
     if mesh_seed_case_dir is not None:
         seed_cells = _n_cells(Path(mesh_seed_case_dir))
         if seed_cells:
@@ -1875,7 +2700,13 @@ def run_foam_case(
         # a written Allrun of blockMesh and setFields instead, every olaFlow
         # breakwater case solved on the bare block mesh, 33000 cells against
         # fields for the seed's 32610 (shelf_demo_olaflow_20261011_1242).
-        if _read_state(base_case_seed_dir).get("own_allrun") and _copy_own_allrun(base_case_seed_dir, case_dir):
+        # A starter case as shipped (never written here, so no state file)
+        # runs its own Allrun too: without it hyStrath's DSMC checks at Knudsen
+        # 0.05 and 0.01 ran a plain split instead of the starter's balanced
+        # decomposition, about 3x slower (shelf_demo_hystrath_20261022_1030).
+        as_shipped = not (base_case_seed_dir / ".foamagent_state.json").is_file()
+        if ((as_shipped or _read_state(base_case_seed_dir).get("own_allrun"))
+                and _copy_own_allrun(base_case_seed_dir, case_dir)):
             own_allrun = True
             state = _read_state(case_dir)
             (case_dir / ".foamagent_state.json").write_text(
@@ -1902,9 +2733,22 @@ def run_foam_case(
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
         given.add(str(rel_path))
-        if not any(str(Path(s.get("folder_name") or "") / s["file_name"]) == str(rel_path) for s in subtasks):
-            subtasks.append({"folder_name": str(rel_path.parent).strip("."), "file_name": rel_path.name})
+        if rel_path.parts[:1] == ("previous_attempts",):
+            # An earlier attempt's record is in the case, not a file to write
+            # against: made subtasks, 413 of them were shown, up to 12,000
+            # characters each, in every edit's prompt, 705,000 tokens a call
+            # (nn_airfoil_s814_20261026_1537, case_003).
+            continue
+        # First, so every file written after it is written against it.
+        subtasks[:] = [s for s in subtasks
+                       if str(Path(s.get("folder_name") or "") / s["file_name"]) != str(rel_path)]
+        subtasks.insert(0, {"folder_name": str(rel_path.parent).strip("."), "file_name": rel_path.name,
+                            "given": True})
         print(f"[foam-native] {case_dir.name}: {rel_path} given as it is, from {src}", flush=True)
+    earlier_count = sum(1 for g in given if Path(g).parts[:1] == ("previous_attempts",))
+    if earlier_count:
+        print(f"[foam-native] {case_dir.name}: {earlier_count} file(s) of earlier attempts given under "
+              "previous_attempts/", flush=True)
 
     # Files the manager changed after the case's previous run (run_case_native's
     # carried_files): copied over the seed and not rewritten by the writer, but,
@@ -1940,15 +2784,67 @@ def run_foam_case(
     if run_script_name and (case_dir / run_script_name).is_file() and not any(
             s.get("file_name") == run_script_name and not s.get("folder_name") for s in subtasks):
         subtasks.append({"file_name": run_script_name, "folder_name": ""})
+    # Scripts nothing ran: a solver's own Allrun stays as it is and runs only
+    # the solve, so the case's post-processing scripts never ran, every record
+    # they were to write was missing, and the interpreter asked for the case
+    # again (shelf_demo_hystrath_20261022_1030, case_001, case_004, case_005).
+    # Such a case gets an Allrun.post that runs them once the Allrun has
+    # finished cleanly (_run_post).
+    # Also on a solver's own OpenFOAM with a written Allrun: that Allrun runs
+    # inside the solver's wrapper, which has no Python of this study, and the
+    # case loop keeps it as written, so hy2Foam cases had no way to run their
+    # post-processing either (shelf_demo_hystrath_20261022_1030, case_005).
+    post_run = (own_allrun or bool(own_runtime(case_dir))) and "Allrun" not in given
+    # Always, not only when the plan already lists scripts: a hy2Foam case
+    # put its post-processing in a script named Allrun.validation, and with no
+    # .py or .sh in its plan it got no Allrun.post to run it
+    # (shelf_demo_hystrath_20261022_1030, case_001).
+    if post_run and not any(s.get("file_name") == "Allrun.post" and not s.get("folder_name")
+                            for s in subtasks):
+        subtasks.append({"file_name": "Allrun.post", "folder_name": ""})
     # The solver's own example scripts, for a case its solver runs by a
     # script: the writer and the reviewer otherwise know its API from memory
     # alone (see rag.shelf_example_scripts).
     script_examples = (rag.shelf_example_scripts(
         user_requirement, _read_solver_from_control_dict(case_dir) or case_info["case_solver"])
         if run_script_name else "")
-    solver_notes = _notes_block(rag.shelf_usage_notes(
-        user_requirement, _read_solver_from_control_dict(case_dir) or case_info["case_solver"]))
+    def _shelf_notes() -> str:
+        return _notes_block(rag.shelf_usage_notes(
+            user_requirement, _read_solver_from_control_dict(case_dir) or case_info["case_solver"]))
+
+    shelf_notes = _shelf_notes()
+    solver_notes = shelf_notes
     solver_notes += _other_cases_note(case_dir, user_requirement)
+    # How the case's own scripts run: told nothing, an NN case's script sourced
+    # OpenFOAM's etc/bashrc under "set -e", which stops the shell at once with
+    # exit 1 and no output, and its log said only "exit code 1"
+    # (nn_in_solver_demo_20261022_1129, case_006).
+    solver_notes += (
+        "\n\nThe case's Allrun, and every script it runs, start with the case's OpenFOAM environment "
+        "already loaded: a script does not source OpenFOAM's etc/bashrc again. Sourced under "
+        "\"set -e\", that file stops the shell at once with exit code 1 and prints nothing.")
+    # The exact solve command. Told only that the case "is solved by running
+    # python runScript.py", a DAFoam lift-curve case made --aoa a required
+    # argument and put its sweep over angles in a runCampaign.py nothing ran;
+    # the Allrun started runScript.py with no arguments and every rank exited
+    # at once (nn_airfoil_s814_20261026_1537, case_002).
+    if run_script_name:
+        solve = allrun_mod.script_command(own_runtime(case_dir).get("run") or "")
+        solver_notes += (
+            f"\n\nThe framework solves this case with exactly `mpirun -np <n> {solve}`, once, with "
+            f"no arguments. Everything the requirement asks the run to compute -- every angle, "
+            f"condition or step of it -- happens inside that one command: {run_script_name} takes "
+            "no required command-line argument (any it reads has a default that is the run the "
+            f"requirement asks for), and a helper script the case needs is called from "
+            f"{run_script_name}, never run in its place.")
+    if post_run:
+        solver_notes += post_notes(case_dir, base_case_seed_dir)
+    # The given mesh as it is on disk, for the writer and review too: only the
+    # setup check had it (see mesh_summary).
+    if given_mesh or mesh_seed_case_dir is not None:
+        summary = mesh_summary(case_dir)
+        if summary:
+            solver_notes += f"\n\nThe case's mesh is given, not written: {summary}."
 
     # Stage 5 — write each subtask file. A file that came from the seed is
     # EDITED toward the requirement, never overwritten from nothing, so the
@@ -1961,6 +2857,17 @@ def run_foam_case(
             print(f"[foam-native] skipped writing {out_path.relative_to(case_dir)}: it is a folder, "
                   "not a file", flush=True)
             continue
+        nested_seed = (_nested_seed_file(case_dir, out_path)
+                       if base_case_seed_dir is not None and not out_path.exists() else None)
+        if nested_seed is not None:
+            # A copy of the case inside the case (timing_case/, production_case/)
+            # starts from the case's own file, not from nothing: written fresh,
+            # DAFoam's transportProperties came out in OpenFOAM 10's dimensioned
+            # form and v2506 refused it (nn_cbfs_les_v2_20261107_2238, case_004).
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(nested_seed, out_path)
+            print(f"[foam-native] {case_dir.name}: {out_path.relative_to(case_dir)} starts from the "
+                  f"case's {nested_seed.relative_to(case_dir)}", flush=True)
         seeded_content = (
             out_path.read_text(encoding="utf-8", errors="ignore")
             if (base_case_seed_dir is not None and out_path.is_file())
@@ -2151,7 +3058,7 @@ def run_foam_case(
         try:
             setup_check = _setup_check(
                 llm, case_dir, user_requirement,
-                files_xml=lambda: _case_files_xml(case_dir, given=given, zero_template=zero_template,
+                files_xml=lambda: _case_files_xml(case_dir, given=given, zero_template=zero_template, requirement=user_requirement,
                                                   mesh_fixed=mesh_seed_case_dir is not None),
                 apply=apply_edits, history=history,
                 rounds=int(os.environ.get("CFD_SCIENTIST_SETUP_CHECK_ROUNDS", "2")), solver_notes=solver_notes)
@@ -2183,16 +3090,35 @@ def run_foam_case(
     # and their records named a start-up line as the error
     # (shelf_demo_dafoam_20261015_1318).
     time_up = ""
+    slow_stops = 0  # runs stopped for not fitting the time they had
     # A case the review could not change is not run again: every edit refused
     # (a given file) or failed left the same failing script, which was then
     # run ten times over (shelf_demo_dafoam_20261015_1318).
     unchanged = ""
     last_inputs = ""
+    # A requirement the case cannot meet: the same failure twice running while
+    # the setup check still finds one of its items missing from the case. Only
+    # the study can change a requirement, and the loop went on rewriting the
+    # case: an NN gradient check required a pass threshold "from the supplied
+    # contract" that no supplied file held, and its scripts refused to run,
+    # attempt after attempt (nn_airfoil_s814_20261026_1537, case_001).
+    unmeetable = ""
+    last_failure = ""
+    last_verdicts: List[str] = []
 
     def _fingerprinted() -> List[str]:
         return [str(Path(t.get("folder_name") or "") / str(t.get("file_name") or ""))
                 for t in subtasks if t.get("file_name")] + sorted(touched)
     for loop_count in range(1, max_loop + 1):
+        # The shelf's usage notes as they are now, each round. Read once at the
+        # start, a note added mid-run (DAFoam fixes each solve's length when the
+        # problem is built) reached no round of the case loops already running,
+        # and two cases kept failing on it (nn_airfoil_s814_20261026_1537).
+        latest = _shelf_notes()
+        if latest != shelf_notes and shelf_notes in solver_notes:
+            solver_notes = solver_notes.replace(shelf_notes, latest, 1)
+            shelf_notes = latest
+            print(f"[foam-native] {case_dir.name}: solver notes updated for run {loop_count}", flush=True)
         if prepare is not None:
             prepare(case_dir)  # a reviewer's rewrite may have dropped it
         last_inputs = _inputs_fingerprint(case_dir, _fingerprinted())
@@ -2203,17 +3129,34 @@ def run_foam_case(
             loop_count -= 1
             break
         run_started = time.time()
+        ledger.before_run(loop_count)
         returncode, out, err, timed_out = run_script(["./Allrun"], case_dir, allrun_env, max(remaining, 60))
+        _reap_case_processes(case_dir)
         allrun_out = out + "\n" + err
         (case_dir / "Allrun.out").write_text(allrun_out)
+        ledger.after_run(loop_count)
         if timed_out and TIME_LIMIT_NOTE in err:
             time_up = (f"Run {loop_count} used up the case's time limit ({max_time_limit_s / 3600:g} h) "
                        "while it was still running (not stuck or crashed); it was stopped there.")
             break
+        if timed_out and (PACE_NOTE in err or CAP_NOTE in err):
+            slow_stops += 1
+            if slow_stops >= _SLOW_STOPS:
+                time_up = (f"{slow_stops} runs of this case were stopped because at their pace they could "
+                           "not finish in the time a run has"
+                           + (f" (the study allows one run at most {_max_run_s() / 3600:g} h)" if _max_run_s() else "")
+                           + ": as set up, it costs more than the study allows. It is left for the study to "
+                           "decide: make it cheaper (a shorter endTime, a larger time step, fewer cells or "
+                           "particles) or leave it out."
+                           + _cost_differences(case_dir, base_case_seed_dir or mesh_seed_case_dir))
+                break
 
+        solver_log = _solver_log(case_dir, case_info["case_solver"])
         clean = (
             returncode == 0
-            and _solver_ended_cleanly(case_dir, case_info["case_solver"])
+            and (_solver_ended_cleanly(case_dir, case_info["case_solver"])
+                 or ((not solver_log.is_file() or _solver_ran_no_steps(case_dir, case_info["case_solver"]))
+                     and _solved_in_written_logs(case_dir, run_started)))
             and not _has_fatal(case_dir)
             and not mesh_check_errors(case_dir)
         )
@@ -2222,6 +3165,25 @@ def run_foam_case(
             break
         if loop_count >= max_loop:
             break
+        failure = _failure_line(case_dir, since=run_started)
+        verdicts = _run_verdicts(case_dir, run_started)
+        # A value found different counts as much as one found absent: case_006's
+        # unmet item was a "mismatch", and its ten refusals were never stopped.
+        missing = [i for i in (setup_check.get("remaining") or [])
+                   if i.get("status") in review.SETUP_PROBLEMS and i.get("effect") != "record"]
+        same = (failure and failure == last_failure) or (verdicts and verdicts == last_verdicts)
+        if same and missing:
+            unmeetable = (
+                f"Runs {loop_count - 1} and {loop_count} failed the same way "
+                f"({(failure if failure == last_failure else ', '.join(verdicts))[:300]}) while the "
+                "case still lacks what its requirement asks for: "
+                + "; ".join(f"{i.get('requirement', '')} (found: {i.get('found') or 'nothing'})"[:400]
+                            for i in missing[:4])
+                + ". The case cannot change its requirement; it is left for the study to decide (rewrite "
+                "the requirement, or rerun with a clarification that resolves it).")
+            break
+        last_failure = failure
+        last_verdicts = verdicts
 
         # Stages 8a-8c, once more when nothing could be changed: the reviewer
         # then has the refusals in front of it. Stopped after one round, a
@@ -2229,11 +3191,18 @@ def run_foam_case(
         # proposed an Allrun edit, was refused, and the case ended before it
         # could act on the refusal (shelf_demo_dafoam_20261019_1057, case_002).
         for review_round in range(1, _REVIEW_ROUNDS + 1):
+            # The whole case, given files too, as the setup check sees it. Shown
+            # only the files written for it, the reviewer of a script that
+            # failed on its own check of an earlier attempt's records never saw
+            # those records, and its fixes guessed their layout three runs
+            # running (nn_airfoil_s814_20261026_1537, case_003).
+            files_xml = _case_files_xml(case_dir, given=given, zero_template=zero_template, requirement=user_requirement,
+                                        mesh_fixed=mesh_seed_case_dir is not None)
             # Stage 8a — reviewer
             analysis = review.review_errors(
                 llm,
                 tutorial_reference=refs.get("tutorial_reference", "") + solver_notes + _examples_note(script_examples),
-                foamfiles_xml=_foamfiles_xml(case_dir, subtasks),
+                foamfiles_xml=files_xml,
                 error_logs=collect_error_logs(case_dir, since=run_started),
                 user_requirement=user_requirement,
                 history_text="\n".join(f"Prior attempt {i + 1}: {h}" for i, h in enumerate(history)),
@@ -2243,7 +3212,7 @@ def run_foam_case(
             # Stage 8b — rewrite plan
             target_files = review.plan_rewrite(
                 llm,
-                foamfiles_xml=_foamfiles_xml(case_dir, subtasks),
+                foamfiles_xml=files_xml,
                 error_logs=collect_error_logs(case_dir, since=run_started),
                 review_analysis=analysis,
                 user_requirement=user_requirement,
@@ -2260,7 +3229,7 @@ def run_foam_case(
                 try:
                     setup_check = _setup_check(
                         llm, case_dir, user_requirement,
-                        files_xml=lambda: _case_files_xml(case_dir, given=given, zero_template=zero_template,
+                        files_xml=lambda: _case_files_xml(case_dir, given=given, zero_template=zero_template, requirement=user_requirement,
                                                           mesh_fixed=mesh_seed_case_dir is not None),
                         apply=apply_edits, history=history, rounds=1, label=f"before run {loop_count + 1}",
                         solver_notes=solver_notes)
@@ -2300,8 +3269,9 @@ def run_foam_case(
         "loop_count": loop_count,
         "max_loop": max_loop,
         "wall_time_s": wall_time_s,
-        "error_logs": [] if success else [m for m in (time_up, unchanged) if m] + [error_summary(case_dir)],
+        "error_logs": [] if success else [m for m in (time_up, unchanged, unmeetable) if m] + [error_summary(case_dir)],
         "stopped_by_time_limit": bool(time_up),
+        "requirement_unmeetable": unmeetable,
         # What the review tried, and what was refused or failed, run by run.
         # Kept only in memory, a record that said "the review changed no file"
         # could not show why (shelf_demo_dafoam_20261019_1057, case_002).
@@ -2312,20 +3282,259 @@ def run_foam_case(
         "setup_check": setup_check,
         **({"carried_changed_by_setup_check": carried_changed} if carried_changed else {}),
     }
+    # Written before Allrun.post runs, so its scripts can read the run's own
+    # record (status, wall time, review history); they read a missing file
+    # or a previous run's (shelf_demo_hystrath_20261022_1030, case_001).
     (case_dir / "run_result.json").write_text(json.dumps(run_result, indent=2))
+    if success and post_run and (case_dir / "Allrun.post").is_file():
+        # A failed Allrun.post is reviewed and its scripts fixed, and it runs
+        # again; the solve is not repeated. Recorded only, case_004's first
+        # script stopped at once on a reader marker it had guessed
+        # ("case.foam"), and none of the case's records were made
+        # (shelf_demo_hystrath_20261022_1030).
+        run_result["post_processing"] = run_post_with_repairs(
+            llm, case_dir, user_requirement, allrun_env,
+            max(max_time_limit_s - (time.monotonic() - t0), 600.0),
+            history=history, solver_notes=solver_notes, zero_template=zero_template, apply=apply_edits)
+
+        (case_dir / "run_result.json").write_text(json.dumps(run_result, indent=2))
     return run_result
 
 
-def _prescribed_mesh(case_dir: Path) -> bool:
-    """A case on a solver's own OpenFOAM whose mesh is shipped with it
-    (constant/polyMesh, no blockMeshDict): the mesh-independence gate cannot
-    refine it and takes it as given (manager tools, run_mesh_gate)."""
+# The workflow's records of a case that Allrun.post may read but not write.
+_POST_PROTECTED = ("decision.json", "run_result.json", "setup_check.json", ".foamagent_state.json",
+                   ".case_scripts.json")
+
+# How long a case's Allrun.post may take at most, and how many times a
+# failed one is fixed and run again.
+_POST_TIMEOUT_S = 3600.0
+_POST_REPAIRS = 2
+# The framework's own source, importable in Allrun.post (cfd_langgraph.foam_load).
+_SRC_DIR = Path(__file__).resolve().parents[2]
+
+
+def _written_field_names(case_dir: Path) -> List[str]:
+    """The files of a solved case's latest time folder (reconstructed, or its
+    first processor folder's), by name: the fields its solver writes."""
+    from .case_clean import parse_time_dir
+
+    case_dir = Path(case_dir)
+    for root in (case_dir, case_dir / "processor0"):
+        if not root.is_dir():
+            continue
+        times = [(parse_time_dir(d.name), d) for d in root.iterdir() if d.is_dir()]
+        times = [(t, d) for t, d in times if t is not None and t > 0]
+        if times:
+            latest = max(times, key=lambda td: td[0])[1]
+            return sorted(f.name for f in latest.iterdir() if f.is_file())
+    return []
+
+
+def _post_file(rel: str, zero_template: str = "") -> bool:
+    """Whether a case file is post-processing (Allrun.post or a script it
+    runs), as opposed to the solved case: its dictionaries, fields, mesh and
+    Allrun."""
+    parts = Path(rel).parts
+    if not parts or rel.strip("/") == "Allrun":
+        return False
+    return parts[0] not in {"0", "constant", "system", zero_template or "0"}
+
+
+def post_notes(case_dir: Path, seed_dir: Optional[Path] = None) -> str:
+    """What the writer and the review of a case's Allrun.post need to know:
+    when it runs and with what, how it opens the case, how OpenFOAM's own
+    utilities reach a solver's own OpenFOAM, and the fields the solve writes
+    (from ``seed_dir``'s run, else the case's own). Shared by a full run and
+    by run_case_native(post_only=True), whose repairs had none of it."""
     from cfd_langgraph.solver_shelf import own_runtime
 
     case_dir = Path(case_dir)
+    notes = ""
+    notes += (
+        "\n\nThis case's Allrun is its solver's own and stays as it is: it runs the solve and nothing "
+        "else. What the requirement asks the case to produce beyond the solver's own output (a "
+        "coefficient, a profile, a summary file) is made by the case's Allrun.post, a bash script in "
+        "the case folder that runs once the Allrun has finished cleanly: from the case folder, outside "
+        "the solver's own environment, with this study's Python (numpy, pyvista) first on PATH. It "
+        "runs the case's post-processing scripts in the order they need, under set -e. Nothing else "
+        "runs a script written for this case, and nothing runs before the Allrun: a step the "
+        "requirement places before the solve (a timing test, a benchmark run) has no place to run. "
+        "The harness times every run itself while it runs and stops one that would not finish in "
+        "the time a run has; Allrun.post reports the run's timing from the solver log's "
+        "ExecutionTime lines, and can read the run's own record, run_result.json (status, wall_time_s), "
+        "which is written before it starts. A solver log with a line reading End finished cleanly; in a "
+        "parallel run that line is followed by \"Finalising parallel run\", so End is not always the "
+        "last line (a check for End as the last line rejected a clean parallel hy2Foam run, "
+        "shelf_demo_hystrath_20261022_1030, case_003). The "
+        "\"sigFpe : Enabling floating point exception trapping\" line near the top of every OpenFOAM "
+        "log is a setting, not an error (a script that matched it rejected a clean hy2Foam run, "
+        "shelf_demo_hystrath_20261022_1030, case_001). In that Python, "
+        "`from cfd_langgraph.foam_load import load_case, load_patches, solved_times` opens the case "
+        "(load_case(case_dir) is its internal mesh at the latest solved time with every field, and "
+        "load_case(case_dir, time=t) at any written time t, also one written only in processor*/ "
+        "folders; solved_times(case_dir) lists them; load_patches(case_dir) is {patch name: mesh} "
+        "for wall quantities), with no marker file "
+        "needed; the case's own marker file, for a reader that needs one, is named after its "
+        f"folder: {case_dir.name}.foam.")
+    # OpenFOAM's own utilities go through the solver's wrapper: run in the
+    # installed OpenFOAM, a hy2Foam case's postProcess -func wallShearStress
+    # stopped on "unable to find turbulence model" three times, and none of
+    # its records were made (shelf_demo_hystrath_20261022_1030, case_005).
+    post_runtime = own_runtime(case_dir)
+    if post_runtime:
+        notes += (
+            f"\n\nThis case runs on {post_runtime.get('solver')}'s own OpenFOAM, not the installed one "
+            "that Allrun.post's environment has loaded. An OpenFOAM utility called from Allrun.post "
+            "(postProcess, foamDictionary, reconstructPar, sample) runs inside the solver's own OpenFOAM "
+            f"only when prefixed with its wrapper: `{post_runtime.get('wrapper')} <utility> ...`; run "
+            "bare, it is another OpenFOAM version that does not read this solver's cases."
+            + (" This solver runs no added function objects: work a wall quantity (shear, heat flux, a "
+               "force) out from the written fields in Python with load_case/load_patches instead."
+               if post_runtime.get("function_objects") is False else ""))
+    # The names the solve writes, from the seed's own run: case_004's
+    # extraction looked for its translational temperature under several
+    # names but not the one hyStrath writes (Ttra_Ar), and stopped
+    # (shelf_demo_hystrath_20261022_1030).
+    written = _written_field_names(seed_dir if seed_dir is not None else case_dir)
+    if written:
+        notes += (
+            "\n\nThe fields this case's solve writes, as its seed case's run wrote them at its "
+            f"latest time ({len(written)}): " + ", ".join(written[:80])
+            + ". Post-processing reads them by these names.")
+    return notes
+
+
+def _post_subtasks(case_dir: Path, zero_template: str = "") -> List[Dict[str, str]]:
+    """Allrun.post and the post-processing scripts beside and below it, as
+    subtasks for the review to read."""
+    found = [case_dir / "Allrun.post"] + [
+        f for f in sorted(case_dir.rglob("*"))
+        if f.is_file() and f.suffix in (".py", ".sh") and not f.name.startswith(".")
+        and "processor" not in str(f.relative_to(case_dir)).split("/")[0]
+        and _post_file(str(f.relative_to(case_dir)), zero_template)]
+    return [{"folder_name": str(f.relative_to(case_dir).parent).strip("."), "file_name": f.name}
+            for f in found if f.is_file()]
+
+
+def run_post_with_repairs(
+    llm: Any, case_dir: Path, user_requirement: str, env: Optional[Dict[str, str]], timeout_s: float, *,
+    history: Optional[List[str]] = None, solver_notes: str = "", zero_template: str = "",
+    apply: Optional[Callable[[List[Dict[str, Any]]], int]] = None,
+) -> Dict[str, Any]:
+    """Run the case's Allrun.post on its finished solve; when it fails, have
+    the review fix only Allrun.post and its scripts and run it again, up to
+    _POST_REPAIRS times. The solve is never repeated. Used after a clean solve
+    and by run_case_native(post_only=True): run once there, a manager expected
+    the fixing rounds a full run has, and a failed post-only run stopped at
+    its first error (shelf_demo_hystrath_20261022_1030)."""
+    case_dir = Path(case_dir)
+    history = history if history is not None else []
+    solver_notes = solver_notes or post_notes(case_dir)
+    subtasks = _post_subtasks(case_dir, zero_template)
+    if apply is None:
+        def apply(targets: List[Dict[str, Any]]) -> int:
+            return _apply_edits(
+                llm, case_dir, targets, history=history, zero_template=zero_template, given=set(),
+                mesh_seed_case_dir=None, run_script_name="", subtasks=subtasks,
+                case_solver=_read_solver_from_control_dict(case_dir), solver_notes=solver_notes)
+    started = time.monotonic()
+    record: Dict[str, Any] = {}
+    for post_round in range(1, _POST_REPAIRS + 2):
+        record = _run_post(case_dir, env, max(timeout_s - (time.monotonic() - started), 300.0))
+        record["round"] = post_round
+        if (record["returncode"] == 0 and not record["timed_out"]) or post_round > _POST_REPAIRS:
+            break
+        post_log = ("The solve finished cleanly; the case's Allrun.post then failed. "
+                    f"log.Allrun.post (end):\n{record['log_tail']}")
+        files_xml = _foamfiles_xml(case_dir, subtasks, max_file_kb=120, max_total_kb=1000)
+        analysis = review.review_errors(
+            llm, tutorial_reference=solver_notes, foamfiles_xml=files_xml,
+            error_logs=post_log, user_requirement=user_requirement,
+            history_text="\n".join(f"Prior attempt {i + 1}: {h}" for i, h in enumerate(history)))
+        targets = review.plan_rewrite(
+            llm, foamfiles_xml=files_xml, error_logs=post_log,
+            review_analysis=analysis + "\n\nThe solve is not run again: change only Allrun.post and "
+            "the post-processing scripts it runs, never the case's dictionaries, fields or mesh.",
+            user_requirement=user_requirement)
+        targets = [t for t in targets if _post_file(str(t.get("file") or ""), zero_template)]
+        history.append(f"Allrun.post failed after the solve (round {post_round}); edited "
+                       f"{', '.join(t['file'] for t in targets) or 'nothing'}.")
+        if not targets:
+            break
+        apply(targets)
+    return record
+
+
+def _run_post(case_dir: Path, env: Optional[Dict[str, str]], timeout_s: float) -> Dict[str, Any]:
+    """Run a case's Allrun.post after a clean solve, from the case folder:
+    outside the solver's own wrapper and with this study's Python first on
+    PATH, since it reads the written fields with numpy and pyvista. Its
+    outcome is recorded in run_result.json and log.Allrun.post; it never
+    makes the solve a failure."""
+    import sys
+
+    # The workflow's records of the case, which a script of the case may read
+    # but not write: run outside run_python's sandbox, a manager's audit
+    # script was set to write its own "ACCEPT_WITH_CAVEATS, confidence 0.99"
+    # into the interpreter's decision.json (shelf_demo_hystrath_20261022_1030,
+    # case_005). Each is put back as it was if Allrun.post changes it.
+    kept = {name: (case_dir / name).read_bytes() if (case_dir / name).is_file() else None
+            for name in _POST_PROTECTED}
+    run_env = dict(env if env is not None else os.environ)
+    run_env["PATH"] = f"{Path(sys.executable).parent}{os.pathsep}{run_env.get('PATH', '')}"
+    run_env["PYTHONPATH"] = os.pathsep.join(p for p in (str(_SRC_DIR), run_env.get("PYTHONPATH", "")) if p)
+    started = time.monotonic()
+    ledger = _CaseLedger(case_dir)
+    ledger.before_run(1, "post-processing run")
+    proc = subprocess.Popen(["bash", "Allrun.post"], cwd=str(case_dir), env=run_env,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=min(float(timeout_s), _POST_TIMEOUT_S))
+        timed_out = False
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        out, _ = proc.communicate()
+        timed_out = True
+    (case_dir / "log.Allrun.post").write_text(out or "")
+    ledger.after_run(1, "post-processing run")
+    refused = []
+    for name, before in kept.items():
+        target = case_dir / name
+        now = target.read_bytes() if target.is_file() else None
+        if now != before:
+            refused.append(name)
+            if before is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.write_bytes(before)
+    record = {
+        "ran": True,
+        "returncode": proc.returncode,
+        "timed_out": timed_out,
+        "wall_time_s": round(time.monotonic() - started, 1),
+        "log": "log.Allrun.post",
+        "log_tail": (out or "")[-2000:],
+        **({"refused_workflow_files": refused,
+            "note": "These are the workflow's own records of the case; Allrun.post may read them but not "
+                    "write them, so they were put back as they were."} if refused else {}),
+    }
+    print(f"[foam-native] {case_dir.name}: Allrun.post "
+          + ("timed out" if timed_out else f"exited {proc.returncode}")
+          + f" after {record['wall_time_s']:g} s (log.Allrun.post)", flush=True)
+    return record
+
+
+def _prescribed_mesh(case_dir: Path) -> bool:
+    """A case whose mesh is shipped with it (constant/polyMesh, no
+    blockMeshDict): the mesh-independence gate cannot refine it and takes it
+    as given (manager tools, run_mesh_gate), and its cases run on it. Not only
+    on a solver's own OpenFOAM: an OpenFOAM 10 case given such a mesh passed
+    the gate, and every case of it then stopped on "expected standard-mesh
+    blockMeshDict" (nn_in_solver_demo_20261022_1129, case_002)."""
+    case_dir = Path(case_dir)
     return ((case_dir / "constant" / "polyMesh").is_dir()
-            and not (case_dir / "system" / "blockMeshDict").is_file()
-            and bool(own_runtime(case_dir)))
+            and not (case_dir / "system" / "blockMeshDict").is_file())
 
 
 def _copy_case_files(base_case_dir: Path, case_dir: Path) -> None:
@@ -2374,7 +3583,13 @@ def _copy_case_files(base_case_dir: Path, case_dir: Path) -> None:
 
 # What a case directory may hold besides its inputs; never carried to a copy.
 _RUN_OUTPUTS = ("postProcessing", "dynamicCode", "VTK", "Allrun.out", "run_result.json",
-                ".foamagent_state.json")
+                ".foamagent_state.json",
+                # The harness's records of the source, not inputs: a case
+                # seeded from a mesh-gate level carried that level's
+                # mesh_assessment.json, and its interpreter read the level's
+                # review as the case's own (shelf_demo_hystrath_20261022_1030).
+                "mesh_assessment.json", "review_checks", "setup_check.json", "decision.json",
+                "failure.json", "interpreter_viz", "figs", ".case_scripts.json", "log.Allrun.post")
 
 
 def _copy_own_allrun(base_case_dir: Path, case_dir: Path) -> bool:
@@ -2396,8 +3611,9 @@ def _copy_own_allrun(base_case_dir: Path, case_dir: Path) -> bool:
         return False
     for item in base_case_dir.iterdir():
         name = item.name
+        # The source's .foam markers are named after the source's folder.
         if (name in _CASE_FILE_DIRS or name in _RUN_OUTPUTS or name.startswith(("log.", "processor"))
-                or parse_time_dir(name) is not None):
+                or name.endswith(".foam") or parse_time_dir(name) is not None):
             continue
         if item.is_dir():
             shutil.copytree(item, case_dir / name, dirs_exist_ok=True)
@@ -2601,6 +3817,16 @@ def mesh_summary(case_dir: Path) -> str:
     patches = _mesh_patches(case_dir)
     if patches:
         parts.append("patches: " + ", ".join(f"{name} ({kind})" for name, kind in patches))
+    # Its files by name: not shown them, an NN case's script checked for
+    # constant/polyMesh/owner and stopped, while the mesh was owner.gz
+    # (nn_in_solver_demo_20261022_1129, case_006).
+    poly = Path(case_dir) / "constant" / "polyMesh"
+    names = sorted(p.name for p in poly.iterdir() if p.is_file()) if poly.is_dir() else []
+    if names:
+        parts.append("files in constant/polyMesh: " + ", ".join(names)
+                     + (" (the .gz files are gzip-compressed, which OpenFOAM reads as they are; a script "
+                        "looking for a mesh file must accept the .gz name)" if any(n.endswith(".gz") for n in names)
+                        else ""))
     return "; ".join(parts)
 
 
@@ -2683,7 +3909,13 @@ def _not_finer(case_dir: Path, parent_dir: Path, parent_cells: Optional[int] = N
     # as over a budget of "about twice", five times, and the gate stopped.
     # 2.25 admits a uniform 1.5x step in two directions.
     budget = refine_budget(parent_dir)
-    if child is not None and parent is not None and child > budget * parent and child > REFINE_FREE_CELLS:
+    # Cells added to cap cell growth (refine_block_counts) are a quality fix,
+    # not a bigger step, so they may take a step past the budget.
+    bmd_text = (case_dir / "system" / "blockMeshDict").read_text(errors="ignore") \
+        if (case_dir / "system" / "blockMeshDict").is_file() else ""
+    growth_capped = any(line.startswith(GROWTH_NOTE) for line in bmd_text.splitlines())
+    if (child is not None and parent is not None and child > budget * parent and child > REFINE_FREE_CELLS
+            and not growth_capped):
         return (f"The refined mesh has {child} cells, {child / parent:.2f} times its parent's {parent}: "
                 f"one refinement step may add at most {budget:g} times the cells. Refine only "
                 "the regions and directions the instruction names, or by a smaller factor.")
@@ -2719,6 +3951,44 @@ def _foam_text(item: Any) -> str:
     return str(item)
 
 
+# Largest ratio of one cell to its neighbour that refining leaves in place; the
+# usual mesh-quality limit is 1.2 to 1.3.
+GROWTH_CAP = 1.2
+GROWTH_NOTE = "// Counts raised beyond the uniform factor so no cell is more than"
+
+
+def _block_growths(after_counts: List[Any]) -> List[Optional[float]]:
+    """A block's total expansion ratio along each of its three directions (the
+    largest over that direction's edges, >= 1), from the grading that follows
+    its cell counts; None where it is not a plain number (multi-grading)."""
+    if len(after_counts) < 2 or not isinstance(after_counts[1], list):
+        return [None, None, None]
+    kind, values = after_counts
+    if kind == "simpleGrading" and len(values) == 3:
+        per = [[values[0]], [values[1]], [values[2]]]
+    elif kind == "edgeGrading" and len(values) == 12:
+        per = [values[0:4], values[4:8], values[8:12]]
+    else:
+        return [None, None, None]
+    out: List[Optional[float]] = []
+    for edges in per:
+        try:
+            ratios = [float(v) for v in edges]
+        except (TypeError, ValueError):
+            out.append(None)
+            continue
+        out.append(max(max(r, 1.0 / r) for r in ratios) if all(r > 0 for r in ratios) else None)
+    return out
+
+
+def _cells_for_growth(total_ratio: float, cap: float = GROWTH_CAP) -> int:
+    """Fewest cells that spread ``total_ratio`` with no cell more than ``cap``
+    times its neighbour."""
+    if total_ratio <= cap:
+        return 1
+    return int(math.ceil(1 + math.log(total_ratio) / math.log(cap) - 1e-9))
+
+
 def refine_block_counts(block_mesh_dict: Path, env: Dict[str, str],
                         budget: float = REFINE_BUDGET, factor: Optional[float] = None) -> Optional[str]:
     """Refine every block of a blockMeshDict uniformly, in code: each direction
@@ -2727,8 +3997,20 @@ def refine_block_counts(block_mesh_dict: Path, env: Dict[str, str],
     wedge direction) stay at one, and equal counts stay equal, so blocks that
     share a face still match. Returns None on success, else why it could not."""
     path = Path(block_mesh_dict)
-    read = subprocess.run(["foamDictionary", "-entry", "blocks", "-value", "-expand", str(path)],
-                          env=env, capture_output=True, text=True)
+    # Expanded into a copy first, then the blocks read from it: asked for
+    # "-entry blocks -value -expand" at once, OpenFOAM v1706's foamDictionary
+    # prints the whole expanded file, so a hyStrath DSMC level could not be
+    # refined in code and was never solved (shelf_demo_hystrath_20261022_1030).
+    expanded = path.with_name(f".{path.name}.expanded")
+    try:
+        expand = subprocess.run(["foamDictionary", "-expand", str(path)], env=env, capture_output=True, text=True)
+        if expand.returncode != 0 or not expand.stdout.strip():
+            return f"foamDictionary could not expand {path.name}: {(expand.stderr or '').strip()[-300:]}"
+        expanded.write_text(expand.stdout)
+        read = subprocess.run(["foamDictionary", "-entry", "blocks", "-value", str(expanded)],
+                              env=env, capture_output=True, text=True)
+    finally:
+        expanded.unlink(missing_ok=True)
     if read.returncode != 0 or not read.stdout.strip():
         return f"foamDictionary could not read the blocks: {(read.stderr or '').strip()[-300:]}"
     try:
@@ -2739,12 +4021,14 @@ def refine_block_counts(block_mesh_dict: Path, env: Dict[str, str],
         return "the blocks entry is not a single list"
     blocks = top[0]
     counts: List[List[Any]] = []
+    growths: List[List[Optional[float]]] = []
     for i, item in enumerate(blocks):
         if item != "hex":
             continue
         # After the vertex list: an optional zone name, then the cell counts.
         found = None
-        for nxt in blocks[i + 2:]:
+        for j in range(i + 2, len(blocks)):
+            nxt = blocks[j]
             if nxt == "hex":
                 break
             if isinstance(nxt, list) and len(nxt) == 3 and all(
@@ -2754,21 +4038,55 @@ def refine_block_counts(block_mesh_dict: Path, env: Dict[str, str],
         if found is None:
             return f"block {len(counts)} has no cell counts this step can read"
         counts.append(found)
+        growths.append(_block_growths(blocks[j + 1:j + 3]))
     if not counts:
         return "the blockMeshDict has no hex blocks"
     dims = max(sum(1 for x in c if int(x) > 1) for c in counts)
     if dims == 0:
         return "no block has more than one cell in any direction"
     factor = factor or budget ** (1.0 / dims)
+    # Even refinement keeps a coarse mesh's cell growth: SD7003's 6k-cell
+    # starter grades 25 wall-normal cells over 18,137x, so each cell is 1.5x the
+    # one below it, and five even levels (13k-334k cells) never settled, while
+    # the 12k starter's 50 cells (1.22x) refined evenly settled at 60,480
+    # (sd7003lm_trial_1). So a count is also raised until no cell is more than
+    # GROWTH_CAP times its neighbour. Raised per original count, so equal
+    # counts stay equal and blocks that share a face still match.
+    need: Dict[int, int] = {}
+    for c, g in zip(counts, growths):
+        for x, total in zip(c, g):
+            if int(x) > 1 and total is not None:
+                need[int(x)] = max(need.get(int(x), 0), _cells_for_growth(total))
+    raised: Dict[int, int] = {}
     for c in counts:
         for k, x in enumerate(c):
             n = int(x)
             if n > 1:
-                c[k] = str(max(n + 1, int(n * factor + 1e-9)))
+                even = max(n + 1, int(n * factor + 1e-9))
+                c[k] = str(max(even, need.get(n, 0)))
+                if need.get(n, 0) > even:
+                    raised[n] = need[n]
     write = subprocess.run(["foamDictionary", "-entry", "blocks", "-set", _foam_text(blocks), str(path)],
                            env=env, capture_output=True, text=True)
     if write.returncode != 0:
         return f"foamDictionary could not write the blocks: {(write.stderr or '').strip()[-300:]}"
+    # Said beside them: the counts are now numbers, and the macros the parent
+    # set them with are still defined above with the parent's values. Editing
+    # from such a file, a model put the macros back and the 99,990-cell level's
+    # refinement came out at its parent's 29,700 cells
+    # (shelf_demo_hystrath_20261022_1030, dsmcfoamplus_knD_0p01).
+    text = path.read_text(errors="ignore")
+    note = ("// The cell counts in blocks below were set by refining every block of the parent "
+            "uniformly.\n// Any count values defined above for them are left from the parent and "
+            "are no longer used.\n")
+    if raised:
+        note += (f"{GROWTH_NOTE} {GROWTH_CAP:g}x its neighbour: "
+                 + ", ".join(f"{n} -> {m}" for n, m in sorted(raised.items())) + " cells.\n")
+    start = next((i for i, line in enumerate(text.splitlines(keepends=True))
+                  if line.split()[:1] == ["blocks"] or line.strip().startswith("blocks(")), None)
+    if start is not None and note not in text:
+        lines = text.splitlines(keepends=True)
+        path.write_text("".join(lines[:start]) + note + "".join(lines[start:]))
     return None
 
 
@@ -2785,10 +4103,14 @@ def refine_mesh_from_parent(
     mesh_review: Optional[Callable[[Path], Optional[str]]] = None,
     max_mesh_reviews: int = 4,
     uniform: bool = False,
+    max_procs: int = allrun_mod.MAX_PROCS,
+    on_meshed: Optional[Callable[[], None]] = None,
 ) -> Dict[str, Any]:
     """Copy an existing case's files wholesale and refine only its mesh —
     with ``uniform``, every block is refined by one factor in code
     (:func:`refine_block_counts`) and the model is used only if that fails —
+    solved on at most ``max_procs`` MPI ranks; ``on_meshed`` is called once
+    the level's mesh dictionary is final, before it is solved —
     the ``base_case_dir`` mesh-copy-and-edit capability
     ``scripts/foam_run.py --base-case-dir --mesh-gate-role refined`` used to
     provide, ported here so mesh-independence checking doesn't need that
@@ -2855,7 +4177,7 @@ def refine_mesh_from_parent(
             case_solver=solver,
         ))
 
-    def _reviewed_mesh() -> Optional[str]:
+    def _reviewed_mesh(model_written: bool) -> Optional[str]:
         """Mesh only and check the result against the parent before any
         solver time is spent -- first in code (a refinement must add cells),
         then with ``mesh_review`` -- and rewrite with the correction. Every
@@ -2868,10 +4190,23 @@ def refine_mesh_from_parent(
                 ["bash", "-c", "blockMesh > log.blockMesh 2>&1 && checkMesh > log.checkMesh 2>&1"],
                 cwd=str(case_dir), env=allrun_env, capture_output=True, text=True,
             )
-            if proc.returncode != 0:
+            if proc.returncode != 0 and not model_written:
                 return None  # the solve loop below diagnoses a mesh that does not build
-            correction = _not_finer(case_dir, base_case_dir, parent_cells) or (
-                mesh_review(case_dir) if mesh_review is not None else None)
+            if proc.returncode != 0:
+                # A model's rewrite that does not build is a rejected version
+                # like any other, so the in-code refinement below still runs.
+                # Handed to the solve loop instead, three SD7003 gate calls
+                # ended on "Inconsistent number of faces between block pair 0
+                # and 3" and the in-code refinement was never tried
+                # (sd7003_trial_1).
+                log = (case_dir / "log.blockMesh").read_text(errors="ignore") \
+                    if (case_dir / "log.blockMesh").is_file() else ""
+                fatal = log.find("FOAM FATAL ERROR")
+                correction = ("The refined blockMeshDict does not build: blockMesh stopped with "
+                              + (log[fatal:fatal + 600].strip() if fatal >= 0 else log[-600:].strip()))
+            else:
+                correction = _not_finer(case_dir, base_case_dir, parent_cells) or (
+                    mesh_review(case_dir) if mesh_review is not None else None)
             if not correction:
                 return None
             if attempt == max_mesh_reviews:
@@ -2894,7 +4229,7 @@ def refine_mesh_from_parent(
               flush=True)
         return correction
 
-    mesh_rejection = _reviewed_mesh()
+    mesh_rejection = _reviewed_mesh(model_written=not refined_in_code)
     # No targeted rewrite passed: refine every block uniformly in code from the
     # parent's file instead -- by a whole factor of 2 when the result is still
     # small, so a graded block's cells cannot shift. In a 3-D channel graded
@@ -2910,12 +4245,23 @@ def refine_mesh_from_parent(
             print(f"[foam] {case_dir.name}: no targeted rewrite passed; refined every block "
                   f"uniformly in code instead{' by 2' if doubled else ''}", flush=True)
             mesh_review = None
-            mesh_rejection = _reviewed_mesh()
+            mesh_rejection = _reviewed_mesh(model_written=False)
+        else:
+            # Said, not dropped: a hyStrath DSMC level ended "not solving it"
+            # with no word of this fallback, and its manager was left to guess
+            # why the level never ran (shelf_demo_hystrath_20261022_1030).
+            print(f"[foam] {case_dir.name}: no targeted rewrite passed, and refining every block "
+                  f"uniformly in code failed too: {why_not}", flush=True)
+            mesh_rejection = (f"{mesh_rejection}\n\nRefining every block uniformly in code, tried "
+                              f"after that, failed too: {why_not}")
 
     allrun_path = case_dir / "Allrun"
     if not own_allrun:
-        allrun_path.write_text(allrun_mod.build_mesh_and_solve_allrun(solver, case_dir=case_dir))
+        allrun_path.write_text(allrun_mod.build_mesh_and_solve_allrun(
+            solver, case_dir=case_dir, max_procs=max_procs))
         allrun_path.chmod(0o755)
+    if on_meshed is not None:
+        on_meshed()
 
     loop_count = 0
     success = False
@@ -2925,11 +4271,24 @@ def refine_mesh_from_parent(
     # baseline/refined_* directories across re-runs, so a re-run gate could
     # otherwise "converge" on a mesh that was never actually built.
     _clean_stale_run_artifacts(case_dir)
+    too_costly = ""
     for loop_count in range(1, (0 if mesh_rejection else max_loop) + 1):
         remaining = max(60, max_time_limit_s - int(time.monotonic() - t0))
-        returncode, out, err, _ = run_script(["./Allrun"], case_dir, allrun_env, remaining)
+        ledger = _CaseLedger(case_dir) if loop_count == 1 else ledger
+        ledger.before_run(loop_count)
+        returncode, out, err, timed_out = run_script(["./Allrun"], case_dir, allrun_env, remaining)
         allrun_out = out + "\n" + err
         (case_dir / "Allrun.out").write_text(allrun_out)
+        ledger.after_run(loop_count)
+        # Too slow is not broken: stopped for pace or the study's cap on one
+        # run, a hyStrath DSMC level was sent to "fix this mesh so it builds and
+        # runs cleanly" and run again at the same cost, about 2 h each
+        # (shelf_demo_hystrath_20261022_1030, dsmcfoamplus_knD_0p01__refined_3).
+        # Made cheaper, a refined level would no longer be the refinement.
+        if timed_out and (PACE_NOTE in err or CAP_NOTE in err):
+            too_costly = next((line.strip() for line in err.splitlines()
+                               if line.strip().startswith("[harness] Stopped")), err.strip()[-600:])
+            break
 
         clean = (
             returncode == 0
@@ -2967,7 +4326,11 @@ def refine_mesh_from_parent(
             case_solver=solver,
         )
         block_mesh_path.write_text(refined_bmd)
-        mesh_rejection = _reviewed_mesh()
+        # A fix written after a failed solve that does not build goes back to
+        # this loop, which diagnoses it like any other failure; called without
+        # the argument, this raised TypeError and ended a gate after 32
+        # minutes of solved levels (sd7003_trial_3).
+        mesh_rejection = _reviewed_mesh(model_written=False)
         if mesh_rejection:
             break
         _clean_stale_run_artifacts(case_dir)
@@ -2988,6 +4351,10 @@ def refine_mesh_from_parent(
     }
     if mesh_rejection and not success:
         run_result["mesh_check_failed"] = mesh_rejection[:3000]
+    if too_costly:
+        run_result["too_costly"] = (
+            f"This level costs more than one run of the study may take, so it was not run again: "
+            f"{too_costly}")
     (case_dir / "run_result.json").write_text(json.dumps(run_result, indent=2))
     return run_result
 
@@ -3051,10 +4418,13 @@ def extend_run(
     script.chmod(0o755)
 
     t0 = time.monotonic()
+    ledger = _CaseLedger(case_dir)
+    ledger.before_run(1, "extension run")
     returncode, out, err, timed_out = run_script(["./Allrun.extend"], case_dir,
                                                  case_env(openfoam_path), max_time_limit_s)
     out = out + "\n" + err + ("\ntimed out" if timed_out else "")
     (case_dir / "Allrun.extend.out").write_text(out)
+    ledger.after_run(1, "extension run")
     ok = returncode == 0 and _solver_ended_cleanly(case_dir, solver) and not _has_fatal(case_dir)
     result_path = case_dir / "run_result.json"
     try:

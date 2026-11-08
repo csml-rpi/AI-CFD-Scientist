@@ -326,6 +326,28 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the manager is told each flagged case's issues",
           gen.get("unvalidated_issues"), {"case_001": ["Lists three Reynolds numbers for one case."]})
 
+    # Written again, a case's requirement is told the mesh it already runs on
+    # (shelf_demo_hystrath_20261022_1030: the starter's domain came back).
+    import shutil as _sh
+    mesh_src = Path("/mnt/sda1/somasn_cfd_scientist_experiments/nn_in_solver_demo_20261022_1129/cases/case_006/constant/polyMesh")
+    if mesh_src.is_dir():
+        _sh.copytree(mesh_src, out_dir / "cases" / "case_002" / "constant" / "polyMesh")
+        contexts = []
+
+        def fake_ctx(self, idea, simulation, run_topic="", **kw):
+            contexts.append((simulation["simulation_id"], kw.get("case_context") or ""))
+            return {"requirement": "Run the cavity at Re = 400.", "valid": True}
+
+        ha.HypothesisAgent.generate_validated_requirement = fake_ctx
+        try:
+            tools["generate_case_requirements"](regenerate_reason="fix one", case_ids=["case_002"])
+        finally:
+            ha.HypothesisAgent.generate_validated_requirement = original
+        check("only the named case is written again", [c[0] for c in contexts], ["exp_002"])
+        check("and it is told the mesh it runs on",
+              "ALREADY RUNS ON" in contexts[0][1] and "case_002: 343 cells" in contexts[0][1], True)
+        _sh.rmtree(out_dir / "cases" / "case_002")  # the tests below start without it
+
     seed = out_dir / "mesh_gate" / "g" / "baseline"
     seed.mkdir(parents=True)
     (out_dir / "mesh_gate" / "g" / "selected_mesh_spec.json").write_text(
@@ -352,8 +374,10 @@ with tempfile.TemporaryDirectory() as tmp:
         r4 = run("case_002", ok_text, physics_group="g")
         check("a passing requirement reports no issues", "requirement_checker_issues" in r4, False)
         run("case_002", "a paraphrase of the requirement", physics_group="g", rerun_reason="test")
+        # A rerun's requirement may carry a note after it (the earlier attempts'
+        # records it is given); the approved text is what it starts with.
         check("a paraphrased requirement_text is not what runs: the approved text for the case_id is",
-              seen[-1], ok_text)
+              seen[-1].startswith(ok_text) and "a paraphrase" not in seen[-1], True)
         check("an unknown case_id is refused with the valid ones listed",
               "Valid case_ids" in run("case_999", "", physics_group="g").get("error", ""), True)
 
@@ -374,6 +398,11 @@ with tempfile.TemporaryDirectory() as tmp:
         check("the successful attempt is kept after two failed reruns",
               (attempts / "case_002_last_success" / "mark").read_text(), "A")
         check("beside the last failed one", (attempts / "case_002" / "mark").read_text(), "B")
+        mt.foam_native.run_foam_case = writes("failed", "D")
+        run("case_002", ok_text, physics_group="g", rerun_reason="test")
+        check("and the failed one before it is kept, numbered, not deleted",
+              ((attempts / "case_002" / "mark").read_text(), (attempts / "case_002.1" / "mark").read_text()),
+              ("C", "B"))
 
         # A file the manager fixed after the last run is carried into the next.
         import os as _os
@@ -419,6 +448,28 @@ with tempfile.TemporaryDirectory() as tmp:
         check("a run stopped before it ended carries its scripts", _edited_since_run(cut), ["runScript.py"])
         (cut / ".foamagent_state.json").unlink()
         check("a folder no run started in carries nothing", _edited_since_run(cut), [])
+        # A script one folder down that the manager fixed after the run is carried;
+        # one first written after the run (an interpreter's plot script) is not.
+        from cfd_langgraph.manager.tools import _CASE_SCRIPTS, _case_scripts
+        deep = out_dir / "deep_case"
+        (deep / "scripts").mkdir(parents=True)
+        (deep / "scripts" / "runCase.py").write_text("before\n")
+        (deep / "processor0").mkdir()
+        (deep / "processor0" / "x.py").write_text("")
+        check("the scripts below the top level are listed, not processor files",
+              _case_scripts(deep), ["scripts/runCase.py"])
+        (deep / _CASE_SCRIPTS).write_text(json.dumps(_case_scripts(deep)))
+        (deep / "run_result.json").write_text("{}")
+        later3 = (deep / "run_result.json").stat().st_mtime + 5
+        (deep / "scripts" / "runCase.py").write_text("the manager's fix\n")
+        (deep / "interpreter_viz").mkdir()
+        (deep / "interpreter_viz" / "plot.py").write_text("")
+        for p in (deep / "scripts" / "runCase.py", deep / "interpreter_viz" / "plot.py"):
+            _os.utime(p, (later3, later3))
+        check("a fixed script one folder down is carried, a later new one is not",
+              _edited_since_run(deep), ["scripts/runCase.py"])
+        (deep / _CASE_SCRIPTS).unlink()
+        check("without the list, scripts below the top level are not carried", _edited_since_run(deep), [])
 
         # A run stopped before it wrote anything does not replace the attempt before it.
         prev2 = out_dir / "previous_attempts" / "case_002"
@@ -466,6 +517,158 @@ with tempfile.TemporaryDirectory() as tmp:
         check("and the run records its requirement's hash", bool(r7.get("requirement_sha256")), True)
     finally:
         mt.foam_native.run_foam_case = real_run
+
+# interpret_case gives the interpreter the case's requirement and what its run wrote
+# (shelf_demo_dafoam_20261019_1057, case_006: judged by blank flow plots alone).
+with tempfile.TemporaryDirectory() as tmp:
+    out_i = Path(tmp)
+    (out_i / "hypotheses_approved.json").write_text("{}")
+    (out_i / "requirements.json").write_text(json.dumps(
+        [{"case_id": "case_001", "user_requirement_text": "Check the adjoint gradient at one cell against central FD."}]))
+    case_i = out_i / "cases" / "case_001"
+    case_i.mkdir(parents=True)
+    (case_i / "run_result.json").write_text(json.dumps({"status": "success", "success": True}))
+    (case_i / "log.blockMesh").write_text("x")
+    (case_i / "gradient_validation.json").write_text(json.dumps({"adjoint_derivative": -4.2e-12}))
+    calls = []
+
+    class _Proc:
+        returncode, stdout, stderr = 0, "", ""
+
+    real_script = mt._run_script
+    mt._run_script = lambda args, **kw: calls.append(args) or _Proc()
+    try:
+        tools_i = {fn.__name__: fn for fn in mt.build_manager_tools(get_settings(), out_i)["manager_tools"]}
+        tools_i["interpret_case"]("case_001")
+    finally:
+        mt._run_script = real_script
+    interp_args = calls[-1]
+    given_req = interp_args[interp_args.index("--requirement") + 1] if "--requirement" in interp_args else ""
+    check("the interpreter is given the case's requirement", "adjoint gradient" in given_req, True)
+    check("and the results its run wrote", "gradient_validation.json" in given_req and "-4.2e-12" in given_req, True)
+
+# A fixed Allrun runs only the solve: the case's Allrun.post runs its
+# post-processing after a clean solve, with this study's Python first on PATH,
+# and is carried into reruns (shelf_demo_hystrath_20261022_1030, case_004).
+from cfd_langgraph.foam_native import loop as fl  # noqa: E402
+import time as _time  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    case_p = Path(tmp)
+    (case_p / "Allrun.post").write_text(
+        "set -e\npython -c \"import sys, json; json.dump({'python': sys.executable}, open('loads.json', 'w'))\"\n"
+        "echo made loads.json\n")
+    rec = fl._run_post(case_p, dict(os.environ), 60)
+    check("Allrun.post ran and exited 0", (rec["ran"], rec["returncode"], rec["timed_out"]), (True, 0, False))
+    check("its log is kept", (case_p / "log.Allrun.post").read_text().strip(), "made loads.json")
+    check("it ran with this study's Python", json.loads((case_p / "loads.json").read_text())["python"], sys.executable)
+    (case_p / "Allrun.post").write_text("set -e\nfalse\necho never\n")
+    rec = fl._run_post(case_p, dict(os.environ), 60)
+    check("a failing Allrun.post is recorded, not raised", (rec["returncode"] != 0, "never" in rec["log_tail"]), (True, False))
+    (case_p / "decision.json").write_text('{"status": "RERUN"}')
+    (case_p / "Allrun.post").write_text(
+        "echo '{\"status\": \"PROCEED\", \"confidence\": 0.99}' > decision.json\necho '{}' > run_result.json\n")
+    rec = fl._run_post(case_p, dict(os.environ), 60)
+    check("Allrun.post cannot write the interpreter's decision",
+          json.loads((case_p / "decision.json").read_text())["status"], "RERUN")
+    check("nor create a run record", (case_p / "run_result.json").exists(), False)
+    check("and the attempt is reported", sorted(rec.get("refused_workflow_files", [])), ["decision.json", "run_result.json"])
+    (case_p / "decision.json").unlink()
+    (case_p / "Allrun.post").write_text("sleep 30\n")
+    rec = fl._run_post(case_p, dict(os.environ), 1)
+    check("a stuck Allrun.post is stopped at its limit", rec["timed_out"], True)
+    (case_p / "Allrun.post").write_text("set -e\npython -c 'import cfd_langgraph.foam_load'\n")
+    rec = fl._run_post(case_p, {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}, 60)
+    check("Allrun.post can import the framework's case loader", rec["returncode"], 0)
+    check("its scripts and Allrun.post are post-processing",
+          [fl._post_file(f) for f in ("Allrun.post", "analysis/extract.py", "loads.py")], [True, True, True])
+    check("the solved case is not",
+          [fl._post_file(f) for f in ("Allrun", "system/controlDict", "constant/dsmcProperties", "0/U",
+                                      "0.orig/U")] + [fl._post_file("0.orig/U", "0.orig")],
+          [False, False, False, False, True, False])
+
+    (case_p / "run_result.json").write_text("{}")
+    _time.sleep(1.2)
+    (case_p / "Allrun.post").write_text("echo edited\n")
+    import os as _os
+    later = _time.time() + 5
+    _os.utime(case_p / "Allrun.post", (later, later))
+    check("an Allrun.post edited after the run is carried", "Allrun.post" in mt._edited_since_run(case_p), True)
+
+# run_python keeps a long stdout whole in a file, so the start is not lost
+# (nn_in_solver_demo_20261022_1129: one smaller script after another).
+with tempfile.TemporaryDirectory() as tmp:
+    out_rp = Path(tmp) / "study"
+    (out_rp / "scratch").mkdir(parents=True)
+    (out_rp / "hypotheses_approved.json").write_text("{}")
+    tools_rp = {fn.__name__: fn for fn in mt.build_manager_tools(get_settings(), out_rp)["manager_tools"]}
+    (out_rp / "scratch" / "big.py").write_text("print('START'); print('x' * 20000); print('END')")
+    r = tools_rp["run_python"](str(out_rp / "scratch" / "big.py"), timeout_s=60)
+    check("a long stdout is kept whole in a file",
+          bool(r.get("stdout_file")) and Path(r["stdout_file"]).read_text().startswith("START"), True)
+    check("with its start shown too", r.get("stdout_head", "")[:5], "START")
+    (out_rp / "scratch" / "small.py").write_text("print('hi')")
+    check("a short stdout needs no file", "stdout_file" in tools_rp["run_python"](
+        str(out_rp / "scratch" / "small.py"), timeout_s=60), False)
+
+# post_only: Allrun.post alone on a finished solve, no re-solve
+# (shelf_demo_hystrath_20261022_1030, case_004).
+with tempfile.TemporaryDirectory() as tmp:
+    out_po = Path(tmp) / "study"
+    case_po = out_po / "cases" / "case_001"
+    case_po.mkdir(parents=True)
+    (out_po / "hypotheses_approved.json").write_text("{}")
+    (case_po / "run_result.json").write_text(json.dumps({"status": "success", "success": True, "loop_count": 1}))
+    (case_po / "Allrun.post").write_text("set -e\necho made > loads.txt\n")
+    tools_po = {fn.__name__: fn for fn in mt.build_manager_tools(get_settings(), out_po)["case_runner_tools"]}
+    r = tools_po["run_case_native"]("case_001", post_only=True)
+    check("post_only runs Allrun.post on the finished solve", (r.get("status"), r["post_processing"]["returncode"]),
+          ("success", 0))
+    check("and its outputs are made", (case_po / "loads.txt").read_text().strip(), "made")
+    rr = json.loads((case_po / "run_result.json").read_text())
+    check("the outcome is recorded, the run kept", (rr["post_processing"]["post_only"], rr["loop_count"]), (True, 1))
+    import time as _t2
+    old_end = _t2.time() - 3600
+    os.utime(case_po / "run_result.json", (old_end, old_end))
+    (case_po / "Allrun.post").write_text("set -e\necho made > loads.txt\n")
+    tools_po["run_case_native"]("case_001", post_only=True)
+    check("post_only keeps the time the run ended",
+          abs((case_po / "run_result.json").stat().st_mtime - old_end) < 2, True)
+    check("so an Allrun.post fixed before it is carried into the next run",
+          "Allrun.post" in mt._edited_since_run(case_po), True)
+    (case_po / "run_result.json").write_text(json.dumps({"status": "failed", "success": False}))
+    check("post_only refuses a case whose solve failed", "error" in tools_po["run_case_native"]("case_001", post_only=True), True)
+
+# A failed Allrun.post is fixed and run again, with only post-processing files
+# changed (run_post_with_repairs, also behind post_only).
+from cfd_langgraph.foam_native import review as fr  # noqa: E402
+
+with tempfile.TemporaryDirectory() as tmp:
+    case_r = Path(tmp)
+    (case_r / "system").mkdir()
+    (case_r / "system" / "controlDict").write_text("application dsmcFoam+;\n")
+    (case_r / "analysis").mkdir()
+    (case_r / "analysis" / "extract.py").write_text("import sys; sys.exit(3)\n")
+    (case_r / "Allrun.post").write_text("set -e\npython analysis/extract.py\n")
+    saved_r = (fr.review_errors, fr.plan_rewrite)
+    applied = []
+    fr.review_errors = lambda llm, **kw: "extract.py exits 3"
+    fr.plan_rewrite = lambda llm, **kw: [{"file": "analysis/extract.py", "changes": "exit 0"},
+                                         {"file": "system/controlDict", "changes": "endTime 1"}]
+
+    def _fix(targets):
+        applied.extend(t["file"] for t in targets)
+        (case_r / "analysis" / "extract.py").write_text("print('ok')\n")
+        return 0
+
+    try:
+        rec = fl.run_post_with_repairs(None, case_r, "make records", dict(os.environ), 60, apply=_fix)
+    finally:
+        fr.review_errors, fr.plan_rewrite = saved_r
+    check("a failed Allrun.post is fixed and passes on its next round", (rec["returncode"], rec["round"]), (0, 2))
+    check("only post-processing files are edited", applied, ["analysis/extract.py"])
+    check("the review is shown the post-processing scripts",
+          [s["file_name"] for s in fl._post_subtasks(case_r)], ["Allrun.post", "extract.py"])
 
 print()
 print("FAILURES:", fails if fails else "none")

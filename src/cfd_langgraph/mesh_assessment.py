@@ -836,6 +836,21 @@ STEADY_CHANGE_TOL = 1e-3
 # A steady run stopped at a fixed iteration count is not settled because it ended:
 # each finer level was further from converged and the gate refined to 4.8M cells
 # (qwen_retest_20261005/cavity_r8).
+def _histories_steady(case: Path, fraction: float = 1.0) -> bool:
+    """Whether every monitored history of the case holds still to within
+    ``fraction`` of the gate tolerance: its fluctuation and the drift between
+    the halves of its settled window. False when there are no histories.
+    The whole tolerance (user, 2026-11-01): a fifth of it rejected a 226k
+    SD7003 level whose means matched a fully settled level within 0.2%, on
+    Cm wobbling 1.16% (sd7003_trial_3)."""
+    stats = [s for s in history_statistics(case) if s.mean]
+    tol = GATE_TOLERANCE_PERCENT / 100.0 * fraction
+    return bool(stats) and all(
+        s.fluctuation_rms <= tol * abs(s.mean)
+        and (len(s.halves) < 2 or abs(s.halves[1][0] - s.halves[0][0]) <= tol * abs(s.mean))
+        for s in stats)
+
+
 def steady_unsettled(case: Path | str) -> Optional[str]:
     """Why a steady solve has not converged, or None if it has or it cannot be
     told. Converged means the solver met its own residual targets, or the
@@ -866,9 +881,85 @@ def steady_unsettled(case: Path | str) -> Optional[str]:
     change = float(np.linalg.norm(u_new - u_old)) / scale
     if change <= STEADY_CHANGE_TOL:
         return None
+    # Forces that no longer move are settled for the gate, whatever a small
+    # residual oscillation of the field does: SD7003's 86k and 124k levels
+    # changed 0.48% and 0.43% of the field per save while every force
+    # coefficient held within 0.5% (rms) and the two agreed within 0.2%, and
+    # the gate stopped on them as unsettled (sd7003_trial_2).
+    if _histories_steady(case):
+        return None
     return (f"The steady solve has not converged: the velocity field still changed by {change:.2%} "
             f"between iterations {times[-2]:g} and {times[-1]:g}, and the solver's own residual "
             "targets were not met. Values measured on this level are not final.")
+
+
+# Saved iterations a steady solve's trend is fitted over.
+STEADY_TREND_SAVES = 6
+
+
+# Running a steady solve longer helps only while it is still heading for a
+# fixed point. SD7003's 12k-cell starter level oscillated instead: the gate
+# doubled its run from 20,000 to 640,000 iterations and it never settled
+# (sd7003_trial_1).
+def steady_will_settle(case: Path | str, growth: float) -> bool:
+    """Whether a steady solve that has not converged would settle if run to
+    ``growth`` times its latest saved iteration. The change of the velocity
+    field per iteration between the last few saves is fitted as exponential
+    decay and extrapolated; settled is steady_unsettled's tolerance. True when
+    it cannot be told (too few saves, fields unreadable), so the solve is run
+    longer as before."""
+    import numpy as np
+
+    from cfd_langgraph.foam_load import load_case
+
+    case = Path(case)
+    times = sorted(t for t in (_time_value(d.name) for d in case.iterdir() if d.is_dir()) if t and t > 0)
+    times = times[-(STEADY_TREND_SAVES + 1):]
+    if len(times) < 4:
+        return True
+    try:
+        fields = [np.asarray(load_case(case, t).point_data["U"], dtype=float) for t in times]
+    except Exception:  # noqa: BLE001
+        return True
+    steps = np.diff(times)
+    rates = [float(np.linalg.norm(b - a)) / (float(np.linalg.norm(b)) or 1.0) / dt
+             for a, b, dt in zip(fields, fields[1:], steps)]
+    # Fitted against iterations counted back from the latest save, so the
+    # intercept is the rate now and stays finite however long the run.
+    since_latest = np.asarray(times[1:]) - times[-1]
+    slope, now = np.polyfit(since_latest, np.log(np.maximum(rates, 1e-300)), 1)
+    if slope >= 0:
+        return False
+    ahead = times[-1] * (growth - 1.0)
+    return math.exp(now + slope * ahead) * steps[-1] <= STEADY_CHANGE_TOL
+
+
+# A finer unsettled level counts as calmer than its parent when its
+# steady_change is at most this fraction of the parent's.
+STEADY_IMPROVING = 0.9
+
+
+def steady_change(case: Path | str) -> Optional[float]:
+    """How unsettled a steady solve is: the mean change of the velocity field
+    between consecutive saved iterations over the last few saves, relative to
+    its size. None for a transient case or when it cannot be told."""
+    import numpy as np
+
+    from cfd_langgraph.foam_load import load_case
+
+    case = Path(case)
+    if not (case / "system" / "controlDict").is_file() or is_transient(case):
+        return None
+    times = sorted(t for t in (_time_value(d.name) for d in case.iterdir() if d.is_dir()) if t and t > 0)
+    times = times[-(STEADY_TREND_SAVES + 1):]
+    if len(times) < 3:
+        return None
+    try:
+        fields = [np.asarray(load_case(case, t).point_data["U"], dtype=float) for t in times]
+    except Exception:  # noqa: BLE001
+        return None
+    return float(np.mean([float(np.linalg.norm(b - a)) / (float(np.linalg.norm(b)) or 1.0)
+                          for a, b in zip(fields, fields[1:])]))
 
 
 def _time_value(name: str) -> Optional[float]:
@@ -887,16 +978,47 @@ def _measured_text(measured: Optional[Dict[str, Dict[str, float]]]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+def _field_ranges(case: Path, most: int = 40) -> str:
+    """Every scalar field written at the level's latest time with its range
+    (min, 1st percentile, median, max over the cells), as review text. Not
+    told which fields there were, a DSMC level's review called its cell-size
+    and time-step criteria "not verified" twice although the run had written
+    mfpToDx_Ar and mctToDt_Ar, the ratios that hold them
+    (shelf_demo_hystrath_20261022_1030, dsmcfoamplus_knD_0p01__refined_2)."""
+    import numpy as np
+
+    try:
+        from cfd_langgraph.foam_load import load_case
+
+        mesh = load_case(case)
+    except Exception:  # noqa: BLE001 - the ranges are extra context, never required
+        return ""
+    lines = []
+    for name in sorted(mesh.cell_data.keys())[:most]:
+        values = np.asarray(mesh.cell_data[name])
+        if values.ndim != 1 or values.size == 0 or not np.issubdtype(values.dtype, np.number):
+            continue
+        p1, median = np.percentile(values, [1, 50])
+        lines.append(f"  {name}: min {values.min():.4g}, 1st percentile {p1:.4g}, median {median:.4g}, "
+                     f"max {values.max():.4g}")
+    if not lines:
+        return ""
+    return ("FIELDS WRITTEN AT THE LATEST TIME (scalar fields over the cells; a solver's own "
+            "resolution ratios, if it writes them, are among these):\n" + "\n".join(lines) + "\n\n")
+
+
 def assess_level(llm: Any, case: Path | str, *, case_description: str,
                  images: List[Path], stats: List[SeriesStats],
                  wall: Optional[Any] = None, transient: Optional[bool] = None,
                  earlier: Optional[List[Path]] = None,
                  earlier_images: Optional[List[Path]] = None,
-                 measured: Optional[Dict[str, Dict[str, float]]] = None) -> Optional[LevelAssessment]:
+                 measured: Optional[Dict[str, Dict[str, float]]] = None,
+                 finer: str = "") -> Optional[LevelAssessment]:
     """Look at one level and decide whether it can be trusted. None on failure --
     an absent judgement must never count as approval. ``earlier`` lists the
     coarser levels of the same sequence, coarsest first, for comparison;
-    ``earlier_images`` are figures of the previous level."""
+    ``earlier_images`` are figures of the previous level; ``finer`` describes a
+    finer level run since, and how the gate quantities compared with it."""
     import base64
 
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -924,8 +1046,10 @@ def assess_level(llm: Any, case: Path | str, *, case_description: str,
         f"THIS LEVEL: {_cell_count(case) or 'unknown'} cells\n"
         f"REFINEMENT BUDGET: {_budget_text(case)}\n"
         f"MONITORED QUANTITIES:\n{_monitored_text(case, stats, wall)}\n\n"
+        + _field_ranges(case)
         + _earlier_text(earlier or [])
         + _measured_text(measured)
+        + (f"{finer.strip()}\n\n" if finer else "")
         + (f"ITERATIVE CONVERGENCE: {steady_note}\n\n" if (steady_note := steady_unsettled(case)) else "")
         + "The figures follow. Check anything that looks wrong with the tools, then judge."
     )
@@ -1194,6 +1318,13 @@ values at fixed interior points or stations along a line, the extremes of a prof
 across the interior and where they occur, the location and strength of a flow feature \
 (a vortex centre, a separation or reattachment point), integrals over the domain or a \
 boundary.
+
+SEPARATION AND REATTACHMENT. Define a recirculation region's separation and reattachment \
+as the two ends of the main region of reversed wall shear along that wall -- short \
+secondary patches of reversed or re-attached flow merged into it or dropped -- never as \
+the first sign change of the shear: a refined mesh resolves short patches inside a \
+bubble, and a first crossing jumps between them, so the check cannot settle. Say which \
+wall, which part of it and which direction is downstream.
 
 Give each quantity a short snake_case name and a precise definition someone could \
 compute from the solution fields alone. Prefer a handful of quantities that are \
@@ -1616,8 +1747,9 @@ is not coarser there; the refinement should be substantial where the instruction
 and in the directions it asked for -- a region to be refined in all directions needs both the \
 longest and the shortest cell extent to drop there, not just the cell area;
 - changes near-wall spacing only in the way the instruction asked (if it asked to keep the \
-first-cell distance, it stays close; if it asked to reduce it, it goes down by roughly that \
-factor, not by orders of magnitude);
+first-cell distance, it stays close; if it asked to reduce it, it goes down by about that \
+factor -- anywhere within a factor of two of it either way is fine, so 4x where 2-3x was \
+asked passes -- and not by orders of magnitude);
 - has no mesh-quality defects: no failed checks, no extreme non-orthogonality or skewness, \
 no aspect ratios far beyond the parent's.
 

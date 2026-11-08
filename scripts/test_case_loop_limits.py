@@ -159,7 +159,16 @@ try:
                                       current_content=text, written_files_ctx="", case_solver="DASimpleFoam")
     check("a failed first try is sent back and the second applied", got.endswith("c = 30\n"))
     check("with the reason it failed", "could not be applied" in prompts[-1])
-    replies[:] = [writer._Patch(replacements=[]), writer._Patch(replacements=[])]
+    # What applied is kept; only what did not is asked for again, on the file with the rest made.
+    replies[:] = [writer._Patch(replacements=[writer._Replacement(old="a = 1", new="a = 10"),
+                                              writer._Replacement(old="not in file", new="x")]),
+                  writer._Patch(replacements=[writer._Replacement(old="c = 3", new="c = 30")])]
+    got = writer.edit_file_by_patches(None, file_name="runScript.py", folder_name="", changes="a to 10, c to 30",
+                                      current_content=text, written_files_ctx="", case_solver="DASimpleFoam")
+    check("replacements that applied are kept when others fail", ("a = 10" in got, got.endswith("c = 30\n")),
+          (True, True))
+    check("and the retry is shown the file with them made", "a = 10" in prompts[-1] and "were applied" in prompts[-1])
+    replies[:] = [writer._Patch(replacements=[]) for _ in range(3)]
     try:
         writer.edit_file_by_patches(None, file_name="runScript.py", folder_name="", changes="x",
                                     current_content=text, written_files_ctx="", case_solver="DASimpleFoam")
@@ -295,8 +304,10 @@ with tempfile.TemporaryDirectory() as tmp:
     for d in ("0", "system", "processor0", "100", ".openmdao_out", "runScript_out"):
         (case / d).mkdir()
     (case / "old_notes.txt").write_text("from before this run")
-    os.utime(case / "old_notes.txt", (time.time() - 3600, time.time() - 3600))
-    since = time.time() - 1
+    # Written before the run starts (an os.utime back-dating would change the
+    # file's ctime, which counts as a write).
+    time.sleep(0.2)
+    since = time.time()
     (case / "results.json").write_text('{"validation": {"status": "failed", "check": "mesh_checksum"}}')
     (case / "runScript_out/summary.txt").write_text("ran 0 iterations")
     for name in ("Allrun.out", "run_result.json", "setup_check.json", "log.simpleDAFoam", "0/U.json",
@@ -306,9 +317,16 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the run's own report is shown with its content",
           "results.json, written by this run" in shown and '"check": "mesh_checksum"' in shown)
     check("and a small report one folder down", "runScript_out/summary.txt, written by this run" in shown)
-    check("but not files from before the run, nor harness, field, log or hidden files",
-          [n for n in ("old_notes", "run_result.json, written", "setup_check.json, written", "Allrun.out, written",
-                       "0/U.json", "system/notes", "processor0", "100/y", ".openmdao_out", "big.bin") if n in shown], [])
+    check("but not the harness's files nor the case's dictionaries as the run's output",
+          [n for n in ("run_result.json, written", "setup_check.json, written", "Allrun.out, written",
+                       "0/U.json, written", "system/notes.txt, written") if n in shown], [])
+    check("a report in a hidden folder comes after the others",
+          shown.index("results.json, written") < shown.index(".openmdao_out/z.json, written"))
+    listing = shown[shown.index("--- every file this run wrote"):]
+    check("every file the run wrote is named, none is out of sight",
+          [n for n in ("0/U.json", "system/notes.txt", "processor0/x.json", "100/y.json", ".openmdao_out/z.json",
+                       "big.bin") if n not in listing], [])
+    check("a file from before the run is not", "old_notes" in shown, False)
     check("without a run start nothing extra is shown", "written by this run" in loop.collect_error_logs(case), False)
     (case / ".truth.failure.json").write_text('{"failed": ["pristine_velocity_misfit"]}')
     (case / ".foamagent_state.json").write_text('{"case_info": {}}')
@@ -443,6 +461,72 @@ with tempfile.TemporaryDirectory() as tmp:
     check("the logs shown stay small", len(shown) < 100_000)
     check("and keep the error at the end", "ValueError: bad" in shown)
     check("saying what was cut", "characters of this line cut" in shown)
+
+print("== 19. the study's cap on one run stops it, and says what to do")
+with tempfile.TemporaryDirectory() as tmp:
+    case = Path(tmp)
+    (case / "Allrun").write_text("#!/bin/bash\nfor i in $(seq 1 180); do echo $i > progress; sleep 1; done\n")
+    (case / "Allrun").chmod(0o755)
+    saved_cap = os.environ.get("CFD_SCIENTIST_MAX_RUN_HOURS")
+    os.environ["CFD_SCIENTIST_MAX_RUN_HOURS"] = "0.001"  # 3.6 s; checked once a minute
+    try:
+        t = time.monotonic()
+        rc, out, err, timed_out = loop.run_script(["./Allrun"], case, None, 600)
+    finally:
+        if saved_cap is None:
+            os.environ.pop("CFD_SCIENTIST_MAX_RUN_HOURS")
+        else:
+            os.environ["CFD_SCIENTIST_MAX_RUN_HOURS"] = saved_cap
+    check("a run longer than the cap is stopped well before its own limit",
+          (timed_out, time.monotonic() - t < 120), (True, True))
+    check("and told it costs more than the study allows", "this study allows one run at most" in err)
+    check("which is not the case's own time limit, so the case is reviewed, not ended",
+          loop.TIME_LIMIT_NOTE in err, False)
+check("no cap when the study sets none", loop._max_run_s() if saved_cap is None else 0.0, 0.0)
+
+print("== 20. a run's pace is judged to its real endTime; a slow case says what differs from its seed")
+with tempfile.TemporaryDirectory() as tmp:
+    case, seed = Path(tmp) / "case", Path(tmp) / "seed"
+    for d in (case, seed):
+        (d / "system").mkdir(parents=True)
+    (case / "system/controlDict.orig").write_text("endTime 1000;\n")  # from before the run
+    started = time.time() + 1
+    os.utime(case / "system/controlDict.orig", (started - 60, started - 60))
+    (case / "system/controlDict").write_text("startTime 0;\nendTime         5e-4;\ndeltaT 1.0e-7;\n")
+    (case / "system/controlDict.full").write_text("endTime 0.006;\ndeltaT 1.0e-7;\n")
+    os.utime(case / "system/controlDict.full", (started + 5, started + 5))
+    (case / "log.dsmcFoam+").write_text("Time = 0.00028\n\nTime = 0.0003\n")
+    check("a startup stage's cut endTime is not taken for the run's",
+          loop._simulated_progress(case, since=started), (0.0003, 0.006))
+    check("but a copy older than the run is not the run's", loop._simulated_progress(case, since=started)[1] < 1000)
+    (seed / "system/controlDict").write_text("endTime 0.006;\ndeltaT          5e-7;\n")
+    (case / "system/controlDict").write_text("endTime 0.006;\ndeltaT 1.0e-7;\n")
+    note = loop._cost_differences(case, seed)
+    check("a case slower than its validated seed is told what differs", "deltaT 5e-7 there, 1.0e-7 here" in note)
+    check("and that the setup check puts back what the requirement fixes", "put back by the setup check" in note)
+    check("nothing is said when nothing a run costs differs", loop._cost_differences(seed, seed), "")
+    check("nor without a seed", loop._cost_differences(case, None), "")
+
+# A run's own verdict identifies its failure when its reasons are reworded
+# (nn_airfoil_s814_20261026_1537, case_006: ten runs refused on the same gate).
+with tempfile.TemporaryDirectory() as tmp:
+    case = Path(tmp)
+    started = time.time() - 1
+    (case / "campaign_run").mkdir()
+    (case / "results.json").write_text(json.dumps({
+        "status": "production_rejected_failed_preproduction_checks",
+        "failures": ["no explicit passed record directly identifies the vector"]}))
+    (case / "campaign_run/campaign_result.json").write_text(json.dumps({"status": "failed"}))
+    first = loop._run_verdicts(case, started)
+    check("a multi-word status is the run's verdict, a bare 'failed' is not", first,
+          ["production_rejected_failed_preproduction_checks"])
+    line = loop._failure_line(case, since=started)
+    (case / "results.json").write_text(json.dumps({
+        "status": "production_rejected_failed_preproduction_checks",
+        "failures": ["no passed evidence shares an evaluation identity"]}))
+    check("reworded reasons keep the same verdict", loop._run_verdicts(case, started), first)
+    check("while the failure lines differ", loop._failure_line(case, since=started) != line, True)
+    check("reports from before the run are not its verdict", loop._run_verdicts(case, time.time() + 60), [])
 
 print()
 print("FAILURES:", FAILURES if FAILURES else "none")

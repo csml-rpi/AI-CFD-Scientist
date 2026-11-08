@@ -160,6 +160,30 @@ else:
           np.allclose(np.asarray(wall_shear(case)[name].cell_data["wallShearStress"]), ref))
 
 
+print("\n== main_reverse_flow_region: the main bubble, not the first sign change ==")
+from cfd_langgraph.foam_load import main_reverse_flow_region  # noqa: E402
+import numpy as np  # noqa: E402
+
+_x = np.linspace(0.0, 1.0, 2001)
+
+
+def _shear(edges):
+    t = np.ones_like(_x)
+    for a, b in edges:
+        t[(_x > a) & (_x < b)] = -1.0
+    return t
+
+
+# SD7003 99k-cell level: one bubble 0.197-0.715 with short attached gaps inside it
+_r = main_reverse_flow_region(_x, _shear([(0.197, 0.46), (0.48, 0.503), (0.515, 0.715)]))
+check("short attached gaps inside a bubble are merged", abs(_r["start"] - 0.197) < 2e-3
+      and abs(_r["end"] - 0.715) < 2e-3 and _r["regions"] == 1, str(_r))
+_r = main_reverse_flow_region(_x, _shear([(0.011, 0.035), (0.2, 0.71)]))
+check("a short reversed patch elsewhere is dropped", abs(_r["start"] - 0.2) < 2e-3, str(_r))
+_r = main_reverse_flow_region(_x[::-1], _shear([(0.2, 0.7)])[::-1])
+check("input order does not matter", abs(_r["end"] - 0.7) < 2e-3, str(_r))
+check("attached flow has no region", main_reverse_flow_region(_x, np.ones_like(_x))["start"] is None)
+
 print()
 print("FAILURES:", FAILURES if FAILURES else "none")
 shutil.rmtree(tmp, ignore_errors=True)

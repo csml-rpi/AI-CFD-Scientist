@@ -419,7 +419,7 @@ def _llm_pyvista_batch_qoi(
         "many values become one number, choose a way that cannot cancel and cannot come out near zero: "
         "values of opposite sign must not offset each other.\n"
         "HELPER MODULE. foam_load.py is saved next to this script; import it with no path setup. "
-        "`from foam_load import load_case, load_patches, wall_shear, molecular_viscosity, sample_points, sample_line`. "
+        "`from foam_load import load_case, load_patches, wall_shear, molecular_viscosity, sample_points, sample_line, main_reverse_flow_region`. "
         "sample_points(case_dir, points) -> {field name: array with one row per point, 'inside': bool per "
         "point} -- the value AT each (x, y, z) point, always an array even for one point: "
         "s = sample_points(case_dir, [[x, y, z]]); s['U'][0] is (Ux, Uy, Uz) there and float(s['p'][0]) "
@@ -433,6 +433,13 @@ def _llm_pyvista_batch_qoi(
         "cell_data 'wallShearStress'} in OpenFOAM's sign convention, taken from the case when it wrote the "
         "field and computed from U, nu and nut when it did not (velocity='UMean' for the time-averaged "
         "stress when UMean exists).\n"
+        "SEPARATION, REATTACHMENT AND RECIRCULATION LENGTH COME FROM main_reverse_flow_region. "
+        "main_reverse_flow_region(position, shear, min_fraction=0.05) -> {'start', 'end', 'length', 'regions'}: "
+        "pass the positions along the wall (x or arc length) and the signed tangential wall shear there, "
+        "positive where the near-wall flow moves downstream (you choose the wall, the part of it, and the "
+        "direction); it returns the ends of the main reversed region, short secondary patches merged or "
+        "dropped. Use it for EVERY separation point, reattachment point or recirculation length; never "
+        "take the first sign change of the shear, which jumps between short patches as the mesh is refined.\n"
         "A QUANTITY THE CASE DID NOT WRITE BUT CAN BE DERIVED IS NOT MISSING. Derive it from the fields "
         "that are there: vorticity and any gradient with mesh.compute_derivative; wall shear stress from "
         "the wall-normal gradient of the tangential velocity between the wall face and the adjacent cell "
@@ -699,6 +706,78 @@ def _llm_pyvista_batch_qoi(
     return {}
 
 
+# The harness's own records of a case, not its results.
+_RECORD_SKIP = {"run_result.json", "setup_check.json", "decision.json", "failure.json", "figures.json",
+                ".foamagent_state.json", ".case_scripts.json", "mesh_assessment.json"}
+
+
+# Words a key may carry after a metric's name: its unit (drag_per_span_N_per_m).
+_UNIT_WORDS = {"n", "m", "per", "w", "pa", "s", "kg", "k", "j", "mm", "cm", "m2", "m3", "s2", "nd",
+               "nondim", "dimensionless", "pct", "percent", "deg", "rad", "kpa", "mpa", "kw", "mw"}
+
+
+def _metrics_from_records(case_dir: Path, metrics: List[str], max_bytes: int = 2_000_000) -> Dict[str, Any]:
+    """The requested metrics as the case's own result files give them: every
+    numeric value in its JSON records (up to three folders down, not in
+    processor or time folders) whose key is the metric's name, or the name
+    followed by a unit (Cd, drag_per_span_N_per_m). Without this the analysis
+    read only PyVista's mesh statistics and missed a hyStrath study's drag,
+    heat and Cd, which each case had written (shelf_demo_hystrath_20261022_1030)."""
+    def norm(text: str) -> str:
+        return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+    wanted = {norm(m): m for m in metrics if norm(m)}
+    own = Path(case_dir).name.lower()
+    found: Dict[str, List[float]] = {}
+    sources: Dict[str, List[str]] = {}
+
+    def walk(node: Any, path: str, source: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, f"{path}.{key}" if path else str(key), source)
+        elif isinstance(node, list):
+            return
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            segments = [seg.lower() for seg in path.split(".")]
+            # Another case's value or a comparison of two, not this case's own.
+            if any(word in seg for seg in segments[:-1] + [segments[-1]]
+                   for word in ("comparison", "reference", "difference", "delta", "error")):
+                return
+            if any(seg.startswith("case_") and seg != own for seg in segments):
+                return
+            last = str(path.rsplit(".", 1)[-1])
+            for key, metric in wanted.items():
+                rest = last[len(metric):] if last.lower().startswith(metric.lower()) else None
+                unit_only = (rest is not None and rest.startswith("_")
+                             and all(tok.lower() in _UNIT_WORDS for tok in rest.strip("_").split("_")))
+                if norm(last) == key or unit_only:
+                    if float(node) not in found.setdefault(metric, []):
+                        found[metric].append(float(node))
+                        sources.setdefault(metric, []).append(f"{source}:{path}")
+
+    # Newest first: a case can hold an earlier run's or an earlier script's
+    # record of the same quantity, and the current one should lead.
+    def mtime(f: Path) -> float:
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for f in sorted(Path(case_dir).rglob("*.json"), key=mtime, reverse=True):
+        rel = f.relative_to(case_dir)
+        if (len(rel.parts) > 4 or f.name in _RECORD_SKIP or f.name.startswith(".")
+                or any(part.startswith("processor") for part in rel.parts)
+                or any(part.replace(".", "", 1).replace("e-", "", 1).isdigit() for part in rel.parts[:-1])):
+            continue
+        try:
+            if f.stat().st_size > max_bytes:
+                continue
+            walk(json.loads(f.read_text(errors="ignore")), "", str(rel))
+        except (OSError, ValueError):
+            continue
+    return {"metrics": found, "metric_sources": sources}
+
+
 def extract_metrics(
     case_dir: Path,
     metrics: List[str],
@@ -725,6 +804,10 @@ def extract_metrics(
         merged.update(precomputed_qoi)
         data["qoi"] = merged
         data["analysis_source"] = "llm_pyvista"
+        records = _metrics_from_records(case_dir, metrics)
+        if records["metrics"]:
+            data["metrics"].update(records["metrics"])
+            data["metric_sources"] = records["metric_sources"]
         return data
 
     if qoi_source == "legacy":
@@ -748,6 +831,10 @@ def extract_metrics(
 
     data["qoi"].update(_extract_from_pyvista_robust(case_dir))
     data["analysis_source"] = "pyvista"
+    records = _metrics_from_records(case_dir, metrics)
+    if records["metrics"]:
+        data["metrics"].update(records["metrics"])
+        data["metric_sources"] = records["metric_sources"]
     return data
 
 
@@ -883,15 +970,32 @@ def main() -> int:
                                         "qoi_source": args.qoi_source}, indent=2), encoding="utf-8")
         return 0
 
+    # Each case's own requirement, from the study's requirements.json beside
+    # the output, so the cross-case step knows what each case was for. Given
+    # none, it read the three gradient checks of shelf_demo_dafoam_20261019_1057
+    # as three regularisation weights of an inversion.
+    requirement_by_case: Dict[str, Dict[str, Any]] = {}
+    requirements_path = out_path.parent / "requirements.json"
+    if requirements_path.is_file():
+        try:
+            entries = json.loads(requirements_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[analyze] warning: could not read {requirements_path}: {e}", file=sys.stderr)
+            entries = []
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and entry.get("case_id"):
+                requirement_by_case[str(entry["case_id"])] = entry
+
     # Run cross-experiment processing so analysis stage can generate true across-case figures/tables.
     experiments_for_cross: List[Dict[str, Any]] = []
     for p in resolved:
+        requirement = requirement_by_case.get(p.name, {})
         experiments_for_cross.append(
             {
                 "simulation_id": p.name,
                 "case_name": p.name,
-                "description": "",
-                "user_requirement": "",
+                "description": str(requirement.get("description") or ""),
+                "user_requirement": str(requirement.get("user_requirement_text") or ""),
                 "sim_dir": str(p),
                 "foam_output_dir": str(p),
             }

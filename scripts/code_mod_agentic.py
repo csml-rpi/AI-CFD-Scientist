@@ -344,8 +344,10 @@ class Sandbox:
         self.max_bash_timeout = max(int(bash_timeout), int(max_bash_timeout))
         self.deadline: Optional[float] = None
         # Real solver launches this candidate has made — the measured cost the
-        # search charges it. See _note_solver_invocations.
-        self.solver_invocations = 0
+        # search charges it: a line per launch in this log, written by the
+        # solver wrappers on the sandbox's PATH (_solver_shim_dir).
+        self.launch_log = self.run_dir / "agentic_solver_launches.log"
+        self._launches_before = self._launch_count()
         # Per-path write counter for the perfectionism-stall circuit-breaker.
         # Generic across topics — any file written more than
         # MAX_WRITES_PER_PATH times in a single session triggers a reject
@@ -374,11 +376,11 @@ class Sandbox:
         # cannot be split are hidden (cfd_langgraph.withheld_data).
         from cfd_langgraph.withheld_data import find_manifest, load_manifest
         self._withheld = load_manifest(find_manifest(self.run_dir))
-        # What counts as one unit of measured cost in this study. Defaults to
-        # the OpenFOAM solvers; a study whose candidates are trained rather
-        # than solved passes its own tokens so the budget still measures the
-        # expensive step rather than counting nothing.
-        self._cost_tokens: Tuple[str, ...] = tuple(cost_tokens) if cost_tokens else self._SOLVER_TOKENS
+        # The executables whose launches are the measured cost in this study.
+        # Defaults to the OpenFOAM flow solvers; a study whose candidates are
+        # trained rather than solved names its own, so the budget still
+        # measures the expensive step rather than counting nothing.
+        self._cost_names: Tuple[str, ...] = tuple(cost_tokens) if cost_tokens else _SOLVER_NAMES
 
     # ---- path checks
     def _is_under(self, p: Path, root: Path) -> bool:
@@ -578,33 +580,23 @@ class Sandbox:
             out["warning"] = warning
         return out
 
-    # Solver executables whose invocation is what a candidate actually costs.
-    # Counted from the command text rather than assumed from the action type:
-    # measured on run oed_20260822_1626_codex_high, candidate
-    # sa_sr_destruction ran 35 simpleFoam solves inside a single candidate
-    # doing its own coefficient sweep, and the search recorded it as cost 2 —
-    # the same as a candidate that solved once. With strategy a free choice
-    # rather than a fixed enum, an unmeasured cost makes an expensive strategy
-    # look free, and the archive cannot honestly compare strategies at all.
-    _SOLVER_TOKENS = (
-        "simpleFoam", "pimpleFoam", "pisoFoam", "rhoCentralFoam", "rhoPimpleFoam",
-        "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam",
-        "potentialFoam", "sonicFoam", "foamRun", "Allrun",
-    )
+    def _launch_count(self) -> int:
+        try:
+            with open(self.launch_log, "rb") as f:
+                return sum(1 for _ in f)
+        except OSError:
+            return 0
 
-    def _note_solver_invocations(self, cmd: str) -> None:
-        """Count solver launches implied by one shell command.
-
-        A loop body counts once per token occurrence, not once per iteration:
-        the exact count inside a `for` loop is not knowable from the text. That
-        under-counts a sweep, so the number is a floor on real cost, never an
-        over-estimate — a bound in the safe direction for budget accounting.
-        """
-        text = str(cmd or "")
-        for token in self._cost_tokens:
-            hits = text.count(token)
-            if hits:
-                self.solver_invocations += hits
+    @property
+    def solver_invocations(self) -> int:
+        """Solver launches made through this sandbox, failed ones too: each
+        start of a flow solver (_SOLVER_NAMES) logs a line before it runs,
+        whether started by a command, an Allrun or the agent's own script.
+        Counted from the command text, every `tail log.pimpleFoam` was a
+        launch and a fit script's forty solves were none; a 2-D cylinder
+        study stopped at "502 of 500 runs" with at least 116 solver logs on
+        disk (cylinder_dev_r3)."""
+        return max(0, self._launch_count() - self._launches_before)
 
     def _run_dir_state(self) -> str:
         """Every file under the run directory by path, size and modification
@@ -713,7 +705,6 @@ class Sandbox:
                     "or decide from what you already have."
                 ),
             }
-        self._note_solver_invocations(cmd)
         repeat_key = cmd.strip()
         # Only back-to-back repeats count: another command since (a rebuild,
         # say) may have changed what this one returns. On
@@ -758,7 +749,12 @@ class Sandbox:
         # python/python3 links to this interpreter goes first instead, so no
         # other tool on PATH is shadowed.
         shim = _interpreter_shim_dir()
-        full = f"{prefix}export PATH=\"{shim}:$PATH\" && {cmd}" if shim else f"{prefix}{cmd}"
+        # The solver wrappers first: each launch is logged, then the real
+        # solver runs (Sandbox.solver_invocations).
+        shim = ":".join(d for d in (_solver_shim_dir(self._cost_names), shim) if d)
+        launches = f"export CFD_SOLVER_LAUNCH_LOG=\"{self.launch_log}\" && "
+        full = (f"{prefix}{launches}export PATH=\"{shim}:$PATH\" && {cmd}" if shim
+                else f"{prefix}{launches}{cmd}")
         bwrap = shutil.which("bwrap")
         if not bwrap:
             return {
@@ -1065,6 +1061,113 @@ def _post_process_hint() -> str:
     return "<application> -postProcess -func wallShearStress -latestTime"
 
 
+def _extension_points_note(hypothesis: str, wm_project_dir: Optional[Path]) -> str:
+    """For each OpenFOAM class the hypothesis names, which of its member functions
+    a subclass can override (virtual) and which it cannot, read from the class's
+    own header in this install. In OpenFOAM 10, kOmegaSSTLM's Fonset, Flength,
+    ReThetac, Fthetat and ReThetat0 are not virtual: a subclass method of the same
+    name is never called. Seven SD7003 candidates "changed" them and ran the stock
+    model, their fits flat at the baseline's score (sd7003lm_trial_1)."""
+    if not wm_project_dir:
+        return ""
+    words, word = [], ""
+    for ch in str(hypothesis) + " ":
+        if ch.isalnum() or ch == "_":
+            word += ch
+        else:
+            # class names carry a capital (kOmegaSSTLM); plain words do not
+            if (len(word) >= 4 and word[0].isalpha() and any(c.isupper() for c in word)
+                    and word not in words):
+                words.append(word)
+            word = ""
+    src = Path(wm_project_dir) / "src"
+    blocks = []
+    for name in words[:40]:
+        header = next(iter(sorted(src.glob(f"*/lnInclude/{name}.H"))), None) or \
+            next(iter(sorted(src.glob(f"*/*/lnInclude/{name}.H"))), None)
+        if header is None:
+            continue
+        try:
+            lines = header.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        virtual, plain = [], []
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line or line.startswith(("//", "#", "*", "/*")):
+                continue
+            is_virtual = line.startswith("virtual ")
+            if not (is_virtual or line.startswith(("tmp<", "void ", "bool ", "scalar ", "const ", "label "))):
+                continue
+            head = line.split("(", 1)[0] if "(" in line else (
+                line if i + 1 < len(lines) and lines[i + 1].strip().startswith("(") else "")
+            parts = head.replace("*", " ").replace("&", " ").split()
+            if not parts:
+                continue
+            method = parts[-1]
+            if not method.replace("_", "").isalnum() or method in (name, f"~{name}", "TypeName"):
+                continue
+            (virtual if is_virtual else plain).append(method)
+        virtual = list(dict.fromkeys(virtual))
+        plain = [m for m in dict.fromkeys(plain) if m not in virtual]
+        if virtual or plain:
+            blocks.append(
+                f"{name} ({header}):\n"
+                f"  virtual, a subclass may override: {', '.join(virtual) or 'none'}\n"
+                f"  NOT virtual, a subclass method of the same name is never called by {name}: "
+                f"{', '.join(plain) or 'none'}\n")
+    if not blocks:
+        return ""
+    return (
+        "============================================================\n"
+        "WHAT A SUBCLASS CAN CHANGE IN THIS OPENFOAM (read from the headers)\n"
+        "============================================================\n"
+        + "".join(blocks)
+        + "To change a function that is not virtual, override a virtual one that calls it\n"
+        "(for the equations it enters, usually correct()) and write the changed equation\n"
+        "there. Then check that the change reaches the solution: a run with a strong\n"
+        "coefficient must give different forces from the neutral one before you fit.\n\n"
+    )
+
+
+def _settled_start_note(starter_case: Path) -> str:
+    """What the starter case's 0/ holds when the mesh gate started every later run
+    from a settled flow (start_decision.json): the agent is told to continue from
+    it as given. Without this, three SD7003 candidates ran potentialFoam on it, as
+    the usual case setup does, and so solved from scratch for the 5,000 iterations
+    meant to continue a settled flow: unconverged, scored 34.6% against the
+    baseline's 6.1% (sd7003lm_trial_1, cand_curvature_sst_limiter_fit)."""
+    try:
+        decision = json.loads((Path(starter_case) / "start_decision.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    if not decision.get("from_settled_state"):
+        return ""
+    fields = ", ".join(decision.get("fields_taken_from_settled_state") or []) or "the solved fields"
+    run_length = decision.get("run_length")
+    averaging = decision.get("averaging_start")
+    return (
+        "============================================================\n"
+        "THE STARTER CASE STARTS FROM A SETTLED FLOW\n"
+        "============================================================\n"
+        f"Its 0/ holds the settled solution of the selected mesh level ({fields}), not\n"
+        "initial guesses, and every run of this study continues from it"
+        + (f" for {run_length:g} iterations" if isinstance(run_length, (int, float)) else "")
+        + (f", averaging from iteration {averaging:g}" if isinstance(averaging, (int, float)) else "")
+        + " (system/controlDict as given).\n"
+        "Copy 0/ as it is into every case you run. Do not reinitialise it: no\n"
+        "potentialFoam, setFields, mapFields or any other step that writes 0/, and no\n"
+        "fresh uniform fields. A run started from rest instead does not converge in that\n"
+        "many iterations, and its score says nothing about your model.\n"
+        + (f"Run every scored case the full {run_length:g} iterations. A case scored before\n"
+           "it gets there is still close to the flow it was given and is not accepted: on\n"
+           "this study a strong change had moved the score less than half its way after\n"
+           "1,000 iterations. Plan your fit's evaluations around that run length.\n"
+           if isinstance(run_length, (int, float)) else "")
+        + "\n"
+    )
+
+
 def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: str = "",
                        starter_case: Path, run_dir: Path,
                        wm_project_dir: Optional[Path],
@@ -1097,6 +1200,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "============================================================\n\n"
         + f"Topic: {topic.strip()}\n\n"
         + f"Hypothesis to implement (variant_name={variant_name}):\n{hypothesis.strip()}\n\n"
+        + _extension_points_note(hypothesis, wm_project_dir)
         + (
             "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP\n\n"
             "  1. NEVER background it. No `nohup`, no trailing `&`, no detached\n"
@@ -1248,6 +1352,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + f"WM_PROJECT_DIR (read-only OpenFOAM install): {wm_project_dir or '(unset)'}\n"
         + f"Starter case (read-only base): {starter_case}\n"
         + f"Run directory (your writable workspace): {run_dir}\n\n"
+        + _settled_start_note(starter_case)
         + (
             # Repair mode: the model and the case already exist and something
             # about the plumbing around them is broken. The full deliverable
@@ -1524,6 +1629,47 @@ def _render_call_args(tool_name: str, tool_args: Any) -> str:
     elif tool_name == "run_bash" and isinstance(shown.get("cmd"), str):
         shown["cmd"] = _clip_middle(shown["cmd"], 4000, 1000)
     return _clip_middle(json.dumps(shown, default=str, ensure_ascii=False), 6000, 1000)
+
+
+# Flow solvers whose launches a candidate is charged for.
+_SOLVER_NAMES = (
+    "simpleFoam", "pimpleFoam", "pisoFoam", "icoFoam", "rhoCentralFoam", "rhoPimpleFoam",
+    "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam", "sonicFoam", "foamRun",
+)
+
+_SOLVER_SHIM = """#!/bin/bash
+# Logs this launch of {name} for the candidate's solver count
+# (code_mod_agentic.Sandbox.solver_invocations), then runs the real {name}.
+# Ranks of a parallel run log once (rank 0).
+here="$(cd "$(dirname "$0")" && pwd)"
+rank="${{OMPI_COMM_WORLD_RANK:-${{PMI_RANK:-0}}}}"
+if [ -n "${{CFD_SOLVER_LAUNCH_LOG:-}}" ] && [ "$rank" = "0" ]; then
+    printf '%s\t%s\t%s\n' "$(date +%s)" "{name}" "$PWD" >> "$CFD_SOLVER_LAUNCH_LOG" 2>/dev/null
+fi
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$here" | paste -sd: -)"
+exec {name} "$@"
+"""
+
+
+def _solver_shim_dir(names: Sequence[str] = _SOLVER_NAMES) -> str:
+    """A folder of wrappers, one per executable in ``names``, that log each
+    launch and run the real one; "" if it cannot be made."""
+    try:
+        import hashlib
+
+        key = hashlib.sha1(_SOLVER_SHIM.encode("utf-8") + "|".join(names).encode()).hexdigest()[:10]
+        shim = Path(__file__).resolve().parent.parent / ".cache" / "solver_bin" / key
+        shim.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            path = shim / name
+            if not path.is_file():
+                tmp = shim / f".{name}.tmp{os.getpid()}"
+                tmp.write_text(_SOLVER_SHIM.format(name=name))
+                tmp.chmod(0o755)
+                tmp.replace(path)
+        return str(shim)
+    except Exception:
+        return ""
 
 
 def _interpreter_shim_dir() -> str:

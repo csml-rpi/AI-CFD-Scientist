@@ -25,8 +25,11 @@ SCRIPT_GEN_SYSTEM = (
     + "\n\nMULTI-CASE BATCH MODE:\n"
     "- You write ONE Python script that loads **every** case listed in cases_config.json (path given below).\n"
     "- Each case has 'id' and 'path' (OpenFOAM case root). Touch or ensure <case_folder_name>.foam exists in each path.\n"
-    "- Save **multiple** PNG files into the output directory given in the config. Use clear names, e.g. "
-    "`01_case_001_Ux_full.png`, `02_case_001_Ux_profile.png`, `10_multi_panel_overview.png`.\n"
+    "- Save **multiple** PNG files into the output directory given in the config.\n"
+    "- REQUIRED FILE NAMES: `cfg[\"figure_jobs\"]` lists the planned figures; each has `out_png_abs`, `kind`, "
+    "`case_id`, `field` and `what_to_visualize`. Save every one of them at **exactly** `out_png_abs` (do not rename, "
+    "do not add prefixes). `field` is the case's own field name (e.g. U_Ar, p_Ar): read that field, never assume "
+    "U or p exist. Any extra figure you add needs its own new file name.\n"
     "- Prefer **coherent styling** across cases: same colormap limits where comparable, same font sizes, same layout logic.\n"
     "- You may create **multi-panel** figures (subplots / multiple render windows saved sequentially) when it helps the paper.\n"
     "- Read config from: `cfg_path = Path(__file__).resolve().parent / \"cases_config.json\"` then `json.loads(cfg_path.read_text())`.\n"
@@ -137,11 +140,15 @@ def build_unified_brief_from_plan(plan: Dict[str, Any]) -> str:
 def write_cases_config(
     output_dir: Path,
     cases: List[Dict[str, str]],
+    figure_jobs: Optional[List[Dict[str, Any]]] = None,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     p = output_dir / "cases_config.json"
     p.write_text(
-        json.dumps({"output_dir": str(output_dir.resolve()), "cases": cases}, indent=2),
+        json.dumps(
+            {"output_dir": str(output_dir.resolve()), "cases": cases, "figure_jobs": list(figure_jobs or [])},
+            indent=2,
+        ),
         encoding="utf-8",
     )
     return p.resolve()
@@ -256,12 +263,15 @@ def run_batch_paper_viz_loop(
     previous_script: str = "",
     extra_feedback: str = "",
     deadline: Optional[float] = None,
+    required_pngs: Optional[List[Path]] = None,
 ) -> Tuple[str, List[Path], Dict[str, Any]]:
     """
     Returns (final_script_text, list of png paths, meta dict with attempts, failures history).
     Each outer attempt: generate OR revise script → run → per-image VLM; on failures, next iteration revises.
     No new attempt starts when another as long as the last would end past
     ``deadline`` (time.monotonic()): the figures of the last attempt are kept.
+    ``required_pngs`` are the plan's out_png files: one the script did not
+    write fails the attempt like a QA reject, so the next revision writes it.
     """
     llm = create_langchain_llm(model=model, temperature=0.0)
     paper_figs_dir = paper_figs_dir.resolve()
@@ -269,9 +279,82 @@ def run_batch_paper_viz_loop(
     ensure_paper_fig_layout_module(paper_figs_dir)
     script_path = paper_figs_dir / "paper_viz_batch.py"
     meta: Dict[str, Any] = {"inner_attempts": 0, "failures_log": [], "programmatic_failures": []}
+    required = [Path(r).resolve() for r in (required_pngs or [])]
     last_script = previous_script.strip()
     pending_qa_block = ""  # if set, use SCRIPT_REVISE_USER
     run_log_tail = ""
+
+    # The figures and script already here, kept until an attempt does better.
+    entry_dir = paper_figs_dir / ".entry_figures"
+    shutil.rmtree(entry_dir, ignore_errors=True)
+    entry_dir.mkdir(parents=True)
+    for old in paper_figs_dir.glob("*.png"):
+        shutil.copy2(old, entry_dir / old.name)
+    entry_script = script_path.read_text(encoding="utf-8") if script_path.is_file() else ""
+
+    def _present(found) -> int:
+        """How many of the required figures are among ``found`` (all PNGs when none are required)."""
+        names = {f.name for f in found}
+        return sum(r.name in names for r in required) if required else len(names)
+
+    def _run_and_check(attempt: int) -> Tuple[bool, List[Path], str, str]:
+        """Run the script on disk and QA its figures: (passed, pngs, feedback, log tail)."""
+        for old in paper_figs_dir.glob("*.png"):
+            try:
+                old.unlink()
+            except OSError:
+                pass
+
+        rc, out, err = _run_script(script_path, cwd=repo_root)
+        log_tail = (out + "\n" + err)[-6000:]
+        pngs = sorted(paper_figs_dir.glob("*.png"))
+        if rc != 0 or not pngs:
+            meta["failures_log"].append({"attempt": attempt, "phase": "run", "error": log_tail[:2000]})
+            if verbose:
+                print(f"[batch_paper_viz] attempt {attempt}: run failed rc={rc} pngs={len(pngs)}")
+            return False, pngs, f"Script failed (exit {rc}) or produced no PNGs. Fix the script.\n{log_tail[:4000]}", log_tail
+
+        failures: List[Tuple[str, str]] = []
+        # A script that named its PNGs its own way left every planned out_png
+        # missing, and the audit could not match one figure to its job
+        # (shelf_demo_hystrath_20261022_1030 wrote 06_01_case_001_... names).
+        for r in required:
+            if not r.is_file():
+                failures.append((r.name, f"[required] not written: save this figure at exactly {r}"))
+        for p in pngs:
+            prog_ok, prog_reason = _programmatic_image_checks(p)
+            if not prog_ok:
+                msg = f"[programmatic] {prog_reason}"
+                failures.append((p.name, msg))
+                meta["programmatic_failures"].append({"file": p.name, "reason": msg})
+                if verbose:
+                    print(f"[batch_paper_viz] QA reject: {p.name} — {msg[:120]}")
+                continue
+            ok, reason = _check_one_image(image_path=p, llm=llm, brief=unified_brief)
+            if not ok:
+                failures.append((p.name, reason))
+                if verbose:
+                    print(f"[batch_paper_viz] QA reject: {p.name} — {reason[:120]}")
+
+        if not failures:
+            if verbose:
+                print(f"[batch_paper_viz] all {len(pngs)} images passed QA (attempt {attempt})")
+            meta["missing_required"] = []
+            return True, pngs, "", log_tail
+
+        meta["failures_log"].append({"attempt": attempt, "phase": "qa", "failures": failures})
+        if verbose:
+            print(f"[batch_paper_viz] attempt {attempt}: {len(failures)} image(s) failed QA; will revise script")
+        return False, pngs, "\n".join(f"- {name}: {rs}" for name, rs in failures), log_tail
+
+    # A script already on disk with no script handed in -- one the manager
+    # repaired between write_paper calls -- runs first as it is; only when it
+    # fails does an attempt rewrite it, starting from it.
+    if not last_script and entry_script.strip():
+        last_script = entry_script.strip()
+        passed, pngs, pending_qa_block, run_log_tail = _run_and_check(0)
+        if passed:
+            return entry_script, pngs, meta
 
     last_took = 0.0
     for attempt in range(1, max(1, max_inner_attempts) + 1):
@@ -329,56 +412,29 @@ def run_batch_paper_viz_loop(
             pass
         script_path.write_text(script_text, encoding="utf-8")
         last_script = script_text
-        pending_qa_block = ""
-
-        for old in paper_figs_dir.glob("*.png"):
-            try:
-                old.unlink()
-            except OSError:
-                pass
-
-        rc, out, err = _run_script(script_path, cwd=repo_root)
-        run_log_tail = (out + "\n" + err)[-6000:]
-        pngs = sorted(paper_figs_dir.glob("*.png"))
-        if rc != 0 or not pngs:
-            meta["failures_log"].append({"attempt": attempt, "phase": "run", "error": run_log_tail[:2000]})
-            pending_qa_block = f"Script failed (exit {rc}) or produced no PNGs. Fix the script.\n{run_log_tail[:4000]}"
-            if verbose:
-                print(f"[batch_paper_viz] attempt {attempt}: run failed rc={rc} pngs={len(pngs)}")
-            last_took = time.monotonic() - started
-            time.sleep(min(2.0, 0.25 * (1 + random.random())))
-            continue
-
-        failures: List[Tuple[str, str]] = []
-        for p in pngs:
-            prog_ok, prog_reason = _programmatic_image_checks(p)
-            if not prog_ok:
-                msg = f"[programmatic] {prog_reason}"
-                failures.append((p.name, msg))
-                meta["programmatic_failures"].append({"file": p.name, "reason": msg})
-                if verbose:
-                    print(f"[batch_paper_viz] QA reject: {p.name} — {msg[:120]}")
-                continue
-            ok, reason = _check_one_image(image_path=p, llm=llm, brief=unified_brief)
-            if not ok:
-                failures.append((p.name, reason))
-                if verbose:
-                    print(f"[batch_paper_viz] QA reject: {p.name} — {reason[:120]}")
-
-        if not failures:
-            if verbose:
-                print(f"[batch_paper_viz] all {len(pngs)} images passed QA (attempt {attempt})")
+        passed, pngs, pending_qa_block, run_log_tail = _run_and_check(attempt)
+        if passed:
             return script_text, pngs, meta
-
-        fb_lines = [f"- {name}: {rs}" for name, rs in failures]
-        pending_qa_block = "\n".join(fb_lines)
-        meta["failures_log"].append({"attempt": attempt, "phase": "qa", "failures": failures})
-        if verbose:
-            print(f"[batch_paper_viz] attempt {attempt}: {len(failures)} image(s) failed QA; will revise script")
         last_took = time.monotonic() - started
         time.sleep(min(2.0, 0.25 * (1 + random.random())))
 
+    # Every attempt failed. A re-render that wrote fewer of the planned figures
+    # than the round before had deleted that round's figures, and the paper
+    # then compiled against none of its 20 (nn_in_solver_demo_20261022_1129):
+    # the figures and script this call started with come back instead.
+    if _present(entry_dir.glob("*.png")) > _present(paper_figs_dir.glob("*.png")):
+        for old in paper_figs_dir.glob("*.png"):
+            old.unlink()
+        for kept in entry_dir.glob("*.png"):
+            shutil.copy2(kept, paper_figs_dir / kept.name)
+        if entry_script:
+            script_path.write_text(entry_script, encoding="utf-8")
+            last_script = entry_script
+        meta["restored_entry_figures"] = True
+        if verbose:
+            print("[batch_paper_viz] no attempt did better than the figures already there; kept those")
     pngs = sorted(paper_figs_dir.glob("*.png"))
+    meta["missing_required"] = [str(r) for r in required if not r.is_file()]
     return last_script, pngs, meta
 
 

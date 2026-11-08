@@ -87,6 +87,7 @@ class _SetupItem(BaseModel):
     found: str = ""
     status: str
     fix: str = ""
+    effect: str = ""
 
 
 class _SetupCheck(BaseModel):
@@ -94,6 +95,31 @@ class _SetupCheck(BaseModel):
 
 
 SETUP_PROBLEMS = ("mismatch", "missing")
+
+
+class _ConditionChange(BaseModel):
+    quantity: str
+    starter: str = ""
+    required: str
+    file: str = ""
+
+
+class _ConditionChanges(BaseModel):
+    items: List[_ConditionChange] = Field(default_factory=list)
+
+
+def condition_changes(llm: Any, *, foamfiles_xml: str, user_requirement: str,
+                      solver_notes: str = "") -> List[Dict[str, str]]:
+    """The physical conditions the requirement sets differently from the
+    starter case in ``foamfiles_xml`` that change the scales a mesh must
+    resolve; empty when it runs the starter's own condition."""
+    user = P.CONDITION_CHECK_USER_PROMPT.format(user_requirement=user_requirement, foamfiles_xml=foamfiles_xml,
+                                                solver_notes=solver_notes.strip() or "(none)")
+    out: _ConditionChanges = structured_output(llm, _ConditionChanges).invoke(
+        [SystemMessage(content=P.with_version_facts(P.CONDITION_CHECK_SYSTEM_PROMPT)), HumanMessage(content=user)]
+    )
+    return [{"quantity": i.quantity.strip(), "starter": i.starter.strip(), "required": i.required.strip(),
+             "file": i.file.strip()} for i in out.items if i.quantity.strip() and i.required.strip()]
 
 
 def check_setup(llm: Any, *, foamfiles_xml: str, user_requirement: str, solver_notes: str = "") -> List[Dict[str, str]]:
@@ -107,7 +133,9 @@ def check_setup(llm: Any, *, foamfiles_xml: str, user_requirement: str, solver_n
     items = []
     for item in out.items:
         status = item.status.strip().lower()
+        # Anything not said to be record-keeping counts as changing the run.
+        effect = "record" if item.effect.strip().lower().startswith("record") else "run"
         items.append({"requirement": item.requirement, "file": item.file, "found": item.found,
                       "status": status if status in ("match", "mismatch", "missing", "unclear") else "unclear",
-                      "fix": item.fix})
+                      "fix": item.fix, "effect": effect})
     return items

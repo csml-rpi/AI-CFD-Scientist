@@ -375,7 +375,8 @@ def test_codex_payload_carries_tools_and_allows_parallel_calls() -> None:
     check("the tools array is sent", payload["tools"][0]["name"] == "run_mesh_gate")
     check("Responses tool specs are flat, not nested", "function" not in payload["tools"][0])
     check("parallel tool calls are allowed when tools are bound", payload["parallel_tool_calls"] is True)
-    check("the prebuilt items are used verbatim", payload["input"] is items)
+    # Equal, not the same list: _bounded_input copies it to cut an oversized text.
+    check("the prebuilt items are used verbatim", payload["input"] == items)
 
     plain = wrapper._build_payload([{"role": "user", "content": "hi"}])
     check("parallel tool calls stay off with no tools", plain["parallel_tool_calls"] is False)

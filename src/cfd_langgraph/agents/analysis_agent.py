@@ -12,6 +12,7 @@ from typing import Optional, List, Dict, Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.prompts import ChatPromptTemplate
 
+from cfd_langgraph.case_records import case_records
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.viz_creator import viz_creator
 from cfd_langgraph.llm.reply import reply_text
@@ -644,8 +645,25 @@ class AnalysisAgent:
             {"type": "text", "text": "Cross-experiment objectives:\n" + ("\n".join(f"- {o}" for o in objectives) if objectives else "- (none)") + "\n\n"},
             {"type": "text", "text": "Generated cross-experiment script (truncated):\n```python\n" + (script_text or "")[:25000] + "\n```\n\n"},
             {"type": "text", "text": "Cross-experiment report (truncated):\n" + (report_text or "")[:25000] + "\n\n"},
-            {"type": "text", "text": "Now inspect attached cross-experiment plots and provide interpretation.\n"},
         ]
+        # The cases' own result files. With only the cut report, the
+        # interpretation said the final network coefficients were not exposed,
+        # though the training case had saved them (nn_in_solver_demo_20261022_1129).
+        try:
+            inventory = json.loads((proc_dir / "case_context.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            inventory = []
+        records = {
+            str(item.get("simulation_id") or Path(str(item["sim_dir"])).name): case_records(Path(str(item["sim_dir"])))
+            for item in (inventory if isinstance(inventory, list) else [])
+            if isinstance(item, dict) and item.get("sim_dir") and Path(str(item["sim_dir"])).is_dir()
+        }
+        if any(records.values()):
+            content_parts.append({"type": "text", "text": (
+                "Each case's own result files, as the case saved them (cut to a length limit); "
+                "report numbers from these where the report above is cut short:\n"
+                + json.dumps(records, indent=1)[:60000] + "\n\n")})
+        content_parts.append({"type": "text", "text": "Now inspect attached cross-experiment plots and provide interpretation.\n"})
         blocks = _image_paths_to_blocks([Path(p) for p in image_paths], max_images=12, max_dimension=1999)
         content_parts.extend(blocks)
         content_parts.append({"type": "text", "text": "\nEnd of artifacts. Write cross-experiment interpretation now."})

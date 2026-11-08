@@ -195,9 +195,27 @@ def _build_case_runner_prompt(out_dir: Path) -> str:
 You will be given, in your task description:
 - a case_id (e.g. "case_003")
 - a physics_group (cases that share a mesh/physics shape use the same group string)
-- the full requirement text FoamAgent needs to write and run the case
+- possibly, files the case must use exactly as they are (a trained network's card and
+  model, a dictionary the study supplies), each with where it goes in the case
 
-Default path: call `run_case_native` exactly once with those three values. It runs the
+The case's approved requirement is in requirements.json: run_case_native runs it for the
+case_id, and requirement_text you pass alongside a case_id is not used. Files you were
+given go in run_case_native's `given_files`, {{path in the case: path of the file}}: they
+are copied in exactly and never rewritten by the writer, the setup check or the review.
+Pass them again on every call: a call without them runs the case without them.
+When your task is to redo only a finished case's post-processing, call run_case_native
+with post_only=True: it runs the case's Allrun.post on the solve the case already has,
+without solving again.
+
+If your task asks for something the approved requirement does not say (a rank count, a
+time step, an end time, where a file goes), run_case_native has no way to pass it to the
+case: the case runs its approved requirement. Do not try to get it in another way. Run the
+case, and put first in your report which of those items the case did not receive, so the
+manager can change this case's requirement (generate_case_requirements with its case_id in
+case_ids). A DSMC case-runner told "at most 16 ranks, dt 5e-7" ran on 32 ranks at the
+requirement's 1e-7 and was then called unauthorized for it.
+
+Default path: call `run_case_native` exactly once with those values. It runs the
 whole FoamAgent loop (parse the requirement, retrieve reference tutorials, decompose
 into files, write each file, generate and run Allrun, review-and-retry on failure) as
 part of this workflow directly — you do not need a separate Foam-Agent installation
@@ -235,7 +253,8 @@ values and the case used the wrong one), call run_case_native once more with the
 requirement_text and `clarification` set to the correct case-specific values.
 
 Then report back, in your final message, a short structured summary: case_id, status
-(success/failed), loop_count, and — if it failed — the last few lines of error_logs. Do
+exactly as run_case_native's result gives it (its `status` field, not your own reading of
+the run), loop_count, and — if it failed — the last few lines of error_logs. Do
 not attempt to fix a failing case beyond the reviewer loop already built into
 run_case_native, do not call the composed runner more than once per case (apart from
 that one clarified re-run), and do not include the full stdout/stderr in your final
@@ -419,6 +438,89 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
 # controls: on qwen_retest_20261005/cavity_r11 one ran to the 9,999-step limit
 # with 375 refused calls in a row. Supplying it here keeps the capability with
 # the same step cap, refusal stop and loop control as the other subagents.
+NN_COUPLER_PROMPT = """You handle the neural network's side when this study puts one inside the solver.
+Cases are written and run by the case-runner; you prepare and check the network, and report
+to the manager what each case must contain. Everything the network was trained with that the
+solver must reproduce lives in its card: the inputs in order and exactly how each is computed,
+the normalisation, the output scaling, the bounds, the training range.
+
+Conventions (DAFoam's): normalised input = (raw + input_shift) * input_scale; output =
+output_scale * (net + output_shift); a non-finite output becomes default_value; then it is
+clipped to [lower_bound, upper_bound]. A network trained on standardised inputs has
+input_shift = -mean and input_scale = 1/std.
+
+A. A network trained INSIDE the solver, through its adjoint (DAFoam):
+ 1. Choose it: inputs from DAFoam's own features (the solver notes list them and say how to
+    declare the model), hidden layers, activation, input shifts and scales that bring each
+    raw feature to about [-1, 1], output shift and scale, bounds, writeFeatures True.
+ 2. Write its daOptions["regressionModel"][name] dictionary as JSON in the study folder, and
+    an initial weight vector of small random values (with run_python): one value for every
+    weight leaves all neurons of a layer identical, and training cannot separate them.
+ 3. Tell the manager what the training case must do: train the weights as the design
+    variable, and save at the end the trained weight vector (prob.get_val(name)) and the
+    options as JSON, with the features and the output field written at the final time.
+    A gradient check of the adjoint against finite differences, when one is asked for,
+    is set up so it can tell: the step must change the checked output far more (100x or
+    so) than two solves of the same setup differ from each other, which is not machine
+    precision for an iterative solve. Find that scatter first (the starter's notes, or
+    two repeat solves), then size the step from the adjoint's own derivative to change
+    the output by well above it; nudge along a direction that matters (the adjoint
+    gradient, or the output layer) rather than one weight that barely moves the output;
+    start every perturbed solve from the converged base flow; pick a condition whose
+    solution settles, not one near stall; and compare two step sizes. A 1e-4 step on one
+    output weight changed lift by 5e-9 while repeat solves differed by 1e-3: the check
+    came out with the wrong sign, time after time, and blocked training for hours.
+ 4. Once it has run: nn_from_dafoam with that case and time. It must report
+    matches_dafoam_formula and a passing dafoam_case_check: the PyTorch network then IS the
+    network DAFoam trained, cell by cell.
+
+B. A trained network used IN a case:
+ 1. Write its card (nn_export's description lists every field) and a model script whose
+    build_model() returns the trained network and sample_inputs() at least 8 raw rows of its
+    training data. Take each definition, shift and scale from how it was trained: never
+    invent or round them.
+ 2. nn_export, then nn_check_parity. Nothing may use the network until parity passes.
+ 3. nn_coded_entries gives the entries a coded object needs. Write the coded object file
+    yourself, complete, in the study folder (for example constant/fvModels for OpenFOAM 10, or
+    a function-object file): those entries; code that computes each feature EXACTLY as its card
+    definition says, builds a List<const scalarField*> of the raw features in the card's order,
+    calls model.evaluate on the exported model.pt and uses the output; and that writes each
+    feature as a field nn_<input name> and the output as the card's output field at each write
+    time. Tell the manager to pass that file to the case with given_files, so it reaches the
+    case exactly as written and is never rewritten, and that the case needs writePrecision 17
+    and writeFormat ascii in controlDict. Told only in prose, a manager left it out of the
+    case's requirement and the case writer evaluated the network by hand instead of through
+    the exported model (nn_in_solver_demo_20261022_1129).
+ 4. After the case has run: nn_check_case on it. Its result counts only when the check
+    passes. Report cells_outside_training_range: the network extrapolates there.
+
+Read the case's feature code against each card definition yourself: the checks prove the
+network gets the features the case computed, not that the case computed them as defined.
+Report back the card path, every check's result, and anything that did not hold, plainly."""
+
+
+def build_nn_coupler_subagent(tools: List[Any], model: Any) -> Any:
+    """The subagent for a neural network inside the solver: its card, its export
+    (with its normalisation), the checks that hold OpenFOAM to it, and a network
+    trained through DAFoam's adjoint turned into PyTorch (cfd_langgraph.nn_coupling)."""
+    return _capped(SubAgent(
+        name="nn-coupler",
+        description=(
+            "Prepares and checks a neural network used inside the solver: one trained through "
+            "DAFoam's adjoint, or a trained PyTorch network to evaluate in an OpenFOAM case. Writes "
+            "its card (inputs, exact definitions, normalisation, bounds), exports it, runs the parity "
+            "and case checks, and says what each case must contain. Does not run cases."
+        ),
+        system_prompt=NN_COUPLER_PROMPT,
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))
+
+
 def build_general_purpose_subagent(tools: List[Any], model: Any) -> Any:
     """deepagents' general-purpose subagent, with this harness's controls."""
     from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT

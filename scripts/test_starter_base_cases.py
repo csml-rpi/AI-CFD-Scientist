@@ -211,6 +211,39 @@ with tempfile.TemporaryDirectory() as tmp:
     (b / "constant" / "physicalProperties").write_text("nu 2e-3;")
     check("a changed set-up file changes it", _case_fingerprint(a) != _case_fingerprint(b))
 
+print("== a starter whose cases run on different OpenFOAMs")
+# Read as holding only its OpenFOAM 10 case, a DAFoam + OpenFOAM 10 starter
+# was described as OpenFOAM 10 throughout, and every DAFoam step was written as
+# an OpenFOAM 10 job (nn_in_solver_demo_20261022_1129).
+import json  # noqa: E402
+import os  # noqa: E402
+
+from cfd_langgraph.starter_cases import top_level_cases  # noqa: E402
+
+MIXED = Path("/mnt/sda1/cfd_solver_shelf/builds/DAFoam/own_openfoam-v2506/starters/convergent_channel_reg343_nn")
+with tempfile.TemporaryDirectory() as tmp:
+    nested = Path(tmp) / "starter"
+    for case in ("one", "two", "two/mesh_study/L1"):
+        (nested / case / "system").mkdir(parents=True)
+        (nested / case / "system" / "controlDict").write_text("application simpleFoam;\n")
+    check("the starter's top-level cases are its cases, not the ones nested in them",
+          [p.name for p in top_level_cases(nested)] == ["one", "two"])
+if MIXED.is_dir() and Path("/mnt/sda1/openfoam10/etc/bashrc").is_file() and os.environ.get("WM_PROJECT_DIR"):
+    from cfd_langgraph.manager.tools import _starter_case_context  # noqa: E402
+
+    with tempfile.TemporaryDirectory() as tmp:
+        study = Path(tmp)
+        (study / "starter_understanding.json").write_text(json.dumps(
+            {"starter_dir": str(MIXED), "base_case_path": ["simpleFoam_SA_of10"]}))
+        text = _starter_case_context(study, "/mnt/sda1/openfoam10")
+        check("both cases are described though the reading named one", "dafoam_v2506" in text
+              and "simpleFoam_SA_of10" in text, detail=text[:400])
+        check("each with the OpenFOAM it runs on", "case by case" in text and "DAFoam's own OpenFOAM" in text
+              and "OpenFOAM 10" in text, detail=text[:400])
+        check("and no case is told to use OpenFOAM 10 alone", "Use THIS version" not in text, detail=text[:400])
+else:
+    print("[SKIP] the mixed DAFoam + OpenFOAM 10 starter, or a loaded OpenFOAM 10, is not here")
+
 print()
 print("FAILURES:", FAILURES if FAILURES else "none")
 sys.exit(1 if FAILURES else 0)
