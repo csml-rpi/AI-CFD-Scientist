@@ -23,6 +23,7 @@ from .subagents import (
     build_case_runner_subagent,
     build_general_purpose_subagent,
     build_nn_coupler_subagent,
+    build_hpc_runner_subagent,
     build_oed_candidate_runner_subagent,
 )
 
@@ -100,6 +101,10 @@ Sequence for a standard study:
    requirement asks it to run the network inside the solver and write the fields
    nn_check_case reads, not to build its own parity program. One that was asked to spent
    ten runs compiling a separate evaluator and never reached the solver.
+   If a prepared case is too large or too long to run on this machine (millions of cells,
+   a long unsteady 3-D run), give it to the `task` tool with subagent_type="hpc-runner": it
+   runs that case folder on NERSC Perlmutter and copies the results back into it. It runs a
+   case that is already written; it does not write one.
 5. Call `generate_case_requirements` — turns every approved hypothesis's experiments
    into validated FoamAgent requirements (requirements.json). Use each requirement's
    `study_id` as its `physics_group` for the steps below, unless you have a reason to
@@ -519,6 +524,10 @@ def build_manager(
                 built["nn_coupler_tools"],
                 create_langchain_llm(model=settings.model, temperature=0.0, agent="nn-coupler"),
             ),
+            build_hpc_runner_subagent(
+                built["hpc_tools"],
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="hpc-runner"),
+            ),
         ],
         # Blocks deepagents' own built-in ls/read_file/write_file/grep/etc —
         # they'd silently run against an empty virtual filesystem instead of
@@ -539,7 +548,8 @@ def build_manager(
         # means a result that somehow reaches this conversation from a
         # subagent tool is protected rather than silently discarded.
         + build_context_middleware(
-            model, manager_tools + case_runner_tools + oed_candidate_tools + built["nn_coupler_tools"],
+            model, manager_tools + case_runner_tools + oed_candidate_tools + built["nn_coupler_tools"]
+            + built["hpc_tools"],
             refusal_stop=_MANAGER_REFUSAL_STOP, status_file=out_dir / "stuck.json",
         )
         + [build_study_mode_middleware(out_dir)],

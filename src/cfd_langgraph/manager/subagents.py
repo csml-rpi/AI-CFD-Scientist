@@ -521,6 +521,55 @@ def build_nn_coupler_subagent(tools: List[Any], model: Any) -> Any:
     ))
 
 
+HPC_RUNNER_PROMPT = """You run OpenFOAM cases of this study on NERSC Perlmutter, a supercomputer,
+and bring their results back into the same local case folders.
+
+The case is prepared locally first (by the case runner or from the starter) and must already
+run as it is: you size the job, submit it, follow it and fetch what the study needs. You do
+not write or rewrite the case's physics, mesh or numerics; a case that fails on Perlmutter for
+a reason in the case goes back to the manager with the error.
+
+1. hpc_overview first: whether this study may submit, the account and its hours, and how many
+   node-hours the study has committed against its limit.
+2. Size the job from the case. Read its cell count (constant/polyMesh/owner's header "note"
+   line has nCells) and its run length (controlDict startTime, endTime, deltaT). Perlmutter
+   CPU nodes have 128 cores; aim for roughly 5,000 to 20,000 cells per core. Below a few
+   thousand cells per core more nodes add cost and little speed. A case under about 200,000
+   cells belongs on qos shared (part of one node). The study is charged nodes x time_limit at
+   most, so ask for the time the run needs plus about 30 %, not the maximum.
+3. hpc_submit_case. If it reports dry_run, Perlmutter is not switched on for this study: say
+   so and report the case, the job you would submit and its cost. Do not retry.
+4. Follow the job with hpc_wait_for_job (or hpc_job_status) until it finishes. A job that
+   ended in TIMEOUT was too short: fetch its logs, see how far it got, and either submit the
+   remainder from the last written time or report back. Never resubmit the same failing job
+   unchanged.
+5. hpc_fetch_results with what="light" for logs and postProcessing; "latest" when a local tool
+   needs the final fields; "all" only when asked.
+
+Report back: the job id, its nodes, time limit and node-hours used, its final state and exit
+code, what was fetched into which case folder, and any error in the solver log, plainly."""
+
+
+def build_hpc_runner_subagent(tools: List[Any], model: Any) -> Any:
+    """The subagent that runs this study's prepared cases on Perlmutter
+    (cfd_langgraph.hpc.perlmutter) and fetches their results back."""
+    return _capped(SubAgent(
+        name="hpc-runner",
+        description=(
+            "Runs a prepared OpenFOAM case of this study on NERSC Perlmutter: sizes the job, submits "
+            "it, follows it to the end and copies the results back into the local case folder. Use "
+            "it for cases too large or too long for this machine. Does not write or change cases."
+        ),
+        system_prompt=HPC_RUNNER_PROMPT,
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))
+
+
 def build_general_purpose_subagent(tools: List[Any], model: Any) -> Any:
     """deepagents' general-purpose subagent, with this harness's controls."""
     from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT

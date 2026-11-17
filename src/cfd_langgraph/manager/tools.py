@@ -38,6 +38,8 @@ from cfd_langgraph.foam_native.openfoam_env import resolve_openfoam_env  # noqa:
 from cfd_langgraph.solver_shelf import run_env as case_env
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
+# Credential folders the agents' file tools never read (see _read_refusal).
+_CREDENTIAL_DIRS = tuple((Path.home() / d).resolve() for d in (".superfacility", ".ssh", ".aws"))
 
 # scripts/ isn't a proper package under src/cfd_langgraph — bootstrap it onto
 # sys.path the same way open_ended_discovery.py/oed_extensions.py already
@@ -4479,6 +4481,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         """Why ``p`` may not be read, or None when it may."""
         if _within(p, scope["own"]) or _within(p, scope["starter"]):
             return None
+        # Keys the framework itself uses (the NERSC Superfacility API key that
+        # hpc_* tools submit with) are never a study's to read.
+        for d in _CREDENTIAL_DIRS:
+            if _within(p, d):
+                return f"Refusing to read {p}: it holds credentials, which a study never reads."
         # The framework itself is not part of a study, as every study brief
         # says. Allowed to read it, a study's agent read the audit and the
         # paper reviewer's code and then forged review.json to pass
@@ -10063,7 +10070,19 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             # An exhausted endgame is not "affordable": the remaining budget
             # cannot fund a rebuild, and there is no compiled elite left whose
             # coefficients an experiment could vary.
-            affordable = budget_remaining >= cheapest and not endgame_exhausted
+            #
+            # Nor is a remainder below a rebuild's cost. Below it the
+            # last-scraps experiment branch above has already had its turn this
+            # call, and force_new_families only offers new families, which need
+            # a rebuild. Measured on the search ablation (2026-11-12): m1_s1 at
+            # 251/258 with a rebuild costing 8 was told 32 times to retry with
+            # force_new_families, got an empty batch each time, and sat idle
+            # for 8 h; W0_s1 (252/258, rebuild 9) did the same 21 times.
+            affordable = (
+                budget_remaining >= cheapest
+                and budget_remaining >= _expected_candidate_cost(history, "code_mod")
+                and not endgame_exhausted
+            )
             guidance = (
                 "Call this tool again with force_new_families=True — that requires every "
                 "niche to be a family the archive has never seen, which is what breaks the "
@@ -10078,6 +10097,12 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 f"budget_remaining={budget_remaining} is below the {cheapest} units the "
                 f"cheapest candidate has been costing in this study, "
                 "so the search really is finished."
+                if budget_remaining < cheapest else
+                f"budget_remaining={budget_remaining} cannot fund a rebuild "
+                f"({_expected_candidate_cost(history, 'code_mod')} units), and no "
+                "coefficient experiment survived validation, so the search really is "
+                "finished. force_new_families will NOT help — a new family needs a "
+                "full rebuild."
             )
             result["error"] = (
                 "No candidate survived validation this round (duplicate families, "
@@ -10085,6 +10110,27 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "was consumed. " + guidance
             )
             result["force_new_families_available"] = affordable
+            # A candidate still running will be recorded and may change the
+            # verdict, so only a search with nothing in flight is closed here.
+            in_flight = _read_json(disc_dir / "background_candidates.json") or {}
+            in_flight = [
+                j for j in in_flight.values()
+                if isinstance(j, dict) and not j.get("finished_at")
+            ] if isinstance(in_flight, dict) else []
+            if not affordable and not in_flight:
+                # The verdict above was only ever said to the manager, so
+                # search_status.json kept search_complete=false, the CLI kept
+                # auto-continuing, and no done checkpoint was written. Record it
+                # and close the search through the same path an exhausted budget
+                # takes (promotion, bridge, done checkpoint).
+                _write_json(disc_dir / "no_affordable_candidate.json", {
+                    "budget_used": budget_used,
+                    "budget_remaining": budget_remaining,
+                    "endgame_exhausted": endgame_exhausted,
+                    "at": datetime.now(timezone.utc).isoformat(),
+                })
+                closed = oed_record_candidate_results([])
+                result["search_complete"] = closed.get("search_complete")
         return result
 
     def oed_record_candidate_results(candidate_dirs: List[str]) -> dict:
@@ -10318,6 +10364,11 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         window = _saturation_window(config, real_evals, total_budget)
         saturated = archive.is_saturated(window=window)
         budget_exhausted = bool(total_budget and budget_used >= total_budget)
+        # oed_propose_candidates found nothing the remainder can fund, and no
+        # budget has been spent since it said so.
+        no_affordable = _read_json(disc_dir / "no_affordable_candidate.json") or {}
+        if no_affordable.get("budget_used") == budget_used:
+            budget_exhausted = True
         # Candidates that measurably beat the baseline. This — not an
         # interpreter verdict — is what makes a candidate worth promoting.
         #
@@ -13742,6 +13793,81 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
         _write_json(candidate_path / "candidate_record.json", record)
         return {"ok": True, "candidate_dir": str(candidate_path), **record}
 
+    # Perlmutter (cfd_langgraph.hpc.perlmutter): a case prepared here runs there
+    # and its results come back into the same case folder. Every call is about
+    # this study's own cases and jobs; the key, the account and the spending
+    # limits come from the environment the study was launched with.
+    def _hpc_call(fn, *args, **kwargs) -> dict:
+        from cfd_langgraph.hpc import perlmutter
+        try:
+            return getattr(perlmutter, fn)(out_dir, *args, **kwargs)
+        except Exception as exc:  # the agent has to see why, not a traceback
+            return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[-2000:]}
+
+    def hpc_overview() -> dict:
+        """Perlmutter's status, whether this study may submit jobs, the NERSC
+        account and its hours, the node-hours this study has committed against
+        its limit, and every job it has submitted."""
+        return _hpc_call("hpc_overview")
+
+    def hpc_submit_case(case_dir: str, nodes: int = 1, time_limit: str = "01:00:00", qos: str = "regular",
+                        ntasks: int = 0, commands: str = "", label: str = "", decomposed: bool = False,
+                        rerun_of: str = "") -> dict:
+        """Copy a case folder of this study to Perlmutter and submit it as a
+        Slurm job. Returns the job id; nothing waits for it.
+
+        nodes: Perlmutter CPU nodes, 128 cores each. A case uses them well down
+          to a few thousand cells per core; fewer cells per core only spends
+          hours. qos shared runs on part of one node (ntasks cores, at most 64).
+        time_limit: the job's wall-clock limit (HH:MM:SS). The study is charged
+          up to nodes x time_limit, so ask for what the run needs plus margin.
+        ntasks: MPI ranks (default every core of the nodes asked for).
+        commands: bash lines run inside the case folder on the compute node.
+          Default: ./Allrun when the case has one, else its controlDict
+          application, decomposed into ntasks and run with srun when ntasks > 1.
+          Parallel runs use `srun -n <ntasks> <solver> -parallel`.
+        label: a short name for the job.
+        decomposed: true to send the case's processor* folders too (split here
+          into exactly ntasks parts), so the job skips a long serial decomposePar.
+        rerun_of: the job id of an earlier job of this study to run again in its
+          folder on Perlmutter, without uploading the case again.
+        A study submits only when it was launched with Perlmutter switched on;
+        otherwise this writes the job script and reports what it would cost."""
+        path, why = _nn_path(case_dir)
+        if why:
+            return {"ok": False, "error": why}
+        if not (path / "system" / "controlDict").is_file():
+            return {"ok": False, "error": f"{path} is not an OpenFOAM case (no system/controlDict)"}
+        return _hpc_call("submit_case", path, nodes=int(nodes), ntasks=int(ntasks), time_limit=str(time_limit),
+                         qos=str(qos), commands=str(commands or ""), label=str(label or ""),
+                         decomposed=bool(decomposed), rerun_of=str(rerun_of or ""))
+
+    def hpc_job_status(job_id: str) -> dict:
+        """A submitted job's Slurm state, elapsed time, exit code and the last
+        lines of its output. finished=true once it has ended."""
+        return _hpc_call("job_status", str(job_id))
+
+    def hpc_wait_for_job(job_id: str, max_wait_s: int = 3600) -> dict:
+        """Wait up to max_wait_s seconds (at most 4 h) for a job to end,
+        checking every minute; returns its status as hpc_job_status does."""
+        return _hpc_call("wait_for_job", str(job_id), max_wait_s=min(int(max_wait_s), 4 * 3600))
+
+    def hpc_fetch_results(job_id: str, what: str = "light") -> dict:
+        """Copy a job's results back into its local case folder.
+        what: light (log files, postProcessing, the Slurm output), latest
+        (light plus the last time folder's fields) or all (everything except
+        processor* folders). Field files of a large 3-D case run to gigabytes;
+        fetch them only when a local tool needs them."""
+        result = _hpc_call("fetch_results", str(job_id), what=str(what))
+        if result.get("ok"):
+            file_ledger.note(out_dir, Path(result["case"]), f"manager: hpc_fetch_results {job_id}",
+                             what=f"results of Perlmutter job {job_id} ({what})")
+        return result
+
+    def hpc_cancel_job(job_id: str) -> dict:
+        """Cancel one of this study's Perlmutter jobs."""
+        return _hpc_call("cancel_job", str(job_id))
+
     def shelf_solvers(topic: str = "") -> dict:
         """Third-party OpenFOAM solvers this framework can use beyond the
         installation's own (wave flumes, additive manufacturing, solid
@@ -13927,6 +14053,20 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
             nn_check_parity,
             nn_check_case,
             nn_coded_entries,
+        ]],
+        # The hpc-runner subagent: runs a case this study prepared on
+        # Perlmutter and brings its results back into the case folder.
+        "hpc_tools": [_with_progress(_recorded(f)) for f in [
+            list_directory,
+            directory_tree,
+            read_text_file,
+            grep_files,
+            hpc_overview,
+            hpc_submit_case,
+            hpc_job_status,
+            hpc_wait_for_job,
+            hpc_fetch_results,
+            hpc_cancel_job,
         ]],
         "case_runner_tools": [_with_progress(_recorded(f)) for f in [
             # General file access, e.g. a reference tutorial or a log file

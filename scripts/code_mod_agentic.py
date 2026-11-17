@@ -598,6 +598,20 @@ class Sandbox:
         disk (cylinder_dev_r3)."""
         return max(0, self._launch_count() - self._launches_before)
 
+    def solver_refusal(self) -> str:
+        """Why an outside limit refused or stopped a solver run, or "".
+
+        A host-side run budget can be smaller than the search's own count
+        (solver_runs_left). Its refusal went to the solver's stderr, which
+        the agent had sent to a log file: it saw rc 97 beside
+        solver_runs_left 139, took the launcher for broken and ran the real
+        binary directly (search_ablation T0_s1, 2026-11-14). The launcher
+        writes the reason to <launch log>.refused instead."""
+        try:
+            return Path(str(self.launch_log) + ".refused").read_text().strip()
+        except OSError:
+            return ""
+
     def _run_dir_state(self) -> str:
         """Every file under the run directory by path, size and modification
         time, hashed: two equal values mean nothing there changed in between.
@@ -2367,6 +2381,10 @@ def run_agent_loop(
         if solver_budget > 0 and isinstance(tool_result, dict):
             tool_result["solver_runs_left"] = max(
                 0, solver_budget - getattr(sandbox, "solver_invocations", 0))
+        refusal = sandbox.solver_refusal() if hasattr(sandbox, "solver_refusal") else ""
+        if refusal and isinstance(tool_result, dict):
+            tool_result["solver_runs_left"] = 0
+            tool_result["solver_budget"] = refusal
         # Turns run out too, and an agent that never sees them go simply stops
         # mid-task without reporting anything.
         refused = isinstance(tool_result, dict) and str(

@@ -512,16 +512,26 @@ def _search_incomplete(out_dir: Path) -> Optional[Dict[str, Any]]:
     Nothing here judges whether a study should continue -- the study already
     said, and a manager that stops anyway is contradicting its own tool.
 
-    Returns None when the file is absent, which is every non-open-discovery
-    run and any search that has not recorded a round yet. Those keep the old
-    behaviour of going idle, because for them there is no computed verdict to
-    honour and "finished" is a judgement rather than a fact.
+    Returns None for every non-open-discovery run, because for those there is
+    no computed verdict to honour and "finished" is a judgement rather than a
+    fact. An open-ended search that is set up (search_config.json) but has not
+    recorded a round yet cannot be complete either: search_status.json is only
+    written when a round is recorded. Treating that as "no verdict" parked
+    search-ablation study cnocap_s2 for 12 h at 117/150 runs on 2026-11-15,
+    after a provider 401 mid-round: the retried step ended with a summary
+    turn and nothing had been recorded yet, so nothing carried on.
     """
+    oed = out_dir / "open_ended_discovery"
     status = None
     try:
-        raw = (out_dir / "open_ended_discovery" / "search_status.json").read_text()
+        raw = (oed / "search_status.json").read_text()
         status = json.loads(raw)
-    except (OSError, ValueError):
+    except OSError:
+        if (oed / "search_config.json").is_file():
+            return {"search_complete": False, "budget_used": "no round recorded yet",
+                    "budget_total": "?", "is_saturated": False}
+        return None
+    except ValueError:
         return None
     if not isinstance(status, dict) or status.get("search_complete") is not False:
         return None
