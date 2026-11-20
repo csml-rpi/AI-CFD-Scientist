@@ -71,6 +71,25 @@ def _reference_data_file(ref_files, fallback=None):
     return fallback
 
 
+def _coded_source_note() -> str:
+    """Which coded source-term form the runtime applier writes on the installed
+    OpenFOAM (scripts/code_mod_runtime.py chooses it the same way)."""
+    try:
+        from cfd_langgraph.openfoam_version import get_profile
+
+        profile = get_profile()
+    except Exception:
+        profile = {}
+    label = profile.get("label") or "the installed OpenFOAM"
+    if profile.get("fork") == "openfoam.com":
+        form = ("the `type scalarCodedSource; fields (<name>);` form (vectorCodedSource for a vector "
+                "field) into fvOptions")
+    else:
+        form = "the `type coded; field <name>;` form into constant/fvModels"
+    return (f"      {label.upper()} NOTE: the runtime applier emits\n"
+            f"      {form}.\n")
+
+
 def _bootstrap(repo_root: Path) -> None:
     foam_src = repo_root / "Foam-Agent" / "src"
     lang_src = repo_root / "src"
@@ -154,16 +173,20 @@ def _try_float(x: Any) -> Optional[float]:
 
 
 def _parse_requested_model(case_dir: Path) -> str:
-    mt = case_dir / "constant" / "momentumTransport"
-    if not mt.is_file():
-        return ""
-    txt = mt.read_text(encoding="utf-8", errors="ignore")
-    m = re.search(r"\bmodel\s+([A-Za-z0-9_]+)\s*;", txt)
-    return m.group(1).strip() if m else ""
+    from cfd_langgraph.openfoam_version import turbulence_model
+
+    return turbulence_model(case_dir).get("model", "")
+
+
+def _solver_log(case_dir: Path) -> Path:
+    """The solver log runApplication writes for this case's own solver."""
+    from cfd_langgraph.openfoam_version import case_solver
+
+    return case_dir / (case_solver(case_dir)["log"] or "log.simpleFoam")
 
 
 def _parse_selected_model_from_log(case_dir: Path) -> str:
-    logp = case_dir / "log.simpleFoam"
+    logp = _solver_log(case_dir)
     if not logp.is_file():
         return ""
     txt = logp.read_text(encoding="utf-8", errors="ignore")
@@ -234,7 +257,7 @@ def _evaluate_open_ended_case_contract(
         "case_dir": str(case_dir),
         "decision_json": str(case_dir / "decision.json"),
         "run_result_json": str(case_dir / "run_result.json"),
-        "log_simpleFoam": str(case_dir / "log.simpleFoam"),
+        "log_simpleFoam": str(_solver_log(case_dir)),
     }
 
     def add_check(name: str, ok: bool, detail: str) -> None:
@@ -1005,7 +1028,8 @@ def _llm_decide_next_action(
 
     fp = starter_understanding.get("flow_parameters", {}) or {}
     ref = starter_understanding.get("reference_data", {}) or {}
-    base_case = starter_understanding.get("base_case_path", "")
+    _declared = _declared_starter_cases(starter_understanding)
+    base_case = ", ".join(str(d) for d in _declared) or starter_understanding.get("base_case_path", "")
 
     compiled_summary = ""
     if compiled_models:
@@ -1099,9 +1123,7 @@ def _llm_decide_next_action(
         "      \"eqn += fvm::Sp(scalar(0.1), eqn.psi());\"),\n"
         "      code_include (optional headers), coefficients (optional named scalars),\n"
         "      selection_mode ('all'|'cellSet'|'cellZone', default 'all').\n"
-        "      OPENFOAM 10 (org) NOTE: the runtime applier emits the modern\n"
-        "      `type coded; field <name>;` form into constant/fvModels (NOT the\n"
-        "      ESI `scalarCodedSource; fields (<name>)` form into fvOptions).\n"
+        + _coded_source_note() +
         "      Available hooks in code_add_sup body: `eqn` is the fvMatrix,\n"
         "      `eqn.psi()` is the field, `mesh()` is the fvMesh, `coeffs()` is\n"
         "      the dictionary for named scalars (use\n"
@@ -1237,7 +1259,7 @@ def _llm_decide_next_action(
             "IMPORTANT: Your `formula_or_modification` spec MUST align with these verified paths and "
             "class names. Do NOT reference headers, directories, or classes that are not listed here "
             "unless they are well-known OpenFOAM core primitives (e.g. fvMatrix, volScalarField). "
-            "This installation may differ from ESI / foam-extend / OpenFOAM-v24xx layouts you have "
+            "This installation may differ from other OpenFOAM versions' layouts you have "
             "seen in training data.\n\n"
         )
 
@@ -1255,7 +1277,8 @@ def _llm_decide_next_action(
     except Exception:
         pass
     # Re-derive run_dir from starter_understanding.base_case_path if possible
-    base_case_path = starter_understanding.get("base_case_path", "")
+    declared_cases = _declared_starter_cases(starter_understanding)
+    base_case_path = declared_cases[0] if declared_cases else starter_understanding.get("base_case_path", "")
     _run_dir_candidate = None
     try:
         if base_case_path:
@@ -1415,7 +1438,9 @@ def _run_python_script_iteration(
     disc_dir_path = run_dir               # e.g. .../open_ended_discovery
     _eff_starter = starter_dir or Path(starter_understanding.get("starter_dir", "")) or (repo_root / "starter")
     starter_dir_str = str(_eff_starter)
-    of_dir = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam")
+    from cfd_langgraph.openfoam_version import find_installation
+
+    of_dir = find_installation() or "/opt/openfoam"
     preamble = (
         f"# ===== AUTO-INJECTED BY ORCHESTRATOR — USE THESE VARIABLES =====\n"
         f"# All key paths are already defined as pathlib.Path objects below.\n"
@@ -1528,8 +1553,8 @@ def _extract_case_metrics(
     if cf_metrics:
         parts.append(cf_metrics)
 
-    # 3. residual convergence tail from simpleFoam log
-    log = case_dir / "log.simpleFoam"
+    # 3. residual convergence tail from the solver's log
+    log = _solver_log(case_dir)
     if log.is_file():
         lines = log.read_text(errors="ignore").splitlines()
         # find last residual lines
@@ -2022,7 +2047,8 @@ def _run_code_mod_iteration(
     print(out)
 
     # interpret
-    _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+    _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
     metrics = _extract_case_metrics(
         exp_dir,
         starter_dir=starter_dir,
@@ -2043,6 +2069,21 @@ def _run_code_mod_iteration(
     }
 
 
+def _declared_starter_cases(starter_understanding: Dict[str, Any]) -> List[Path]:
+    """Every case starter_understanding names, resolved against the starter.
+
+    ``base_case_path`` may be a list, a single path, or one string naming
+    several -- a two-case starter answers with both. Treating that answer as
+    one path finds neither case, so resolution is shared rather than
+    re-implemented per call site.
+    """
+    try:
+        from cfd_langgraph.starter_cases import starter_base_case_dirs  # type: ignore
+        return starter_base_case_dirs(starter_understanding)
+    except Exception:
+        return []
+
+
 def _resolve_starter_case_dir(
     starter_dir: Optional[Path],
     starter_understanding: Dict[str, Any],
@@ -2053,6 +2094,9 @@ def _resolve_starter_case_dir(
     cand = (base_case_dir or "").strip() or str(starter_understanding.get("base_case_path", "") or "").strip()
     if cand and Path(cand).exists() and (Path(cand) / "constant").is_dir():
         return Path(cand)
+    for declared in _declared_starter_cases(starter_understanding):
+        if (declared / "constant").is_dir():
+            return declared
     if starter_dir is not None and Path(starter_dir).is_dir():
         for d in sorted(Path(starter_dir).rglob("*")):
             if not d.is_dir():
@@ -2202,7 +2246,8 @@ def _run_agentic_code_mod_iteration(
                 "run_validity": gate_result,
             }
         # Run interpret on the converged case to score it.
-        _run_interpret(Path(case_dir), repo_root, timeline_path, env=env, objective_contract=objective_contract)
+        _run_interpret(Path(case_dir), repo_root, timeline_path, env=env,
+                           objective_contract=objective_contract, topic=topic)
         metrics = _extract_case_metrics(
             Path(case_dir),
             starter_dir=starter_dir,
@@ -2388,6 +2433,11 @@ def _run_runtime_code_mod_iteration(
     # modifications (e.g. a broken customSource in fvModels) that would
     # contaminate independent hypotheses with unrelated bugs.
     base = (base_case_dir or "").strip() or str(starter_understanding.get("base_case_path", "") or "").strip()
+    if not base or not Path(base).exists():
+        for declared in _declared_starter_cases(starter_understanding):
+            if (declared / "constant").is_dir():
+                base = str(declared)
+                break
     if (not base or not Path(base).exists()) and starter_dir is not None:
         # Scan starter_dir (1-3 levels deep) for a complete OpenFOAM case.
         for d in sorted(Path(starter_dir).rglob("*")):
@@ -2475,13 +2525,13 @@ def _run_runtime_code_mod_iteration(
             f"runtime modification already applied via OpenFOAM's coded* "
             f"infrastructure (codedFvOption / codedFixedValue / coded "
             f"functionObject / dictionary edit). DO NOT modify "
-            f"constant/momentumTransport. DO NOT generate a custom turbulence "
+            f"the turbulence dictionary. DO NOT generate a custom turbulence "
             f"model class. The standard built-in model is intentional; the "
-            f"modification lives in constant/fvOptions, 0/<field> BCs, or "
+            f"modification lives in the source-term dictionary, 0/<field> BCs, or "
             f"system/controlDict.functions. Just run the case to convergence "
             f"and report metrics."
         ),
-        model_name="(built-in; runtime modification in fvOptions/BCs/functions)",
+        model_name="(built-in; runtime modification in source terms/BCs/functions)",
         params=params,
         ref_info=ref_info,
         topic=topic,
@@ -2748,7 +2798,8 @@ def _run_runtime_code_mod_iteration(
     # to visualize, and the viz/interpret LLM calls can stall indefinitely
     # on streaming responses (we've seen 15+ min hangs).
     if run_ok:
-        _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+        _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
         metrics = _extract_case_metrics(
             exp_dir,
             starter_dir=starter_dir,
@@ -3089,7 +3140,11 @@ def _run_experiment_iteration(
             # Patch fvModels coefficient values from action.parameters.
             # Generic: iterate every numeric key in action.parameters and
             # update its top-level entry inside constant/fvModels.
-            fvmodels = case_dir_resolved / "constant" / "fvModels"
+            # The source-term dictionary the case actually has: fvModels on
+            # openfoam.org, fvOptions on openfoam.com (constant/ or system/).
+            from cfd_langgraph.openfoam_version import case_file as _case_file
+
+            fvmodels = _case_file(case_dir_resolved, "sources") or case_dir_resolved / "constant" / "fvModels"
             if fvmodels.is_file():
                 txt = fvmodels.read_text(encoding="utf-8")
                 user_params = action.get("parameters", {}) or {}
@@ -3149,7 +3204,8 @@ def _run_experiment_iteration(
             }
         run_ok = (rc == 0) and (str(runtime_run_result.get("status", "")).upper() == "OK")
         if run_ok:
-            _run_interpret(exp_dir, repo_root, timeline_path, env=env, objective_contract=objective_contract)
+            _run_interpret(exp_dir, repo_root, timeline_path, env=env,
+                       objective_contract=objective_contract, topic=topic)
             metrics = _extract_case_metrics(
                 exp_dir,
                 starter_dir=starter_dir,
@@ -3275,6 +3331,69 @@ def _comparator_exemplar_text(
     return fallback
 
 
+def _interpret_requirement(topic: str, objective_contract: Optional[Dict[str, Any]]) -> str:
+    """What the case is for, in the words the judge needs to judge it.
+
+    Without this the judge is shown figures and a solver log and asked whether
+    the run is acceptable, with no statement of what the case is or what the
+    study is measuring. It then reports what it sees as unremarkable: the same
+    figures judged with and without this text came back PROCEED at confidence
+    0.8 and RERUN at 0.15.
+    """
+    parts: List[str] = []
+    if str(topic or "").strip():
+        parts.append(str(topic).strip()[:2000])
+    quantities = (objective_contract or {}).get("objective_quantities") or []
+    named = [str(q).strip() for q in quantities if str(q).strip()]
+    if named:
+        parts.append("The quantities this study is judged on are: " + ", ".join(named[:12]) + ".")
+    return "\n\n".join(parts)
+
+
+def _incumbent_best_from_history(case_dir: Path, direction: str) -> Optional[float]:
+    """The best score recorded so far, read from the discovery history on disk.
+
+    Derived here rather than threaded through every call site, so a caller that
+    does not track the leader still gets the check gated rather than run on
+    every candidate.
+    """
+    hist = _read_json(case_dir.parent / "history.json", [])
+    values: List[float] = []
+    for h in hist if isinstance(hist, list) else []:
+        if not isinstance(h, dict):
+            continue
+        value = (h.get("metric_aggregated") or {}).get("primary")
+        if value is None:
+            score = h.get("score")
+            value = score.get("value") if isinstance(score, dict) else None
+        try:
+            values.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    if not values:
+        return None
+    return max(values) if str(direction).lower().startswith("max") else min(values)
+
+
+def _takes_the_lead(value: Any, incumbent: Optional[float], direction: str) -> bool:
+    """Is this score better than the one currently leading?
+
+    Nothing leading yet counts as taking the lead, so the first scored
+    candidate is checked rather than skipped.
+    """
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    if incumbent is None:
+        return True
+    try:
+        best = float(incumbent)
+    except (TypeError, ValueError):
+        return True
+    return v > best if str(direction).lower().startswith("max") else v < best
+
+
 def _run_interpret(
     case_dir: Path,
     repo_root: Path,
@@ -3282,6 +3401,9 @@ def _run_interpret(
     env: Optional[Dict[str, str]] = None,
     *,
     objective_contract: Optional[Dict[str, Any]] = None,
+    incumbent_best: Optional[float] = None,
+    direction: str = "min",
+    topic: str = "",
 ) -> None:
     """Run viz + interpret on a finished case.
 
@@ -3296,6 +3418,15 @@ def _run_interpret(
 
     Vision-only path (when no comparator score is available): run the
     existing viz_creator + vision-LLM scoring pipeline.
+
+    A score cannot see the solution it came from. A quantity read on a
+    boundary leaves the interior unconstrained, so a candidate can match it
+    while the field is wrong -- and then the fast path reports the match and
+    nothing looks at the field. Rendering every candidate is too slow to be
+    worth it, but a candidate only matters once it takes the lead: so when the
+    comparator score beats ``incumbent_best``, the field is rendered and judged
+    as well as scored. ``incumbent_best`` of None means nothing leads yet, and
+    the check runs.
     """
     decision_path = case_dir / "decision.json"
 
@@ -3307,28 +3438,39 @@ def _run_interpret(
                 extracted = _extract_error_metrics(comp_out)
                 primary = _choose_primary_score(extracted)
                 if primary is not None:
+                    value = primary.get("value")
+                    facing = str(primary.get("direction", direction) or direction)
+                    if incumbent_best is None:
+                        incumbent_best = _incumbent_best_from_history(case_dir, facing)
+                    leads = _takes_the_lead(value, incumbent_best, facing)
                     _write_json(decision_path, {
                         "status": "UNKNOWN",
                         "confidence": 0.0,
                         "reason": (
-                            f"interpret skipped — using deterministic comparator score "
+                            f"deterministic comparator score "
                             f"{primary.get('metric','?')}={primary.get('value','?')} "
                             f"(direction={primary.get('direction','min')}). "
-                            f"Vision interpret is not invoked when a numeric score is available."
+                            + ("This candidate takes the lead, so its field is also being "
+                               "rendered and judged." if leads else
+                               "It does not lead, so the field is not rendered.")
                         )[:500],
                         "suggested_changes": [],
                         "raw": {"comparator_output_head": str(comp_out)[:800]},
                         "score_only_path": True,
+                        "field_check_run": bool(leads),
                     })
-                    print(f"[OED][interpret] score-only path: skipping LLM interpret "
-                          f"(score={primary})")
                     append_timeline_event(timeline_path, {
                         "stage": "interpret",
                         "case_id": case_dir.name,
-                        "status": "score_only_skipped",
+                        "status": "scored_and_field_checked" if leads else "score_only_skipped",
                         "score": primary,
                     })
-                    return
+                    if not leads:
+                        print(f"[OED][interpret] score-only path: does not lead, field not "
+                              f"rendered (score={primary}, incumbent={incumbent_best})")
+                        return
+                    print(f"[OED][interpret] score={primary} takes the lead over "
+                          f"{incumbent_best}; rendering and judging its field")
         except Exception as ex:
             print(f"[OED][interpret] score-only short-circuit failed "
                   f"({type(ex).__name__}: {ex}); falling through to vision interpret")
@@ -3361,7 +3503,9 @@ def _run_interpret(
              "--case", str(case_dir),
              "--figs", str(figs_dir),
              "--output", str(decision_path),
-             "--timeline", str(timeline_path)],
+             "--timeline", str(timeline_path),
+             *(["--requirement", _interpret_requirement(topic, objective_contract)]
+               if _interpret_requirement(topic, objective_contract) else [])],
             cwd=repo_root,
             env=env,
             timeout=INTERP_TIMEOUT_S,
@@ -3423,6 +3567,7 @@ def run_open_ended_discovery(
     multi_flow: bool = False,
     starter_dirs: Optional[List[Path]] = None,
     metric_aggregator: str = "llm_judge",  # llm_judge (default) | weighted_sum | min_improvement | pareto_rank (legacy)
+    evaluation_cases: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     baseline_metrics = baseline_metrics or {}
     baseline_score_value: Optional[float] = None
@@ -3649,15 +3794,29 @@ def run_open_ended_discovery(
                         ),
                         "adapter_attempts": _attempt_lines,
                     })
+                    _val_case, _val_view = _sur_base, None
+                    if bound:
+                        _val_case, _val_view, _val_error = _surrogate_validation_split(
+                            run_dir=run_dir, disc_dir=disc_dir, topic=topic, starter=_sur_starter,
+                            scorer=Path(_sur_scorer), baseline=_sur_base, bound=bound, specs=specs,
+                            primary=_primary, reference=Path(_sur_ref),
+                        )
+                        if _val_error:
+                            bound = {}
+                            _write_json(disc_dir / "bound_comparators.json", bound)
+                            ext_state["bound_comparators"] = bound
+                            _write_json(disc_dir / "surrogate_setup_status.json", {
+                                "stage": "validation_split", "ok": False, "detail": _val_error})
                     if bound:
                         bv = _oedx.compute_metric_vector(
-                            case_dir=_sur_base, bound_comparators=bound,
+                            case_dir=_val_case, bound_comparators=bound,
                             reference_file=Path(_sur_ref), baseline_final_time=None,
-                            metric_specs=specs,
+                            metric_specs=specs, scorer_view=_val_view,
                         )
                         _write_json(disc_dir / "baseline_metric_vector.json", bv)
                         ext_state["baseline_metric_vector"] = bv
-                        print(f"[OED-SURROGATE] baseline metric vector: {bv.get('metrics', {})}", flush=True)
+                        print(f"[OED-SURROGATE] baseline metric vector"
+                              f"{' (validation split)' if _val_view else ''}: {bv.get('metrics', {})}", flush=True)
                 else:
                     print("[OED-SURROGATE] no usable metrics were proposed.", flush=True)
                     _write_json(disc_dir / "surrogate_setup_status.json", {"stage": "metric_proposal", "ok": False,
@@ -3909,6 +4068,9 @@ def run_open_ended_discovery(
                     ),
                     baseline_final_time=baseline_final_time,
                     topic=topic,
+                    # The study's declared cases: a comparator must score the
+                    # case it is given, which only a second case can show.
+                    probe_cases=[Path(c) for c in (evaluation_cases or [])] or None,
                 )
                 _write_json(disc_dir / "bound_comparators.json", bound)
                 ext_state["bound_comparators"] = bound
@@ -5196,6 +5358,71 @@ def run_open_ended_discovery(
 # CLI
 # ---------------------------------------------------------------------------
 
+def _surrogate_validation_split(
+    *, run_dir: Path, disc_dir: Path, topic: str, starter: Path, scorer: Path, baseline: Path,
+    bound: Dict[str, Any], specs: List[Dict[str, Any]], primary: str, reference: Path,
+) -> Tuple[Path, Optional[str], str]:
+    """Where this study's search is scored: on a validation split of the
+    training data when its test targets are withheld from candidates, so the
+    test set is scored once, at the end (cfd_langgraph.validation_split).
+    Returns (baseline case to score, scorer view manifest, error)."""
+    import math
+
+    import oed_extensions as _ox  # type: ignore
+    import surrogate_setup as _sur  # type: ignore
+
+    test_manifest = run_dir / "withheld_test_targets" / "manifest.json"
+    if not test_manifest.is_file():
+        return baseline, None, ""
+    for _p in (str(Path(__file__).resolve().parent.parent / "src"),):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
+    from cfd_langgraph import pipeline_contract as pc
+    from cfd_langgraph import validation_split as vs
+
+    def _invoke(messages: List[Tuple[str, str]]) -> str:
+        return _ox._llm_invoke(messages, timeout_s=900)
+
+    spec_path = disc_dir / pc.SPEC_FILE
+    spec = pc.load_spec(spec_path)
+    if not spec:
+        spec, problems = pc.propose_spec(
+            llm_invoke=_invoke, brief=f"{topic}\n\n{_sur._task_brief(starter)}", scorer_path=scorer,
+            baseline_dir=baseline, baseline_listing=_sur._result_listing(baseline))
+        if not spec:
+            return baseline, None, ("Could not establish which prediction and timing files the scorer "
+                                    f"reads per seed: {'; '.join(problems)[:800]}")
+        _write_json(spec_path, spec)
+    print(f"[OED-SURROGATE] pipeline spec: {json.dumps(spec)[:600]}", flush=True)
+
+    def _smoke(case_dir: Path, scorer_manifest: str) -> Tuple[bool, str]:
+        mv = _ox.compute_metric_vector(case_dir=case_dir, bound_comparators=bound,
+                                       reference_file=reference, metric_specs=specs,
+                                       scorer_view=scorer_manifest)
+        value = (mv.get("metrics") or {}).get(primary)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return True, f"{primary} = {value}"
+        raw = (mv.get("raw_outputs") or {}).get(primary, "")
+        return False, f"{json.dumps(mv.get('errors') or {})[:800]} {raw[-1500:]}"
+
+    status = vs.build(study_dir=run_dir, starter=starter, scorer_path=scorer, baseline_dir=baseline,
+                      test_manifest_path=test_manifest, llm_invoke=_invoke, smoke_test=_smoke,
+                      strip_fences=_ox._strip_code_fences)
+    if not status.get("ok"):
+        last = (status.get("attempts") or [{}])[-1]
+        return baseline, None, ("No validation split of the training data passed its checks, so the "
+                                "search cannot be scored without the test set. Last attempt: "
+                                + "; ".join(last.get("problems") or [str(last.get("error", ""))])[:1200])
+    paths = vs.paths(run_dir)
+    problems = pc.check_spec(spec, paths["baseline"])
+    if problems:
+        return baseline, None, ("The validation reference result does not follow the scorer's file "
+                                f"names: {'; '.join(problems)[:800]}")
+    print(f"[OED-SURROGATE] validation split: {status.get('train_count')} training samples kept, "
+          f"stand-ins {status.get('validation_counts')}", flush=True)
+    return paths["baseline"], str(paths["scorer_manifest"]), ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Closed-loop open-ended CFD discovery.")
     parser.add_argument("--run-dir", required=True, type=str)
@@ -5208,6 +5435,8 @@ def main() -> int:
                              "Overrides starter_understanding['starter_dir'] if provided.")
     parser.add_argument("--literature", default="", type=str)
     parser.add_argument("--base-case-dir", default="", type=str)
+    parser.add_argument("--evaluation-case", action="append", default=[],
+                        help="a declared evaluation case of a multi-case study (repeatable)")
     parser.add_argument("--baseline-metrics", default="", type=str,
                         help="Path to baseline_metrics.json produced by baseline_setup. "
                              "Used to gate PROCEED on variant_score < baseline_score and "
@@ -5328,6 +5557,7 @@ def main() -> int:
         multi_flow=multi_flow_flag,
         starter_dirs=starter_dirs_paths or None,
         metric_aggregator=str(args.metric_aggregator),
+        evaluation_cases=list(args.evaluation_case or []),
     )
     print(json.dumps({"status": "ok", "summary": summary.get("best_model_description", "")}, indent=2))
     return 0

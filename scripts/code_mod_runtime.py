@@ -102,6 +102,7 @@ import re
 import shutil
 import subprocess
 import sys
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -227,19 +228,17 @@ def _detect_openfoam_flavor() -> str:
       of-org 10+:  type coded; field <name>;       (in constant/fvModels)
       esi:         type scalarCodedSource; fields (<name>);  (in constant/fvOptions)
     """
-    import os
-    wm_dir = os.environ.get("WM_PROJECT_DIR", "")
-    ver = os.environ.get("WM_PROJECT_VERSION", "")
-    # ESI versions look like "v2306", "v2312"; OF-org versions look like "10", "11"
-    if ver.startswith("v"):
-        return "esi"
-    if ver and ver[0].isdigit():
-        return "of-org"
-    if wm_dir and "openfoam" in wm_dir.lower():
-        # Heuristic: ESI installations typically have "OpenFOAM-v" in the path
-        if "openfoam-v" in wm_dir.lower() or wm_dir.lower().endswith("-v2306"):
-            return "esi"
-    return "of-org"
+    import sys as _sys
+
+    _src = str(Path(__file__).resolve().parents[1] / "src")
+    if _src not in _sys.path:
+        _sys.path.insert(0, _src)
+    from cfd_langgraph.openfoam_version import get_profile
+
+    profile = get_profile()
+    if profile.get("ok"):
+        return "esi" if profile["fork"] == "openfoam.com" else "of-org"
+    return "esi" if os.environ.get("WM_PROJECT_VERSION", "").startswith("v") else "of-org"
 
 
 def _resolve_fvoptions_path(case_dir: Path) -> Tuple[Path, str]:

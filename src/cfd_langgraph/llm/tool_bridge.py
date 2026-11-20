@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 from typing import Any, Callable, Coroutine, Dict, List, Sequence
 
@@ -194,6 +195,25 @@ def render_conversation(messages: Sequence[BaseMessage]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Largest tool result sent whole, in characters (the same ceiling the
+# manager's middleware puts on new results, llm/caching.py).
+_TOOL_RESULT_CHARS = int(os.getenv("CFD_SCIENTIST_TOOL_RESULT_CHARS") or 200_000)
+
+
+def _clipped(text: str) -> str:
+    """A tool result cut to its head and tail when it is over the ceiling.
+
+    Applied when the request is built, so a result already in a saved
+    conversation is covered too: a 29.7 MB grep result stayed in
+    shelf_demo_dafoam_20261015_1318's history and every later request was
+    refused ("string too long ... maximum length 10485760"), five
+    continuations in a row, until the study stopped (2026-10-18)."""
+    if len(text) <= _TOOL_RESULT_CHARS:
+        return text
+    half = _TOOL_RESULT_CHARS // 2
+    return text[:half] + f"\n…[{len(text) - 2 * half} characters omitted]…\n" + text[-half:]
+
+
 def messages_to_responses_input(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
     """LangChain messages -> Responses API input items.
 
@@ -209,7 +229,7 @@ def messages_to_responses_input(messages: Sequence[BaseMessage]) -> List[Dict[st
                 {
                     "type": "function_call_output",
                     "call_id": message.tool_call_id,
-                    "output": _text_of(message.content),
+                    "output": _clipped(_text_of(message.content)),
                 }
             )
             continue

@@ -17,7 +17,7 @@ def _calibration_window_from_env() -> float:
 
 class CaseCoordinator:
     """Per-study coordinator: the first case in a physics group calibrates the
-    machine (runs alone, benchmarked), every later case in that group is
+    machine (benchmarked on its own processes), every later case in that group is
     scheduled against the concurrency limit that calibration produced.
 
     Calibration holds everything else back for at most ``calibration_window_s``
@@ -53,6 +53,7 @@ class CaseCoordinator:
         self._profiles: Dict[str, ResourceProfile] = {}
         self._condition = threading.Condition()
         self._active_cases = 0
+        self._active_by_group: Dict[str, int] = {}
         self._calibrating = False
         self._calibration_waiters = 0
         self._calibrating_groups: Set[str] = set()
@@ -64,9 +65,9 @@ class CaseCoordinator:
         Per-group semaphores alone are unsafe for mixed studies: group A and
         group B could each launch their full machine-sized allowance. Every
         case therefore also acquires a study-wide dynamic slot whose limit is
-        the minimum of all calibrated group limits. New group calibration is
-        exclusive and gets priority over ordinary launches, so its system-wide
-        measurements are not contaminated by another case.
+        the minimum of all calibrated group limits. One group calibrates at a
+        time, with priority over ordinary launches; cases already running carry
+        on, and the calibration counts only the processes its own case starts.
         """
         while True:
             calibrate = False
@@ -93,10 +94,25 @@ class CaseCoordinator:
                 return self._calibrate(group, run_fn)
         return self._run_limited(group, run_fn)
 
-    def _effective_global_limit(self) -> int:
+    def busy(self) -> bool:
+        """Whether any case of this study is running or calibrating now."""
+        with self._condition:
+            return bool(self._active_cases or self._calibrating or self._calibrating_groups)
+
+    def _effective_global_limit(self, group: Optional[str] = None) -> int:
+        """The study-wide limit: the smallest limit of the groups with cases
+        running now and of ``group``. A group whose cases have all finished no
+        longer bounds the others: SD7003's mesh-gate group, calibrated on a
+        16-core solve at one case at a time, kept discovery to one candidate
+        at a time on 2 of its 16 cores after the gate had finished, while
+        discovery's own limit was 13 (sd7003lm_trial_1)."""
         if not self._schedulers:
             return 1
-        return max(1, min(s.max_concurrency for s in self._schedulers.values()))
+        live = [s.max_concurrency for g, s in self._schedulers.items()
+                if g == group or self._active_by_group.get(g, 0) > 0]
+        if not live:
+            live = [s.max_concurrency for s in self._schedulers.values()]
+        return max(1, min(live))
 
     def _install(self, group: str, profile: ResourceProfile) -> None:
         """Set ``group``'s limit from ``profile``. Caller holds ``_condition``."""
@@ -112,7 +128,13 @@ class CaseCoordinator:
         with self._condition:
             self._calibration_waiters += 1
             try:
-                self._condition.wait_for(lambda: not self._calibrating and self._active_cases == 0)
+                # One calibration at a time, but not alone on the machine: it
+                # counts only sessions started after it began
+                # (resource_probe.running_sessions). Waiting for every running
+                # case to finish held a new group's first case back for a whole
+                # 2.5-hour DSMC run of another group, after every restart
+                # (shelf_demo_hystrath_20261022_1030, case_006 behind case_004).
+                self._condition.wait_for(lambda: not self._calibrating)
                 self._calibrating = True
             finally:
                 self._calibration_waiters -= 1
@@ -134,6 +156,7 @@ class CaseCoordinator:
                 self._calibrating = False
                 # Still running, now as an ordinary case that holds a slot.
                 self._active_cases += 1
+                self._active_by_group[group] = self._active_by_group.get(group, 0) + 1
                 released = True
                 self._condition.notify_all()
 
@@ -145,6 +168,7 @@ class CaseCoordinator:
             with self._condition:
                 if released:
                     self._active_cases -= 1
+                    self._active_by_group[group] = self._active_by_group.get(group, 1) - 1
                 else:
                     self._calibrating = False
                 self._calibrating_groups.discard(group)
@@ -153,6 +177,7 @@ class CaseCoordinator:
         with self._condition:
             if released:
                 self._active_cases -= 1
+                self._active_by_group[group] = self._active_by_group.get(group, 1) - 1
             else:
                 self._install(group, profile)
                 self._calibrating = False
@@ -166,15 +191,17 @@ class CaseCoordinator:
                 lambda: (
                     not self._calibrating
                     and self._calibration_waiters == 0
-                    and self._active_cases < self._effective_global_limit()
+                    and self._active_cases < self._effective_global_limit(group)
                 )
             )
             self._active_cases += 1
+            self._active_by_group[group] = self._active_by_group.get(group, 0) + 1
         try:
             return self._schedulers[group].run(run_fn)
         finally:
             with self._condition:
                 self._active_cases -= 1
+                self._active_by_group[group] = self._active_by_group.get(group, 1) - 1
                 self._condition.notify_all()
 
     def profile_for(self, group: str) -> Optional[ResourceProfile]:

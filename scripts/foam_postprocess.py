@@ -40,6 +40,10 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -150,15 +154,10 @@ def _missing_fields_at_latest(case_dir: Path, expected_fields: List[str]) -> Lis
 def _resolve_bashrc(override: Optional[str] = None) -> Optional[str]:
     if override and Path(override).is_file():
         return override
-    env_wm = os.environ.get("WM_PROJECT_DIR", "").strip()
-    if env_wm:
-        cand = Path(env_wm) / "etc" / "bashrc"
-        if cand.is_file():
-            return str(cand)
-    for guess in ("/mnt/sda1/openfoam10/etc/bashrc", "/opt/openfoam10/etc/bashrc"):
-        if Path(guess).is_file():
-            return guess
-    return None
+    from cfd_langgraph.openfoam_version import find_installation
+
+    install = find_installation()
+    return str(Path(install) / "etc" / "bashrc") if install else None
 
 
 def run_openfoam_postprocess(
@@ -169,18 +168,29 @@ def run_openfoam_postprocess(
     timeout_s: int = 300,
 ) -> Dict[str, Any]:
     """
-    Invoke `<app> -postProcess -latestTime [-funcs (n1 n2 ...)]` on the case.
+    Evaluate function objects on the case's latest time with its solver's own
+    models loaded: `<app> -postProcess` (openfoam.org 10 and earlier,
+    openfoam.com) or `foamPostProcess -solver <module>` (openfoam.org 11+).
     Returns {ok, rc, stdout_tail, stderr_tail, app, args}.
     """
+    from cfd_langgraph.openfoam_version import case_solver, get_profile
+
     cd = Path(case_dir)
-    app = _read_application(cd / "system" / "controlDict")
+    profile = get_profile()
+    solver = case_solver(cd, profile)
+    app = solver["application"]
     if not app:
-        return {"ok": False, "rc": -1, "error": "could not read application from controlDict"}
+        return {"ok": False, "rc": -1, "error": "could not read the solver from controlDict"}
     bashrc_path = _resolve_bashrc(bashrc)
     if not bashrc_path:
-        return {"ok": False, "rc": -1, "error": "no OpenFOAM bashrc found (WM_PROJECT_DIR/openfoam10)"}
+        return {"ok": False, "rc": -1, "error": "no OpenFOAM installation found (set WM_PROJECT_DIR)"}
 
-    args = [app, "-postProcess", "-latestTime"]
+    if profile.get("solver_style") == "modules" or (profile.get("utilities") or {}).get("foamPostProcess"):
+        args = ["foamPostProcess"] + (["-solver", solver["module"]] if solver["module"] else []) + ["-latestTime"]
+    elif app != "foamRun":
+        args = [app, "-postProcess", "-latestTime"]
+    else:
+        args = [profile.get("post_process", "postProcess"), "-latestTime"]
     if funcs:
         args += ["-funcs", "(" + " ".join(funcs) + ")"]
     cmd = f". \"{bashrc_path}\" >/dev/null 2>&1 && cd \"{cd}\" && " + " ".join(args)

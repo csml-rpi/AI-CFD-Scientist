@@ -50,6 +50,7 @@ def build_planner_payload(
     mesh_bundle: Dict[str, Any],
     code_mod_note: str,
     starter_understanding_note: str = "",
+    case_fields: Dict[str, Dict[str, Any]] | None = None,
 ) -> str:
     """Single text block for the planner LLM."""
     cases = manifest.get("cases") if isinstance(manifest.get("cases"), list) else []
@@ -79,10 +80,24 @@ def build_planner_payload(
             indent=2,
         )
     analysis_excerpt = json.dumps(analysis, indent=2)[:25_000]
+    # The planner names the field of each velocity/pressure contour; it can
+    # only get that right from what the case wrote (hyStrath's dsmcFoam+ writes
+    # U_Ar and p_Ar, no U or p: shelf_demo_hystrath_20261022_1030).
+    field_lines: List[str] = []
+    for cid, info in sorted((case_fields or {}).items()):
+        if not isinstance(info, dict):
+            continue
+        field_lines.append(
+            f"- {cid}: latest time={info.get('time')} velocity-like={info.get('velocity_field')} "
+            f"pressure-like={info.get('pressure_field')} fields={', '.join(info.get('fields') or [])}"
+            + (f" NOTE: {info['pressure_note']}" if info.get("pressure_note") else "")
+        )
     parts = [
         f"TOPIC:\n{topic}\n",
         "\nRUN DIRECTORY LAYOUT (partial):\n" + summarize_run_directory(run_dir),
         "\nMANIFEST CASES:\n" + "\n".join(case_summaries),
+        "\nCASE FIELDS (latest written time; use these names for `field`):\n"
+        + ("\n".join(field_lines) or "(not available)"),
         "\nREQUIREMENTS (per case):\n" + "\n".join(req_brief),
         "\nANALYSIS JSON (truncated):\n" + analysis_excerpt,
         "\nMESH INDEPENDENCE BUNDLE (summary):\n" + (mesh_note or "(none)"),

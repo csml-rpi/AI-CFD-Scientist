@@ -280,6 +280,7 @@ class SearchArchive:
         strategy_transfer: float = 0.5,
         strategy_prior_visits: int = 1,
         population_size: int = 3,
+        min_chain_tries: int = 3,
     ) -> None:
         # q is min-max normalized into [0, 1] (see select_niche), so
         # exploration_c must be calibrated against THAT range, not raw score
@@ -293,6 +294,14 @@ class SearchArchive:
         # lets a strong, reasonably-visited niche's q actually win once it's
         # earned it — verified in scripts/test_oed_search_archive.py.
         self.exploration_c = exploration_c
+        # How many attempts (scored candidates and failed builds) a chain gets
+        # before the search may leave it (select_action). Left to the sampler,
+        # 35 of 39 chains of closure_20260826_codex, 27 of 32 of
+        # closure_20260906_codex and 11 of 13 of cylinder_dev_r3 stopped at
+        # their first candidate, while all 12 refinements those runs made beat
+        # their parent, and the best model of two of the three was a
+        # refinement (user, 2026-10-29: three tries before switching away).
+        self.min_chain_tries = max(1, int(min_chain_tries))
         # Visits-without-improvement at which a family's exploitation value
         # is halved. 3 is deliberately short: by the third consecutive
         # non-improving evaluation a coefficient sweep has already mapped
@@ -1213,6 +1222,21 @@ class SearchArchive:
             if twin is None:
                 deduped.append(lin)
 
+        # A chain is refined until it has had min_chain_tries attempts, best
+        # chain first; only then does the sampler decide (see min_chain_tries).
+        # A chain picked earlier in this batch is excluded above, so the other
+        # slots of a batch still go to other chains or new mechanisms.
+        unfinished = [
+            l for l in deduped
+            if len(l.get("all_scored") or l["members"]) + int(l.get("failures") or 0) < self.min_chain_tries
+        ]
+        if unfinished:
+            lin = min(unfinished, key=lambda l: (l["best_norm_score"], l["root_iteration"]))
+            tries = len(lin.get("all_scored") or lin["members"]) + int(lin.get("failures") or 0)
+            return self._deepen_pick(
+                lin, f"; held to {self.min_chain_tries} attempts before the search moves on "
+                     f"({tries} so far)")
+
         best: Optional[Tuple[float, Dict[str, Any]]] = None
         best_sample = 0.0
         for lin in deduped:
@@ -1392,35 +1416,7 @@ class SearchArchive:
         )[1]
 
         if chosen == "deepen":
-            tip = lin["tip"]
-            entry = tip["history_entry"] or {}
-            return {
-                "action": "deepen",
-                # So the prompt can tell an improving step from a regressing
-                # one without re-deriving the objective's direction.
-                "direction": self._direction or "min",
-                "lineage_id": lin["root_iteration"],
-                "family": entry.get("family"),
-                "strategy": entry.get("strategy"),
-                "elite": entry,
-                "is_new": False,
-                "depth": lin["depth"],
-                "score_trace": lin["score_trace"],
-                # The path ends at the tip, so its last step is ALWAYS an
-                # improvement and the trace alone can never tell the proposer
-                # that its previous attempt went backwards. These three carry
-                # the sibling evidence the path drops.
-                "last_attempt_regressed": lin.get("last_attempt_regressed", False),
-                "last_attempt_score": lin.get("last_attempt_score"),
-                "stalled": lin.get("stalled", 0),
-                "rationale": (
-                    f"lineage rooted at iteration {lin['root_iteration']} is at depth "
-                    f"{lin['depth']} with trace {[round(x, 6) for x in lin['score_trace']]}; "
-                    f"refining its best member"
-                    + (f"; {lin['stalled']} attempt(s) since it last improved"
-                       if lin.get("stalled") else "")
-                ),
-            }
+            return self._deepen_pick(lin)
         if chosen == "widen":
             # A new lineage inside a family we already know something about --
             # the middle ground between refining one chain and opening an
@@ -1456,6 +1452,39 @@ class SearchArchive:
         return {"action": "new_family", "family": None, "strategy": None,
                 "is_new": True, "elite": None, "lineage_id": None,
                 "rationale": "opening a mechanism not yet in the archive"}
+
+    def _deepen_pick(self, lin: Dict[str, Any], note: str = "") -> Dict[str, Any]:
+        """select_action's "deepen" result for ``lin``: refine its best member."""
+        tip = lin["tip"]
+        entry = tip["history_entry"] or {}
+        return {
+            "action": "deepen",
+            # So the prompt can tell an improving step from a regressing
+            # one without re-deriving the objective's direction.
+            "direction": self._direction or "min",
+            "lineage_id": lin["root_iteration"],
+            "family": entry.get("family"),
+            "strategy": entry.get("strategy"),
+            "elite": entry,
+            "is_new": False,
+            "depth": lin["depth"],
+            "score_trace": lin["score_trace"],
+            # The path ends at the tip, so its last step is ALWAYS an
+            # improvement and the trace alone can never tell the proposer
+            # that its previous attempt went backwards. These three carry
+            # the sibling evidence the path drops.
+            "last_attempt_regressed": lin.get("last_attempt_regressed", False),
+            "last_attempt_score": lin.get("last_attempt_score"),
+            "stalled": lin.get("stalled", 0),
+            "rationale": (
+                f"lineage rooted at iteration {lin['root_iteration']} is at depth "
+                f"{lin['depth']} with trace {[round(x, 6) for x in lin['score_trace']]}; "
+                f"refining its best member"
+                + (f"; {lin['stalled']} attempt(s) since it last improved"
+                   if lin.get("stalled") else "")
+                + note
+            ),
+        }
 
     def record_action_outcome(self, action: str, improved: bool) -> None:
         """Tell the allocator whether a move paid off, so its arms can learn.

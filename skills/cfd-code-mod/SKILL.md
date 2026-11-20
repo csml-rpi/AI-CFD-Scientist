@@ -1,12 +1,12 @@
 ---
 name: cfd-code-mod
-description: Custom OpenFOAM model implementation entry — alias for cfd-skills/cfd-code-modify. Use when the user wants to implement, modify, or add a custom viscosity / turbulence / source term / fvOption inside a case-local customModels directory. The full self-contained recipe (with the OPENFOAM 10 LITERATURE CHANGE AGENT v2 protocol embedded verbatim) lives in cfd-skills/cfd-code-modify/SKILL.md.
+description: Custom OpenFOAM model implementation entry — alias for cfd-skills/cfd-code-modify. Use when the user wants to implement, modify, or add a custom viscosity / turbulence / source term / fvOption inside a case-local customModels directory. The full self-contained recipe (with the LITERATURE CHANGE AGENT v2 protocol embedded verbatim, applied to the installed OpenFOAM version) lives in cfd-skills/cfd-code-modify/SKILL.md.
 allowed-tools: Bash, Read, Write
 ---
 
 # cfd-code-mod (alias)
 
-This skill is a **thin alias** for `cfd-skills/cfd-code-modify/SKILL.md`. The full ARIS/DS-style self-contained recipe — including the OPENFOAM 10 LITERATURE CHANGE AGENT v2 protocol embedded verbatim, the wmake compile-fix loop, and the smoke-test recipe — lives there.
+This skill is a **thin alias** for `cfd-skills/cfd-code-modify/SKILL.md`. The full ARIS/DS-style self-contained recipe — including the LITERATURE CHANGE AGENT v2 protocol embedded verbatim (applied to the installed OpenFOAM version), the wmake compile-fix loop, and the smoke-test recipe — lives there.
 
 ## Why an alias?
 After the Nov 2026 ARIS/DS-style refactor, all recipe content moved to `cfd-skills/`. `CLAUDE.md` routing for "implement / modify / viscosity model / Bingham / power-law / Carreau / source term / fvOption" historically pointed here, so this file remains for backward compatibility.

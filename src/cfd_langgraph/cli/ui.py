@@ -27,12 +27,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import faulthandler
 import html
 import re
 import shutil
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -399,8 +401,15 @@ class Console:
         def _worker() -> None:
             try:
                 drive()
-            except SystemExit:
-                pass
+            except SystemExit as exc:
+                # A deliberate stop (quit, end of input) prints its own line
+                # first; anything else raising SystemExit in the study ended the
+                # session with no output at all (sd7003_trial_1 cfd_scientist,
+                # 2026-11-01 01:40, one second into oed_propose_candidates).
+                # Say what raised it.
+                frames = traceback.extract_tb(exc.__traceback__)
+                where = f" from {Path(frames[-1].filename).name}:{frames[-1].lineno}" if frames else ""
+                print(f"\nsession ended: exit code {exc.code!r}{where}", flush=True)
             except BaseException as exc:  # surfaced, then the session ends cleanly
                 print(f"\n✗ session ended with an error: {exc!r}", flush=True)
             finally:
@@ -453,6 +462,9 @@ class Console:
 
         if banner:
             print(banner, flush=True)
+        # A crash in native code (solver bindings, numpy, the model client)
+        # otherwise leaves only the shell's "exited" line behind.
+        faulthandler.enable(sys.__stderr__)
         with patch_stdout(raw=True):
             asyncio.run(_ui())
         self.shutdown()

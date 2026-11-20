@@ -164,7 +164,7 @@ Run case_001 first, then feed each output back as `{previous_requirement}` for t
 
 ### Step 6 — Sanity-check each requirement
 For each generated paragraph, verify:
-- Mentions a concrete solver (`simpleFoam`, `pimpleFoam`, `icoFoam`, …).
+- Mentions a concrete solver (`simpleFoam`, `pimpleFoam`, `icoFoam`, …, or on openfoam.org 11+ a solver module such as `incompressibleFluid` run by `foamRun`) that the installed version has.
 - Mentions concrete BCs for every patch implied by the geometry (inlet, outlet, walls, frontAndBack for 2D).
 - Mentions cell count (or nx×ny×nz) — this is required by FoamAgent.
 - Mentions `endTime`, `deltaT`, `writeInterval`.

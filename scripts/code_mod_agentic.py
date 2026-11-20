@@ -46,7 +46,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -86,11 +86,21 @@ def _grep_error_lines(stdout: str, stderr: str, *, max_lines: int = 40) -> str:
             hits.append(i)
     if not hits:
         return ""
-    # Collect each hit + 2 lines of context above; dedupe & cap.
+    # Collect each hit with 2 lines above it, and for a FATAL/Error line the
+    # lines below it too: OpenFOAM prints its actual message under "FOAM FATAL
+    # ERROR" and before "From function". Context above alone kept only the
+    # banner -- on qwen_retest_20261005/slau_r5, 15 of 21 fatal errors reached
+    # the agent without their message ("Arguments of max have different
+    # dimensions" and the like). Dedupe & cap.
     keep: set = set()
     for i in hits:
         for j in range(max(0, i - 2), i + 1):
             keep.add(j)
+        if "FATAL" in combined[i][1] or "Error" in combined[i][1]:
+            for j in range(i + 1, min(len(combined), i + 7)):
+                keep.add(j)
+                if "From function" in combined[j][1]:
+                    break
     sel = sorted(keep)[:max_lines]
     out_lines = [f"[{combined[i][0]}] {combined[i][1]}" for i in sel]
     if len(sorted(keep)) > max_lines:
@@ -217,6 +227,8 @@ def _accelerator_sandbox_args() -> List[str]:
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT / "src"))
 # The repository folders that hold studies' outputs, named as manager/tools.py
 # names them for its own file tools.
 _REPO_STUDY_STORES = ("runs", "results", "submissions")
@@ -332,8 +344,10 @@ class Sandbox:
         self.max_bash_timeout = max(int(bash_timeout), int(max_bash_timeout))
         self.deadline: Optional[float] = None
         # Real solver launches this candidate has made — the measured cost the
-        # search charges it. See _note_solver_invocations.
-        self.solver_invocations = 0
+        # search charges it: a line per launch in this log, written by the
+        # solver wrappers on the sandbox's PATH (_solver_shim_dir).
+        self.launch_log = self.run_dir / "agentic_solver_launches.log"
+        self._launches_before = self._launch_count()
         # Per-path write counter for the perfectionism-stall circuit-breaker.
         # Generic across topics — any file written more than
         # MAX_WRITES_PER_PATH times in a single session triggers a reject
@@ -346,12 +360,27 @@ class Sandbox:
         # `cat <<EOF > train_v2.py` was sent 15 times, another version 7,
         # another 4, never run and never checked, until the turn cap.
         self._bash_repeats: Dict[str, Dict[str, Any]] = {}
+        self._last_bash_key = ""
         self.MAX_IDENTICAL_BASH_RESULTS = 3
-        # What counts as one unit of measured cost in this study. Defaults to
-        # the OpenFOAM solvers; a study whose candidates are trained rather
-        # than solved passes its own tokens so the budget still measures the
-        # expensive step rather than counting nothing.
-        self._cost_tokens: Tuple[str, ...] = tuple(cost_tokens) if cost_tokens else self._SOLVER_TOKENS
+        # Each command's last result and the state of the run directory it
+        # left. A command asked for again with nothing changed since is
+        # answered from here, whatever ran in between: a back-to-back count
+        # alone let qwen_retest_20261005/slau_r7 alternate two field dumps for
+        # 35 turns. Callers read last_call_repeated / last_call_changed.
+        self._bash_seen: Dict[str, Dict[str, Any]] = {}
+        self._reads_seen: Dict[str, Tuple[int, int]] = {}
+        self.last_call_repeated = False
+        self.last_call_changed = False
+        # Test-set targets this study withholds from candidates: copies holding only
+        # the legal input fields are mounted over the originals, and files that
+        # cannot be split are hidden (cfd_langgraph.withheld_data).
+        from cfd_langgraph.withheld_data import find_manifest, load_manifest
+        self._withheld = load_manifest(find_manifest(self.run_dir))
+        # The executables whose launches are the measured cost in this study.
+        # Defaults to the OpenFOAM flow solvers; a study whose candidates are
+        # trained rather than solved names its own, so the budget still
+        # measures the expensive step rather than counting nothing.
+        self._cost_names: Tuple[str, ...] = tuple(cost_tokens) if cost_tokens else _SOLVER_NAMES
 
     # ---- path checks
     def _is_under(self, p: Path, root: Path) -> bool:
@@ -405,6 +434,30 @@ class Sandbox:
         ok, why = self._read_allowed(p)
         if not ok:
             return {"ok": False, "error": f"read denied: {p} (must be inside run_dir / the starter folder / WM_PROJECT_DIR)"}
+        entries = self._withheld.get("entries") or []
+        rp = p.resolve()
+        # The same answer the shell's mounts give (run_bash): replacements and
+        # hidden paths apply in order, a later one covering an earlier one --
+        # a folder hidden after files inside it were replaced hides them too --
+        # and folders shown again (reveal) apply last, as the originals.
+        effect: Optional[Dict[str, Any]] = None
+        for entry in entries:
+            held = Path(entry["path"])
+            action = entry.get("action")
+            if action == "replace" and rp == held:
+                effect = entry
+            elif action == "hide" and (rp == held or (entry.get("is_dir") and held in rp.parents)):
+                effect = entry
+        revealed = any(entry.get("action") == "reveal"
+                       and (rp == Path(entry["path"]) or Path(entry["path"]) in rp.parents)
+                       for entry in entries)
+        if effect is not None and not revealed:
+            if effect.get("action") == "replace":
+                p = Path(effect["source"])
+            else:
+                return {"ok": False, "error": (
+                    f"withheld: {effect['path']} holds target values of an evaluation set, which "
+                    "candidates never see. The framework scores your predictions after you finish.")}
         if not p.is_file():
             return {"ok": False, "error": f"not a file: {p}"}
         try:
@@ -445,6 +498,17 @@ class Sandbox:
         if truncated:
             result["note"] = (f"showing characters {begin}-{end} of {total}; call read_file "
                               f"again with start={end} for the next page")
+        self.last_call_changed = False
+        read_key = f"{p.resolve()}|{begin}|{page}"
+        try:
+            signature = (size, p.stat().st_mtime_ns)
+        except OSError:
+            signature = (size, 0)
+        self.last_call_repeated = self._reads_seen.get(read_key) == signature
+        self._reads_seen[read_key] = signature
+        if self.last_call_repeated:
+            result["unchanged"] = ("You have read this exact part of this file before and it has not "
+                                   "changed since. Decide from what it says.")
         return result
 
     # ---- tool: write_file
@@ -453,6 +517,11 @@ class Sandbox:
         ok, why = self._write_allowed(p)
         if not ok:
             return {"ok": False, "error": f"write denied: {p} ({why})"}
+        # A written file can change what any command returns.
+        self._bash_repeats.clear()
+        self._last_bash_key = ""
+        self.last_call_repeated = False
+        self.last_call_changed = True
         if mode not in ("w", "a"):
             return {"ok": False, "error": f"unsupported mode: {mode}"}
 
@@ -511,33 +580,58 @@ class Sandbox:
             out["warning"] = warning
         return out
 
-    # Solver executables whose invocation is what a candidate actually costs.
-    # Counted from the command text rather than assumed from the action type:
-    # measured on run oed_20260822_1626_codex_high, candidate
-    # sa_sr_destruction ran 35 simpleFoam solves inside a single candidate
-    # doing its own coefficient sweep, and the search recorded it as cost 2 —
-    # the same as a candidate that solved once. With strategy a free choice
-    # rather than a fixed enum, an unmeasured cost makes an expensive strategy
-    # look free, and the archive cannot honestly compare strategies at all.
-    _SOLVER_TOKENS = (
-        "simpleFoam", "pimpleFoam", "pisoFoam", "rhoCentralFoam", "rhoPimpleFoam",
-        "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam",
-        "potentialFoam", "sonicFoam", "Allrun",
-    )
+    def _launch_count(self) -> int:
+        try:
+            with open(self.launch_log, "rb") as f:
+                return sum(1 for _ in f)
+        except OSError:
+            return 0
 
-    def _note_solver_invocations(self, cmd: str) -> None:
-        """Count solver launches implied by one shell command.
+    @property
+    def solver_invocations(self) -> int:
+        """Solver launches made through this sandbox, failed ones too: each
+        start of a flow solver (_SOLVER_NAMES) logs a line before it runs,
+        whether started by a command, an Allrun or the agent's own script.
+        Counted from the command text, every `tail log.pimpleFoam` was a
+        launch and a fit script's forty solves were none; a 2-D cylinder
+        study stopped at "502 of 500 runs" with at least 116 solver logs on
+        disk (cylinder_dev_r3)."""
+        return max(0, self._launch_count() - self._launches_before)
 
-        A loop body counts once per token occurrence, not once per iteration:
-        the exact count inside a `for` loop is not knowable from the text. That
-        under-counts a sweep, so the number is a floor on real cost, never an
-        over-estimate — a bound in the safe direction for budget accounting.
-        """
-        text = str(cmd or "")
-        for token in self._cost_tokens:
-            hits = text.count(token)
-            if hits:
-                self.solver_invocations += hits
+    def solver_refusal(self) -> str:
+        """Why an outside limit refused or stopped a solver run, or "".
+
+        A host-side run budget can be smaller than the search's own count
+        (solver_runs_left). Its refusal went to the solver's stderr, which
+        the agent had sent to a log file: it saw rc 97 beside
+        solver_runs_left 139, took the launcher for broken and ran the real
+        binary directly (search_ablation T0_s1, 2026-11-14). The launcher
+        writes the reason to <launch log>.refused instead."""
+        try:
+            return Path(str(self.launch_log) + ".refused").read_text().strip()
+        except OSError:
+            return ""
+
+    def _run_dir_state(self) -> str:
+        """Every file under the run directory by path, size and modification
+        time, hashed: two equal values mean nothing there changed in between.
+        The harness's own log and status files are left out."""
+        import hashlib
+
+        digest = hashlib.md5()
+        top = str(self.run_dir)
+        for root, dirs, files in os.walk(top):
+            dirs.sort()
+            for name in sorted(files):
+                if root == top and name.startswith("agentic_"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    st = os.stat(path)
+                except OSError:
+                    continue
+                digest.update(f"{path}|{st.st_size}|{st.st_mtime_ns}\n".encode("utf-8", "replace"))
+        return digest.hexdigest()
 
     def _note_bash_result(self, key: str, result: Dict[str, Any]) -> None:
         """Count how often a command came back with the very same result.
@@ -606,8 +700,33 @@ class Sandbox:
             return {"ok": False, "error": f"cwd does not exist: {cwd_p}"}
         if not isinstance(cmd, str) or not cmd.strip():
             return {"ok": False, "error": "empty command"}
-        self._note_solver_invocations(cmd)
+        self.last_call_repeated = False
+        self.last_call_changed = False
+        seen_key = f"{cmd.strip()}|{cwd_p}|{timeout}"
+        state_before = self._run_dir_state()
+        seen = self._bash_seen.get(seen_key)
+        if seen and seen["state"] == state_before:
+            # Nothing it could read has changed since it last ran, so running it
+            # again returns the same thing.
+            seen["times"] += 1
+            self.last_call_repeated = True
+            return {
+                **seen["result"],
+                "not_rerun": (
+                    f"Not run again: this exact command has been asked for {seen['times']} times and "
+                    "nothing in the run directory has changed since it last ran, so the output above "
+                    "is from that run. Running it again cannot show anything new. Change something, "
+                    "or decide from what you already have."
+                ),
+            }
         repeat_key = cmd.strip()
+        # Only back-to-back repeats count: another command since (a rebuild,
+        # say) may have changed what this one returns. On
+        # qwen_retest_20261005/slau_r5, 23 commands were refused although the
+        # agent had rebuilt or rewritten what they ran since their last run.
+        if repeat_key != self._last_bash_key:
+            self._bash_repeats.pop(repeat_key, None)
+        self._last_bash_key = repeat_key
         seen = self._bash_repeats.get(repeat_key)
         if seen and int(seen.get("count", 0)) >= self.MAX_IDENTICAL_BASH_RESULTS:
             return {
@@ -623,15 +742,20 @@ class Sandbox:
                 "last_rc": seen.get("rc"),
             }
         # Ensure OpenFOAM env is sourced (so wmake works) — find a bashrc.
-        bashrc_candidates = []
-        if self.wm:
-            bashrc_candidates.append(str(self.wm / "etc" / "bashrc"))
-        bashrc_candidates += [
-            "/mnt/sda1/openfoam10/etc/bashrc",
-            "/opt/openfoam10/etc/bashrc",
-        ]
-        bashrc = next((b for b in bashrc_candidates if Path(b).is_file()), None)
+        from cfd_langgraph.openfoam_version import find_installation
+
+        install = find_installation(str(self.wm) if self.wm else "")
+        bashrc = str(Path(install) / "etc" / "bashrc") if install else None
         prefix = f". \"{bashrc}\" >/dev/null 2>&1 && " if bashrc else ""
+        # Validated third-party solvers on the shelf (cfd_langgraph.solver_shelf)
+        # go on PATH / LD_LIBRARY_PATH after the bashrc, which would reset them.
+        if install:
+            from cfd_langgraph.openfoam_version import get_profile
+            from cfd_langgraph.solver_shelf import shell_exports
+
+            exports = shell_exports(get_profile(str(install)))
+            if exports:
+                prefix += f"{exports} && "
         # `bash -lc` runs the user's login profile, which put another conda
         # install's python first on PATH: a bare `python` in the sandbox ran
         # Python 3.10 with torch 2.11 while the brief listed 3.12 with torch 2.13
@@ -639,7 +763,12 @@ class Sandbox:
         # python/python3 links to this interpreter goes first instead, so no
         # other tool on PATH is shadowed.
         shim = _interpreter_shim_dir()
-        full = f"{prefix}export PATH=\"{shim}:$PATH\" && {cmd}" if shim else f"{prefix}{cmd}"
+        # The solver wrappers first: each launch is logged, then the real
+        # solver runs (Sandbox.solver_invocations).
+        shim = ":".join(d for d in (_solver_shim_dir(self._cost_names), shim) if d)
+        launches = f"export CFD_SOLVER_LAUNCH_LOG=\"{self.launch_log}\" && "
+        full = (f"{prefix}{launches}export PATH=\"{shim}:$PATH\" && {cmd}" if shim
+                else f"{prefix}{launches}{cmd}")
         bwrap = shutil.which("bwrap")
         if not bwrap:
             return {
@@ -674,6 +803,21 @@ class Sandbox:
             self.run_dir, self.starter_root, (self.starter_case, self.starter_root, self.wm)
         ):
             sandbox_cmd += ["--tmpfs", masked]
+        entries = self._withheld.get("entries") or []
+        for entry in entries:
+            if entry.get("action") == "replace":
+                sandbox_cmd += ["--ro-bind", entry["source"], entry["path"]]
+            elif entry.get("action") == "reveal":
+                continue
+            elif entry.get("is_dir"):
+                sandbox_cmd += ["--tmpfs", entry["path"]]
+            else:
+                sandbox_cmd += ["--ro-bind", self._withheld.get("empty_file", "/dev/null"), entry["path"]]
+        # Training samples' own folders inside a hidden folder, shown again
+        # after it is hidden (a raw dataset holding train and test side by side).
+        for entry in entries:
+            if entry.get("action") == "reveal":
+                sandbox_cmd += ["--ro-bind", entry["path"], entry["path"]]
         try:
             self.run_dir.relative_to(Path("/tmp"))
             run_is_under_tmp = True
@@ -751,6 +895,7 @@ class Sandbox:
             if trimmed_note:
                 timed_out["timeout_note"] = trimmed_note
             self._note_bash_result(repeat_key, timed_out)
+            self.last_call_changed = self._run_dir_state() != state_before
             return timed_out
         out = out or ""
         err = err or ""
@@ -766,6 +911,9 @@ class Sandbox:
         if trimmed_note:
             result["timeout_note"] = trimmed_note
         self._note_bash_result(repeat_key, result)
+        state_after = self._run_dir_state()
+        self.last_call_changed = state_after != state_before
+        self._bash_seen[seen_key] = {"state": state_after, "result": dict(result), "times": 1}
         return result
 
 
@@ -794,7 +942,7 @@ TOOLS:
       Run a shell command in a filesystem sandbox: the host is read-only and
       only the run directory (plus an ephemeral /tmp) is writable. The OpenFOAM
       bashrc is auto-sourced before each command, so wmake / blockMesh /
-      simpleFoam etc. are on PATH. Returns {rc, stdout, stderr, timeout,
+      the solvers are on PATH. Returns {rc, stdout, stderr, timeout,
       error_summary}. ALWAYS check `error_summary` first — it pre-extracts
       gcc/wmake/FOAM/runtime error lines (with 2-line context) so you don't
       need to scan a long stdout to find the failure. A Make/files entry that
@@ -812,7 +960,7 @@ TOOLS:
 
   {"tool": "done", "args": {"case_dir": "<abs path>", "class_name": "<name>", "compiled_so": "<abs .so path>", "summary": "<one-line summary>"}}
       Signal completion. Call this ONLY after wmake produced a .so AND
-      simpleFoam reached End. The framework will validate.
+      the case's solver reached End. The framework will validate.
 
 PROTOCOL RULES:
   - Output EXACTLY ONE JSON object per turn. No prose. No code fences. No
@@ -833,8 +981,9 @@ PROTOCOL RULES:
     it builds.
   - Activate the new component by editing whichever case dictionary is
     appropriate for THIS modification family (turbulence model → the
-    momentum/turbulence transport dictionary; viscosity model →
-    transportProperties; volumetric source → fvModels; field BC →
+    turbulence dictionary; viscosity model → the transport properties
+    dictionary; volumetric source → the source-term dictionary — each named
+    for this OpenFOAM in the OPENFOAM INSTALLATION block; field BC →
     0/<field>; numerical scheme → fvSchemes; thermo / radiation → the
     relevant constant/ dict; etc.) and add a libs (...) entry to
     system/controlDict if a compiled .so must be loaded.
@@ -851,6 +1000,16 @@ PROTOCOL RULES:
     and let the build/run errors drive subsequent edits.
 
   ── GENERIC WORKFLOW CHECKLIST (track which step you are on) ─────────────
+  When the modification CHANGES AN EXISTING OPENFOAM CLASS, start from a copy
+  of it that already compiles, instead of writing steps [1]-[5] by hand:
+    [0] python3 @SCAFFOLD@ --name <the class, or the type name the
+        case selects it by> --new-name <NewName> --dest <run_dir>/<case>/customModels/<NewName>
+        It copies the stock source, renames it, writes Make/files and Make/options
+        from the stock library's own, and compiles it; the JSON it prints gives
+        the library path and how to select it. Select the copy in the case
+        (step [6]) and run it UNCHANGED first: the log must end in `End`. Then
+        make your change in the copy one piece at a time, `wmake libso` after
+        each, so any failure points at the last edit.
   When the modification is a CLASS DERIVATION (compiled custom library):
     [1] Write the class header  (declarations: members, virtual overrides)
     [2] Write the class implementation (definitions of overridden methods,
@@ -872,8 +1031,8 @@ PROTOCOL RULES:
 
   When the modification is a RUNTIME (coded* / dictionary edit only):
     [1] Edit the relevant case dictionary in-place (e.g. add a coded entry
-        to constant/fvModels, or replace a BC in 0/<field>, or apply a
-        dict patch).
+        to the source-term dictionary, or replace a BC in 0/<field>, or
+        apply a dict patch).
     [2] Run the case (application from system/controlDict). Coded blocks
         are JIT-compiled by OpenFOAM at solver startup; no wmake needed.
     [3] If the JIT compile fails, fix the C++ in the SAME dictionary file
@@ -896,15 +1055,155 @@ _SAFETY = """SAFETY RULES (every tool call enforces these; violations get a deni
    that case-local customModels tree. $FOAM_USER_LIBBIN is not an allowed
    compilation target.
 4. Activation by case dictionaries only: system/controlDict.libs and the
-   relevant constant/ dictionary (constant/momentumTransport, etc.).
+   relevant constant/ dictionary (the turbulence dictionary, etc.).
 """
+
+
+def _version_facts(wm_project_dir: Optional[Path]) -> str:
+    from cfd_langgraph.openfoam_version import describe, get_profile
+
+    return describe(get_profile(str(wm_project_dir) if wm_project_dir else ""))
+
+
+def _post_process_hint() -> str:
+    """How to evaluate a function object afterwards on this installation."""
+    from cfd_langgraph.openfoam_version import get_profile
+
+    profile = get_profile()
+    if profile.get("solver_style") == "modules" or (profile.get("utilities") or {}).get("foamPostProcess"):
+        return "foamPostProcess -solver <the controlDict's solver module> -func wallShearStress -latestTime"
+    return "<application> -postProcess -func wallShearStress -latestTime"
+
+
+def _extension_points_note(hypothesis: str, wm_project_dir: Optional[Path]) -> str:
+    """For each OpenFOAM class the hypothesis names, which of its member functions
+    a subclass can override (virtual) and which it cannot, read from the class's
+    own header in this install. In OpenFOAM 10, kOmegaSSTLM's Fonset, Flength,
+    ReThetac, Fthetat and ReThetat0 are not virtual: a subclass method of the same
+    name is never called. Seven SD7003 candidates "changed" them and ran the stock
+    model, their fits flat at the baseline's score (sd7003lm_trial_1)."""
+    if not wm_project_dir:
+        return ""
+    words, word = [], ""
+    for ch in str(hypothesis) + " ":
+        if ch.isalnum() or ch == "_":
+            word += ch
+        else:
+            # class names carry a capital (kOmegaSSTLM); plain words do not
+            if (len(word) >= 4 and word[0].isalpha() and any(c.isupper() for c in word)
+                    and word not in words):
+                words.append(word)
+            word = ""
+    src = Path(wm_project_dir) / "src"
+    blocks = []
+    for name in words[:40]:
+        header = next(iter(sorted(src.glob(f"*/lnInclude/{name}.H"))), None) or \
+            next(iter(sorted(src.glob(f"*/*/lnInclude/{name}.H"))), None)
+        if header is None:
+            continue
+        try:
+            lines = header.read_text(errors="ignore").splitlines()
+        except OSError:
+            continue
+        virtual, plain = [], []
+        for i, raw in enumerate(lines):
+            line = raw.strip()
+            if not line or line.startswith(("//", "#", "*", "/*")):
+                continue
+            is_virtual = line.startswith("virtual ")
+            if not (is_virtual or line.startswith(("tmp<", "void ", "bool ", "scalar ", "const ", "label "))):
+                continue
+            head = line.split("(", 1)[0] if "(" in line else (
+                line if i + 1 < len(lines) and lines[i + 1].strip().startswith("(") else "")
+            parts = head.replace("*", " ").replace("&", " ").split()
+            if not parts:
+                continue
+            method = parts[-1]
+            if not method.replace("_", "").isalnum() or method in (name, f"~{name}", "TypeName"):
+                continue
+            (virtual if is_virtual else plain).append(method)
+        virtual = list(dict.fromkeys(virtual))
+        plain = [m for m in dict.fromkeys(plain) if m not in virtual]
+        if virtual or plain:
+            blocks.append(
+                f"{name} ({header}):\n"
+                f"  virtual, a subclass may override: {', '.join(virtual) or 'none'}\n"
+                f"  NOT virtual, a subclass method of the same name is never called by {name}: "
+                f"{', '.join(plain) or 'none'}\n")
+    if not blocks:
+        return ""
+    return (
+        "============================================================\n"
+        "WHAT A SUBCLASS CAN CHANGE IN THIS OPENFOAM (read from the headers)\n"
+        "============================================================\n"
+        + "".join(blocks)
+        + "To change a function that is not virtual, override a virtual one that calls it\n"
+        "(for the equations it enters, usually correct()) and write the changed equation\n"
+        "there. Then check that the change reaches the solution: a run with a strong\n"
+        "coefficient must give different forces from the neutral one before you fit.\n\n"
+    )
+
+
+def _settled_start_note(starter_case: Path) -> str:
+    """What the starter case's 0/ holds when the mesh gate started every later run
+    from a settled flow (start_decision.json): the agent is told to continue from
+    it as given. Without this, three SD7003 candidates ran potentialFoam on it, as
+    the usual case setup does, and so solved from scratch for the 5,000 iterations
+    meant to continue a settled flow: unconverged, scored 34.6% against the
+    baseline's 6.1% (sd7003lm_trial_1, cand_curvature_sst_limiter_fit)."""
+    try:
+        decision = json.loads((Path(starter_case) / "start_decision.json").read_text())
+    except (OSError, ValueError):
+        return ""
+    if not decision.get("from_settled_state"):
+        return ""
+    fields = ", ".join(decision.get("fields_taken_from_settled_state") or []) or "the solved fields"
+    run_length = decision.get("run_length")
+    averaging = decision.get("averaging_start")
+    return (
+        "============================================================\n"
+        "THE STARTER CASE STARTS FROM A SETTLED FLOW\n"
+        "============================================================\n"
+        f"Its 0/ holds the settled solution of the selected mesh level ({fields}), not\n"
+        "initial guesses, and every run of this study continues from it"
+        + (f" for {run_length:g} iterations" if isinstance(run_length, (int, float)) else "")
+        + (f", averaging from iteration {averaging:g}" if isinstance(averaging, (int, float)) else "")
+        + " (system/controlDict as given).\n"
+        "Copy 0/ as it is into every case you run. Do not reinitialise it: no\n"
+        "potentialFoam, setFields, mapFields or any other step that writes 0/, and no\n"
+        "fresh uniform fields. A run started from rest instead does not converge in that\n"
+        "many iterations, and its score says nothing about your model.\n"
+        + (f"Run every scored case the full {run_length:g} iterations. A case scored before\n"
+           "it gets there is still close to the flow it was given and is not accepted: on\n"
+           "this study a strong change had moved the score less than half its way after\n"
+           "1,000 iterations. Plan your fit's evaluations around that run length.\n"
+           if isinstance(run_length, (int, float)) else "")
+        + "\n"
+    )
+
+
+def _model_requirements_note() -> str:
+    """The properties a general model must keep (cfd_langgraph.model_requirements),
+    for the choices the hypothesis leaves open: how a term is limited, which
+    direction or input it uses, how a fitted form is clipped. The hypothesis
+    itself is not re-litigated here; that was the proposer's job."""
+    try:
+        from cfd_langgraph.model_requirements import model_requirements_block
+    except Exception:
+        return ""
+    return (
+        model_requirements_block()
+        + "Where the hypothesis leaves a choice open, make it so these hold. If the\n"
+        "hypothesis as written breaks a MUST HOLD item, implement it as written and say\n"
+        "which item in your final report; do not quietly change the model.\n\n"
+    )
 
 
 def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: str = "",
                        starter_case: Path, run_dir: Path,
                        wm_project_dir: Optional[Path],
                        prior_attempt: str = "", repair_goal: str = "",
-                       timeout_s: int = 0) -> str:
+                       timeout_s: int = 0, solver_budget: int = 0) -> str:
     """Generic deliverable template across CFD modification kinds: turbulence
     closure, viscosity / non-Newtonian model, thermophysical property model,
     custom boundary condition, custom fvOption / fvModel source term, custom
@@ -924,13 +1223,16 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
 
     return (
         _SAFETY
-        + "\n" + _TOOLS_SPEC
+        + "\n" + _TOOLS_SPEC.replace("@SCAFFOLD@", str(Path(__file__).resolve().parent / "foam_scaffold.py"))
         + ("\n" + grounding if grounding else "")
+        + "\n\nOPENFOAM INSTALLATION (write every file for this version):\n" + _version_facts(wm_project_dir)
         + "\n============================================================\n"
         + "TASK\n"
         + "============================================================\n\n"
         + f"Topic: {topic.strip()}\n\n"
         + f"Hypothesis to implement (variant_name={variant_name}):\n{hypothesis.strip()}\n\n"
+        + _model_requirements_note()
+        + _extension_points_note(hypothesis, wm_project_dir)
         + (
             "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP\n\n"
             "  1. NEVER background it. No `nohup`, no trailing `&`, no detached\n"
@@ -1022,9 +1324,67 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
             "useful result. Being killed at the fence is not.\n\n"
             if timeout_s > 0 else ""
         )
+        + (
+            # The time budget above is not a proxy for this one. Seconds and
+            # solver runs only trade off when solver time is the binding
+            # constraint; when it is not, an agent planning by the clock
+            # overshoots the run budget by whatever the ratio between them is.
+            "============================================================\n"
+            "YOUR SOLVER-RUN BUDGET\n"
+            "============================================================\n"
+            f"{solver_budget} solver runs remain for the WHOLE search, shared with every\n"
+            "other candidate still to come. They are not yours alone. Spending them\n"
+            "here is spending them instead of on the next idea.\n\n"
+            "Cost every fit, sweep or optimiser loop in RUNS as well as seconds,\n"
+            "and say both out loud in your reasoning:\n"
+            "    (objective evaluations) x (cases per evaluation) = total solver runs\n"
+            "If that is a large share of the number above, shrink it until it is not.\n"
+            "A fit that leaves budget for other ideas is worth more than a thorough\n"
+            "one that consumes the search.\n\n"
+            "Every tool result carries `solver_runs_left`. Check it; the number above\n"
+            "is only true at the moment this brief was written.\n\n"
+            if solver_budget > 0 else ""
+        )
+        + (
+            # Without this, every candidate writes its own search from scratch:
+            # the searches differ run to run, and nothing bounds them. An agent
+            # shown only a wall-clock budget costs its plan in seconds and
+            # overshoots the solver-run budget by whatever the ratio between the
+            # two happens to be.
+            "============================================================\n"
+            "FITTING COEFFICIENTS: USE THE PROVIDED OPTIMISER\n"
+            "============================================================\n"
+            "Do NOT write your own search loop, and do NOT call scipy's optimisers\n"
+            "directly. Use this, which holds the loop and enforces an evaluation cap:\n\n"
+            f"    P={_REPO_ROOT}/scripts/param_search.py\n\n"
+            "    python3 $P init --state fit.json --backend bo \\\n"
+            "        --bounds '{\"<coeff>\": [<low>, <high>], ...}' --budget <n>\n"
+            "    python3 $P ask  --state fit.json          # -> {\"id\": 0, \"params\": {...}}\n"
+            "    #   ... write those coefficients into the case, run the solver, score it\n"
+            "    python3 $P tell --state fit.json --id 0 --score 0.00412\n"
+            "    #   ... repeat ask/tell; a run that produced no score: --id N --failed\n"
+            "    python3 $P best --state fit.json          # the winner, when you are done\n\n"
+            "YOU choose the backend, from the shape of the model you just built.\n"
+            "With d parameters and a budget of n evaluations:\n"
+            "  bo      Gaussian process + expected improvement. Few, EXPENSIVE\n"
+            "          evaluations: n up to ~100, d up to ~10. The right default when\n"
+            "          one evaluation is a solver run.\n"
+            "  cmaes   Covariance Matrix Adaptation. Many parameters (d >= 5) AND a\n"
+            "          large budget (n > ~100), or parameters that are correlated or\n"
+            "          badly scaled. Below ~100 evaluations it is still estimating its\n"
+            "          covariance matrix and has not paid for itself.\n"
+            "  random  n < 2d. Too few points for any model of the landscape to mean\n"
+            "          anything.\n"
+            "Say in your reasoning which you picked and why, in one line.\n\n"
+            "`ask` refuses once --budget is spent. That refusal IS the budget: when it\n"
+            "comes, take `best`, deploy those coefficients, verify, and report. Do not\n"
+            "start a second search to get around it. Set --budget from the solver-run\n"
+            "arithmetic above, not from what would be thorough.\n\n"
+        )
         + f"WM_PROJECT_DIR (read-only OpenFOAM install): {wm_project_dir or '(unset)'}\n"
         + f"Starter case (read-only base): {starter_case}\n"
         + f"Run directory (your writable workspace): {run_dir}\n\n"
+        + _settled_start_note(starter_case)
         + (
             # Repair mode: the model and the case already exist and something
             # about the plumbing around them is broken. The full deliverable
@@ -1105,9 +1465,9 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "      directory. Iterate on errors as needed.\n"
         + "  (d) Activate the compiled library by editing the appropriate case\n"
         + "      dictionary. The right dictionary depends on the modification\n"
-        + "      kind (constant/momentumTransport for turbulence, constant/\n"
-        + "      transportProperties for viscosity, constant/fvModels for sources,\n"
-        + "      0/<field> boundaryField for BCs, system/fvSchemes for schemes,\n"
+        + "      kind (the turbulence, transport-properties and source-term\n"
+        + "      dictionaries named in the OPENFOAM INSTALLATION block, 0/<field>\n"
+        + "      boundaryField for BCs, system/fvSchemes for schemes,\n"
         + "      etc.) and add a `libs (\"libYourName.so\");` entry to system/controlDict.\n"
         + "  (e) Run the application named in system/controlDict (whatever it\n"
         + "      is — simpleFoam, pimpleFoam, foamRun, chtMultiRegionFoam, etc.)\n"
@@ -1122,7 +1482,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "      bogus RMSE. Run the solver with default flags. If you must\n"
         + "      skip them for performance during debugging, run them as a\n"
         + "      post-processing pass afterwards via\n"
-        + "      `<application> -postProcess -func wallShearStress -latestTime`\n"
+        + f"      `{_post_process_hint()}`\n"
         + "      (or the relevant function names from controlDict).\n"
         + "  (f) Call `done` with the case_dir, class_name, and .so path.\n\n"
         + "Begin. Output ONE tool call per turn as a single JSON object.\n"
@@ -1210,6 +1570,68 @@ def _transcript_cap_chars() -> int:
     return max(20_000, value)
 
 
+def render_transcript_window(
+    chunks: Sequence[str],
+    *,
+    kept_from: int,
+    cap: int,
+    next_turn_prompt: str,
+) -> Tuple[str, int]:
+    """A bounded view of a build agent's history whose prefix stays put.
+
+    Returns ``(text, kept_from)`` -- the rendered transcript and the index of
+    the oldest chunk it kept, which the caller stores so the window only ever
+    moves forward.
+
+    Every turn re-sends this whole string, so its leading characters decide
+    whether the provider can serve that turn from its prompt cache. Applying a
+    cap as ``full[-cap:]`` makes the view a sliding window: each turn ``full``
+    is longer, so the window starts at a different offset, and the cached
+    prefix is destroyed on every single turn once the cap is passed.
+
+    Measured over one 40-turn build agent: while the transcript fitted under
+    the cap, turns cached 80-90% of their input; past it the cached portion
+    fell to a fixed floor -- the system message and the unchanging brief,
+    nothing else -- while the prompt itself grew to 80k tokens, so the miss
+    became more expensive exactly as it became more frequent.
+
+    So the boundary moves in steps rather than continuously: whole oldest
+    chunks are dropped, and only far enough to get back under a target well
+    below the cap, leaving room for several more turns to simply append.
+    Between drops the prefix is byte-identical and caches; a drop costs one
+    miss. Chunks are dropped whole, never cut mid-chunk, so the agent is never
+    handed half a script.
+    """
+    if not chunks:
+        return "", kept_from
+
+    def build(start: int) -> str:
+        header = ("\n\n=== CONVERSATION SO FAR ===\n" if start == 0 else
+                  "\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n")
+        return (header + "\n".join(chunks[start:])
+                + "\n=== END CONVERSATION ===\n\n" + next_turn_prompt)
+
+    start = max(0, min(int(kept_from), len(chunks) - 1))
+    text = build(start)
+    if len(text) <= cap:
+        return text, start
+
+    target = max(20_000, int(cap * 0.7))
+    while start < len(chunks) - 1 and len(build(start)) > target:
+        start += 1
+    text = build(start)
+    if len(text) > cap:
+        # One chunk larger than the whole cap. Nothing more can be dropped
+        # without losing the turn that just happened, so clip it: that turn
+        # pays a cache miss rather than the agent losing what it just did.
+        # The header is part of the budget -- clipping to `cap` and then
+        # prepending it returns cap + len(header), which is over the limit the
+        # caller asked for.
+        header = "\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n"
+        text = header + text[-max(0, cap - len(header)):]
+    return text, start
+
+
 def _clip_middle(text: str, head: int, tail: int) -> str:
     if len(text) <= head + tail:
         return text
@@ -1241,6 +1663,47 @@ def _render_call_args(tool_name: str, tool_args: Any) -> str:
     return _clip_middle(json.dumps(shown, default=str, ensure_ascii=False), 6000, 1000)
 
 
+# Flow solvers whose launches a candidate is charged for.
+_SOLVER_NAMES = (
+    "simpleFoam", "pimpleFoam", "pisoFoam", "icoFoam", "rhoCentralFoam", "rhoPimpleFoam",
+    "rhoSimpleFoam", "buoyantSimpleFoam", "buoyantPimpleFoam", "interFoam", "sonicFoam", "foamRun",
+)
+
+_SOLVER_SHIM = """#!/bin/bash
+# Logs this launch of {name} for the candidate's solver count
+# (code_mod_agentic.Sandbox.solver_invocations), then runs the real {name}.
+# Ranks of a parallel run log once (rank 0).
+here="$(cd "$(dirname "$0")" && pwd)"
+rank="${{OMPI_COMM_WORLD_RANK:-${{PMI_RANK:-0}}}}"
+if [ -n "${{CFD_SOLVER_LAUNCH_LOG:-}}" ] && [ "$rank" = "0" ]; then
+    printf '%s\t%s\t%s\n' "$(date +%s)" "{name}" "$PWD" >> "$CFD_SOLVER_LAUNCH_LOG" 2>/dev/null
+fi
+PATH="$(printf '%s' "$PATH" | tr ':' '\n' | grep -vxF "$here" | paste -sd: -)"
+exec {name} "$@"
+"""
+
+
+def _solver_shim_dir(names: Sequence[str] = _SOLVER_NAMES) -> str:
+    """A folder of wrappers, one per executable in ``names``, that log each
+    launch and run the real one; "" if it cannot be made."""
+    try:
+        import hashlib
+
+        key = hashlib.sha1(_SOLVER_SHIM.encode("utf-8") + "|".join(names).encode()).hexdigest()[:10]
+        shim = Path(__file__).resolve().parent.parent / ".cache" / "solver_bin" / key
+        shim.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            path = shim / name
+            if not path.is_file():
+                tmp = shim / f".{name}.tmp{os.getpid()}"
+                tmp.write_text(_SOLVER_SHIM.format(name=name))
+                tmp.chmod(0o755)
+                tmp.replace(path)
+        return str(shim)
+    except Exception:
+        return ""
+
+
 def _interpreter_shim_dir() -> str:
     """A folder holding only python/python3 links to this interpreter, or ""."""
     try:
@@ -1268,6 +1731,23 @@ def _agent_tool_protocol() -> str:
 
 
 _AGENT_TOOL_NAMES = ("read_file", "write_file", "run_bash", "done")
+# How many times a done call may be sent back for something missing, and how
+# many turns before the end the agent is told to wrap up.
+DONE_REFUSALS = 2
+FINISH_WARNING_TURNS = 5
+# ...and the share of a session's wall clock left when it is told the same.
+FINISH_WARNING_FRACTION = 0.15
+# A session ends early when this many of its last STUCK_WINDOW calls repeated an
+# earlier call with nothing changed in between (or were refused for it), and
+# says what it kept repeating, so whoever started it can redirect it. The four
+# build sessions of qwen_retest_20261005/slau_r7 each ran to their 400-turn cap
+# with 13-30 such refusals.
+STUCK_WINDOW = int(os.environ.get("CFD_SCIENTIST_AGENT_STUCK_WINDOW", "") or 12)
+STUCK_REPEATS = int(os.environ.get("CFD_SCIENTIST_AGENT_STUCK_REPEATS", "") or 8)
+# The same for a session that reads and searches without ever acting on it:
+# qwen_retest_20261005/slau_r8 named its own bug at turn 88 and then spent 40
+# calls grepping OpenFOAM headers, each one different, so no repeat was counted.
+NO_CHANGE_LIMIT = int(os.environ.get("CFD_SCIENTIST_AGENT_NO_CHANGE_LIMIT", "") or 25)
 
 
 def _unknown_tool_error(tool_call: Dict[str, Any], native: bool, from_text: bool) -> str:
@@ -1472,6 +1952,17 @@ def _bootstrap_paths(repo_root: Path) -> None:
             sys.path.insert(0, sp)
 
 
+def _compiled_library_check(payload: Dict[str, Any]) -> Optional[str]:
+    """A build's done must point at a compiled library that exists."""
+    so = str(payload.get("compiled_so") or "").strip()
+    if not so:
+        return "compiled_so is empty: compile the library first and give the path of the .so it produced."
+    if not Path(so).is_file():
+        return (f"compiled_so {so} does not exist. Compile the library (wmake) and give the path of "
+                "the .so it actually produced.")
+    return None
+
+
 def run_agent_loop(
     *,
     repo_root: Path,
@@ -1485,14 +1976,20 @@ def run_agent_loop(
     model: str,
     max_turns: int,
     timeout_s: int,
+    solver_budget: int = 0,
     prior_attempt: str = "",
     repair_goal: str = "",
     system_message: str = "",
     initial_prompt: str = "",
     cost_tokens: Optional[Sequence[str]] = None,
     done_fields: Optional[Dict[str, str]] = None,
+    done_check: Optional[Callable[[Dict[str, Any]], Optional[str]]] = None,
 ) -> Dict[str, Any]:
     """Run one agentic build.
+
+    ``done_check`` receives the payload of a ``done`` call and returns None to
+    accept it, or what is still missing; a refused ``done`` goes back to the
+    agent with that message, at most ``DONE_REFUSALS`` times.
 
     ``system_message`` / ``initial_prompt`` / ``cost_tokens`` let a caller
     reuse this loop for a study whose candidates are not OpenFOAM libraries.
@@ -1580,6 +2077,7 @@ def run_agent_loop(
         prior_attempt=prior_attempt,
         repair_goal=repair_goal,
         timeout_s=timeout_s,
+        solver_budget=solver_budget,
     )
 
     # IMPORTANT: do NOT accumulate AIMessage / HumanMessage pairs across turns.
@@ -1594,18 +2092,29 @@ def run_agent_loop(
     TRANSCRIPT_CAP = _transcript_cap_chars()  # chars; oldest turns dropped above this
     next_turn_prompt = "Now output your next tool-call JSON object."
 
+    # Index of the oldest transcript chunk still shown. Only ever moves
+    # forward, and only when the cap is actually exceeded -- see below.
+    kept_from = 0
+
     def render_transcript(cap: Optional[int] = None) -> str:
-        cap = TRANSCRIPT_CAP if cap is None else cap
-        if not transcript_chunks:
-            return ""
-        full = "\n\n=== CONVERSATION SO FAR ===\n" + "\n".join(transcript_chunks) + "\n=== END CONVERSATION ===\n\n" + next_turn_prompt
-        if len(full) <= cap:
-            return full
-        # Truncate from the front (keep most recent turns); always keep the
-        # marker lines so the agent knows it's seeing a truncated view.
-        keep = full[-cap:]
-        return ("\n\n=== CONVERSATION SO FAR (truncated; older turns omitted) ===\n"
-                + keep)
+        """This agent's own history, bounded, with a prefix that stays put.
+
+        An explicit ``cap`` is the shrinking retry ladder: a one-off render for
+        a single request, which must NOT move the shared boundary. Moving it
+        would let one empty reply permanently discard history every later turn
+        still needs.
+        """
+        nonlocal kept_from
+        persistent = cap is None
+        text, moved = render_transcript_window(
+            transcript_chunks,
+            kept_from=kept_from if persistent else 0,
+            cap=TRANSCRIPT_CAP if cap is None else cap,
+            next_turn_prompt=next_turn_prompt,
+        )
+        if persistent:
+            kept_from = moved
+        return text
 
     llm = create_langchain_llm(model=model, temperature=0.0)
     llm_for_turns = llm
@@ -1620,6 +2129,22 @@ def run_agent_loop(
             log(f"# native tool calling unavailable ({type(exc).__name__}: {str(exc)[:200]}); "
                 "using the JSON text protocol")
     log(f"# tool protocol: {'native' if native_tools_enabled else 'text'}")
+    # The turn after a refused command runs with thinking on, when thinking was
+    # switched off through the chat template: in replays this broke repeat
+    # loops a small model without thinking could not leave (see
+    # cfd_langgraph.llm.caching.build_loop_control_middleware).
+    from cfd_langgraph.llm.caching import _thinking_on
+    thinking_settings = _thinking_on(llm)
+    # True while the agent is repeating itself: set by a repeated or refused
+    # call, cleared only by a call that changes the run directory, so thinking
+    # stays on for the whole loop rather than for one turn after each refusal.
+    last_refused = False
+    recent_repeats: List[bool] = []
+    repeated_calls: List[str] = []
+    quiet_calls: List[str] = []
+    session_changed = False
+    quiet_warned = False
+    stuck_reason = ""
     started = time.time()
     final_payload: Dict[str, Any] = {}
     aborted_reason = ""
@@ -1669,9 +2194,14 @@ def run_agent_loop(
     if wall_clock_enabled:
         sandbox.deadline = started + timeout_s
 
+    done_refusals = 0
     for turn in range(1, max_turns + 1):
         if wall_clock_enabled and time.time() - started > timeout_s:
             aborted_reason = f"timeout after {timeout_s}s"
+            log(f"\n# {aborted_reason}")
+            break
+        if stuck_reason:
+            aborted_reason = stuck_reason
             log(f"\n# {aborted_reason}")
             break
         log(f"\n--- turn {turn} ---")
@@ -1690,7 +2220,14 @@ def run_agent_loop(
                 break
             tries += 1
             try:
-                ai_resp = llm_for_turns.invoke(messages)
+                if last_refused and thinking_settings is not None:
+                    cap = getattr(llm, "max_tokens", None)
+                    ai_resp = llm_for_turns.bind(
+                        extra_body=thinking_settings,
+                        **({"max_tokens": 2 * cap} if isinstance(cap, int) else {}),
+                    ).invoke(messages)
+                else:
+                    ai_resp = llm_for_turns.invoke(messages)
                 last_exc = None
                 break
             except Exception as exc:
@@ -1823,11 +2360,21 @@ def run_agent_loop(
         tool_name = str(tool_call.get("tool", "")).strip()
         tool_args = tool_call.get("args") or {}
         if tool_name == "done":
-            final_payload = tool_args if isinstance(tool_args, dict) else {}
+            payload = tool_args if isinstance(tool_args, dict) else {}
+            missing = done_check(payload) if done_check else None
+            if missing and done_refusals < DONE_REFUSALS:
+                done_refusals += 1
+                log(f"# done refused ({done_refusals}/{DONE_REFUSALS}): {missing[:300]}")
+                transcript_chunks.append(
+                    f"[turn {turn}] done was NOT accepted: {missing} Do that, then call done again.")
+                continue
+            final_payload = payload
             log(f"# DONE: {json.dumps(final_payload)[:600]}")
             break
 
         # execute tool
+        sandbox.last_call_repeated = False
+        sandbox.last_call_changed = False
         try:
             if tool_name == "read_file":
                 tool_result = sandbox.read_file(**tool_args)
@@ -1846,6 +2393,84 @@ def run_agent_loop(
         # thirty turns in had no way to see how much of it was left.
         if wall_clock_enabled and isinstance(tool_result, dict):
             tool_result["time_left_s"] = max(0, int(timeout_s - (time.time() - started)))
+        # Same reasoning as time_left_s: a budget stated once, thirty turns
+        # ago, is a budget the agent can no longer see. Solver runs are the
+        # scarcer of the two, so they are the one it must not lose track of.
+        if solver_budget > 0 and isinstance(tool_result, dict):
+            tool_result["solver_runs_left"] = max(
+                0, solver_budget - getattr(sandbox, "solver_invocations", 0))
+        refusal = sandbox.solver_refusal() if hasattr(sandbox, "solver_refusal") else ""
+        if refusal and isinstance(tool_result, dict):
+            tool_result["solver_runs_left"] = 0
+            tool_result["solver_budget"] = refusal
+        # Turns run out too, and an agent that never sees them go simply stops
+        # mid-task without reporting anything.
+        refused = isinstance(tool_result, dict) and str(
+            tool_result.get("error", "")).startswith("refused: this exact command")
+        repeated = refused or bool(getattr(sandbox, "last_call_repeated", False))
+        if repeated:
+            last_refused = True
+        elif getattr(sandbox, "last_call_changed", False):
+            last_refused = False
+        if repeated and thinking_settings is not None:
+            log("# the last call repeated an earlier one: thinking stays on until a call changes something")
+        recent_repeats = (recent_repeats + [repeated])[-STUCK_WINDOW:]
+        shown = (tool_args.get("cmd") or tool_args.get("path") or "") if isinstance(tool_args, dict) else ""
+        call_line = f"{tool_name}: {' '.join(str(shown).split())[:160]}"
+        if repeated:
+            repeated_calls = (repeated_calls + [call_line])[-STUCK_REPEATS:]
+        if len(recent_repeats) == STUCK_WINDOW and sum(recent_repeats) >= STUCK_REPEATS:
+            distinct = list(dict.fromkeys(repeated_calls))
+            stuck_reason = (
+                f"stuck: {sum(recent_repeats)} of the last {STUCK_WINDOW} calls repeated an earlier "
+                "call with nothing changed in between, so the session was ended early. It kept "
+                "repeating: " + " | ".join(distinct[:4]))
+        # Reading without acting is counted from the session's first change on,
+        # so the opening read of the brief is not cut short.
+        # The first such streak only turns thinking on and says so; ending the
+        # session at once spent a whole continuation of slau_r8 in 2.5 minutes,
+        # when 25 quick reads followed a crash.
+        if getattr(sandbox, "last_call_changed", False):
+            session_changed = True
+            quiet_calls = []
+            quiet_warned = False
+        elif session_changed:
+            quiet_calls.append(call_line)
+            if len(quiet_calls) >= NO_CHANGE_LIMIT and not stuck_reason:
+                if not quiet_warned:
+                    quiet_warned = True
+                    quiet_calls = []
+                    last_refused = True
+                    log(f"# {NO_CHANGE_LIMIT} calls without a change: told to act; thinking stays on until one")
+                    if isinstance(tool_result, dict):
+                        tool_result["act_now"] = (
+                            f"You have made {NO_CHANGE_LIMIT} calls in a row without changing anything in "
+                            "your run directory. Stop gathering information: make the change you judge most "
+                            "likely to fix the problem, then build and run it to find out. If you cannot, call "
+                            f"done and say what is blocking you. Another {NO_CHANGE_LIMIT} calls without a "
+                            "change end this session.")
+                else:
+                    aim = _turn_note(ai_text, limit=500)
+                    stuck_reason = (
+                        f"stuck: {2 * NO_CHANGE_LIMIT} calls read or searched without changing anything in the "
+                        "run directory, after being told to act, so the session was ended early."
+                        + (f" What it said it was looking for: {aim}" if aim else "")
+                        + " Its last calls: " + " | ".join(quiet_calls[-4:]))
+        if isinstance(tool_result, dict):
+            turns_left = max_turns - turn
+            tool_result["turns_left"] = turns_left
+            if turns_left <= FINISH_WARNING_TURNS:
+                tool_result["finish_now"] = (
+                    f"{turns_left} turn(s) left. Start nothing new. Finish what is in hand and "
+                    "call done with what you have, saying in its summary what is incomplete.")
+            # The clock runs out too, usually first: slau_r8 had 270 turns but 27
+            # minutes left, with its results in hand and its record unwritten.
+            elif wall_clock_enabled and timeout_s - (time.time() - started) <= FINISH_WARNING_FRACTION * timeout_s:
+                minutes = max(0, int((timeout_s - (time.time() - started)) // 60))
+                tool_result["finish_now"] = (
+                    f"About {minutes} minute(s) of this session's time left. Start nothing new: write "
+                    "what the task needs recorded (the verification record and the report) from what "
+                    "you have, then call done, saying in its summary what is incomplete.")
 
         # Truncate large fields before logging / before they enter the transcript.
         # For build/run output, prefer the TAIL (compile errors land at the end)
@@ -2031,7 +2656,16 @@ def _find_compiled_artifacts(  # noqa: C901
         )
         app_match = re.search(r"(?m)^\s*application\s+([^;\s]+)\s*;", control_text)
         application = app_match.group(1) if app_match else ""
-        candidate_logs = [case_dir / f"log.{application}"] if application else []
+        # The same logs the manager's own check reads (tools._solver_logs):
+        # log.<application> first, then every other log.* newest first, the
+        # OpenFOAM banner below telling solver output from the rest. Agents
+        # name their runs -- log.pimpleFoam.endpoint after a fit -- and on
+        # cylinder_dev_r3 a candidate scoring 13.0% against a 33.7% baseline
+        # was marked "did not reach End" for that name alone.
+        named = [case_dir / f"log.{application}"] if application else []
+        others = sorted((q for q in case_dir.glob("log.*") if q.is_file() and q not in named),
+                        key=lambda q: q.stat().st_mtime, reverse=True)
+        candidate_logs = [q for q in named if q.is_file()] + others
         for log in candidate_logs:
             if not log.is_file():
                 continue
@@ -2073,6 +2707,7 @@ def run(
     model: str,
     timeout_s: int,
     max_turns: int,
+    solver_budget: int = 0,
     prior_attempt: str = "",
     repair_goal: str = "",
 ) -> Dict[str, Any]:
@@ -2098,8 +2733,10 @@ def run(
         model=model,
         max_turns=max_turns,
         timeout_s=timeout_s,
+        solver_budget=solver_budget,
         prior_attempt=prior_attempt,
         repair_goal=repair_goal,
+        done_check=_compiled_library_check,
     )
     # Use the claimed case_dir and variant_name to find a fresh case-local
     # .so. Outputs in $FOAM_USER_LIBBIN are never accepted.
@@ -2144,7 +2781,7 @@ def run(
         if not artifacts.get("compiled_so"):
             result["error"] = "no fresh case-local .so produced under customModels/"
         elif not artifacts.get("converged"):
-            result["error"] = "compiled .so but simpleFoam did not reach End"
+            result["error"] = "compiled .so but no solver log in the case reached End"
         else:
             result["error"] = "unknown agentic failure"
         result["compile_error_hint"] = result["error"]
@@ -2174,6 +2811,8 @@ def main() -> int:
                              "and what the fitted result becomes. When empty, the hypothesis "
                              "is the whole instruction.")
     parser.add_argument("--max-turns", default=120, type=int)
+    parser.add_argument("--solver-budget", default=0, type=int,
+                        help="Solver runs left for the WHOLE search, shared with every\nother candidate. 0 leaves it unstated.")
     parser.add_argument("--prior-attempt", default="", type=str,
                         help="What an earlier attempt at this same candidate did and why it "
                              "stopped. Turns this into a CONTINUATION: the agent is told to "
@@ -2203,6 +2842,7 @@ def main() -> int:
         model=model,
         timeout_s=args.timeout,
         max_turns=args.max_turns,
+        solver_budget=args.solver_budget,
         prior_attempt=args.prior_attempt,
         repair_goal=args.repair_goal,
     )

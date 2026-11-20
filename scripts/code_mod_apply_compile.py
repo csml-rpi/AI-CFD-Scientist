@@ -25,6 +25,32 @@ def _write(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _profile() -> Dict[str, Any]:
+    _src = str(Path(__file__).resolve().parents[1] / "src")
+    if _src not in sys.path:
+        sys.path.insert(0, _src)
+    from cfd_langgraph.openfoam_version import get_profile
+
+    return get_profile()
+
+
+def _of10_rules() -> bool:
+    """The deterministic fixes and templates below encode OpenFOAM 10's own
+    class layout, constructor order and library names; they apply on that
+    version only. On any other the model works from the installation's own
+    sources and the version facts it is given."""
+    from cfd_langgraph.openfoam_version import major
+
+    p = _profile()
+    return bool(p.get("ok")) and p.get("fork") == "openfoam.org" and major(p) == 10
+
+
+def _version_facts() -> str:
+    from cfd_langgraph.openfoam_version import describe
+
+    return describe(_profile())
+
+
 def _sanitize_wmake_make_fragment(text: str) -> str:
     """
     wmake parses Make/files and Make/options as makefile fragments.
@@ -288,6 +314,18 @@ def _patch_activation_dict(path: Path, class_name: str, mode: str, build: Option
         return
     txt = path.read_text(encoding="utf-8", errors="ignore")
 
+    if mode == "custom_viscosity" and _profile().get("fork") == "openfoam.com":
+        # openfoam.com selects the viscosity model in transportProperties with
+        # `transportModel <Class>;` and reads <Class>Coeffs beside it.
+        coeff_block_name = f"{class_name}Coeffs"
+        if re.search(r"\btransportModel\s+\w+\s*;", txt):
+            txt = re.sub(r"\btransportModel\s+\w+\s*;", f"transportModel  {class_name};", txt, count=1)
+        else:
+            txt += f"\ntransportModel  {class_name};\n"
+        if coeff_block_name not in txt:
+            txt += f"\n{coeff_block_name}\n{{\n{_DEFAULT_CUSTOM_VISCOSITY_COEFF_LINES}}}\n"
+        _write(path, txt)
+        return
     if mode == "custom_viscosity":
         coeff_block_name = f"{class_name}Coeffs"
         if re.search(rf"\bviscosityModel\s+{re.escape(class_name)}\s*;", txt) and coeff_block_name in txt:
@@ -1143,7 +1181,14 @@ def _llm_openfoam_custom_files_bundle(
             "recon_reference_context": recon_ctx if isinstance(recon_ctx, dict) else None,
         }
         sys_extra = ""
-        if mode == "custom_turbulence_model_modification":
+        if mode == "custom_turbulence_model_modification" and not _of10_rules():
+            sys_extra = (
+                " Turbulence libraries: take the include paths, LIB_LIBS, base-class constructor "
+                "signature and registration macro from a stock RAS model of THIS installation (its "
+                "source is under $WM_PROJECT_DIR/src; the reference files show where), never from "
+                "another OpenFOAM version."
+            )
+        elif mode == "custom_turbulence_model_modification":
             sys_extra = (
                 " OpenFOAM 10 incompressible RAS turbulence libraries MUST: "
                 "(1) use Make/options EXE_INC/LIB_LIBS with "
@@ -1161,6 +1206,7 @@ def _llm_openfoam_custom_files_bundle(
                 "#include \"makeIncompressibleMomentumTransportModel.H\" then makeRASModel(ClassName); "
                 "— not makeIncompressibleMomentumTransportModelTypes / makeTemplatedIncompressibleMomentumTransportModel."
             )
+        sys_extra += " INSTALLED OPENFOAM (write for this version): " + " ".join(_version_facts().split())
         recon_clamp = ""
         if isinstance(recon_ctx, dict) and recon_ctx.get("verified_include_paths"):
             vpaths = recon_ctx.get("verified_include_paths") or []
@@ -1178,14 +1224,14 @@ def _llm_openfoam_custom_files_bundle(
                 "`recon_reference_context.selected_files[].rel` and class names named in "
                 "`recon_reference_context.class_signatures`. If the recon selected a Make/options "
                 "sample from the parent library subtree, mirror its EXE_INC / LIB_LIBS structure. "
-                f"Verified include paths from recon (use these, not ESI/foam-extend layouts): "
+                f"Verified include paths from recon (these exist in this installation; use them): "
                 f"{json.dumps(vpaths, default=str)[:3000]}. "
                 f"Selected source files from recon: {json.dumps(rel_list)[:2000]}."
             )
         messages = [
             SystemMessage(
                 content=(
-                    "Generate OpenFOAM10 custom model files as strict JSON with keys: "
+                    f"Generate {_profile().get('label') or 'OpenFOAM'} custom model files as strict JSON with keys: "
                     "header, source, make_files, make_options, optional needs_more_refs(array of paths). "
                     "No placeholders. Must compile with wmake libso in user case customModels. "
                     "make_files and make_options are wmake makefile fragments: valid makefile syntax only; "
@@ -1319,13 +1365,14 @@ def _generate_files(case_path: Path, class_name: str, mode: str, build: Dict[str
             files_txt = existing["make_files"]
             opts_txt = existing["make_options"]
             incomplete = False
-    # Deterministic fallback exists only for generalisedNewtonian viscosity — never invent wrong C++ for other modes.
-    if incomplete and mode != "custom_viscosity":
+    # Deterministic fallback exists only for generalisedNewtonian viscosity on
+    # OpenFOAM 10 -- never invent wrong C++ for other modes or versions.
+    if incomplete and (mode != "custom_viscosity" or not _of10_rules()):
         return {
             "_generation_incomplete": True,
             "reason": (
                 f"Incomplete LLM output for mode={mode!r}; no automatic C++/Make fallback "
-                "(only custom_viscosity has a safe template)."
+                "(only custom_viscosity on OpenFOAM 10 has a safe template)."
             ),
             "header": str(h_path),
             "source": str(c_path),
@@ -1467,6 +1514,8 @@ def _sanitize_custom_turbulence_model_of10(
     Fixes recurring failures: wrong header names, NoRepository .C include, wrong ctor order,
     and invalid registration macros for makeRASModel.
     """
+    if not _of10_rules():
+        return []
     notes: List[str] = []
     root = case_dir / "customModels" / class_name
     h_path = root / f"{class_name}.H"
@@ -1625,7 +1674,7 @@ def _apply_compile_fixes(case_dir: Path, class_name: str, err_text: str, mode: s
     if any(k in err for k in ["fatal error:", "no such file or directory", "cannot find"]):
         # OF10 compatibility: some generated sources still include makeRASModel.H,
         # but OF10 registration uses makeIncompressibleMomentumTransportModel.H.
-        if "makerasmodel.h" in err and c_path.is_file():
+        if "makerasmodel.h" in err and c_path.is_file() and _of10_rules():
             raw_c = c_path.read_text(encoding="utf-8", errors="ignore")
             fixed_c = raw_c.replace('#include "makeRASModel.H"\n', "")
             if '#include "makeIncompressibleMomentumTransportModel.H"' not in fixed_c:
@@ -1639,7 +1688,7 @@ def _apply_compile_fixes(case_dir: Path, class_name: str, err_text: str, mode: s
         if mode == "custom_turbulence_model_modification" and opts_path.is_file():
             raw = opts_path.read_text(encoding="utf-8", errors="ignore")
             stripped = _strip_bad_make_options_lines(raw)
-            if _make_options_needs_of10_reset(stripped):
+            if _of10_rules() and _make_options_needs_of10_reset(stripped):
                 _write(opts_path, _sanitize_wmake_make_fragment(_MAKE_OPTIONS_OF10_INCOMPRESSIBLE_RAS))
                 fixes.append("reset_Make/options_to_OF10_incompressible_RAS_template")
             elif stripped != raw:

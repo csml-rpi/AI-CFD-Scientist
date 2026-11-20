@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ class ResourceProfile:
 
     wall_clock_s: float
     peak_used_mem_mb: float
-    avg_cpu_percent: float  # system-wide psutil.cpu_percent() average, 0-100
+    avg_cpu_percent: float  # the case's processes, as percent of the whole machine, 0-100
     logical_cores: int = field(default_factory=lambda: psutil.cpu_count(logical=True) or 1)
     sample_count: int = 1  # how many live samples backed this profile; 0 = unmeasured
 
@@ -42,29 +43,62 @@ class ResourceProfile:
 
 
 class _SystemSampler:
-    """Samples system-wide memory/CPU on a background thread while calibration runs.
+    """Samples the CPU and memory of this process's child processes on a
+    background thread while calibration runs.
 
-    Deliberately system-wide rather than per-process: the calibration case is
-    run alone (no other case running concurrently), so the delta attributable
-    to it is a reasonable proxy without needing to track the FoamAgent
-    subprocess's PID tree. Known limitation: unrelated load on a shared
-    machine during calibration will skew the measurement.
+    The calibration case is the only case this study runs at the time, so its
+    work is this process's children. It used to be measured system-wide,
+    which counted every other study on a shared machine as this case's cost:
+    on airfrans_codex_20261009, calibrated while three other studies were
+    solving, one candidate build was taken to need a third of the machine and
+    the study ran its builds three at a time on a machine 91% idle.
     """
 
-    def __init__(self, interval_s: float = 2.0):
+    def __init__(self, interval_s: float = 2.0, skip_sessions: Optional[set] = None):
         self.interval_s = interval_s
+        # Sessions already running when calibration began: other cases'
+        # (each runs its scripts in a session of its own) and this process's.
+        self.skip_sessions = set(skip_sessions or ())
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.mem_used_samples_mb: List[float] = []
         self.cpu_percent_samples: List[float] = []
 
+    def _tree(self) -> Tuple[dict, float]:
+        """{pid: CPU seconds so far} and resident MB of this process's
+        children, but for those in a session in ``skip_sessions``."""
+        cpu: dict = {}
+        rss_mb = 0.0
+        for proc in psutil.Process().children(recursive=True):
+            try:
+                if self.skip_sessions and os.getsid(proc.pid) in self.skip_sessions:
+                    continue
+                with proc.oneshot():
+                    times = proc.cpu_times()
+                    cpu[proc.pid] = times.user + times.system
+                    rss_mb += proc.memory_info().rss / (1024 * 1024)
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess, ProcessLookupError,
+                    PermissionError):
+                continue
+        return cpu, rss_mb
+
     def _loop(self) -> None:
-        psutil.cpu_percent(interval=None)  # prime psutil's internal delta timer
+        cores = psutil.cpu_count(logical=True) or 1
+        last, _ = self._tree()
+        t_last = time.monotonic()
         while not self._stop.is_set():
             time.sleep(self.interval_s)
-            vm = psutil.virtual_memory()
-            self.mem_used_samples_mb.append((vm.total - vm.available) / (1024 * 1024))
-            self.cpu_percent_samples.append(psutil.cpu_percent(interval=None))
+            now_cpu, rss_mb = self._tree()
+            now = time.monotonic()
+            # A child first seen now started since the last sample: all its
+            # CPU time falls in this interval.
+            used_s = sum(max(0.0, t - last.get(pid, 0.0)) for pid, t in now_cpu.items())
+            busy_cores = used_s / max(now - t_last, 1e-6)
+            last, t_last = now_cpu, now
+            self.mem_used_samples_mb.append(rss_mb)
+            # Kept on the old scale, percent of the whole machine, which
+            # ResourceProfile.cores_used converts back to cores.
+            self.cpu_percent_samples.append(min(100.0, 100.0 * busy_cores / cores))
 
     def __enter__(self) -> "_SystemSampler":
         self._thread = threading.Thread(target=self._loop, daemon=True)
@@ -96,6 +130,20 @@ def _profile_from(sampler: _SystemSampler, baseline_used_mb: float, wall_clock_s
     )
 
 
+def running_sessions() -> set:
+    """The sessions of this process and of its children now: what a
+    calibration starting now must not count. Each case runs its scripts in a
+    session of its own (foam_native.loop.run_script), so a case started after
+    this is told apart from the cases already running."""
+    sessions = {os.getsid(0)}
+    for proc in psutil.Process().children(recursive=True):
+        try:
+            sessions.add(os.getsid(proc.pid))
+        except (ProcessLookupError, PermissionError):
+            continue
+    return sessions
+
+
 def benchmark_case(
     run_fn: Callable[[], Any], *, sample_interval_s: float = 2.0,
     window_s: Optional[float] = None,
@@ -105,9 +153,9 @@ def benchmark_case(
 
     ``run_fn`` must be a blocking call that launches and waits for exactly one
     case (e.g. ``lambda: FoamAgentRunner(...).run(..., execute=True)``).
-    Call this only for the first case of a physics group / study — running it
-    alone, with nothing else competing for the machine, is what makes the
-    measurement meaningful.
+    Call this only for the first case of a physics group. Only processes in
+    sessions started after it begins are counted, so cases already running
+    are not part of the measurement.
 
     With ``window_s`` and ``on_window``, ``on_window`` is called once, from a
     timer thread, with the profile measured over the first ``window_s``
@@ -118,10 +166,10 @@ def benchmark_case(
     Returns ``(run_fn()'s return value, ResourceProfile)``, the profile over
     the whole run.
     """
-    baseline = psutil.virtual_memory()
-    baseline_used_mb = (baseline.total - baseline.available) / (1024 * 1024)
+    # The sampler measures this process's children only, which start at nothing.
+    baseline_used_mb = 0.0
 
-    sampler = _SystemSampler(interval_s=sample_interval_s)
+    sampler = _SystemSampler(interval_s=sample_interval_s, skip_sessions=running_sessions())
     t0 = time.monotonic()
     timer: Optional[threading.Timer] = None
     with sampler:

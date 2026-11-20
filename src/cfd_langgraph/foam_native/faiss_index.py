@@ -59,23 +59,54 @@ def embedding_model_name() -> str:
     return os.environ.get("CFD_SCIENTIST_EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
 
 
+def versioned_index_dir(profile: Dict[str, Any]) -> Path:
+    """Where the indices built from one installation's tutorials live
+    (scripts/build_tutorial_index.py)."""
+    key = f"{profile.get('fork', 'openfoam')}_{profile.get('version', 'unknown')}"
+    return _REPO_ROOT / "database" / "faiss_versions" / re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+
+
+def _installed_version_index() -> Optional[Path]:
+    """The indices built from the installed OpenFOAM's own tutorials, if any."""
+    try:
+        from cfd_langgraph.openfoam_version import get_profile
+
+        profile = get_profile()
+    except Exception:  # noqa: BLE001
+        return None
+    if not profile.get("ok"):
+        return None
+    path = versioned_index_dir(profile)
+    return path if (path / "openfoam_version.json").is_file() else None
+
+
 def index_root() -> Optional[Path]:
     """Directory holding ``<sanitised-model-name>/<index-name>/``.
 
-    Checked in order: an explicit override, a repo-local copy, then the
-    vendored Foam-Agent location. The last one is why nothing breaks today —
+    Checked in order: an explicit override, indices built from the installed
+    OpenFOAM's own tutorials (scripts/build_tutorial_index.py), a repo-local
+    copy, then the vendored Foam-Agent location. The last one is why nothing breaks today —
     but it is a fallback, not a requirement: drop the indices in
     ``<repo>/database/faiss/`` (or point ``CFD_SCIENTIST_FAISS_DIR`` anywhere)
     and no Foam-Agent checkout is involved at all.
     """
+    roots = index_roots()
+    return roots[0] if roots else None
+
+
+def index_roots() -> List[Path]:
+    """Every index directory present, in the order index_root checks them. A
+    directory named in CFD_SCIENTIST_FAISS_DIR is the only one used."""
     override = os.environ.get("CFD_SCIENTIST_FAISS_DIR")
-    candidates = [Path(override)] if override else []
+    if override:
+        return [Path(override)] if Path(override).is_dir() else []
+    candidates: List[Path] = []
+    installed = _installed_version_index()
+    if installed is not None:
+        candidates.append(installed)
     candidates.append(_REPO_ROOT / "database" / "faiss")
     candidates.append(_REPO_ROOT / "Foam-Agent" / "database" / "faiss")
-    for path in candidates:
-        if path.is_dir():
-            return path
-    return None
+    return [path for path in candidates if path.is_dir()]
 
 
 def tokenize(text: str) -> str:
@@ -101,15 +132,18 @@ def _embeddings() -> Any:
 def _load(db_name: str) -> Any:
     from langchain_community.vectorstores import FAISS
 
-    root = index_root()
-    if root is None:
+    roots = index_roots()
+    if not roots:
         raise FileNotFoundError(
             "No FAISS index directory found. Set CFD_SCIENTIST_FAISS_DIR, or place the "
             f"prebuilt indices under {_REPO_ROOT / 'database' / 'faiss'}."
         )
-    path = root / embedding_model_name().replace("/", "_").replace(":", "_") / db_name
-    if not path.is_dir():
-        raise FileNotFoundError(f"FAISS index not found: {path}")
+    # The first directory that has this index: one built from the installed
+    # version's tutorials holds the tutorial indices but not command help.
+    model_dir = embedding_model_name().replace("/", "_").replace(":", "_")
+    path = next((r / model_dir / db_name for r in roots if (r / model_dir / db_name).is_dir()), None)
+    if path is None:
+        raise FileNotFoundError(f"FAISS index {db_name} not found under {[str(r) for r in roots]}")
     return FAISS.load_local(str(path), _embeddings(), allow_dangerous_deserialization=True)
 
 

@@ -32,6 +32,7 @@ Phase 3 — multi-flow:
 """
 from __future__ import annotations
 
+import math
 import json
 import multiprocessing as _mp
 import pickle as _pickle
@@ -1676,11 +1677,26 @@ def _run_comparator_with_optional_baseline_time(
     timeout_s: int,
     metric_name: str = "",
     extra_env: Optional[Dict[str, str]] = None,
+    scorer_view: Optional[str] = None,
 ) -> "subprocess.CompletedProcess[str]":
     """Run a comparator, forwarding --baseline-time when supported. On any
     error invoking with the flag, retry without it (back-compat).
-    ``extra_env`` is added to the comparator's environment."""
+    ``extra_env`` is added to the comparator's environment. ``scorer_view``
+    names a manifest whose files are mounted over the originals while it runs:
+    the validation copy a study's search is scored on
+    (cfd_langgraph.validation_split)."""
     env = {**_os.environ, **extra_env} if extra_env else None
+    if scorer_view:
+        _src = str(Path(__file__).resolve().parent.parent / "src")
+        if _src not in sys.path:
+            sys.path.insert(0, _src)
+        from cfd_langgraph.withheld_data import view_command
+
+        def _viewed(cmd: List[str]) -> List[str]:
+            return view_command(cmd, scorer_view)
+    else:
+        def _viewed(cmd: List[str]) -> List[str]:
+            return cmd
     base_cmd = [sys.executable, str(comparator),
                 "--case", str(case_dir),
                 "--reference", str(reference_file)]
@@ -1699,12 +1715,12 @@ def _run_comparator_with_optional_baseline_time(
     if baseline_time is not None and _comparator_supports_baseline_time(comparator):
         try:
             return subprocess.run(
-                base_cmd + ["--baseline-time", str(baseline_time)],
+                _viewed(base_cmd + ["--baseline-time", str(baseline_time)]),
                 capture_output=True, text=True, timeout=timeout_s, env=env,
             )
         except Exception:
             pass
-    return subprocess.run(base_cmd, capture_output=True, text=True, timeout=timeout_s, env=env)
+    return subprocess.run(_viewed(base_cmd), capture_output=True, text=True, timeout=timeout_s, env=env)
 
 
 _TIME_USED_RE = re.compile(r"^TIME_USED:\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)\s*$", re.MULTILINE)
@@ -1786,6 +1802,116 @@ def judge_comparator_output(
     if res.returncode != 0:
         return False, f"non-zero exit ({res.returncode}); stderr: {(res.stderr or '')[:300]}", val
     return True, "ok", val
+
+
+def _numbers_under_key(blob: Any, key: str) -> List[float]:
+    """Every finite number stored under ``key`` anywhere in a JSON structure.
+
+    A starter's scorer nests its results however it likes -- often one level
+    per case, e.g. {"cases": {"<case>": {"<metric>": ...}}} -- so the key is
+    searched for rather than addressed by a path we would have to know in
+    advance.
+    """
+    found: List[float] = []
+    if isinstance(blob, dict):
+        for k, v in blob.items():
+            if str(k) == key and isinstance(v, (int, float)) and not isinstance(v, bool):
+                value = float(v)
+                if math.isfinite(value):
+                    found.append(value)
+            else:
+                found.extend(_numbers_under_key(v, key))
+    elif isinstance(blob, list):
+        for item in blob:
+            found.extend(_numbers_under_key(item, key))
+    return found
+
+
+def score_with_comparator_interface(
+    *,
+    comparator: Path,
+    interface: Dict[str, Any],
+    case_dir: Path,
+    reference_file: Optional[Path],
+    metric_name: str,
+    work_dir: Path,
+    timeout_s: int = 600,
+) -> Tuple[bool, str, Optional[float]]:
+    """Run a starter's own scorer through the interface described for it.
+
+    ``selftest_comparator`` speaks one contract and refuses everything else,
+    which is right for a comparator this pipeline authored and wrong for one
+    the starter shipped. This is the second attempt, used only after the
+    strict path has already failed: run the script the way its own argument
+    parser wants it, and read the number out under the key it really reports.
+
+    The value is accepted only when the script reports ONE value for the key.
+    Several different values means the command scored more than the case we
+    asked about, and a number that might belong to another case is worse than
+    no number -- the caller then refuses, as it did before.
+
+    Returns (ok, reason, value), like selftest_comparator.
+    """
+    argv_template = [str(token) for token in (interface.get("argv") or [])]
+    key = str((interface.get("metric_keys") or {}).get(metric_name) or "").strip()
+    if not argv_template or not key:
+        return False, "no interface described for this comparator", None
+
+    work_dir.mkdir(parents=True, exist_ok=True)
+    out_path = work_dir / f"comparator_out_{re.sub(r'[^A-Za-z0-9_.-]', '_', metric_name)}.json"
+    substitutions = {
+        "{python}": sys.executable,
+        "{script}": str(comparator),
+        "{case}": str(case_dir),
+        "{reference}": str(reference_file) if reference_file else "",
+        "{out}": str(out_path),
+    }
+    argv: List[str] = []
+    for token in argv_template:
+        for placeholder, value in substitutions.items():
+            token = token.replace(placeholder, value)
+        if token.strip():
+            argv.append(token)
+    if not argv:
+        return False, "interface produced an empty command", None
+
+    try:
+        res = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        return False, "timeout", None
+    except Exception as exc:  # noqa: BLE001
+        return False, f"exec error: {exc}", None
+
+    # A scorer commonly exits non-zero because the case missed its pass
+    # tolerance. That is a verdict, not a failure to measure, so the number it
+    # wrote still counts; only the absence of a number is a failure here.
+    values: List[float] = []
+    if out_path.is_file():
+        try:
+            values = _numbers_under_key(json.loads(out_path.read_text()), key)
+        except Exception:
+            values = []
+    if not values:
+        blob = (res.stdout or "") + "\n" + (res.stderr or "")
+        m = re.search(rf"\b{re.escape(key)}\s*[:=]\s*(-?\d+\.?\d*(?:[eE][+-]?\d+)?)", blob)
+        if m:
+            try:
+                candidate = float(m.group(1))
+                if math.isfinite(candidate):
+                    values = [candidate]
+            except ValueError:
+                values = []
+    if not values:
+        return False, (
+            f"ran as {' '.join(argv[1:])[:160]} (exit {res.returncode}) but reported no "
+            f"{key}: {((res.stderr or res.stdout or '').strip()[:200])}"
+        ), None
+    if any(abs(v - values[0]) > 1e-12 * max(1.0, abs(values[0])) for v in values[1:]):
+        return False, (
+            f"reported {len(values)} different values for {key}; that command scored more than "
+            "the one case it was given"
+        ), None
+    return True, "ok", values[0]
 
 
 def _classify_selftest_failure(
@@ -2352,6 +2478,63 @@ def fabricated_coordinates(source: str, metric: Optional[Dict[str, Any]] = None)
     return bool(_COORD_SYNTHESIS_RE.search(source))
 
 
+def scores_whole_study(
+    *,
+    comparator: Path,
+    baseline_case_dir: Path,
+    baseline_value: Optional[float],
+    probe_cases: Optional[List[Path]],
+    reference_file: Path,
+    metric_name: str,
+) -> str:
+    """Why ``comparator`` cannot be a per-case scorer, or "" if nothing says so.
+
+    A study declared over several cases scores each case with the bound
+    comparator and averages the results itself. A comparator that instead
+    computes the whole study's figure -- walks every case and prints their
+    mean, whatever --case it is given -- returns the same number for every
+    case: the mean still comes out right, but every per-case score is that mean
+    copied, and the scorer runs N x N times. Measured on closure_20260826_codex:
+    all 32 per-case scores read 0.0739291 where the real ones span 0.015 to
+    0.133. The check runs it on up to two other declared cases and refuses it
+    when every value is the same non-integer number; a probe case that cannot
+    be scored leaves the check inconclusive rather than failing it.
+    """
+    if baseline_value is None or not probe_cases:
+        return ""
+    try:
+        base_resolved = Path(baseline_case_dir).resolve()
+    except OSError:
+        base_resolved = Path(baseline_case_dir)
+    others = []
+    for case in probe_cases:
+        try:
+            resolved = Path(case).resolve()
+        except OSError:
+            continue
+        if resolved != base_resolved and resolved.is_dir() and resolved not in others:
+            others.append(resolved)
+    others = others[:2]
+    if not others:
+        return ""
+    if float(baseline_value) == round(float(baseline_value)):
+        return ""   # a count or a pass/fail flag can legitimately repeat
+    for case in others:
+        st = _selftest_comparator_full(comparator=comparator, case_dir=case,
+                                       reference_file=reference_file, metric_name=metric_name)
+        if not st.get("ok") or st.get("value") is None:
+            return ""
+        if float(st["value"]) != float(baseline_value):
+            return ""
+    names = ", ".join(c.name for c in others)
+    return (
+        f"it returned exactly {baseline_value!r} for {Path(baseline_case_dir).name} and the same "
+        f"value for {names}: it ignores --case and scores the whole set of cases. This study is "
+        f"scored over {len(probe_cases)} cases and averages them itself, so the comparator must "
+        f"score only the one case passed as --case and print that case's {metric_name}."
+    )
+
+
 def author_and_selftest(
     metric: Dict[str, Any],
     *,
@@ -2368,6 +2551,7 @@ def author_and_selftest(
     exemplar_text: str = "",
     pyvista_after_attempt: int = 5,
     expected_value: Optional[float] = None,
+    probe_cases: Optional[List[Path]] = None,
 ) -> Dict[str, Any]:
     """Author + self-test a comparator with up to ``max_attempts`` retries.
 
@@ -2606,9 +2790,20 @@ def author_and_selftest(
                         f"baseline {metric_name} is {expected_value:.6g} — off by a factor "
                         f"of {ratio:.4g}. This is a normalisation or unit error, not a "
                         f"methodological difference. Re-derive the normalisation from the "
-                        f"case's own constant/transportProperties; do not hardcode 1.0."
+                        f"case's own transport-properties dictionary (constant/physicalProperties "
+                        f"or constant/transportProperties, whichever the case has); do not hardcode 1.0."
                     ),
                 }
+
+        # In a multi-case study it must score the case it is given, not the
+        # whole study (see scores_whole_study).
+        if st["ok"] and probe_cases:
+            whole = scores_whole_study(
+                comparator=cand_path, baseline_case_dir=baseline_case_dir,
+                baseline_value=st["value"], probe_cases=probe_cases,
+                reference_file=reference_file, metric_name=metric_name)
+            if whole:
+                st = {**st, "ok": False, "reason": whole}
 
         failure_mode = "ok" if st["ok"] else _classify_selftest_failure(
             stdout=st["stdout"], stderr=st["stderr"], value=st["value"],
@@ -2823,6 +3018,7 @@ def resolve_metric_comparators(
     topic: str = "",
     locked_comparator: Optional[Path] = None,
     cache_dirs: Optional[List[Path]] = None,
+    probe_cases: Optional[List[Path]] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """
     For each metric:
@@ -2866,6 +3062,11 @@ def resolve_metric_comparators(
                 reference_file=reference_file, metric_name=name,
                 baseline_time=baseline_final_time,
             )
+            whole = scores_whole_study(
+                comparator=locked_path, baseline_case_dir=baseline_case_dir, baseline_value=val,
+                probe_cases=probe_cases, reference_file=reference_file, metric_name=name) if ok else ""
+            if whole:
+                ok, reason = False, whole
             if ok:
                 print(f"[OED-EXT][phase1] {name} bound to the study's own comparator "
                       f"{locked_path} (selftest {val})")
@@ -2884,6 +3085,11 @@ def resolve_metric_comparators(
                 reference_file=reference_file, metric_name=name,
                 baseline_time=baseline_final_time,
             )
+            whole = scores_whole_study(
+                comparator=Path(ep), baseline_case_dir=baseline_case_dir, baseline_value=val,
+                probe_cases=probe_cases, reference_file=reference_file, metric_name=name) if ok else ""
+            if whole:
+                ok, reason = False, whole
             if ok:
                 bound[name] = {"path": ep, "origin": "existing",
                                "selftest_ok": True, "selftest_value": val,
@@ -2931,6 +3137,7 @@ def resolve_metric_comparators(
             exemplar_text=exemplar_text,
             pyvista_after_attempt=5,
             expected_value=expectation_for_metric(name, expectations),
+            probe_cases=probe_cases,
         )
         bound[name] = result
         if not result.get("selftest_ok"):
@@ -2978,6 +3185,7 @@ def compute_metric_vector(
     baseline_final_time: Optional[float] = None,
     metric_specs: Optional[List[Dict[str, Any]]] = None,
     output_dir: Optional[Path] = None,
+    scorer_view: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run all bound comparators against case_dir. Returns:
@@ -3051,7 +3259,7 @@ def compute_metric_vector(
                     comparator=sp, case_dir=case_dir, reference_file=reference_file,
                     baseline_time=bt,
                     timeout_s=timeout_s if timeout_s is not None else _comparator_timeout(info),
-                    metric_name=name, extra_env=extra_env,
+                    metric_name=name, extra_env=extra_env, scorer_view=scorer_view,
                 )
             except Exception as exc:
                 errors[name] = failed_runs[run_key] = f"exec: {exc}"

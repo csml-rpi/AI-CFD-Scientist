@@ -22,7 +22,8 @@ def _bootstrap_paths(repo_root: Path) -> None:
 
 EMBEDDED_CODE_MOD_PROTOCOL_V2 = """
 SYSTEM WORKFLOW (EMBEDDED):
-- Implement exactly one small in-family OpenFOAM 10 custom change per invocation.
+- Implement exactly one small in-family OpenFOAM custom change per invocation, for the installed
+  OpenFOAM version (named, with its file conventions, under OPENFOAM INSTALLATION below).
 - Supported modes: custom_source | custom_viscosity | custom_turbulence_model_modification | custom_case_library | compare_builtin_models.
 - compare_builtin_models: NO custom compilation — run N cases, each selecting a different built-in
   model via `constant/<dict>` (e.g. momentumTransport's RASModel), same mesh/BCs/numerics.
@@ -33,10 +34,10 @@ SYSTEM WORKFLOW (EMBEDDED):
 - Required outputs: <ClassName>.H, <ClassName>.C, Make/files, Make/options
 - Build method: wmake libso only.
 - Load through system/controlDict libs entry.
-- Activate in:
-  - custom_source -> constant/fvModels
-  - custom_viscosity -> constant/momentumTransport (fallback turbulenceProperties)
-  - turbulence modification -> constant/momentumTransport (fallback turbulenceProperties)
+- Activate in the dictionaries this OpenFOAM uses for each role:
+  - custom_source -> the source-term dictionary
+  - custom_viscosity -> the viscosity / transport dictionary
+  - turbulence modification -> the turbulence dictionary
 - Use only supported parent families:
   SpalartAllmaras, kEpsilon, RNGkEpsilon, realizableKE, kOmega, kOmegaSST.
 - If symbols/units/parent/insertion site are ambiguous: stop and return NEEDS_INFO context.
@@ -565,13 +566,13 @@ def _llm_classify_code_mod_mode(
 
     ctx = (merged_text or "")[:14000]
     sys_prompt = (
-        "You route OpenFOAM 10 **case-local** code changes (under <case>/customModels/, wmake libso, libs in controlDict).\n"
+        f"You route {_version_label()} **case-local** code changes (under <case>/customModels/, wmake libso, libs in controlDict).\n"
         "Return STRICT JSON only, no markdown:\n"
         '{"mode":"<one>","parent_model_hint":"<one or unknown>","confidence":"high|medium|low","reason":"<short>"}\n'
         "mode must be exactly one of:\n"
         "  custom_viscosity — non-Newtonian / strain-rate viscosity / rheology\n"
         "  custom_turbulence_model_modification — RAS/LES closure tied to a named parent model\n"
-        "  custom_source — fvModels / volumetric source / actuator-style term\n"
+        "  custom_source — fvModels or fvOptions / volumetric source / actuator-style term\n"
         "  custom_case_library — any other custom compiled library (flux scheme, BC, functionObject, …)\n"
         "  compare_builtin_models — NO custom code required; user is asking to run/compare\n"
         "                           existing built-in OpenFOAM models against each other. Pick this\n"
@@ -677,6 +678,55 @@ def _extract_formula_symbols(formula_text: str, repo_root: Optional[Path] = None
             continue
         if t not in out:
             out.append(t)
+    return out
+
+
+def _version_label() -> str:
+    from cfd_langgraph.openfoam_version import get_profile
+
+    return get_profile().get("label") or "OpenFOAM"
+
+
+def _version_facts() -> str:
+    from cfd_langgraph.openfoam_version import describe, get_profile
+
+    return describe(get_profile())
+
+
+_HEADER_INDEX: Dict[str, Dict[str, List[Path]]] = {}
+
+
+def _class_files(wm: Path, names: List[str], *, sources: bool = True) -> List[Path]:
+    """For each class name: its header (and source, when ``sources``) in the
+    installed src tree, followed by the Make/options of the library it lives
+    in. Generated lnInclude copies and the adjoint/multiphase duplicates of a
+    class are passed over for the primary one."""
+    key = str(wm)
+    if key not in _HEADER_INDEX:
+        index: Dict[str, List[Path]] = {}
+        for root, dirs, files in os.walk(wm / "src"):
+            dirs[:] = [d for d in dirs if d not in ("lnInclude", "Make")]
+            for f in files:
+                if f.endswith(".H"):
+                    index.setdefault(f[:-2], []).append(Path(root) / f)
+        _HEADER_INDEX[key] = index
+    index = _HEADER_INDEX[key]
+    out: List[Path] = []
+    for name in names:
+        hits = sorted(index.get(name, []), key=lambda p: (
+            any(t in str(p) for t in ("adjoint", "phaseSystem", "twoPhase", "multiphase")), len(p.parts)))
+        if not hits:
+            continue
+        header = hits[0]
+        out.append(header)
+        if sources and header.with_suffix(".C").is_file():
+            out.append(header.with_suffix(".C"))
+        for folder in header.parents:
+            if (folder / "Make" / "options").is_file():
+                out.append(folder / "Make" / "options")
+                break
+            if folder == wm / "src":
+                break
     return out
 
 
@@ -796,51 +846,24 @@ def _collect_openfoam_reference_files(
 
     topic_l = (topic or "").lower()
     refs: List[Path] = []
-    base = wm / "src" / "MomentumTransportModels" / "momentumTransportModels" / "laminar" / "generalisedNewtonian"
+    # Found by class name in the installed src tree, not by an OpenFOAM 10
+    # path: openfoam.com keeps these in TurbulenceModels/, transportModels/
+    # and fvOptions/, openfoam.org in MomentumTransportModels/,
+    # physicalProperties/ and finiteVolume/.../fvModels/.
     if mode == "custom_viscosity":
-        candidates = [
-            base / "generalisedNewtonianViscosityModels" / "generalisedNewtonianViscosityModel" / "generalisedNewtonianViscosityModel.H",
-            base / "generalisedNewtonianViscosityModels" / "generalisedNewtonianViscosityModel" / "generalisedNewtonianViscosityModel.C",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "strainRateViscosityModel" / "strainRateViscosityModel.H",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "strainRateViscosityModel" / "strainRateViscosityModel.C",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "powerLaw" / "powerLaw.H",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "powerLaw" / "powerLaw.C",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "BirdCarreau" / "BirdCarreau.H",
-            base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "BirdCarreau" / "BirdCarreau.C",
-            wm / "src" / "MomentumTransportModels" / "momentumTransportModels" / "Make" / "options",
-            wm / "src" / "physicalProperties" / "viscosity" / "viscosity.H",
-        ]
+        names = ["generalisedNewtonianViscosityModel", "strainRateViscosityModel", "viscosityModel",
+                 "powerLaw", "BirdCarreau"]
         if any(k in topic_l for k in ["sisko", "herschel", "bulkley", "bingham", "yield"]):
-            candidates.extend(
-                [
-                    base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "HerschelBulkley" / "HerschelBulkley.H",
-                    base / "generalisedNewtonianViscosityModels" / "strainRateViscosityModels" / "HerschelBulkley" / "HerschelBulkley.C",
-                ]
-            )
+            names.append("HerschelBulkley")
+        candidates = _class_files(wm, names)
     elif mode == "custom_turbulence_model_modification":
-        mtm = wm / "src" / "MomentumTransportModels" / "momentumTransportModels"
-        candidates = [
-            mtm / "RAS" / "RASModel" / "RASModel.H",
-            mtm / "RAS" / "RASModel" / "RASModel.C",
-            mtm / "Make" / "options",
-        ]
-        if parent and parent != "unknown":
-            # Select one concrete parent implementation if present.
-            for p in mtm.rglob(f"{parent}.H"):
-                candidates.append(p)
-                c = p.with_suffix(".C")
-                if c.exists():
-                    candidates.append(c)
-                break
+        names = ["RASModel"] + ([parent] if parent and parent != "unknown" else [])
+        candidates = _class_files(wm, names)
     elif mode == "custom_source":
-        candidates = [wm / "src" / "fvModels" / "fvModel.H", wm / "src" / "fvModels" / "Make" / "options"]
+        candidates = _class_files(wm, ["fvModel", "fvOption"])
     elif mode == "custom_case_library":
-        candidates = [
-            wm / "src" / "finiteVolume" / "Make" / "options",
-            wm / "src" / "fvModels" / "fvModel.H",
-            wm / "src" / "OpenFOAM" / "Make" / "options",
-            wm / "src" / "MomentumTransportModels" / "momentumTransportModels" / "Make" / "options",
-        ]
+        candidates = [wm / "src" / "finiteVolume" / "Make" / "options", wm / "src" / "OpenFOAM" / "Make" / "options"]
+        candidates += _class_files(wm, ["fvModel", "fvOption", "RASModel"], sources=False)
         for sub in (
             wm / "src" / "finiteVolume" / "lnInclude",
             wm / "src" / "meshTools" / "lnInclude",
@@ -894,13 +917,16 @@ def _build_payload(
 ) -> Dict[str, Any]:
     dictionary_files = _collect_dictionary_texts(case_path)
     control_text = dictionary_files.get("system/controlDict") or _read_text(case_path / "system" / "controlDict")
-    momentum_text = dictionary_files.get("constant/momentumTransport") or _read_text(
-        case_path / "constant" / "momentumTransport"
-    )
+    from cfd_langgraph.openfoam_version import case_file, case_solver, get_profile
+
+    profile = get_profile()
+    turbulence_file = case_file(case_path, "turbulence")
+    sources_file = case_file(case_path, "sources")
+    momentum_text = _read_text(turbulence_file) if turbulence_file else ""
     turb_text = dictionary_files.get("constant/turbulenceProperties") or _read_text(
         case_path / "constant" / "turbulenceProperties"
     )
-    fv_models_text = dictionary_files.get("constant/fvModels") or _read_text(case_path / "constant" / "fvModels")
+    fv_models_text = _read_text(sources_file) if sources_file else ""
     fields = _collect_existing_fields(case_path)
     if "U" not in fields:
         fields.append("U")
@@ -993,9 +1019,10 @@ def _build_payload(
         ]
 
     return {
-        "openfoam_version": "10",
+        "openfoam_version": str(profile.get("version") or ""),
+        "openfoam_fork": str(profile.get("fork") or ""),
         "case_path": str(case_path),
-        "solver": "simpleFoam",
+        "solver": case_solver(case_path, profile)["command"] or "simpleFoam",
         "case_snapshot": {
             "controlDict_text": control_text,
             "momentumTransport_text": momentum_text,
@@ -1008,7 +1035,10 @@ def _build_payload(
             "dictionary_files_note": "Full 0/, system/, and constant/ text (constant/polyMesh excluded). Mesh remains on disk only.",
         },
         "solver_capabilities": {
-            "supports_fvModels": True,
+            # The source-term dictionary this OpenFOAM reads: fvModels on
+            # openfoam.org 9+, fvOptions on openfoam.com and older openfoam.org.
+            "supports_fvModels": (profile.get("files") or {}).get("sources", "fvModels") == "fvModels",
+            "source_dictionary": (profile.get("files") or {}).get("sources", "fvModels"),
             "fvModels_supported_fields": ["U", "T", "h"],
         },
         "openfoam_api_context": {
@@ -1120,7 +1150,7 @@ def main() -> int:
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parent.parent
-    protocol_text = EMBEDDED_CODE_MOD_PROTOCOL_V2
+    protocol_text = EMBEDDED_CODE_MOD_PROTOCOL_V2 + "\nOPENFOAM INSTALLATION:\n" + _version_facts()
     run_dir = Path(args.run_dir).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
     lit_records = _read_json(Path(args.literature), []) if args.literature else []

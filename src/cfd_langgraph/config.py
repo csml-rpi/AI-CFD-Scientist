@@ -8,6 +8,12 @@ from pydantic import BaseModel
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+
+def _default_openfoam_path() -> str:
+    from cfd_langgraph.openfoam_version import find_installation
+
+    return find_installation()
+
 class Settings(BaseModel):
     model: str = os.environ.get(
         "CFD_SCIENTIST_MODEL",
@@ -32,7 +38,9 @@ class Settings(BaseModel):
             str(_REPO_ROOT / "Foam-Agent" / "foambench_main.py"),
         )
     )
-    openfoam_path: str = os.environ.get("WM_PROJECT_DIR", "/opt/openfoam10")
+    # The installation sourced in this environment, else one found in the usual
+    # places (cfd_langgraph.openfoam_version.find_installation).
+    openfoam_path: str = os.environ.get("WM_PROJECT_DIR") or _default_openfoam_path()
 
     # Literature-aware ideation
     s2_api_key: str | None = os.environ.get("S2_API_KEY")

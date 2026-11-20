@@ -1,0 +1,27 @@
+name: solids4foam
+summary: >
+  Solid mechanics and fluid-solid interaction in OpenFOAM: linear and
+  nonlinear elasticity, plasticity, hyperelasticity, contact, thermo- and
+  poro-elasticity, and partitioned FSI with IQN-ILS / Aitken coupling.
+domains: [solid mechanics, structural mechanics, elasticity, plasticity, stress analysis,
+          fluid-structure interaction, FSI, flexible structure, deformable solid, contact, beam, plate]
+repo: https://github.com/solids4foam/solids4foam
+license: GPL-3.0
+builds:
+  # v2.4. PETSc is optional and not available here: the PETScSNES solution
+  # algorithm and the FSI cases that need it are unavailable. Eigen 3.3.7 is
+  # fetched by ThirdParty/Allwmake when no system copy exists.
+  - fork: openfoam.com
+    versions: [v2312, v2406, v2412, v2506, v2512, v2606]
+    ref: 1341312f951caf4d8fcc69499c6ce1a588826156
+    build: unset PETSC_DIR; export S4F_UNITY_BUILD=1; ./Allwmake -j ${WM_NCOMPPROCS:-16} -s
+provides:
+  applications: [solids4Foam]
+  libraries: [libsolids4FoamModels, libRBFMeshMotionSolver]
+usage: >
+  Run the solids4Foam application. constant/physicsProperties selects
+  `type solid | fluid | fluidSolidInteraction`; constant/solidProperties,
+  fluidProperties and fsiProperties pick the models; the material law is in
+  constant/mechanicalProperties. Tutorials that compile a helper library find
+  the solids4foam tree through SOLIDS4FOAM_ROOT.
+tutorials: tutorials

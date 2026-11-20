@@ -6,7 +6,7 @@ After the Nov 2026 refactor, every skill in this directory is **self-contained**
 
 - The agent-driven recipe is the **primary path**. Each skill walks the calling agent through every step end-to-end.
 - The expert prompts from `prompts/prompts.yaml` (HypothesisAgent, IdeationAgent, ResultsInterpreterAgent, WriterAgent, PaperReviewerAgent, RunValidityAgent, MetricProposer, ComparatorAuthor, ComparatorVerifier, MetricSetupAgent, MetricSetupVerifier) are **embedded verbatim** in the SKILL files that use them. The YAML remains the single authoritative source; the embedded copies allow each skill to be useful from a different agent framework where that YAML may not be available.
-- The OPENFOAM 10 LITERATURE CHANGE AGENT v2 protocol (`openfoam_literature_change_agent_prompt_v2.txt`) is embedded verbatim inside `cfd-code-modify/SKILL.md`.
+- The LITERATURE CHANGE AGENT v2 protocol (`openfoam_literature_change_agent_prompt_v2.txt`; written against openfoam.org 10, applied to the installed version by its rule 12.1) is embedded verbatim inside `cfd-code-modify/SKILL.md`.
 - Scripts are an **optional fast-path** inside each skill, not a primary mechanism. The exception is `cfd-experiment`, which keeps `scripts/foam_run.py` as the actual execution mechanism because that script *is* the FoamAgent framework wrapper — reimplementing it would mean reimplementing FoamAgent (DeepScientist makes the same trade-off with its baseline runner).
 
 The two modes share the same expert prompts (`prompts/prompts.yaml`), the same artifact JSON contracts (`lit.json`, `requirements.json`, `selected_mesh_spec.json`, `decision.json`, `analysis.json`, etc.), and — where helpful — the same Python helper scripts (`scripts/*.py`). Pick whichever mode fits your workflow, or mix them.
@@ -148,7 +148,7 @@ The skills assume the agent can run Bash, read/write files, and (for figure inte
 
 ### Environment (all agents)
 
-Whichever agent you use, activate the environment first (`conda activate cfd-scientist`) and have OpenFOAM 10 on `PATH` for any real CFD run. Skill mode calls `scripts/stage_gate_audit.py`, `scripts/foam_run.py`, `scripts/rag_query.py`, and the batch tools `scripts/audit_bundle.py` / `scripts/sanitize_bundle.py`; the **only** off-limits script is `scripts/orchestrator_run.py` (the LangGraph driver, which bypasses skill chaining).
+Whichever agent you use, activate the environment first (`conda activate cfd-scientist`) and have your OpenFOAM sourced (any openfoam.org 9+ or openfoam.com v2006+ release; see `skills/cfd-orchestrator` Step 3b) for any real CFD run. Skill mode calls `scripts/stage_gate_audit.py`, `scripts/foam_run.py`, `scripts/rag_query.py`, and the batch tools `scripts/audit_bundle.py` / `scripts/sanitize_bundle.py`; the **only** off-limits script is `scripts/orchestrator_run.py` (the LangGraph driver, which bypasses skill chaining).
 
 ---
 

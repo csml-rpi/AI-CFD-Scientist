@@ -18,7 +18,18 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from oed_search_archive import SearchArchive  # noqa: E402
+from oed_search_archive import SearchArchive as _SearchArchive  # noqa: E402
+
+
+class SearchArchive(_SearchArchive):
+    """The sampler's tests build archives without the min_chain_tries rule,
+    which would otherwise answer every one of their unrefined roots with a
+    forced refinement before the sampler is reached; that rule has its own test
+    (test_a_chain_gets_its_minimum_attempts)."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("min_chain_tries", 1)
+        super().__init__(*args, **kwargs)
 
 FAILURES = 0
 
@@ -1089,6 +1100,39 @@ def test_lineages_are_reconstructed_from_parents() -> None:
     check("a chain with an unscored ancestor still forms a lineage", len(c.lineages()) == 1)
 
 
+def test_a_chain_gets_its_minimum_attempts() -> None:
+    """A chain is refined until it has had three attempts before the search
+    moves on (user, 2026-10-29): left to the sampler, 85% of chains in three
+    finished runs stopped at their first candidate."""
+    import random
+    a = _SearchArchive()
+    check("three attempts by default", a.min_chain_tries == 3)
+    a.replay([_ln(1, "F", 0.10), _ln(2, "G", 0.12)], baseline_direction="min")
+    picks = [a.select_action(500, 1000, rng=random.Random(s)) for s in range(50)]
+    check("a chain with one attempt is always refined",
+          all(p["action"] == "deepen" for p in picks), {p["action"] for p in picks})
+    check("the better chain first", all(p["lineage_id"] == 1 for p in picks), {p["lineage_id"] for p in picks})
+    check("and the pick says why", all("held to 3 attempts" in p["rationale"] for p in picks))
+    second = a.select_action(500, 1000, rng=random.Random(0), exclude_lineages={1})
+    check("a batch's next slot takes the next unfinished chain",
+          second["action"] == "deepen" and second["lineage_id"] == 2, second)
+
+    b = _SearchArchive()
+    b.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.11, parent=1), _ln(3, "F", 0.105, parent=1)],
+             baseline_direction="min")
+    seen = {b.select_action(500, 1000, rng=random.Random(s))["action"] for s in range(80)}
+    check("after three attempts the sampler decides again", len(seen) > 1, seen)
+
+    c = _SearchArchive()
+    c.replay([_ln(1, "F", 0.10), _ln(2, "F", 0.09, parent=1)], baseline_direction="min")
+    check("two attempts, even improving ones, are not yet three",
+          c.select_action(500, 1000, rng=random.Random(1))["action"] == "deepen")
+    off = _SearchArchive(min_chain_tries=1)
+    off.replay([_ln(1, "F", 0.10), _ln(2, "G", 0.12)], baseline_direction="min")
+    seen = {off.select_action(500, 1000, rng=random.Random(s))["action"] for s in range(80)}
+    check("min_chain_tries=1 leaves it to the sampler", len(seen) > 1, seen)
+
+
 def test_allocator_asks_the_allocation_question() -> None:
     import random
     a = SearchArchive()
@@ -2112,6 +2156,7 @@ def main() -> int:
     test_select_niche_can_actually_hand_over_an_elite()
     test_a_cell_keeps_more_than_its_winner()
     test_lineages_are_reconstructed_from_parents()
+    test_a_chain_gets_its_minimum_attempts()
     test_allocator_asks_the_allocation_question()
     test_allocation_follows_the_evidence()
     test_deepen_does_not_win_by_arithmetic()

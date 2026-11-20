@@ -1,0 +1,334 @@
+name: DAFoam
+summary: >
+  Discrete adjoint for OpenFOAM: gradients of a flow quantity (drag, lift,
+  pressure loss, heat flux, ...) with respect to thousands of design variables
+  (shape, inflow, field parameters) at the cost of one extra solve, for
+  gradient-based aerodynamic shape optimisation, field inversion and
+  aero-structural / aero-thermal design.
+domains: [adjoint, shape optimisation, shape optimization, aerodynamic optimization, design optimization,
+          sensitivity, gradient, field inversion, airfoil optimization, wing optimization, inverse design]
+repo: https://github.com/mdolab/dafoam
+license: GPL-3.0
+runtime:
+  # DAFoam v5 is written against OpenFOAM v2506 and needs an AD-compiled copy
+  # of it, so it brings its own: one build serves every installed version,
+  # and the installed OpenFOAM is never used by it.
+  kind: own_openfoam
+  openfoam: OpenFOAM-v2506 (+ OpenFOAM-AD reverse mode)
+  # A case whose controlDict names one of DAFoam's solvers runs every command
+  # inside the wrapper, and is solved by its runScript.py, not by the program.
+  wrapper: dafoam-run
+  programs:
+    DASimpleFoam: &script {run: python runScript.py, inputs: [runScript.py, FFD]}
+    DARhoSimpleFoam: *script
+    DARhoSimpleCFoam: *script
+    DAPimpleFoam: *script
+    DAPimpleDyMFoam: *script
+    DARhoPimpleFoam: *script
+    DAIrkPimpleFoam: *script
+    DATurboFoam: *script
+    DAHeatTransferFoam: *script
+    DAScalarTransportFoam: *script
+    DASolidDisplacementFoam: *script
+    DATopoChtFoam: *script
+    DAHisaFoam: *script
+    DAInterFoam: *script
+    # Older DAFoam names, which its own regression cases still carry in
+    # controlDict. The application does not choose the solver: runScript.py's
+    # solverName does, so these run the same way.
+    simpleDAFoam: *script
+    pisoDAFoam: *script
+builds:
+  - fork: any
+    versions: [any]
+    key: own_openfoam-v2506
+    ref: a941594dc3d0a85b885074f8aabcf2806ad4604d   # v5.1.1
+    build: bash "$SHELF_RECIPE_DIR/build.sh"
+provides:
+  applications: [dafoam-run]
+  start:
+    dafoam-run: >-
+      dafoam-run python -c "import dafoam, mphys, openmdao, pygeo, idwarp;
+      from dafoam.libs.pyDASolvers import pyDASolvers;
+      from dafoam.libs.ADR.pyDASolvers import pyDASolvers as AD; print('ok')"
+  libraries: []
+usage: >
+  A Python optimisation framework with its own OpenFOAM v2506. A case is an
+  OpenFOAM v2506 case (0/, constant/, system/ in that version's syntax) plus
+  a runScript.py that sets daOptions (solverName such as DASimpleFoam,
+  DARhoSimpleFoam, DAPimpleFoam; the functions to differentiate; the design
+  variables) and builds an OpenMDAO/Mphys problem, and FFD/ when it moves the
+  shape. The controlDict application names the same DAFoam solver as
+  solverName; the case is then solved by running
+  `mpirun -np <n> python runScript.py` inside the wrapper dafoam-run, which
+  loads DAFoam's environment in place of the installed OpenFOAM's, and the
+  run counts as finished when that command exits 0. By hand:
+  `dafoam-run mpirun -np <n> python runScript.py`. Write cases from the
+  DAFoam tutorials and regression cases, never from the installed version's
+  tutorials. For shape derivatives set IDWarp's "useRotations": False in
+  meshOptions: its derivative omits the rotation terms its warp applies,
+  which put shape gradients ~3 % off the true ones on the validation case;
+  with rotations off they match finite differences to 3e-6. Do not cache
+  fields in fvSolution (a `cache { grad(U); }` entry): on more than one rank
+  DAFoam then aborts at its first iteration with "MPI_Waitall returned with
+  error", while a single rank runs; without it the same case runs on four.
+  A runScript.py must not redirect or capture its own stdout or stderr (no
+  os.dup2 onto a pipe read by a thread, no contextlib redirect around the
+  solve): DAFoam's solver keeps hold of Python while it runs, so the reading
+  thread never drains the pipe; once it fills, rank 0 blocks in the write and
+  the other ranks spin at full load waiting for it, with nothing in the log
+  (an S809 lift-curve case hung like this at its first primal). The run's
+  output already goes to the case's log; read each solve's printed history
+  ("CL: ...") from that file, or take the values from the problem
+  (prob.get_val) after the solve.
+  Several conditions in one run (a lift curve over angles): build the
+  problem once, then for each condition set its input and solve again --
+  prob.set_val("patchV", np.array([U, alpha_deg])); prob.run_model() -- each
+  solve starting from the last one's flow (DASolver.setStates resets it).
+  Building a new problem (a new DASolver or Multipoint) for each angle in the
+  same process does not hold: after ten rebuilds an S814 sweep's ranks sat in
+  different MPI calls (one reducing the mesh bounds in movePoints, another
+  broadcasting processor paths for the new solver) and the run hung with no
+  output. The same rebuild also logs a harmless decomposePar "already
+  decomposed" FOAM FATAL ERROR each time. This holds for any second problem
+  in the process, a separate one for a timing test included: each problem's
+  solver counts its adjoint solutions from 1 and moves the latest time folder
+  to 0.0001 at its first adjoint, so the second one's adjoint stops with
+  "processorN/0.0001 already exists, moving failed!". Time the short test on
+  the same problem the production solves use.
+  daOptions "writeAdjointFields": True works only when daOptions "function"
+  defines a single function; with more (CL and CD, say) DAFoam stops at the
+  first adjoint with "writeAdjointFields supports only one function, while
+  multiple are defined!", after every primal before it has run (an S814
+  gradient check lost three 40,000-iteration solves to it, twice). Leave it
+  False, or define only the function being differentiated.
+  DAFoam's Python side works in the current directory: at each adjoint it
+  moves <current directory>/processorN/<latest time> to processorN/0.0001.
+  A solver set up in another folder (os.chdir around builder.initialize, one
+  folder per condition) solves in that folder, but its first adjoint looks in
+  the current one and stops with "Can not move <cwd>/processorN/<time> to
+  .../0.0001" (an S814 five-angle training failed so after its five primals,
+  about 1.5 h). Keep the case folder as the current directory for the whole
+  run, with one solver; several conditions are solved in it one after
+  another by setting their input (patchV) between solves, as above.
+  The adjoint's GMRES stops at daOptions "adjEqnOption" "gmresMaxIters"
+  (1000 by default) whether or not it has converged. A solve that ends
+  "Total iterations: 1000. PetscConvergedReason: -3" has not: its gradient is
+  wrong, and IPOPT stops with "EXIT: Invalid number in NLP function or
+  derivative detected". Near stall, once the model has been changed, the
+  adjoint needs more than at the baseline (583 iterations at S809 10 deg; an
+  S814 training adjoint still had residual 1e-2 at 1000): set gmresMaxIters
+  well above that (several thousand) and check PetscConvergedReason > 0 for
+  every adjoint before its gradient is used.
+  The IPOPT under pyoptsparse 2.16 in this build predates "max_wall_time":
+  setting it stops the driver at its first iteration with "Tried to set
+  Option: max_wall_time. It is not a valid option" (tested). "max_cpu_time"
+  and "max_iter" work; for a wall-clock limit, check elapsed time in the
+  run's own objective callback and stop there.
+  A finite-difference check of a DAFoam gradient compares solves that each
+  stop short of machine precision, so two solves of one setup differ by far
+  more than round-off (lift by 1e-3 between differently started solves near
+  stall). Size the step so the checked output changes 100x or more than that
+  scatter (estimate the change from the adjoint derivative first), start the
+  perturbed solves from the base solve's converged states (setStates) so
+  they share its drift, use a condition that settles, and compare two step
+  sizes. A 1e-4 step on one network weight moved lift by 5e-9 and every such
+  check came out noise.
+  In one problem every solve runs from time 0 (DAFoam resets it) to the
+  controlDict endTime read when the problem was built, or stops earlier at
+  the stopping rules also read then (primalMinResTol, primalFuncStdTol).
+  Nothing changes them between solves: DASolver.solver.setTime, rewriting
+  controlDict's endTime (tested: 300 rewritten to 700 and to 200, both
+  solves ran 300) and setOption + updateDAOption on those tolerances (the
+  solver keeps the values it read when built) all leave each solve as it
+  was. A timing estimate from a "short" solve is then a full one. Conditions
+  that need different lengths run at the longest; to end each solve once its
+  lift has settled, set daOptions "primalFuncStdTol": {"stdTol": ...,
+  "funcNames": ["CL"], "nStepsFrac": ...} before building the problem.
+  Before the first run_model, the problem's state outputs (prob.get_val of
+  "...aero_states") hold OpenMDAO's starting value 1.0 in every entry, not
+  the case's fields, as CL and CD do. A state saved from there and put back
+  with setStates starts every solve from U = 1, p = 1 and nuTilda = 1 m2/s
+  (an S814 gradient check then started at CL 1931 with chiSA = 1 everywhere
+  and ended at CL 0.09). Take the starting state from DASolver.getStates()
+  after the problem is set up, or from a solve already run.
+  DASolver.getStates() is this rank's states, by default (daOptions
+  "adjStateOrdering": "state", DAIndex.C) one state after another, not cell
+  by cell: U as u, v, w of local cell 0, then of cell 1, ... (3 x n entries,
+  n = DASolver.solver.getNLocalCells()), then p (n), then nuTilda (n), then
+  phi (one per local face). The cells' velocities are
+  states[:3 * n].reshape(n, 3). Read as (n, 5) rows of u, v, w, p, nuTilda,
+  the first 5n entries are not cells: an S809 sweep that set "each cell's
+  U" that way before every angle wrote the inflow velocity into p and
+  nuTilda (nuTilda about 10 m2/s in much of the domain), and no angle's
+  primal converged in 30,000 iterations (p's residual stayed at 1).
+  On more than one rank pyDAFoam decomposes the case itself when the script
+  starts (it writes system/decomposeParDict and runs decomposePar): a
+  runScript.py must not run decomposePar or reconstructPar itself, and a
+  field it writes into 0/ before building the problem is decomposed with the
+  case. Other utilities run before the problem is built, on rank 0, act on
+  the undecomposed case (postProcess -func writeCellCentres writes the cell
+  centres to 0/C, 0/Cx, 0/Cy, 0/Cz, compressed as C.gz, Cx.gz, ... when
+  controlDict has writeCompression on, as DAFoam's cases do; read either). A per-cell field input is declared in
+  inputInfo with type "field", its fieldName, fieldType ("scalar" or
+  "vector"), "distributed" and "components" (the OpenMDAO components that
+  receive it, ["solver", "function"]), as
+  tests/runRegTests_DASimpleFoamForward.py does; that test's run_tests(...)
+  is prob.run_model() followed by prob.compute_totals(...). With
+  "distributed": False the input is one array of every cell on every rank,
+  in DAFoam's global cell order: rank 0's cells, then rank 1's, and so on,
+  which is the undecomposed mesh's order only when the run has one rank. With
+  "distributed": True each rank's array holds only its own cells. To give a
+  field input values cell by cell on several ranks, write the field into 0/
+  before the problem is built (it is decomposed with the case) and read it
+  back in the input's order with getOFFieldGlobal. Then give the input those
+  values (the val of the component that outputs it, or prob.set_val): every
+  solve sets the field from the input's value, overwriting what 0/ held. A
+  0/betaFINuTilda of 1.4 in 100 cells with the input left at ones solved with
+  beta = 1 everywhere (CD unchanged); with the input set to the values read
+  back, CD fell from 2.5158 to 2.5104.
+  The production multiplier betaFINuTilda is part of DAFoam's own
+  Spalart-Allmaras models (constant/turbulenceProperties RASModel
+  SpalartAllmaras or SpalartAllmarasFv3; it defaults to 1 everywhere): there
+  is no separate field-inversion model in this version, and a model name such
+  as SpalartAllmarasFv3FieldInversion fails with "Unknown RAS model type".
+  daOptions "solverName" must be a DASolver type (DASimpleFoam,
+  DARhoSimpleFoam, DAPimpleFoam, ...). controlDict's application may carry
+  DAFoam's legacy name (simpleDAFoam) and that is fine there, but it is a
+  different setting: solverName "simpleDAFoam" fails with "Unknown DASolver
+  type".
+  pyDASolvers getOFField(fieldName, fieldType, field) takes fieldType
+  "scalar" or "vector" and a flat float64 numpy array of this rank's cells
+  times 1 or 3 components. getOFFieldGlobal(fieldName, "scalar", field)
+  takes "scalar" only ("vector" stops with "fieldType not valid") and an
+  array of every cell in the global order above, but fills only this rank's
+  cells: zero the array first, then sum it over ranks (mpi4py
+  Allreduce, MPI.SUM) to have the whole field on every rank.
+  Every function in "function" needs "type", "source" ("allCells", a
+  "boxToCell" with its box, or "patchToFace" with its patches) and "scale".
+  Its value is the output <scenario>.aero_post.<function name> of the
+  problem. A "variance" function (misfit to reference data) also needs
+  "mode" ("field", "surface", or "probePoint" with "probePointCoords"),
+  "varName", "varType" ("scalar" or "vector"), "indices" (the components,
+  for a vector, e.g. [0, 1, 2]) and "timeDependentRefData" (False for a
+  steady case); then it reads the reference field from 0/<varName>Data
+  (0/UData for U) when the problem is built. If that file is missing it only
+  prints a WARNING ("Can't find data files") and the function is 0 from then
+  on, so check the log for it.
+  There is no regularisation option for a field input: add any penalty on
+  the design array as an OpenMDAO component (om.ExecComp or an
+  ExplicitComponent with its derivatives) and add it to the objective.
+  A neural network inside the solver: daOptions "regressionModel" {"active":
+  True, "<name>": {"modelType": "neuralNetwork", "inputNames": [...],
+  "outputName": "betaFINuTilda", "hiddenLayerNeurons": [5, 5],
+  "inputShift": [...], "inputScale": [...], "outputShift": 1.0,
+  "outputScale": 1.0, "activationFunction": "tanh" (or "sigmoid", "relu" with
+  "leakyCoeff"), "outputUpperBound": ..., "outputLowerBound": ...,
+  "defaultOutputValue": 1.0, "writeFeatures": True}}. Its inputs are DAFoam's
+  own features: VoS, PoD, chiSA, pGradStream, PSoSS, SCurv, UOrth, KoU2,
+  ReWall, CoP, TauoK (DARegression.C computes each; the ratios are
+  A / (A + B + 1e-16), in [0, 1]). The network is evaluated from the current
+  flow at every primal iteration: normalised input = (raw + inputShift) *
+  inputScale, output = outputScale * (net + outputShift), then a non-finite
+  value becomes defaultOutputValue and the result is clipped to the bounds.
+  writeFeatures writes each input, already normalised, as a field named after
+  it, beside the output field. Those feature fields are held by the
+  regression model, not in the mesh's object registry: read them from the
+  written files. DASolver.solver.getOFField / getOFFieldGlobal("chiSA", ...)
+  after a solve stops every rank with "failed lookup of chiSA (objectRegistry
+  region0)" (its list of available fields has betaFINuTilda but none of the
+  inputs); an S809 run lost all 18 of its finished 12,000-iteration solves
+  to it. The weights are trained through the adjoint as
+  a design variable, as tests/runRegTests_DASimpleFoamRegPar.py does:
+  inputInfo {"<name>": {"type": "regressionPar", "components": ["solver",
+  "function"]}}; in configure, n = self.scenario.coupling.solver.DASolver.
+  getNRegressionParameters("<name>"), an om.IndepVarComp output "<name>" of n
+  values connected to "scenario.<name>", and add_design_var("<name>", ...).
+  The vector holds, neuron by neuron, each neuron's input weights and then its
+  bias; after the optimisation prob.get_val("<name>") is the trained vector.
+  Start it from small random values: equal values give every neuron of a
+  layer the same gradient, and they stay identical. modelType
+  "externalTensorFlow" evaluates a Keras model through Python with derivatives
+  with respect to its inputs only: its weights are not trained by the adjoint.
+  A primal solve stops when its residual falls below primalMinResTol
+  (default 1e-8) or at controlDict's endTime, and DAFoam reports "Primal
+  solution failed!" (an AnalysisError in the problem) when the largest final
+  residual divided by primalMinResTol is above primalMinResTolDiff (default
+  1e2). Both must be positive: set negative, every solve is reported failed.
+  For a fixed number of iterations, give a primalMinResTol below what the
+  solve reaches and a primalMinResTolDiff large enough to accept the residual
+  it ends with.
+  After every primal solve DAFoam renames the case's last time folder to
+  0.0001, 0.0002, ... (pyDAFoam renameSolution), finding it by its time
+  printed with "%g", which keeps 6 significant digits. A last time of 1 or
+  more whose folder name needs more digits (deltaT 0.014285714 ending at
+  1.0855227) is then looked for as 1.08552 and the solve stops with "Can not
+  move .../1.08552 to .../0.0001". A steady solver (DASimpleFoam,
+  DARhoSimpleFoam) takes deltaT 1, as DAFoam's own cases do: its iterations
+  are not time steps, so a CFL limit does not apply to it.
+  The number in the log's "Running Primal Solver 001" counts the solves of
+  one DAFoam solver object (pyDAFoam nSolvePrimals), not solves overall: in a
+  problem with one scenario per condition every condition prints 001 at the
+  first evaluation, 002 at the second, so it numbers evaluations and repeats
+  across conditions.
+  "Minimal residual X satisfied the prescribed tolerance Y" is printed only
+  when a primal stops early because its residual fell below primalMinResTol
+  ("Functions max std ... satisfied" when primalFuncStdTol is met instead;
+  DASolver.C). A primal that runs to its endTime prints neither line; whether
+  it is accepted is the primalMinResTolDiff check, failed as AnalysisError.
+  A log parser that requires the line rejects every solve that ran its full
+  length. DAFoam prints nothing when a primal is accepted: no "converged",
+  "completed" or primal_converged line exists. A rejected primal prints
+  "Primal min residual X did not satisfy the prescribed tolerance Y" and
+  "Primal solution failed!" (or "Regression model computation has invalid
+  values. Primal solution failed!"), and mphys raises AnalysisError("Primal
+  solution failed!") (DASolver.C checkResidualTol, mphys_dafoam.py). In a
+  saved log, a solve was accepted when that failure line is absent from it.
+  A DAFoam primal prints its residuals, at the steps printInterval names, as
+  "U0 initRes: 0.99 finalRes: 0.08 nIters: 1", one line per velocity
+  component (U0, U1, U2) and one each for p and nuTilda (DAUtility.C
+  primalResidualControl); it prints no OpenFOAM "Solving for Ux, Initial
+  residual = ..." lines. The residual it judges a solve by is the largest
+  initial residual, taking the median of the three velocity components.
+  Several conditions solved at the same time run as separate MPI jobs, one
+  per condition, each in its own case folder with its own decomposition,
+  launched together and waited on; a coordinating script combines their
+  functions and gradients. They cannot share one MPI job: DAFoam starts
+  OpenFOAM with "-parallel" on the whole MPI world (pyDAFoam _initializeComm,
+  pyDASolvers) and creates its adjoint vectors on PETSc.COMM_WORLD
+  (mphys_dafoam.py), so mphys MultipointParallel with split communicators
+  does not run DAFoam scenarios side by side. A job launched from inside an
+  MPI program needs the OMPI_*, PMI_* and PMIX_* variables removed from its
+  environment.
+  Optimisers: om.pyOptSparseDriver with optimizer "IPOPT" or "SLSQP" (SNOPT
+  is not built). Check a gradient with prob.check_totals(of=[...], wrt=[...],
+  form="central", step=...) or by comparing prob.compute_totals with central
+  differences of prob.run_model. Finite differences of a flow solve are only
+  as accurate as its convergence: for a small sensitivity converge the flow
+  to a tighter primalMinResTol than the case's default and give it enough
+  iterations to reach it, or the differences are noise. For the same reason
+  IPOPT, stopped by its tol alone, can spend a very long time in line
+  searches near the optimum; its acceptable_tol / acceptable_iter stopping
+  test ends such a run. A patch that daOptions primalBC sets a value on must
+  have, in 0/, one of the types DAFoam can set (DAField.C): fixedValue,
+  inletOutlet, outletInlet, fixedGradient, or for pressure
+  characteristicFarfieldPressure. Any other type there -- freestreamPressure,
+  freestream, freestreamVelocity -- stops every run at start with "only
+  support fixedValues, inletOutlet, outletInlet, fixedGradient". For a far
+  field that is zero-gradient for pressure where flow enters and fixed where
+  it leaves, use outletInlet. A patchVelocity input's value is [speed, angle
+  of attack in degrees] (DAInputPatchVelocity.C: Ux = speed cos(angle), Uy =
+  speed sin(angle)), not the two velocity components: given [U cos a, U sin a]
+  it runs at about U sin a degrees, and the log line "Setting UMag = ... AoA
+  = ... degs" shows the angle it actually used. When a solve fails or misses
+  primalMinResTol x primalMinResTolDiff, DAFoam raises AnalysisError before its
+  functions are computed: CL, CD and every other function output then still
+  hold OpenMDAO's starting value 1.0, which is not a result. The solver log's
+  "CL:" lines carry the iterates' values.
+tutorials: tests
+# Python classes whose methods the writer of a runScript.py is shown, so it
+# calls only what exists (solver_shelf.api_index).
+api:
+  - dafoam.libs.pyDASolvers.pyDASolvers
+  - dafoam.pyDAFoam.PYDAFOAM
+  - dafoam.mphys.mphys_dafoam.DAFoamBuilder

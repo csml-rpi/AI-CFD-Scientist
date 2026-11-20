@@ -125,6 +125,11 @@ CONVERSION RULES:
      * If the topic mentions time step, end time, write interval, or other run-control limits, reflect those in the requirement.
    - If the topic does not mention such constraints, use reasonable defaults; if it does, the generated requirement must explicitly satisfy them.
 
+9) WHERE THE CASE RUNS
+   - The framework runs this case in its own case folder, already copied from the study's validated case and mesh. Describe only this case's physics, settings and outputs.
+   - Never name folders or paths, never say to create, copy or move a case or a run directory, and never give commands to run: a case written to run in another folder runs files the framework never checks or fixes.
+   - The topic's instructions about where files go, what may be read, installing or provenance are for the framework, not for this case: leave them out of the requirement.
+
 OUTPUT FORMAT:
 - Return EXACTLY ONE paragraph of plain English
 - No lists, JSON, YAML, or Markdown
@@ -215,7 +220,7 @@ Return ONLY a JSON array of objects with keys: hypothesis_id, statement, rationa
 2. `json.loads` the response; on failure, retry once with the LLM, attaching the parse error.
 3. For each hypothesis, validate:
    - `hypothesis_id` matches `^h_\d{3}$` — renumber if not.
-   - `constraints.solver` is non-empty (use a sensible default like `simpleFoam` for steady incompressible only if the LLM left it blank AND log a `hypothesis_default_filled` warning to timeline).
+   - `constraints.solver` is non-empty (use a sensible default like `simpleFoam` — `incompressibleFluid` run by `foamRun` on openfoam.org 11+ — for steady incompressible only if the LLM left it blank AND log a `hypothesis_default_filled` warning to timeline).
    - `supporting_papers` IDs all exist in `lit.json` — drop any that don't.
    - At least one quantitative constraint is set (Re / CFL / mesh_cells_max / endTime).
 4. Discard any hypothesis missing required fields after one retry.

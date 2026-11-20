@@ -261,15 +261,17 @@ def test_a_stream_that_dies_mid_body_is_retried() -> None:
             detail=f"{attempts['n']} attempts",
         )
         check("and the retry's answer is returned", result.content == "the answer", detail=repr(result.content))
-        check("backoff grows between attempts", sleeps == [2, 4], detail=str(sleeps))
+        check("backoff grows between attempts",
+              sleeps == list(CodexResponsesWrapper._BACKOFF_SECONDS[:2]), detail=str(sleeps))
 
         attempts["n"], sleeps[:] = 0, []
         requests.post = lambda *_a, **_k: (attempts.__setitem__("n", attempts["n"] + 1), _Resp(die=True))[1]
         try:
             wrapper.invoke([{"role": "user", "content": "hi"}])
         except RuntimeError as exc:
-            check("a permanently broken stream gives up with a clear error", "after 4 attempts" in str(exc))
-            check("and does not retry forever", attempts["n"] == 4, detail=str(attempts))
+            n = CodexResponsesWrapper._MAX_ATTEMPTS
+            check("a permanently broken stream gives up with a clear error", f"after {n} attempts" in str(exc))
+            check("and does not retry forever", attempts["n"] == n, detail=str(attempts))
         else:
             check("a permanently broken stream gives up with a clear error", False, detail="no error")
     finally:
@@ -316,12 +318,54 @@ def test_request_errors_are_not_retried() -> None:
         try:
             wrapper.invoke([{"role": "user", "content": "hi"}])
         except RuntimeError:
-            check("but a 503 is retried", attempts["n"] == 4, detail=str(attempts))
+            check("but a 503 is retried", attempts["n"] == CodexResponsesWrapper._MAX_ATTEMPTS,
+                  detail=str(attempts))
         else:
             check("but a 503 is retried", False, detail="no error raised")
+
+        # A 401 that says the login service was busy is retried; one that does not, is not.
+        class _LoginBusy(_Bad):
+            status_code = 401
+            text = ('{"error":{"message":"authentication failed (status=503): {\\"error\\":'
+                    '\\"Too many concurrent requests\\"}","type":"authentication_error"}}')
+
+        class _Unauthorized(_Bad):
+            status_code = 401
+            text = '{"error":{"message":"Your authentication token has expired"}}'
+
+        for cls, retried, name in ((_LoginBusy, True, "a 401 from a busy login service is retried"),
+                                   (_Unauthorized, False, "a 401 for a bad token is not")):
+            attempts["n"] = 0
+            wrapper._refresh_credentials = lambda: False
+            requests.post = lambda *_a, _c=cls, **_k: (attempts.__setitem__("n", attempts["n"] + 1), _c())[1]
+            try:
+                wrapper.invoke([{"role": "user", "content": "hi"}])
+            except (RuntimeError, requests.HTTPError):
+                pass
+            want = CodexResponsesWrapper._MAX_ATTEMPTS if retried else 1
+            check(name, attempts["n"] == want, detail=str(attempts))
     finally:
         requests.post = real_post
         codex_oauth.time.sleep = real_sleep
+
+
+# --- an oversized input text is cut before it is sent ------------------------
+# The backend refuses a string over 10 MB with HTTP 400 (2026-10-21: a 15 MB
+# case-loop prompt ended a DAFoam case run).
+def test_oversized_input_is_cut():
+    from cfd_langgraph.llm.codex_oauth import CodexResponsesWrapper as W
+
+    big = "a" * 15_000_000 + "END"
+    items = [{"role": "user", "content": [{"type": "input_text", "text": big}]},
+             {"type": "function_call_output", "call_id": "c", "output": "small"}]
+    out = W._bounded_input(items)
+    text = out[0]["content"][0]["text"]
+    check("a 15 MB input text is cut under the 10 MB limit", len(text) < 10_485_760, detail=str(len(text)))
+    check("keeping its end", text.endswith("END"))
+    check("a small item is untouched", out[1]["output"] == "small")
+
+
+test_oversized_input_is_cut()
 
 
 # --- terminal SSE event -----------------------------------------------------
@@ -416,6 +460,145 @@ def test_a_failed_response_reports_its_reason() -> None:
 
 
 
+def test_an_overloaded_response_is_retried() -> None:
+    """Regression, 2026-10-16: a streamed `response.failed` ("Our servers are
+    currently overloaded") was raised outside the retry ladder, so one busy
+    reply ended a 63-minute DAFoam case run. It is retried like a dropped
+    stream; a `response.incomplete` is a real outcome and is not."""
+    import requests
+
+    from cfd_langgraph.llm import codex_oauth
+    from cfd_langgraph.llm.codex_oauth import CodexResponsesWrapper
+
+    wrapper = CodexResponsesWrapper(token="t", model="m", stream=True)
+    attempts = {"n": 0}
+    real_post, real_sleep = requests.post, codex_oauth.time.sleep
+    codex_oauth.time.sleep = lambda _s: None
+
+    def event(kind: str, body: dict) -> bytes:
+        return b"data: " + json.dumps({"type": kind, "response": body}).encode()
+
+    class _Resp:
+        status_code = 200
+        ok = True
+        text = ""
+
+        def __init__(self, lines: list) -> None:
+            self._lines = lines
+
+        def iter_lines(self, decode_unicode: bool = False):
+            yield from self._lines
+
+        def close(self):
+            pass
+
+    busy = event("response.failed", {"error": {"message": "Our servers are currently overloaded."}})
+    good = event("response.completed", {"output": [{"content": [{"type": "output_text", "text": "ok"}]}]})
+    try:
+        def flaky(*_a, **_k):
+            attempts["n"] += 1
+            return _Resp([busy] if attempts["n"] < 3 else [good])
+
+        requests.post = flaky
+        result = wrapper.invoke([{"role": "user", "content": "hi"}])
+        check("an overloaded response.failed is retried", attempts["n"] == 3, detail=str(attempts))
+        check("and the retry's answer is returned", result.content == "ok", detail=repr(result.content))
+
+        attempts["n"] = 0
+        from cfd_langgraph.llm.codex_oauth import ContextOverflowError
+        too_big = event("response.failed", {"error": {
+            "code": "context_length_exceeded",
+            "message": "Your input exceeds the context window of this model."}})
+        requests.post = lambda *_a, **_k: (attempts.__setitem__("n", attempts["n"] + 1), _Resp([too_big]))[1]
+        try:
+            wrapper.invoke([{"role": "user", "content": "hi"}])
+        except ContextOverflowError:
+            check("a context-window refusal is raised as ContextOverflowError, not retried",
+                  attempts["n"] == 1, detail=str(attempts))
+        except Exception as exc:  # noqa: BLE001
+            check("a context-window refusal is raised as ContextOverflowError, not retried",
+                  False, detail=f"{type(exc).__name__}: {exc}")
+        else:
+            check("a context-window refusal is raised as ContextOverflowError, not retried",
+                  False, detail="no error raised")
+
+        attempts["n"] = 0
+        cut = event("response.incomplete", {"incomplete_details": {"reason": "max_output_tokens"}})
+        requests.post = lambda *_a, **_k: (attempts.__setitem__("n", attempts["n"] + 1), _Resp([cut]))[1]
+        try:
+            wrapper.invoke([{"role": "user", "content": "hi"}])
+        except RuntimeError as exc:
+            check("an empty response.incomplete is not retried",
+                  attempts["n"] == 1 and "max_output_tokens" in str(exc), detail=f"{attempts} {exc}")
+        else:
+            check("an empty response.incomplete is not retried", False, detail="no error raised")
+    finally:
+        requests.post = real_post
+        codex_oauth.time.sleep = real_sleep
+
+
+def test_a_commentary_preamble_is_not_part_of_the_answer() -> None:
+    """Regression, 2026-10-22: gpt-5.6-sol sends "I'll inspect ..." as a
+    message of phase "commentary" before its answer of phase "final_answer".
+    The deltas of both were joined, so a written runScript.py began with the
+    preamble and did not compile, and two sentences ran together across the
+    join (shelf_demo_dafoam_20261019_1057)."""
+    import requests
+
+    from cfd_langgraph.llm.codex_oauth import CodexResponsesWrapper
+
+    def line(payload: dict) -> bytes:
+        return b"data: " + json.dumps(payload).encode()
+
+    def message(phase, text: str) -> list:
+        item = {"type": "message", "content": [{"type": "output_text", "text": text}]}
+        if phase:
+            item["phase"] = phase
+        return [line({"type": "response.output_text.delta", "delta": text}),
+                line({"type": "response.output_item.done", "item": item})]
+
+    class _Resp:
+        status_code = 200
+        ok = True
+        text = ""
+
+        def __init__(self, lines: list) -> None:
+            self._lines = lines
+
+        def iter_lines(self, decode_unicode: bool = False):
+            yield from self._lines
+
+        def close(self):
+            pass
+
+    wrapper = CodexResponsesWrapper(token="t", model="m", stream=True)
+    done = line({"type": "response.completed", "response": {"output": []}})
+    real_post = requests.post
+    try:
+        requests.post = lambda *_a, **_k: _Resp(
+            message("commentary", "I’ll check the file first.") + message("final_answer", "import os\n") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("a streamed reply keeps only its final_answer", got == "import os", detail=repr(got))
+
+        requests.post = lambda *_a, **_k: _Resp(
+            message("commentary", "Reading it.") + message("commentary", "Now the log.") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("commentary alone is kept, its messages apart",
+              got == "Reading it.\n\nNow the log.", detail=repr(got))
+
+        requests.post = lambda *_a, **_k: _Resp(message(None, "plain") + [done])
+        got = wrapper.invoke([{"role": "user", "content": "hi"}]).content
+        check("a message without a phase is kept as before", got == "plain", detail=repr(got))
+    finally:
+        requests.post = real_post
+
+    body = {"output": [
+        {"type": "message", "phase": "commentary", "content": [{"type": "output_text", "text": "First, x."}]},
+        {"type": "message", "phase": "final_answer", "content": [{"type": "output_text", "text": "answer"}]}]}
+    got = CodexResponsesWrapper._extract_output_text(body)
+    check("a whole response body keeps only its final_answer", got == "answer", detail=repr(got))
+
+
 def main() -> int:
     tests = (
         test_codex_cli_nested_shape,
@@ -428,9 +611,11 @@ def main() -> int:
         test_no_foam_agent_import,
         test_a_stream_that_dies_mid_body_is_retried,
         test_request_errors_are_not_retried,
+        test_an_overloaded_response_is_retried,
         test_terminal_event_content_is_not_discarded,
         test_streamed_text_is_not_duplicated_by_the_terminal_event,
         test_a_failed_response_reports_its_reason,
+        test_a_commentary_preamble_is_not_part_of_the_answer,
     )
     for test in tests:
         # A raising test is a failing test, not an aborted suite. Without this

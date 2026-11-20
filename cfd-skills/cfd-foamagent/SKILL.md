@@ -96,6 +96,8 @@ Persist as `<case_dir>/.foamagent_state.json#case_info`.
 
 ## Stage 2 — RAG retrieval (FAISS via scripts/rag_query.py)
 
+> **Installed version first.** Write every file for the OpenFOAM the user has (cfd-orchestrator Step 3b), and append those facts to every system prompt below. The prebuilt FAISS index was built from openfoam.org 10 tutorials. When the installed version is another one, take the references from the installation's own tutorials instead (`scripts/build_tutorial_index.py` builds an index from them, or search them directly: `grep -rl "<solver or module>" $FOAM_TUTORIALS --include=controlDict`). On openfoam.org 11+ the solver is a module: `solver <module>;` in controlDict, run with `foamRun`.
+
 Query three FAISS indices against the parsed `case_info` + `user_requirement`:
 
 ```bash
@@ -204,7 +206,7 @@ You are an expert in OpenFOAM simulation and numerical modeling.
 Your task is to generate a complete and functional file named: <file_name>{file_name}</file_name> within the <folder_name>{folder_name}</folder_name> directory.
 Ensure all required values are present and match with the files content already generated.
 Before finalizing the output, ensure:
-- All necessary fields exist (e.g., if `nu` is defined in `constant/transportProperties`, it must be used correctly in `0/U`).
+- All necessary fields exist (e.g., if `nu` is defined in the case's transport properties file, it must be used correctly in `0/U`).
 - Cross-check field names between different files to avoid mismatches.
 - Ensure units and dimensions are correct for all physical variables.
 - Ensure case solver settings are consistent with the user's requirements. Available solvers are: {case_solver}.
@@ -236,7 +238,7 @@ Write files in this order so each step has the prior context it needs:
 1. `system/controlDict` (sets the application name everything else aligns to)
 2. `system/fvSchemes`, `system/fvSolution`
 3. `constant/transportProperties` (or `constant/physicalProperties`, `constant/cloudProperties`, etc., depending on solver)
-4. `constant/momentumTransport` (for RANS) or `constant/turbulenceProperties` (legacy naming)
+4. `constant/momentumTransport` (openfoam.org 10+) or `constant/turbulenceProperties` (openfoam.com, older openfoam.org) — whichever the installed version reads (cfd-orchestrator Step 3b)
 5. `system/blockMeshDict` (if `mesh_type=standard_mesh`)
 6. `0/<field>` files (one per field declared in `controlDict`/`transportProperties`/turbulence model)
 7. Any extra subtasks not covered above

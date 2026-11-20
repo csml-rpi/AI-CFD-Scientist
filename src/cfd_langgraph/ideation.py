@@ -338,6 +338,23 @@ _FITTED_MODEL_STUDY_BRIEF = (
 )
 
 
+_PRESCRIBED_STUDY_BRIEF = (
+    "THE BRIEF PRESCRIBES THIS STUDY. The configuration, the cases or parameter values to "
+    "run and the comparisons to make are already decided by it. Your idea is that study, "
+    "stated exactly as the brief gives it: one experiment per case the brief names, with "
+    "the brief's own values. When the brief has several steps or phases -- a validation "
+    "step and then the study, or several configurations -- every step is part of the idea "
+    "and every case in every step is an experiment. Do not add cases, physics, models or "
+    "variations, do not drop any, and do not substitute a study you find more interesting. "
+    "Novelty is not asked for: carrying out what the brief asks is the task.\n\n"
+)
+_PRESCRIBED_NOVELTY = {
+    "max_similarity_to_prior": 0.0,
+    "judgement": "novel",
+    "reason": "Not judged: the brief prescribes this study, so reproducing it is the task.",
+}
+
+
 def _generate_one_idea(
     llm: Any,
     ideation_prompts: Dict[str, Any],
@@ -350,6 +367,7 @@ def _generate_one_idea(
     candidate_similarity_threshold: float = 0.92,
     case_context: str = "",
     study_mode: str = "",
+    prescribed: bool = False,
 ) -> Dict[str, Any]:
     """One novelty-checked idea, with retries. Extracted from ``run_ideation``'s
     original loop body so both a single idea and a batch of candidates
@@ -361,6 +379,14 @@ def _generate_one_idea(
     fitted_model_study = str(study_mode or "").strip().lower() == "surrogate"
     if fitted_model_study:
         system_prompt = _FITTED_MODEL_STUDY_BRIEF + system_prompt
+    elif prescribed:
+        # The study is already decided by its brief, so the deliverable is
+        # that study, not a new one -- and novelty is not judged (below). On
+        # qwen_retest_20261005/cavity, asked for novel ideas on a benchmark
+        # the brief fixed, every on-topic idea was rejected as too similar to
+        # the literature and the run went on with 3-D Bingham, rotating
+        # cylinder and MHD variants.
+        system_prompt = _PRESCRIBED_STUDY_BRIEF + system_prompt
     elif case_context:
         # The base prompt asks for "an impactful CFD research idea" and "a
         # non-overlapping set of experiments" -- i.e. a study design. Given a
@@ -385,6 +411,14 @@ def _generate_one_idea(
             "Use the prior studies for the mechanisms they identify, expressed "
             "within what the topic varies; they are not study designs to copy.\n\n"
         ) + system_prompt
+    else:
+        system_prompt = (
+            "SERVE THE STATED OBJECTIVE. Every idea must address what the research "
+            "topic asks, on the configuration it names. An idea that changes the "
+            "problem itself -- a different fluid, geometry, flow regime or physics "
+            "from the ones the topic specifies -- is off-topic, however interesting. "
+            "State in each idea how it serves the objective.\n\n"
+        ) + system_prompt
     previous_ideas = previous_ideas or []
     user_prompt = ideation_prompts.get(
         "literature_aware_user_prompt",
@@ -398,6 +432,22 @@ def _generate_one_idea(
         user_prompt = (
             "THE TASK'S DATA AND SCORING — given, not to be changed:\n"
             f"{case_context}\n\n"
+        ) + user_prompt
+    elif case_context and prescribed:
+        # A prescribed brief can name more than one case: a validation run on
+        # one configuration and the study proper on another. Presented as THE
+        # fixed case on which only a model change is allowed, the starter
+        # swallowed the brief: on shelf_demo_olaflow_20261010_1356 the starter
+        # was the empty-flume validation case, and the brief's validation and
+        # its four-condition breakwater sweep came back as one "incident-wave
+        # baseline" experiment in a flume with no breakwater.
+        user_prompt = (
+            "A CASE THE BRIEF NAMES — use it where the brief uses it:\n"
+            f"{case_context}\n\n"
+            "This is one starting case, not the whole study. The brief may name other cases, "
+            "configurations, steps or phases (for example a validation run on one setup and a "
+            "parameter sweep on another); each of them is part of the study and gets its own "
+            "experiments, with the brief's own values.\n\n"
         ) + user_prompt
     elif case_context:
         # Without this the ideator has no idea a concrete case already exists,
@@ -442,6 +492,8 @@ def _generate_one_idea(
             + "\nYour candidate must be materially different from all of them."
         )
 
+    first_user_prompt = user_prompt
+
     if verbose:
         print("[Ideation] Generating idea (LLM)...", flush=True)
 
@@ -476,7 +528,10 @@ def _generate_one_idea(
         else:
             idea_json = _normalize_to_experiments_schema(idea_json, settings.ideation_max_experiments)
             try:
-                novelty_eval = novelty_score_llm(llm, idea_json, lit_items)
+                novelty_eval = (_PRESCRIBED_NOVELTY if prescribed
+                                else novelty_score_llm(llm, idea_json, lit_items))
+                if prescribed:
+                    novelty_method = "not_applicable_prescribed_study"
                 novelty_val = float(novelty_eval.get("max_similarity_to_prior", 1.0))
                 novelty_judgement = str(novelty_eval.get("judgement", "")).lower()
                 novelty_reason = str(novelty_eval.get("reason", "") or "")
@@ -536,20 +591,47 @@ def _generate_one_idea(
                 attempt + 1, retries + 1, too_similar, too_similar_to_batch, invalid_count), flush=True)
 
         if attempt < retries:
-            retry_tpl = ideation_prompts.get(
-                "novelty_retry_user_prompt",
-                "Previous idea too similar or exceeds limits. Regenerate with better novelty and max experiments <= {max_experiments}.\n\nPrior studies:\n{literature_context}\n\nPrevious idea:\n{previous_idea}",
-            )
-            user_prompt = retry_tpl.format(
-                literature_context=literature_context,
-                previous_idea=json.dumps(idea_json, ensure_ascii=False),
-                max_experiments=settings.ideation_max_experiments,
-            )
-            if previous_ideas:
-                user_prompt += (
-                    "\n\nAlso avoid duplicating these already-proposed candidates:\n- "
-                    + "\n- ".join(_idea_distinguishing_text(x)[:1200] for x in previous_ideas[-8:])
+            # The retry keeps the first request (topic, fixed case, papers) and
+            # says which check failed. It used to replace the request with the
+            # papers and "regenerate with better novelty": with the brief gone,
+            # a prescribed DAFoam airfoil study rejected only for its experiment
+            # count came back as a DU 00-W-212 DDES study and then a pitching
+            # URANS study, both from the papers (nn_airfoil_s809_20261025_1323).
+            failed = []
+            if idea_json.get("parse_error"):
+                failed.append("it was not valid JSON in the required schema")
+            if invalid_count:
+                failed.append(
+                    f"it had {count_val if count_val is not None else 'no readable number of'} "
+                    f"experiments; between 1 and {settings.ideation_max_experiments} are allowed"
+                    + (" -- group the brief's cases into fewer experiments (several cases of one "
+                       "configuration can be one experiment) rather than dropping any"
+                       if prescribed else ""))
+            if too_similar and not prescribed:
+                failed.append("it was judged too similar to the prior studies"
+                              + (f" ({novelty_reason})" if novelty_reason else ""))
+            if too_similar_to_batch:
+                failed.append("it duplicates a candidate already proposed in this batch")
+            if too_similar and not prescribed:
+                retry_tpl = ideation_prompts.get(
+                    "novelty_retry_user_prompt",
+                    "Previous idea too similar or exceeds limits. Regenerate with better novelty and max experiments <= {max_experiments}.\n\nPrior studies:\n{literature_context}\n\nPrevious idea:\n{previous_idea}",
                 )
+                retry_note = retry_tpl.format(
+                    literature_context="(the prior studies are listed above)",
+                    previous_idea=json.dumps(idea_json, ensure_ascii=False),
+                    max_experiments=settings.ideation_max_experiments,
+                )
+            else:
+                retry_note = (
+                    "Previous idea:\n" + json.dumps(idea_json, ensure_ascii=False)
+                    + "\n\nRevise it to fix exactly that, and keep everything else the research "
+                    "topic above asks for. Output ONLY valid JSON in the required schema.")
+            user_prompt = (
+                first_user_prompt
+                + "\n\nYOUR PREVIOUS ANSWER WAS NOT ACCEPTED: " + "; ".join(failed) + ".\n\n"
+                + retry_note
+            )
 
     if verbose:
         exp_count = _extract_experiment_count(idea_json)
@@ -613,6 +695,7 @@ def run_ideation_batch(
     require_literature: bool = False,
     case_context: str = "",
     study_mode: str = "",
+    prescribed: bool = False,
 ) -> Dict[str, Any]:
     """Propose step of the propose -> critique -> rank hypothesis pipeline.
 
@@ -649,12 +732,13 @@ def run_ideation_batch(
 
     candidates: List[Dict[str, Any]] = []
     prior_ideas: List[Dict[str, Any]] = []
-    for i in range(max(1, num_candidates)):
+    # A prescribed study has one right idea: the study itself.
+    for i in range(1 if prescribed else max(1, num_candidates)):
         try:
             one = _generate_one_idea(
                 llm, ideation_prompts, research_topic, literature_context, lit_items,
                 settings, verbose=verbose, previous_ideas=prior_ideas,
-                case_context=case_context, study_mode=study_mode,
+                case_context=case_context, study_mode=study_mode, prescribed=prescribed,
             )
         except Exception as exc:
             # Its calls have already spent their retries. Keep the ideas this

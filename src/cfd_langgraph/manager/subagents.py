@@ -1,14 +1,187 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from deepagents import SubAgent
+
+# A subagent that loops runs until the graph's step limit stops it, and
+# deepagents sets that to 9,999. Measured on the ALCF nemotron-3-ultra cavity
+# runs: a case-runner called run_case_native 352 times against a precondition
+# only the manager could clear ("no converged mesh-gate selection"), and would
+# have kept going for hours. One case legitimately needs tens of steps, so a
+# few hundred is generous; past that the subagent is told to report back and
+# the manager -- the only agent that can fix an upstream block -- gets its turn.
+_SUBAGENT_STEP_LIMIT = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_STEPS") or 300)
+
+
+def _text(content: Any) -> str:
+    """A message's text, whether the provider gave a string or a list of parts."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p if isinstance(p, str) else str(p.get("text", "")) for p in content
+                         if isinstance(p, (str, dict)))
+    return str(content or "")
+
+
+def _record(messages: List[Any]) -> str:
+    """A stopped subagent's task, its own notes and its latest tool calls, short
+    enough for any model's context."""
+    task, notes, calls, counts, results = "", [], [], {}, {}
+    for message in messages or []:
+        kind = getattr(message, "type", "")
+        if kind == "human" and not task:
+            task = _text(message.content)[:3000]
+        elif kind == "ai":
+            note = _text(message.content).strip()
+            if note:
+                notes.append(note[:600])
+            for call in getattr(message, "tool_calls", None) or []:
+                counts[call.get("name", "?")] = counts.get(call.get("name", "?"), 0) + 1
+                calls.append(call)
+        elif kind == "tool":
+            results[getattr(message, "tool_call_id", "")] = _text(message.content)
+    lines = [f"TASK:\n{task}", "", "ITS OWN NOTES (latest last):", *notes[-15:], "",
+             "TOOL CALLS MADE: " + ", ".join(f"{k} x{v}" for k, v in sorted(counts.items())),
+             "", "ITS LATEST CALLS AND WHAT CAME BACK:"]
+    for call in calls[-8:]:
+        args = json.dumps(call.get("args", {}), default=str)[:200]
+        lines.append(f"- {call.get('name')}({args}) -> {results.get(call.get('id', ''), '')[:400]}")
+    return "\n".join(lines)[-12000:]
+
+
+def _stopped_report(spec: Any, state: Any, why: str) -> Any:
+    """What the manager is told when a subagent is stopped: the subagent's own
+    report of what it found, written from its record. A bare "it was stopped"
+    threw away everything it had learned, and the manager sent another one
+    off to learn it again, six times in one study (shelf_demo_dafoam_20261011_1437)."""
+    from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+    name = spec["name"]
+    record = _record((state or {}).get("messages", []) if isinstance(state, dict) else [])
+    report = ""
+    model = spec.get("model") if isinstance(spec, dict) else None
+    try:
+        if model is None:
+            raise ValueError("the subagent has no model of its own")
+        reply = model.invoke([
+            SystemMessage(content=(
+                "You were working on the task below for another agent and were stopped "
+                f"({why}) before finishing. Write your report for that agent from the record "
+                "below: what you found, with the file paths and numbers that show it; what "
+                "you changed; what is still unknown; and the next step you would take. Only "
+                "what the record shows -- say where it shows nothing.")),
+            HumanMessage(content=record),
+        ])
+        report = _text(getattr(reply, "content", "")).strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [subagents] {name}: its report could not be written ({exc}); passing its record", flush=True)
+    return AIMessage(content=(
+        f"The {name} subagent was stopped ({why}) before finishing. "
+        + (f"Its report, written when it was stopped:\n\n{report}" if report
+           else f"Its record:\n\n{record}")
+        + "\n\nIts files are in place. Decide the next step from this: launched again with "
+        "the same task, a subagent starts over from nothing."
+    ))
+
+
+# Refusals in a row after which a subagent is stopped. Each refusal already
+# tells the model to do something else; one that keeps making refused calls
+# is not going to finish, and every further turn costs a full model call.
+# Measured on qwen_retest_20261005/cavity: case-runners made 2,436 refused
+# run_case_native calls and 4,881 refused re-reads over twelve hours.
+_REFUSAL_STOP = int(os.environ.get("CFD_SCIENTIST_SUBAGENT_REFUSALS") or 20)
+from cfd_langgraph.llm.caching import stuck  # noqa: E402
+
+
+# The limit is set per call because a recursion_limit in the caller's config wins over
+# a bound one, and the task tool passes the manager's 9,999: case-runners told to stop
+# at 300 ran ~10,000 steps (qwen_retest_20261005/cavity). Raised, GraphRecursionError
+# failed the manager's whole step and left the study idle (nemotron cavity runs).
+def _capped(spec: SubAgent, precheck: Optional[Callable[[], Optional[str]]] = None) -> Any:
+    """``spec`` compiled with a step limit applied on every call, a stop after a
+    run of refused calls, and an optional ``precheck`` that may refuse to start
+    it; unchanged if deepagents' compile entrypoint is not where it used to be.
+    Hitting a limit hands the manager a plain message instead of an exception."""
+    try:
+        from deepagents.middleware.subagents import create_sub_agent
+        from langgraph.errors import GraphRecursionError
+        from langchain_core.messages import AIMessage
+        from langchain_core.runnables import RunnableLambda
+
+        compiled = create_sub_agent(spec)
+        name = spec["name"]
+
+        def _config(config: Any) -> Dict[str, Any]:
+            return {**(config or {}), "recursion_limit": _SUBAGENT_STEP_LIMIT}
+
+        def _refused_start() -> Any:
+            reason = precheck() if precheck is not None else None
+            if not reason:
+                return None
+            print(f"  ⛔ {name} not started: {reason[:200]}", flush=True)
+            return {"messages": [AIMessage(content=reason)]}
+
+        def _run(state: Any, config: Any = None) -> Any:
+            refused = _refused_start()
+            if refused is not None:
+                return refused
+            last = None
+            try:
+                for last in compiled.stream(state, _config(config), stream_mode="values"):
+                    if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
+                        print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
+                        return {"messages": [_stopped_report(spec, last, f"{_REFUSAL_STOP} or more of its recent calls were refused")]}
+                return last
+            except GraphRecursionError:
+                print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
+                return {"messages": [_stopped_report(spec, last, f"at its {_SUBAGENT_STEP_LIMIT}-step limit")]}
+
+        async def _arun(state: Any, config: Any = None) -> Any:
+            refused = _refused_start()
+            if refused is not None:
+                return refused
+            last = None
+            try:
+                async for last in compiled.astream(state, _config(config), stream_mode="values"):
+                    if stuck((last or {}).get("messages", []), _REFUSAL_STOP):
+                        print(f"  ⛔ {name} stopped: {_REFUSAL_STOP}+ of its recent calls were refused", flush=True)
+                        return {"messages": [_stopped_report(spec, last, f"{_REFUSAL_STOP} or more of its recent calls were refused")]}
+                return last
+            except GraphRecursionError:
+                print(f"  ⛔ {name} stopped at its {_SUBAGENT_STEP_LIMIT}-step limit", flush=True)
+                return {"messages": [_stopped_report(spec, last, f"at its {_SUBAGENT_STEP_LIMIT}-step limit")]}
+
+        runnable = RunnableLambda(_run, afunc=_arun)
+    except Exception as exc:  # pragma: no cover - depends on deepagents internals
+        print(f"[subagents] step limit not applied to {spec['name']}: {exc}", flush=True)
+        return spec
+    return {"name": spec["name"], "description": spec["description"], "runnable": runnable}
+
+
+def _no_converged_mesh_gate(out_dir: Path) -> Optional[str]:
+    """Why a case-runner cannot do anything yet, or None. run_case_native
+    refuses every case of a physics group without a converged mesh gate, and
+    only the manager can run the gate."""
+    for spec_path in (Path(out_dir) / "mesh_gate").glob("*/selected_mesh_spec.json"):
+        try:
+            if json.loads(spec_path.read_text()).get("converged"):
+                return None
+        except (OSError, ValueError):
+            continue
+    return ("Not started: no physics group in this study has a converged mesh gate yet, so "
+            "run_case_native would refuse every case. Only you, the manager, can run "
+            "run_mesh_gate. Get a converged gate for the case's physics group first; launching "
+            "case-runners before that cannot succeed.")
 
 from cfd_langgraph.llm.caching import (
     build_caching_middleware,
     build_context_middleware,
 )
+from cfd_langgraph.model_requirements import model_requirements_block
 
 from .control import (
     DENY_BUILTIN_FILESYSTEM_TOOLS,
@@ -23,9 +196,27 @@ def _build_case_runner_prompt(out_dir: Path) -> str:
 You will be given, in your task description:
 - a case_id (e.g. "case_003")
 - a physics_group (cases that share a mesh/physics shape use the same group string)
-- the full requirement text FoamAgent needs to write and run the case
+- possibly, files the case must use exactly as they are (a trained network's card and
+  model, a dictionary the study supplies), each with where it goes in the case
 
-Default path: call `run_case_native` exactly once with those three values. It runs the
+The case's approved requirement is in requirements.json: run_case_native runs it for the
+case_id, and requirement_text you pass alongside a case_id is not used. Files you were
+given go in run_case_native's `given_files`, {{path in the case: path of the file}}: they
+are copied in exactly and never rewritten by the writer, the setup check or the review.
+Pass them again on every call: a call without them runs the case without them.
+When your task is to redo only a finished case's post-processing, call run_case_native
+with post_only=True: it runs the case's Allrun.post on the solve the case already has,
+without solving again.
+
+If your task asks for something the approved requirement does not say (a rank count, a
+time step, an end time, where a file goes), run_case_native has no way to pass it to the
+case: the case runs its approved requirement. Do not try to get it in another way. Run the
+case, and put first in your report which of those items the case did not receive, so the
+manager can change this case's requirement (generate_case_requirements with its case_id in
+case_ids). A DSMC case-runner told "at most 16 ranks, dt 5e-7" ran on 32 ranks at the
+requirement's 1e-7 and was then called unauthorized for it.
+
+Default path: call `run_case_native` exactly once with those values. It runs the
 whole FoamAgent loop (parse the requirement, retrieve reference tutorials, decompose
 into files, write each file, generate and run Allrun, review-and-retry on failure) as
 part of this workflow directly — you do not need a separate Foam-Agent installation
@@ -36,6 +227,13 @@ want to regenerate a single file), call the individual stage tools instead:
 `foam_parse_requirement`, `foam_retrieve_references`, `foam_decompose_subtasks`,
 `foam_write_case_file`, `foam_generate_allrun`, `foam_review_errors`.
 
+run_case_native writes every file of the case from the requirement: the OpenFOAM
+dictionaries and, for a solver run by a script (such as DAFoam's runScript.py), that
+script, which runs from the case folder on as many ranks as system/decomposeParDict's
+numberOfSubdomains. A case file you write by hand is replaced on the next run, and a
+folder you make inside the case is never run. What the case must compute belongs in its
+requirement (or, for a flagged requirement, its clarification).
+
 If you write or compile anything yourself beyond what run_case_native produces — a
 custom-model source file, a scratch test of something before committing to it — it goes
 inside this specific case's own directory, {out_dir}/cases/<case_id>/, e.g. a compiled
@@ -44,6 +242,11 @@ repo root, never in /tmp — both are shared across every study and case that ha
 and writing there either pollutes them permanently or risks a collision with another
 case running concurrently right now.
 
+If run_case_native's result has `start_protocol`, the case was started from the study's
+settled flow on purpose: its 0/ fields hold that flow and its endTime is the study's run
+length, whatever the requirement text says about initial fields or iteration counts. That
+is not a setup error -- do not change those files, and do not re-run to "fix" them.
+
 If run_case_native's result lists `requirement_checker_issues`, the approved requirement
 failed the requirement checker. Check the case against those issues and your task
 description. If one made this case come out wrong (e.g. the requirement lists several
@@ -51,14 +254,15 @@ values and the case used the wrong one), call run_case_native once more with the
 requirement_text and `clarification` set to the correct case-specific values.
 
 Then report back, in your final message, a short structured summary: case_id, status
-(success/failed), loop_count, and — if it failed — the last few lines of error_logs. Do
+exactly as run_case_native's result gives it (its `status` field, not your own reading of
+the run), loop_count, and — if it failed — the last few lines of error_logs. Do
 not attempt to fix a failing case beyond the reviewer loop already built into
 run_case_native, do not call the composed runner more than once per case (apart from
 that one clarified re-run), and do not include the full stdout/stderr in your final
 report — the manager only needs the outcome, not the transcript."""
 
 
-def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> SubAgent:
+def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> Any:
     """The subagent every experiment case runs through.
 
     Isolated context by design: FoamAgent's planner/writer/reviewer loop for
@@ -75,7 +279,7 @@ def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> S
     file, then a review/rewrite round per retry), all sharing the same large
     system prompt + tool-definitions prefix.
     """
-    return SubAgent(
+    return _capped(SubAgent(
         name="case-runner",
         description=(
             "Runs exactly one OpenFOAM case (plan, write, run, review-and-retry) using "
@@ -95,7 +299,7 @@ def build_case_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> S
         # tools so a case can't silently "read" or "grep" an empty virtual
         # filesystem instead of the real case directory.
         permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
-    )
+    ), precheck=lambda: _no_converged_mesh_gate(out_dir))
 
 
 def _build_oed_candidate_runner_prompt(out_dir: Path) -> str:
@@ -197,7 +401,7 @@ candidate_dir the run tool returns) — the run tools already write there. {out_
 shared across every study, and other candidates are running concurrently right now."""
 
 
-def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> SubAgent:
+def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: Path) -> Any:
     """The subagent every open-ended-discovery candidate runs through.
 
     Mirrors build_case_runner_subagent exactly, for the same reason: the
@@ -211,7 +415,7 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
     oed_score_candidate / oed_record_candidate_results, and
     scripts/oed_search_archive.py for the archive this whole loop serves.
     """
-    return SubAgent(
+    return _capped(SubAgent(
         name="oed-candidate-runner",
         description=(
             "Runs exactly one open-ended-discovery candidate (build a proposed model, or "
@@ -227,4 +431,161 @@ def build_oed_candidate_runner_subagent(tools: List[Any], model: Any, out_dir: P
         + build_caching_middleware(model) + build_context_middleware(model, tools),
         interrupt_on=build_interrupt_on(tools),
         permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
-    )
+    ))
+
+
+# deepagents adds a "general-purpose" subagent with the manager's own tools
+# unless one is supplied, and that default carries none of this harness's
+# controls: on qwen_retest_20261005/cavity_r11 one ran to the 9,999-step limit
+# with 375 refused calls in a row. Supplying it here keeps the capability with
+# the same step cap, refusal stop and loop control as the other subagents.
+NN_COUPLER_PROMPT = """You handle the neural network's side when this study puts one inside the solver.
+Cases are written and run by the case-runner; you prepare and check the network, and report
+to the manager what each case must contain. Everything the network was trained with that the
+solver must reproduce lives in its card: the inputs in order and exactly how each is computed,
+the normalisation, the output scaling, the bounds, the training range.
+
+Conventions (DAFoam's): normalised input = (raw + input_shift) * input_scale; output =
+output_scale * (net + output_shift); a non-finite output becomes default_value; then it is
+clipped to [lower_bound, upper_bound]. A network trained on standardised inputs has
+input_shift = -mean and input_scale = 1/std.
+
+A. A network trained INSIDE the solver, through its adjoint (DAFoam):
+ 1. Choose it: inputs from DAFoam's own features (the solver notes list them and say how to
+    declare the model), hidden layers, activation, input shifts and scales that bring each
+    raw feature to about [-1, 1], output shift and scale, bounds, writeFeatures True.
+ 2. Write its daOptions["regressionModel"][name] dictionary as JSON in the study folder, and
+    an initial weight vector of small random values (with run_python): one value for every
+    weight leaves all neurons of a layer identical, and training cannot separate them.
+ 3. Tell the manager what the training case must do: train the weights as the design
+    variable, and save at the end the trained weight vector (prob.get_val(name)) and the
+    options as JSON, with the features and the output field written at the final time.
+    A gradient check of the adjoint against finite differences, when one is asked for,
+    is set up so it can tell: the step must change the checked output far more (100x or
+    so) than two solves of the same setup differ from each other, which is not machine
+    precision for an iterative solve. Find that scatter first (the starter's notes, or
+    two repeat solves), then size the step from the adjoint's own derivative to change
+    the output by well above it; nudge along a direction that matters (the adjoint
+    gradient, or the output layer) rather than one weight that barely moves the output;
+    start every perturbed solve from the converged base flow; pick a condition whose
+    solution settles, not one near stall; and compare two step sizes. A 1e-4 step on one
+    output weight changed lift by 5e-9 while repeat solves differed by 1e-3: the check
+    came out with the wrong sign, time after time, and blocked training for hours.
+ 4. Once it has run: nn_from_dafoam with that case and time. It must report
+    matches_dafoam_formula and a passing dafoam_case_check: the PyTorch network then IS the
+    network DAFoam trained, cell by cell.
+
+B. A trained network used IN a case:
+ 1. Write its card (nn_export's description lists every field) and a model script whose
+    build_model() returns the trained network and sample_inputs() at least 8 raw rows of its
+    training data. Take each definition, shift and scale from how it was trained: never
+    invent or round them.
+ 2. nn_export, then nn_check_parity. Nothing may use the network until parity passes.
+ 3. nn_coded_entries gives the entries a coded object needs. Write the coded object file
+    yourself, complete, in the study folder (for example constant/fvModels for OpenFOAM 10, or
+    a function-object file): those entries; code that computes each feature EXACTLY as its card
+    definition says, builds a List<const scalarField*> of the raw features in the card's order,
+    calls model.evaluate on the exported model.pt and uses the output; and that writes each
+    feature as a field nn_<input name> and the output as the card's output field at each write
+    time. Tell the manager to pass that file to the case with given_files, so it reaches the
+    case exactly as written and is never rewritten, and that the case needs writePrecision 17
+    and writeFormat ascii in controlDict. Told only in prose, a manager left it out of the
+    case's requirement and the case writer evaluated the network by hand instead of through
+    the exported model (nn_in_solver_demo_20261022_1129).
+ 4. After the case has run: nn_check_case on it. Its result counts only when the check
+    passes. Report cells_outside_training_range: the network extrapolates there.
+
+Read the case's feature code against each card definition yourself: the checks prove the
+network gets the features the case computed, not that the case computed them as defined.
+Report back the card path, every check's result, and anything that did not hold, plainly."""
+
+
+def build_nn_coupler_subagent(tools: List[Any], model: Any) -> Any:
+    """The subagent for a neural network inside the solver: its card, its export
+    (with its normalisation), the checks that hold OpenFOAM to it, and a network
+    trained through DAFoam's adjoint turned into PyTorch (cfd_langgraph.nn_coupling)."""
+    return _capped(SubAgent(
+        name="nn-coupler",
+        description=(
+            "Prepares and checks a neural network used inside the solver: one trained through "
+            "DAFoam's adjoint, or a trained PyTorch network to evaluate in an OpenFOAM case. Writes "
+            "its card (inputs, exact definitions, normalisation, bounds), exports it, runs the parity "
+            "and case checks, and says what each case must contain. Does not run cases."
+        ),
+        # The network is a solver model, so it carries the same requirements as
+        # a hand-written one; they bite when its inputs, outputs and bounds are chosen.
+        system_prompt=NN_COUPLER_PROMPT + "\n\nWhen you choose a network's inputs, outputs and "
+        "bounds (section A, step 1), these hold for it as for any solver model:\n" + model_requirements_block(),
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))
+
+
+HPC_RUNNER_PROMPT = """You run OpenFOAM cases of this study on NERSC Perlmutter, a supercomputer,
+and bring their results back into the same local case folders.
+
+The case is prepared locally first (by the case runner or from the starter) and must already
+run as it is: you size the job, submit it, follow it and fetch what the study needs. You do
+not write or rewrite the case's physics, mesh or numerics; a case that fails on Perlmutter for
+a reason in the case goes back to the manager with the error.
+
+1. hpc_overview first: whether this study may submit, the account and its hours, and how many
+   node-hours the study has committed against its limit.
+2. Size the job from the case. Read its cell count (constant/polyMesh/owner's header "note"
+   line has nCells) and its run length (controlDict startTime, endTime, deltaT). Perlmutter
+   CPU nodes have 128 cores; aim for roughly 5,000 to 20,000 cells per core. Below a few
+   thousand cells per core more nodes add cost and little speed. A case under about 200,000
+   cells belongs on qos shared (part of one node). The study is charged nodes x time_limit at
+   most, so ask for the time the run needs plus about 30 %, not the maximum.
+3. hpc_submit_case. If it reports dry_run, Perlmutter is not switched on for this study: say
+   so and report the case, the job you would submit and its cost. Do not retry.
+4. Follow the job with hpc_wait_for_job (or hpc_job_status) until it finishes. A job that
+   ended in TIMEOUT was too short: fetch its logs, see how far it got, and either submit the
+   remainder from the last written time or report back. Never resubmit the same failing job
+   unchanged.
+5. hpc_fetch_results with what="light" for logs and postProcessing; "latest" when a local tool
+   needs the final fields; "all" only when asked.
+
+Report back: the job id, its nodes, time limit and node-hours used, its final state and exit
+code, what was fetched into which case folder, and any error in the solver log, plainly."""
+
+
+def build_hpc_runner_subagent(tools: List[Any], model: Any) -> Any:
+    """The subagent that runs this study's prepared cases on Perlmutter
+    (cfd_langgraph.hpc.perlmutter) and fetches their results back."""
+    return _capped(SubAgent(
+        name="hpc-runner",
+        description=(
+            "Runs a prepared OpenFOAM case of this study on NERSC Perlmutter: sizes the job, submits "
+            "it, follows it to the end and copies the results back into the local case folder. Use "
+            "it for cases too large or too long for this machine. Does not write or change cases."
+        ),
+        system_prompt=HPC_RUNNER_PROMPT,
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))
+
+
+def build_general_purpose_subagent(tools: List[Any], model: Any) -> Any:
+    """deepagents' general-purpose subagent, with this harness's controls."""
+    from deepagents.middleware.subagents import GENERAL_PURPOSE_SUBAGENT
+
+    return _capped(SubAgent(
+        name=GENERAL_PURPOSE_SUBAGENT["name"],
+        description=GENERAL_PURPOSE_SUBAGENT["description"],
+        system_prompt=GENERAL_PURPOSE_SUBAGENT["system_prompt"],
+        tools=tools,
+        model=model,
+        middleware=build_hide_builtin_filesystem_tools_middleware()
+        + build_caching_middleware(model) + build_context_middleware(model, tools),
+        interrupt_on=build_interrupt_on(tools),
+        permissions=DENY_BUILTIN_FILESYSTEM_TOOLS,
+    ))

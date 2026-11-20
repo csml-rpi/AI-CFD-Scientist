@@ -1,0 +1,27 @@
+name: turbinesFoam
+summary: >
+  Actuator-line models of wind and marine (tidal) turbines, foils and
+  propellers as volume sources in a stock incompressible solver
+  (simpleFoam / pimpleFoam), with dynamic stall and end corrections.
+domains: [wind turbine, tidal turbine, marine turbine, hydrokinetic turbine, actuator line,
+          rotor, propeller, vertical axis turbine, cross-flow turbine, foil, blade]
+repo: https://github.com/turbinesFoam/turbinesFoam
+license: GPL-3.0
+builds:
+  # A library of fvOptions; the repository's CI covers v2212-v2412. The
+  # library's Make/files targets $(FOAM_USER_LIBBIN).
+  - fork: openfoam.com
+    versions: [v2212, v2306, v2312, v2406, v2412, v2512]
+    ref: 9ba9e80d4d97a28909f8082c0ee7868b551fcee5
+    build: wmake libso src
+provides:
+  applications: []
+  libraries: [libturbinesFoam]
+usage: >
+  Not a solver: load libturbinesFoam.so through controlDict libs and add an
+  fvOption of type actuatorLineSource, axialFlowTurbineALSource or
+  crossFlowTurbineALSource (system/fvOptions, selectionMode cellSet with a
+  topoSet cellSet), run with simpleFoam or pimpleFoam. Foil data and blade
+  geometry go in the fvOption dictionary. Loads go to
+  postProcessing/actuatorLines/ and postProcessing/turbines/.
+tutorials: tutorials

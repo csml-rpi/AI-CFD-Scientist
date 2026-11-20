@@ -34,7 +34,25 @@ from cfd_langgraph.utils import extract_json_object, strip_json_fences
 from cfd_langgraph.viz_creator import viz_creator
 from cfd_langgraph.llm.reply import reply_text
 
-VIZ_MAX_RETRIES = 10
+# Each figure-script rewrite is a 15-25k-token reply of ~5 min; ten of them
+# filled the interpreter's hour (shelf_demo_olaflow_20261011_1242). The
+# figures only serve the decision, so four tries are enough.
+VIZ_MAX_RETRIES = int(__import__("os").environ.get("CFD_SCIENTIST_INTERPRET_VIZ_RETRIES") or 4)
+
+
+def _viz_deadline() -> Optional[float]:
+    """When figure attempts must stop: CFD_SCIENTIST_INTERPRET_BUDGET_S after
+    this process started, less ten minutes for the interpretation itself."""
+    import os
+
+    try:
+        budget = float(os.environ.get("CFD_SCIENTIST_INTERPRET_BUDGET_S") or 0)
+    except ValueError:
+        budget = 0.0
+    return _STARTED + budget - 600 if budget > 600 else None
+
+
+_STARTED = time.monotonic()
 
 
 def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
@@ -62,6 +80,16 @@ def _interp_rerun_reason_for_log(interp: Dict[str, Any]) -> str:
         if s:
             return s
     return ""
+
+
+def _case_inventory_text(case_dir: Path) -> str:
+    """What the case contains, for a planner that would otherwise guess."""
+    try:
+        from cfd_langgraph.case_inventory import collect
+
+        return collect(case_dir).describe()
+    except Exception as exc:  # noqa: BLE001
+        return f"(inventory unavailable: {type(exc).__name__}: {exc})"
 
 
 class ResultsInterpreterAgent:
@@ -396,7 +424,8 @@ class ResultsInterpreterAgent:
                 parts.append(str(experiment_spec["case_name"]).strip())
         return "\n".join(p for p in parts if p) or "No user requirement provided."
 
-    def _plan_what_to_visualize(self, user_req: str, case_structure: Dict[str, Any]) -> str:
+    def _plan_what_to_visualize(self, user_req: str, case_structure: Dict[str, Any],
+                                inventory: str = "") -> str:
         """
         Decide, per experiment, what to visualize based on:
         - user requirement text
@@ -433,11 +462,16 @@ class ResultsInterpreterAgent:
                 "{times}\n\n"
                 "Available field variables (cell/point data):\n"
                 "{variables}\n\n"
+                "WHAT THIS CASE CONTAINS:\n"
+                "{inventory}\n\n"
                 f"Describe at most {max_viz} distinct visualization types to create "
                 "to best evaluate whether the simulation satisfies the requirement. "
                 "Mention which fields (e.g., U, p), which times (early/mid/late or specific values), "
                 "and what types of plots (contours, slices, centerline profiles, etc.). "
-                "Only request plots derivable from this single case's data. "
+                "Request only what this single case can produce. Anything derivable from the fields listed is available: compute it rather than calling it missing. PyVista derives vorticity, Q-criterion and gradients from a velocity field, streamlines and magnitudes from it too, and samples any line, plane or point out of the volume at any written time. A wall quantity comes from its boundary patch. Only a quantity the simulation genuinely never produced -- a field it did not solve for, or a time it did not write -- is actually unavailable, and that is the only case to treat as out of reach. "
+                "Asking for something it never produced -- a probe history when no probe ran -- "
+                "cannot be satisfied by any redraw, and the figures are then judged incomplete "
+                "for a reason nothing can fix. "
                 "Plain text only, no bullet lists, no JSON, no code."
             )
             prompt = ChatPromptTemplate.from_messages(
@@ -452,6 +486,7 @@ class ResultsInterpreterAgent:
                     "user_requirement": user_req,
                     "times": ", ".join(times) if times else "(no time folders discovered)",
                     "variables": ", ".join(vars_) if vars_ else "(no variables discovered)",
+                    "inventory": inventory or "(inventory unavailable)",
                 }
             ))
             text = str(content or "").strip()
@@ -508,6 +543,13 @@ class ResultsInterpreterAgent:
         output_dir = self._extract_output_dir(experiment_results)
         solver_log_payload = self._collect_solver_log_tails(experiment_results, n_lines=20)
         solver_log_tail = solver_log_payload.get("tail_text", "") or "(no solver log found)"
+        # What the case's files say about the run, on every path: given only a
+        # 20-line log tail, the interpreter read a hyStrath "Iteration no 40000
+        # (0.02 s)" (wall time per step) as the run reaching 0.02 s of a 0.004 s
+        # run, and it never saw the solver's notes (sign conventions, log format)
+        # that the case's writer had (shelf_demo_hystrath_20261022_1030, case_005).
+        if output_dir is not None:
+            user_req = user_req + self._run_facts(output_dir, user_req)
 
         if output_dir is None:
             return self._text_only_interpret(user_req, solver_log_tail, experiment_results)
@@ -560,11 +602,13 @@ class ResultsInterpreterAgent:
             model=self.model,
             foam_output_dir=output_dir,
             viz_dir=viz_base,
-            what_to_visualize=self._plan_what_to_visualize(user_req, case_structure),
+            what_to_visualize=self._plan_what_to_visualize(
+                user_req, case_structure, inventory=_case_inventory_text(output_dir)),
             user_requirement=user_req,
             reference_viz_script=None,
             max_retries=VIZ_MAX_RETRIES,
             strict_quality=False,
+            deadline=_viz_deadline(),
         )
 
         image_paths: List[Path] = [Path(p) for p in viz_result.get("images", [])]
@@ -606,7 +650,9 @@ class ResultsInterpreterAgent:
             "(3) Are the flow results physically plausible and consistent with the specified parameters? "
             "(4) What issues exist, if any? "
             "(5) Should the run be redone (rerun_required)? Set rerun_required=true if EITHER the physics "
-            "are wrong OR the case configuration does not match the experiment specification. "
+            "are wrong OR the case configuration does not match the experiment specification. When the "
+            "solution is sound but records the requirement asks for are missing, set rerun_required=false "
+            "and requirement_met=false and name the missing records: they are made without solving again. "
             "Scope is strictly this single experiment. "
             "Return ONLY valid JSON with keys: simulation_success (bool), requirement_met (bool), "
             "issues (string or list), rerun_required (bool), summary (string), reasons (string).",
@@ -625,7 +671,9 @@ class ResultsInterpreterAgent:
         )
         if verbose:
             print("[Interpreter] Invoking vision LLM for interpretation...", flush=True)
-        content = self._invoke_vision_llm(user_req, image_paths, system_interp, user_interp)
+        content = self._invoke_vision_llm(
+            user_req + "\n\nTHE SOLVER LOG'S LAST LINES:\n" + solver_log_tail,
+            image_paths, system_interp, user_interp)
         try:
             parsed = json.loads(extract_json_object(content))
         except Exception:
@@ -633,7 +681,7 @@ class ResultsInterpreterAgent:
 
         # Normalize rerun_required/requirement_met to avoid contradictory states.
         # Rules:
-        # 1) If rerun_required is provided, requirement_met is its inverse.
+        # 1) If only rerun_required is provided, requirement_met is its inverse.
         # 2) Else if requirement_met is provided, rerun_required is its inverse.
         # 3) If neither is provided, default to rerun_required=False and requirement_met=True.
         rr_raw = parsed.get("rerun_required", None)
@@ -641,7 +689,15 @@ class ResultsInterpreterAgent:
         rr_provided = rr_raw is not None
         rm_provided = rm_raw is not None
 
-        if rr_provided:
+        # Both given: both kept, but for a rerun, which never meets the
+        # requirement. Forced to each other's inverse, "solution sound, records
+        # missing" (no rerun, requirement not met) could not be said, so every
+        # missing record came back RERUN and asked for a whole new solve
+        # (shelf_demo_hystrath_20261022_1030, case_001, case_004, case_005).
+        if rr_provided and rm_provided:
+            rerun_required = bool(rr_raw)
+            requirement_met = bool(rm_raw) and not rerun_required
+        elif rr_provided:
             rerun_required = bool(rr_raw)
             requirement_met = not rerun_required
         elif rm_provided:
@@ -668,14 +724,88 @@ class ResultsInterpreterAgent:
             print(line, flush=True)
         return parsed
 
+    @staticmethod
+    def _run_facts(output_dir: Path, user_req: str) -> str:
+        """The run as the case's files record it: endTime, the time folders
+        written, the last simulated time in the newest log, and the notes of a
+        shelf solver the case runs on."""
+        def entry(path: Path, key: str) -> str:
+            try:
+                for line in path.read_text(errors="ignore").splitlines():
+                    words = line.replace(";", " ").split()
+                    if len(words) >= 2 and words[0] == key:
+                        return words[1]
+            except OSError:
+                pass
+            return ""
+
+        control = Path(output_dir) / "system" / "controlDict"
+        lines = [f"endTime in system/controlDict: {entry(control, 'endTime') or 'not found'}"]
+        times = []
+        for d in Path(output_dir).iterdir():
+            try:
+                if d.is_dir():
+                    times.append((float(d.name), d.name))
+            except ValueError:
+                continue
+        if times:
+            names = [name for _, name in sorted(times)]
+            lines.append("time folders written: " + ", ".join(names[:3] + (["..."] if len(names) > 6 else [])
+                                                           + names[max(3, len(names) - 3):]))
+        # The mesh the case ran on, from its own checkMesh: the case also holds
+        # its starter's README, and a DSMC case on a refined 17,472-cell mesh
+        # was judged as the README's native 8,800-cell one
+        # (shelf_demo_hystrath_20261022_1030, case_004).
+        check_mesh = Path(output_dir) / "log.checkMesh"
+        cells = entry(check_mesh, "cells:") if check_mesh.is_file() else ""
+        if cells:
+            lines.append(f"cells in the mesh this case ran on (its log.checkMesh): {cells}; a count "
+                         "another file in the case gives (a starter's README) may describe another mesh")
+        logs = [q for q in Path(output_dir).glob("log.*") if q.is_file()]
+        if logs:
+            newest = max(logs, key=lambda q: q.stat().st_mtime)
+            try:
+                with newest.open("rb") as fh:
+                    fh.seek(max(0, newest.stat().st_size - 2_000_000))
+                    tail = fh.read().decode(errors="ignore")
+                last = next((ln.strip() for ln in reversed(tail.splitlines())
+                             if ln.split()[:2] == ["Time", "="]), "")
+                if last:
+                    lines.append(f"last simulated time in {newest.name}: {last}")
+            except OSError:
+                pass
+        notes = ""
+        try:
+            from cfd_langgraph.foam_native import rag
+            notes = rag.shelf_usage_notes(user_req, entry(control, "application"))
+        except Exception:  # noqa: BLE001 - notes are extra context, never required
+            notes = ""
+        return ("\n\nRUN FACTS (read from the case's files; a time in a progress line such as "
+                "'Iteration no N (t s)' is wall time per step, not simulated time):\n- " + "\n- ".join(lines)
+                + (f"\n\nNOTES ON THE SOLVER THIS CASE RUNS ON:\n{notes}" if notes.strip() else ""))
+
     def _collect_solver_log_tails(
         self, experiment_result: Dict[str, Any], n_lines: int = 20
     ) -> Dict[str, Any]:
         output_dir = self._extract_output_dir(experiment_result)
         if output_dir is None:
             return {"output_dir": None, "files": [], "tail_text": ""}
+        # The case's own application first: an olaFlow case logs to
+        # log.olaFlow, which neither the list below nor the "foam"-in-the-name
+        # fallback finds, so every finished case read as "no solver log" and
+        # was sent back to run again (shelf_demo_olaflow_20261011_1242).
+        application = ""
+        try:
+            for line in (output_dir / "system" / "controlDict").read_text(errors="ignore").splitlines():
+                words = line.replace(";", " ").split()
+                if len(words) >= 2 and words[0] == "application":
+                    application = words[1]
+                    break
+        except OSError:
+            pass
         preferred = [
-            "log.icoFoam", "log.pisoFoam", "log.pimpleFoam",
+            *([f"log.{application}"] if application else []),
+            "log.foamRun", "log.icoFoam", "log.pisoFoam", "log.pimpleFoam",
             "log.simpleFoam", "log.rhoPimpleFoam", "log.rhoSimpleFoam",
         ]
         files: List[Path] = []

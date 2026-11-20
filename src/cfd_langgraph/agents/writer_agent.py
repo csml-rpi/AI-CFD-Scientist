@@ -45,6 +45,18 @@ def _get_figure_paths_for_review(
     return paths
 
 
+def _required_figures_text(required: Optional[List[str]], lead: str = "") -> str:
+    """The planned figures the paper must embed. The final audit (H15) needs an
+    \\includegraphics for every figure job's out_png, and the writer, never told
+    which files those were, embedded its own pick (shelf_demo_dafoam_20261019_1057,
+    shelf_demo_hystrath_20261022_1030)."""
+    # imported here: the paper_unified package imports its pipeline, which imports this module
+    from cfd_langgraph.paper_unified.figure_contract import required_figures_block
+
+    block = required_figures_block([Path(p) for p in (required or [])])
+    return f"{lead}{block}\n\n" if block else ""
+
+
 # Writer features: experiment-only, no hallucination, grounded to visualizations, 8–15 pages.
 AI_SCIENTIST_V2_STYLE_CHECKLIST = """
 Manuscript requirements (experiment-grounded, no hallucination):
@@ -163,6 +175,7 @@ class WriterAgent:
         visualization_bundle: Optional[List[Dict[str, Any]]] = None,
         max_literature_papers: int = 40,
         verbose: bool = False,
+        required_figures: Optional[List[str]] = None,
     ) -> str:
         # Prefer workflow ideation literature to keep end-to-end context aligned.
         lit_bundle: Any = ideation_literature_bundle or []
@@ -199,6 +212,7 @@ class WriterAgent:
             "Literature survey bundle:\n{lit_bundle}\n\n"
             "Candidate citations (use these; add \\cite{{}} where appropriate):\n{citations}\n\n"
             "Visualization bundle (figures and paths): Include only good-quality images. You must include at least one figure from each experiment; omit poor or uninformative images. Every figure included must have a caption and be referenced in the text. Do not include figures that do not clearly support the narrative.\n{viz_bundle}\n\n"
+            "{required_figures}"
             "Mandatory style checklist (Sakana AI Scientist v2–aligned):\n{checklist}\n\n"
             "Requirements:\n"
             "- Structure: Abstract, Introduction, Related Work, Methods, Results, Discussion, Conclusion; add Reproducibility appendix and Claim–Evidence table.\n"
@@ -226,6 +240,7 @@ class WriterAgent:
                 "citations": json.dumps(citations),
                 "checklist": AI_SCIENTIST_V2_STYLE_CHECKLIST,
                 "viz_bundle": json.dumps(visualization_bundle or []),
+                "required_figures": _required_figures_text(required_figures),
             }
         )
         result = reply_text(out)
@@ -241,6 +256,7 @@ class WriterAgent:
         work_dir: Optional[Path] = None,
         analysis_context: Optional[str] = None,
         verbose: bool = False,
+        required_figures: Optional[List[str]] = None,
     ) -> str:
         """Revise the LaTeX paper based on reviewer recommendations. analysis_context (topic, idea, analysis report) is provided so the writer knows what experiments exist and what figures are available per experiment."""
         system = self.prompts.get(
@@ -263,8 +279,11 @@ class WriterAgent:
                                 paths_for_exp.append(rel)
                         except ValueError:
                             paths_for_exp.append(p)
+                # Every path: cut at 15, a study's 8 contours and the analysis's
+                # figures filled the list and the plots the manager offered were
+                # never shown to the writer (shelf_demo_hystrath_20261022_1030).
                 if paths_for_exp:
-                    by_exp.setdefault(sim_id, []).extend(paths_for_exp[:15])
+                    by_exp.setdefault(sim_id, []).extend(paths_for_exp)
             if by_exp:
                 lines = []
                 for sid, plist in sorted(by_exp.items()):
@@ -280,7 +299,10 @@ class WriterAgent:
             analysis_block = (
                 "\n\nANALYSIS CONTEXT (topic, experiments, available figures—use this to add missing experiment figures or correct descriptions):\n"
                 "---\n"
-                f"{analysis_context[:30000]}\n"
+                # The first draft gets it whole. Cut at 30k, a 43k analysis
+                # filled it and the image analysis, case records and rules after
+                # it never reached a revision (shelf_demo_hystrath_20261022_1030).
+                f"{analysis_context[:200_000]}\n"
                 "---\n"
             )
         user = (
@@ -291,6 +313,7 @@ class WriterAgent:
             "CURRENT LaTeX:\n{tex_content}\n\n"
             "REVIEWER RECOMMENDATIONS:\n{recommendations}"
             "{fig_paths}"
+            "{required_figures}"
             "{analysis_context}"
         )
         prompt = ChatPromptTemplate.from_messages([
@@ -304,6 +327,7 @@ class WriterAgent:
             "tex_content": tex_content[:80000],
             "recommendations": "\n".join(f"- {r}" for r in recommendations),
             "fig_paths": fig_paths_block,
+            "required_figures": _required_figures_text(required_figures, lead="\n\n"),
             "analysis_context": analysis_block,
         })
         if verbose:
@@ -339,9 +363,12 @@ class WriterAgent:
         err = compile_error or ""
         summary = extract_pdflatex_errors(err, max_errors=8)
         tail = err[-_COMPILE_ERR_TAIL_CHARS:] if len(err) > _COMPILE_ERR_TAIL_CHARS else err
+        # The system prompt takes no variables, and its "\end{document}" read as
+        # a template variable crashed every compile recovery
+        # (nn_in_solver_demo_20261022_1129).
         prompt = ChatPromptTemplate.from_messages(
             [
-                ("system", system),
+                ("system", system.replace("{", "{{").replace("}", "}}")),
                 ("human", user_t),
             ]
         )

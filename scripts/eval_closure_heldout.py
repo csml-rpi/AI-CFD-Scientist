@@ -122,8 +122,11 @@ def main() -> int:
     import numpy as np
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model-case", required=True, type=Path,
+    parser.add_argument("--model-case", type=Path, default=None,
                         help="a case containing the discovered model's customModels/")
+    parser.add_argument("--stock", action="store_true",
+                        help="run the cases with the turbulence model they ship with "
+                             "(the baseline), installing no model")
     parser.add_argument("--model-name", default="",
                         help="RASModel name; inferred from customModels/ when omitted")
     parser.add_argument("--data", required=True, type=Path,
@@ -138,15 +141,20 @@ def main() -> int:
                         help="comma-separated subset of test case names (default: all eight)")
     args = parser.parse_args()
 
+    if args.stock == bool(args.model_case):
+        print("give exactly one of --model-case or --stock", file=sys.stderr)
+        return 1
     model_name = args.model_name.strip()
-    if not model_name:
+    if args.stock:
+        model_name = "(stock: the cases' own turbulence model)"
+    elif not model_name:
         custom = args.model_case / "customModels"
         entries = [p.name for p in custom.iterdir() if p.is_dir()] if custom.is_dir() else []
         if len(entries) != 1:
             print(f"could not infer --model-name from {custom} (found {entries})", file=sys.stderr)
             return 1
         model_name = entries[0]
-    print(f"model: {model_name}   from: {args.model_case}")
+    print(f"model: {model_name}   from: {args.model_case or '-'}")
 
     wanted = [c.strip() for c in args.cases.split(",") if c.strip()] or list(TEST_CASES)
     work = args.work or (args.out / "_work")
@@ -183,7 +191,15 @@ def main() -> int:
                     continue
                 shutil.rmtree(child, ignore_errors=True)
 
-        error = install_model(args.model_case, target, model_name)
+        if args.stock:
+            # The challenge's baseline is k-omega SST. NASA_2DWMH names the
+            # benchmark's AugmentedkOmegaSST hook, which plain OpenFOAM lacks;
+            # its baseline is the same stock model.
+            props = target / "constant" / "turbulenceProperties"
+            text = props.read_text()
+            if "AugmentedkOmegaSST;" in text:
+                props.write_text(text.replace("AugmentedkOmegaSST;", "kOmegaSST;"))
+        error = None if args.stock else install_model(args.model_case, target, model_name)
         if error:
             skipped[name] = f"model install failed: {error}"
             print(f"  SKIP {name}: {skipped[name]}")

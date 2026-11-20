@@ -17,6 +17,14 @@ class _CaseInfo(BaseModel):
     case_solver: str = Field(description="Must be one of the provided case_solver_list")
 
 
+def _installed_solvers() -> List[str]:
+    """The solvers (or, on openfoam.org 11+, solver modules) this installation's
+    own tutorials run."""
+    from cfd_langgraph.openfoam_version import get_profile, solver_choices
+
+    return solver_choices(get_profile())
+
+
 def parse_requirement(
     llm: Any,
     user_requirement: str,
@@ -30,7 +38,7 @@ def parse_requirement(
     case_category, case_solver}."""
     domains = case_domain_list or P.DEFAULT_CASE_DOMAIN_LIST
     categories = case_category_list or P.DEFAULT_CASE_CATEGORY_LIST
-    solvers = case_solver_list or P.DEFAULT_CASE_SOLVER_LIST
+    solvers = case_solver_list or _installed_solvers() or P.DEFAULT_CASE_SOLVER_LIST
     system = P.PARSE_SYSTEM_PROMPT.format(
         case_domain_list=domains, case_category_list=categories, case_solver_list=solvers,
     )

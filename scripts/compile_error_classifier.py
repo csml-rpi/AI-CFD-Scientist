@@ -215,8 +215,8 @@ _COACHING: Dict[str, str] = {
     ),
     "L5": (
         "TIER L5 (environment). OpenFOAM environment is not initialized. The "
-        "build host needs `source $WM_PROJECT_DIR/etc/bashrc` (or the bundled "
-        "OpenFOAM-10/etc/bashrc) before wmake can run. This is a host-level fix, "
+        "build host needs `source $WM_PROJECT_DIR/etc/bashrc` (the installed "
+        "OpenFOAM's own bashrc) before wmake can run. This is a host-level fix, "
         "not a code change."
     ),
     "L9": (

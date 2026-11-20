@@ -12,6 +12,21 @@ from .resource_probe import ResourceProfile
 
 logger = logging.getLogger(__name__)
 
+# New launches wait while no GPU this process may use has this much free.
+_GPU_FREE_FLOOR_MB = float(os.environ.get("CFD_SCIENTIST_GPU_FREE_FLOOR_MB") or 4096)
+
+
+def _most_free_gpu_mb() -> Optional[float]:
+    """Free memory of the emptiest GPU this study was given, or None when it
+    was given none: a CFD study names no GPUs and must not wait on GPUs
+    another study has filled."""
+    if not os.environ.get("CUDA_VISIBLE_DEVICES", "").strip():
+        return None
+    from cfd_langgraph.pipeline_contract import visible_gpu_memory
+
+    gpus = visible_gpu_memory()
+    return max((total - used for total, used in gpus.values()), default=None) if gpus else None
+
 T = TypeVar("T")
 
 
@@ -112,12 +127,22 @@ class ResourceAwareScheduler:
                 return self._paused.is_set()
             self._last_check = now
             available_mb = psutil.virtual_memory().available / (1024 * 1024)
+            gpu_free_mb = _most_free_gpu_mb()
             if available_mb < self._pressure_floor:
                 if not self._paused.is_set():
                     logger.warning(
                         "Resource pressure: %.0fMB free < floor %.0fMB — holding new case launches.",
                         available_mb,
                         self._pressure_floor,
+                    )
+                self._paused.set()
+            elif gpu_free_mb is not None and gpu_free_mb < _GPU_FREE_FLOOR_MB:
+                # Every GPU this study may use is nearly full: a new model
+                # trained now would run out of GPU memory, not just wait.
+                if not self._paused.is_set():
+                    logger.warning(
+                        "GPU pressure: most free GPU has %.0fMB < floor %.0fMB — holding new case launches.",
+                        gpu_free_mb, _GPU_FREE_FLOOR_MB,
                     )
                 self._paused.set()
             else:

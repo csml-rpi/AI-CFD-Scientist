@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import contextlib
+import os
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Dict, Tuple
 
 from deepagents import FilesystemPermission, create_deep_agent
 
@@ -18,7 +19,13 @@ from .control import (
     build_hide_builtin_filesystem_tools_middleware,
     build_interrupt_on,
 )
-from .subagents import build_case_runner_subagent, build_oed_candidate_runner_subagent
+from .subagents import (
+    build_case_runner_subagent,
+    build_general_purpose_subagent,
+    build_nn_coupler_subagent,
+    build_hpc_runner_subagent,
+    build_oed_candidate_runner_subagent,
+)
 
 _MANAGER_GRAPH_NAME = "cfd-scientist-manager"
 from .tools import build_manager_tools
@@ -73,10 +80,37 @@ Sequence for a standard study:
    human approval before it executes — a person may approve it as-is, edit which
    candidate_ids are approved, or reject it and send you back to step 2/3 with feedback.
    Wait for that decision; do not try to work around it.
+   If the flow needs physics the installed OpenFOAM does not ship (water waves, melt
+   pools, solid mechanics or fluid-structure interaction, turbines, ...), call
+   `shelf_solvers` with the research topic. Use a third-party solver only if it reports
+   `usable: true`; one that matches but is not built can be built and validated with
+   `shelf_install`. A requirement that uses one names it.
+   If the study puts a neural network inside the solver -- one trained through the
+   solver's adjoint (DAFoam's regressionModel) or a trained PyTorch network evaluated in a
+   case -- give the network's side to the `task` tool with subagent_type="nn-coupler":
+   its card (each input and its exact definition, the normalisation, output scaling and
+   bounds), its export and its checks. Do this before `generate_case_requirements`, and pass
+   what the nn-coupler fixed (the network's inputs and definitions, normalisation,
+   architecture, output mapping and bounds, the initial weight and options files, and
+   what each case must do with them) to it as `study_notes`: the requirement writer sees
+   nothing else of it. Cases still run through case-runner; the file the
+   nn-coupler writes for a case (the coded object that evaluates the network) goes to that
+   case with `given_files`, so it runs exactly as written. A network is used in a case only
+   after `nn_check_parity` passes, and a result of a case that used one counts only when
+   `nn_check_case` passes on that case. Those two tools are the checks: a case's
+   requirement asks it to run the network inside the solver and write the fields
+   nn_check_case reads, not to build its own parity program. One that was asked to spent
+   ten runs compiling a separate evaluator and never reached the solver.
+   If a prepared case is too large or too long to run on this machine (millions of cells,
+   a long unsteady 3-D run), give it to the `task` tool with subagent_type="hpc-runner": it
+   runs that case folder on NERSC Perlmutter and copies the results back into it. It runs a
+   case that is already written; it does not write one.
 5. Call `generate_case_requirements` — turns every approved hypothesis's experiments
    into validated FoamAgent requirements (requirements.json). Use each requirement's
    `study_id` as its `physics_group` for the steps below, unless you have a reason to
-   split further.
+   split further. When the brief requires mesh independence for each condition
+   separately, give each condition its own physics_group,
+   so each gets its own mesh gate.
 6. For each physics_group present in requirements.json, call `run_mesh_gate` once
    with a representative requirement's text (and the research topic) before running
    the rest of that group's cases — mesh-independence is mandatory ahead of every
@@ -84,7 +118,10 @@ Sequence for a standard study:
    stopping at the first level where an LLM judges the physically-trustworthy QoIs
    converged (~5% rule) — read `converged` and `selected_level` in its result before
    trusting the mesh; `converged: false` means it hit max_refine_levels without
-   settling and needs a human look, not a silent pass.
+   settling, and its `next_steps` says what you may do then. No case of that group can
+   run until it converges, so do not launch case-runners for it. Its result also says how every
+   later run of the group starts (`start_decision`): from the selected level's settled
+   flow for a set run length, or from rest. That is applied for you.
 7. Launch every approved case via the `task` tool with subagent_type="case-runner",
    giving it a case_id (from requirements.json), the matching physics_group, and the
    requirement text. `run_case_native` enforces that physics_group's converged
@@ -96,7 +133,11 @@ Sequence for a standard study:
    REVISE, decide whether to retry that one case (revise the requirement, relaunch via
    `task`) — do not stop the whole study over one failing case.
 9. Once every case has a decision, call `analyze_all_cases` with the full list of
-   case_ids for a cross-case comparison.
+   case_ids for a cross-case comparison. If the topic or the task's brief names its own
+   scorer or verdict script, run it with `run_python` exactly as the brief shows, on each
+   condition's final case, and report its output as the study's verdict; use `run_python`
+   for any figures the task asks for too. Only `run_python` runs a script: files you
+   write are not run.
 10. Call `write_paper` to draft the manuscript, generate figures, and run the
     reviewer loop.
 11. Call `run_audit_and_record` to run the stage-gate audit and, if it passes, record
@@ -167,7 +208,7 @@ selected case and cannot invent a separate baseline requirement:
      point `starter_dir` at a folder this study created. Neither works — the baseline is
      checked for real solved fields — and both cost hours before the failure surfaces.
 
-  a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's selected_level>,
+  a. Call `oed_setup_search(topic, baseline_case_dir=<run_mesh_gate's baseline_case, or its selected_level if it gives none>,
      total_budget=<in SOLVER RUNS, not candidates: a code-mod candidate costs roughly 50 runs on a multi-case benchmark and ~2 on a single-case one, so budget for the number of candidates you want times that — e.g. 2000-4000 for a 40-80 candidate campaign>)` once. It resolves reference data and
      authors the scored comparators every candidate will be judged against, and computes
      the baseline score to gate on.
@@ -185,11 +226,16 @@ selected case and cannot invent a separate baseline requirement:
      DEEPEN line says either that the last step improved (continue) or that the attempts
      since then did not beat it (try a different single change from the same parent).
      Follow the line you were given rather than a general rule.
-  c. Launch every returned candidate as a `task` call with subagent_type="oed-candidate-runner"
-     — a single message with one task call per candidate, concurrently, same as launching
-     cases in step 7. Give each one its full candidate spec from step b, including its
-     `strategy` — that is what fences its build agent's clock against other candidates of
-     the same kind rather than against the fastest strategy in the study.
+  c. Launch the returned candidates with `oed_launch_candidates(task_descriptions)`, one
+     description per candidate, each the full task for the oed-candidate-runner: its
+     candidate spec from step b, including its `strategy` — that is what fences its build
+     agent's clock against other candidates of the same kind rather than against the
+     fastest strategy in the study. It returns at once; each candidate is built and scored
+     by the oed-candidate-runner in the background, as many at a time as `build_slots`
+     allows. Then call `oed_wait_for_candidates()`: it returns each candidate's report as
+     soon as that candidate is done, while the others keep building. Do not wait for a
+     whole round: handle each finished report (c1, c2), record it (d), and propose and
+     launch more so that about `build_slots` candidates are always in flight.
   c1. If a candidate reports that its build agent did NOT finish cleanly, it hands you an
      `unclean_finish_diagnosis`. Act on that before anything else, because this failure
      mode does not produce a null score — it produces a plausible one. A build agent
@@ -225,14 +271,14 @@ selected case and cannot invent a separate baseline requirement:
      - If `may_repair` is true, carry out `repair_steps` with your file and shell tools,
        then call `oed_note_repair_attempt(candidate_dir, what_was_changed)` BEFORE
        re-running anything, so the attempt is counted even if the re-run dies. Then send
-       the candidate back to `oed-candidate-runner` to re-run
-       `oed_run_evaluation_cases` and `oed_score_candidate`.
+       the candidate back to the oed-candidate-runner (`oed_launch_candidates` with a task
+       to re-run `oed_run_evaluation_cases` and `oed_score_candidate` on it).
      - Two attempts per candidate, no more. `repair_attempts_remaining` tells you what is
        left. When it hits zero, or the verdict says not repairable, record the null score
        with its cause and spend the budget on a different mechanism instead — grinding a
        broken closure costs a new one its chance.
-  d. Once all of that round's candidates report back, call `oed_record_candidate_results`
-     with the list of candidate_dir paths they used (each subagent's own
+  d. As candidates report back from `oed_wait_for_candidates`, call
+     `oed_record_candidate_results` with the candidate_dir paths of the finished ones (each subagent's own
      oed_score_candidate call already wrote the real result to disk — you're just telling
      this tool where to find them, not re-typing scores). It returns budget_used,
      proceed_count, is_saturated, and the updated archive summary.
@@ -240,8 +286,7 @@ selected case and cannot invent a separate baseline requirement:
      Scoring always goes through the oed-candidate-runner. If a candidate has no score on
      disk — it is listed in `missing_candidate_records`, or a restart interrupted it — call
      `oed_candidate_status(candidate_dir)` and follow its next_step: a build that finished is
-     scored by launching the oed-candidate-runner with a task to score that existing
-     candidate_dir. Never re-propose it under the same variant_name to get it scored; an
+     scored by `oed_launch_candidates` with a task to score that existing candidate_dir. Never re-propose it under the same variant_name to get it scored; an
      existing variant_name is never rebuilt.
 
      Each candidate record carries a `run_window`: the start and end time the case was
@@ -258,6 +303,11 @@ selected case and cannot invent a separate baseline requirement:
      proceed_count is at least 1 (the search has plateaued and you already have a working
      result — stopping earlier than that discards budget for nothing, stopping much later
      than that just burns budget on a family that's already flat).
+  e2. In a study scored on a validation split (step d's result says so in
+     `final_test_next`), the search never sees the test set. When the search is over,
+     call `oed_final_test` once, before anything else: it re-trains the best candidate
+     on the full training data and scores it on the test set. Its result is the
+     study's result; report the validation and test scores side by side.
   f. When step d returns search_complete=true, use every case ID in
      `case_ids_to_interpret` (baseline plus promoted candidates) with
      `interpret_case`. Pass only cases whose interpreter status is PROCEED to
@@ -301,6 +351,96 @@ def _require_tool_calling_support(model: Any, settings: Settings) -> None:
     )
 
 
+# Refused calls in a row after which the manager is stopped and the study
+# recorded as stuck (see llm/caching.build_loop_control_middleware).
+_MANAGER_REFUSAL_STOP = int(os.environ.get("CFD_SCIENTIST_MANAGER_REFUSALS") or 30)
+
+# Tools a study of each kind never uses, by the prompt's own instructions for
+# that kind. Hidden from the model once read_starter_folder has decided the
+# kind: fewer wrong options and about 4-6k fewer tokens of schemas a turn.
+_IMPL_TOOLS = {"impl_run", "impl_status", "impl_verify", "impl_continue"}
+_TOOLS_NOT_FOR_MODE = {
+    "implementation": {
+        "propose_and_rank_hypotheses", "advance_with_approved_hypotheses",
+        "generate_case_requirements", "run_mesh_gate", "interpret_case", "analyze_all_cases",
+        "restore_last_success", "write_paper", "task", "shelf_solvers", "shelf_install",
+        "nn_export", "nn_from_dafoam", "nn_check_parity", "nn_check_case", "nn_coded_entries",
+    },
+    "surrogate": _IMPL_TOOLS | {
+        "generate_case_requirements", "run_mesh_gate", "oed_prepare_baseline",
+        "interpret_case", "analyze_all_cases", "restore_last_success", "write_paper", "shelf_solvers",
+        "shelf_install",
+        "nn_export", "nn_from_dafoam", "nn_check_parity", "nn_check_case", "nn_coded_entries",
+    },
+    "solver": set(_IMPL_TOOLS),
+}
+_MODE_HEADER = {
+    "implementation": (
+        "STUDY TYPE: implementation (decided by read_starter_folder). Follow the steps for an "
+        "implementation study in this prompt -- the part that begins 'If `read_starter_folder` "
+        "reports `study_mode: \"implementation\"`'. The standard, open-ended-discovery and "
+        "surrogate sequences do not apply, and their tools are not offered."
+    ),
+    "surrogate": (
+        "STUDY TYPE: surrogate (decided by read_starter_folder). Follow the changes for a "
+        "surrogate study in this prompt -- the part that begins 'If `read_starter_folder` "
+        "reports `study_mode: \"surrogate\"`'. Tools that do not apply are not offered."
+    ),
+}
+
+
+def _tool_name(tool: Any) -> str:
+    if isinstance(tool, dict):
+        return str(tool.get("name") or (tool.get("function") or {}).get("name") or "")
+    return str(getattr(tool, "name", "") or "")
+
+
+def build_study_mode_middleware(out_dir: Path) -> Any:
+    """Offer each kind of study only its own tools, and say which kind it is at
+    the top of the system prompt, once read_starter_folder has decided it
+    (study_mode.json). Until then nothing changes."""
+    import json as _json
+
+    from langchain.agents.middleware import AgentMiddleware
+    from langchain_core.messages import SystemMessage
+
+    def _mode() -> str:
+        try:
+            return str(_json.loads((Path(out_dir) / "study_mode.json").read_text()).get("mode", "")).lower()
+        except (OSError, ValueError, AttributeError):
+            return ""
+
+    def _prepare(request: Any) -> Any:
+        mode = _mode()
+        hidden = _TOOLS_NOT_FOR_MODE.get(mode)
+        if not hidden:
+            return request
+        overrides: Dict[str, Any] = {"tools": [
+            t for t in request.tools
+            if _tool_name(t) not in hidden
+            and not (mode == "implementation" and _tool_name(t).startswith("oed_"))
+        ]}
+        header = _MODE_HEADER.get(mode)
+        system = request.system_message
+        if header and system is not None:
+            content = system.content
+            if isinstance(content, str):
+                content = header + "\n\n" + content
+            else:
+                content = [{"type": "text", "text": header}, *content]
+            overrides["system_message"] = SystemMessage(content=content)
+        return request.override(**overrides)
+
+    class StudyModeTools(AgentMiddleware):
+        def wrap_model_call(self, request: Any, handler: Any) -> Any:
+            return handler(_prepare(request))
+
+        async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+            return await handler(_prepare(request))
+
+    return StudyModeTools()
+
+
 def build_manager(
     settings: Settings, out_dir: Path
 ) -> Tuple[Any, contextlib.ExitStack]:
@@ -337,6 +477,19 @@ def build_manager(
     oed_candidate_runner = build_oed_candidate_runner_subagent(
         oed_candidate_tools, oed_candidate_model, out_dir
     )
+    # Candidates run in the background through the same runner and are
+    # collected as they finish (see background.py). The runner then leaves the
+    # `task` list, so a round can no longer be fanned out as one blocking
+    # message whose results all wait for its slowest candidate.
+    background_tools = []
+    if isinstance(oed_candidate_runner, dict) and "runnable" in oed_candidate_runner:
+        from .background import build_background_candidate_tools
+        from .tools import _with_progress
+
+        background_tools = [_with_progress(f) for f in build_background_candidate_tools(
+            oed_candidate_runner, out_dir, built.get("coordinator"))]
+    general_purpose_tools = manager_tools
+    manager_tools = manager_tools + background_tools
 
     stack = contextlib.ExitStack()
     checkpointer: Any
@@ -361,7 +514,21 @@ def build_manager(
         model=model,
         tools=manager_tools,
         system_prompt=_build_manager_system_prompt(out_dir),
-        subagents=[case_runner, oed_candidate_runner],
+        subagents=[
+            case_runner, *([] if background_tools else [oed_candidate_runner]),
+            build_general_purpose_subagent(
+                general_purpose_tools,
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="general-purpose"),
+            ),
+            build_nn_coupler_subagent(
+                built["nn_coupler_tools"],
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="nn-coupler"),
+            ),
+            build_hpc_runner_subagent(
+                built["hpc_tools"],
+                create_langchain_llm(model=settings.model, temperature=0.0, agent="hpc-runner"),
+            ),
+        ],
         # Blocks deepagents' own built-in ls/read_file/write_file/grep/etc —
         # they'd silently run against an empty virtual filesystem instead of
         # the real disk (see control.py). Forces the model onto our real,
@@ -381,8 +548,11 @@ def build_manager(
         # means a result that somehow reaches this conversation from a
         # subagent tool is protected rather than silently discarded.
         + build_context_middleware(
-            model, manager_tools + case_runner_tools + oed_candidate_tools
-        ),
+            model, manager_tools + case_runner_tools + oed_candidate_tools + built["nn_coupler_tools"]
+            + built["hpc_tools"],
+            refusal_stop=_MANAGER_REFUSAL_STOP, status_file=out_dir / "stuck.json",
+        )
+        + [build_study_mode_middleware(out_dir)],
         # Every manager tool is watched for a Ctrl-C-requested pause (see
         # control.py) — cost-free until GLOBAL_INTERRUPT is actually set, and
         # the pause always lands *before* a tool runs, never mid-call, so

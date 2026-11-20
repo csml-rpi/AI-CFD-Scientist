@@ -75,7 +75,7 @@ For each `(variant × condition)`:
 1. **Copy** the baseline case to `<case_dir>` (`cp -r baseline_case/case <case_dir>`). Because custom libraries are built case-local (see `cfd-code-modify` — `customModels/<Class>/` lives inside the case), `cp -r` carries the compiled `.so` with the copy; no global library is needed.
 2. **Patch** the dictionary entries that vary (e.g. `constant/cloudProperties.phaseChangeModel`, `0/T.internalField`, `system/controlDict.endTime`). **Do not** patch fields you didn't intend to change.
 3. **Activate** any compiled custom library with a **case-relative** `libs` entry — `libs ("customModels/<Class>/lib<Class>.so");` in `system/controlDict` — and point the relevant model selector at the new class name. Use the case-relative path, never a bare `lib<Class>.so` name: the bare form depends on `FOAM_USER_LIBBIN` / the global library search path and breaks reproducibility when the case is moved or shared.
-4. **Run** the application named in `system/controlDict` (`reactingFoam`, `simpleFoam`, etc.) via Bash. Stream stdout to `log.<solver>`.
+4. **Run** the application named in `system/controlDict` (`reactingFoam`, `simpleFoam`, etc.; `foamRun` when controlDict names a `solver` module, openfoam.org 11+) via Bash. Stream stdout to `log.<solver>`.
 5. **Parse** the log for the QoI using a `cfd-stats` pattern (e.g. Pattern 1 for droplet K, Pattern 2 for Cf, Pattern 3 for drag).
 6. **Append** one row to `<out-dir>/results.csv` with: variant, condition, QoI, ratio-vs-reference, sample count, t_end.
 
@@ -290,6 +290,8 @@ Rules:
   - Accept multi-solver Allruns (e.g. potentialFoam + simpleFoam). It is
     OK as long as a flow solver runs to completion.
   - Accept BOTH `runApplication simpleFoam` and `runParallel simpleFoam`.
+  - `foamRun` (with the solver module named in controlDict) is a flow
+    solver: openfoam.org 11 and later run every solver that way.
   - If the only solver invocation is commented out, that is BROKEN — emit
     a corrected Allrun that uncomments / restores it. Provide a serial
     fallback when parallel decomposition is not staged.

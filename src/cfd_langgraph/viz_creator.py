@@ -31,10 +31,47 @@ def _ensure_marker_foam(case_dir: Path) -> Path:
     return marker
 
 
-def _run_script(script_path: Path, cwd: Path) -> tuple[int, str, str]:
+def _install_foam_load(viz_dir: Path) -> None:
+    """Put foam_load.py beside the generated script so it can import it."""
+    from cfd_langgraph.foam_load import install_beside
+
+    if install_beside(viz_dir) is None:
+        _log(f"could not install foam_load.py into {viz_dir}")
+
+
+# The paths are defined by the harness, not typed by the model: on
+# qwen_retest_20261005/cavity_r11 a model copying the case path into its script
+# mistyped one character, all ten attempts failed with "Cannot open directory",
+# and the case was judged REVISE although it was correct.
+_PATH_NAMES = ("foam_output_dir", "viz_dir", "marker_name")
+_PATH_HEADER = (
+    "import sys as _sys\n"
+    "from pathlib import Path as _Path\n"
+    "foam_output_dir = _Path(_sys.argv[1])\n"
+    "viz_dir = _Path(_sys.argv[2])\n"
+    "marker_name = _sys.argv[3]\n"
+)
+
+
+def _with_harness_paths(script_text: str) -> str:
+    """The script with the harness's own definitions of the case paths at the
+    top, and any top-level assignment of those names by the model dropped."""
+    future, kept = [], []
+    for line in script_text.splitlines():
+        if line.startswith("from __future__ import"):
+            future.append(line)  # must stay the first statement
+            continue
+        head = line.split("=", 1)[0].split(":", 1)[0].strip()
+        if not line[:1].isspace() and "=" in line and head in _PATH_NAMES:
+            continue
+        kept.append(line)
+    return "".join(f + "\n" for f in future) + _PATH_HEADER + "\n".join(kept) + "\n"
+
+
+def _run_script(script_path: Path, cwd: Path, args: Optional[List[str]] = None) -> tuple[int, str, str]:
     try:
         proc = subprocess.run(
-            [sys.executable, str(script_path)],
+            [sys.executable, str(script_path), *(args or [])],
             cwd=str(cwd),
             capture_output=True,
             text=True,
@@ -70,7 +107,7 @@ def _images_to_blocks(image_paths: List[Path], max_images: int = 16) -> List[Dic
 _PAPER_PYVISTA_ONLY_SYSTEM = (
     "You write Python scripts for CFD **paper figures** using **PyVista only** for all raster (PNG) output.\n"
     "Requirements:\n"
-    "- Load OpenFOAM data with PyVista from foam_output_dir using the given marker .foam file.\n"
+    "- A helper module, foam_load.py, is saved next to this script inside viz_dir, so a plain\n  `import foam_load` resolves with no path setup. Load the case with it, never with a\n  reader you construct yourself:\n      from foam_load import load_case, load_patches, cut_plane, face_camera, new_plotter, solved_times\n      mesh  = load_case(foam_output_dir)     # internal mesh, latest solved time\n      plane = cut_plane(foam_output_dir)     # the plane the flow lives in\n      p = new_plotter()                      # off-screen, correct window size\n  load_case enables the fields as point data, so mesh['U'] works and can be\n  contoured or sliced directly. Pass time=<t> for a specific time.\n- Do NOT import vtk, do NOT call OpenFOAMReader, SetFileName, SetDirectoryName or\n  enable_all_*_arrays yourself, and do NOT touch a .foam file. All of that is done.\n- For a field view, plot cut_plane(...) and NOT the raw mesh: a 2-D case is one cell\n  thick, and which direction that is cannot be told from the bounding box, so choosing\n  a slice yourself gives an edge-on view showing no geometry. cut_plane already picked\n  it (for a 3-D case, the plane containing the flow). Follow with face_camera(p, plane)\n  so the plane faces the camera; p.view_xy() shows any plane but z-normal edge-on.\n- Read a wall quantity from its own boundary, never from the interior mesh:\n      walls = load_patches(foam_output_dir)   # {{patch name: mesh}}\n      wss   = walls['<wall patch>']['wallShearStress']\n  Interpolated onto the interior, a wall field is ~0 everywhere off the wall, and the\n  plot comes out as a flat line at ~1e-13.\n- Size the figure to the domain: a long shallow domain in a square canvas leaves the\n  geometry a thin band in the middle. Set window_size to the domain aspect ratio and\n  call p.camera.zoom(...) so the geometry fills the frame.\n"
     "- Use off_screen=True plotters only. Save PNGs **only** via PyVista (e.g. plotter.screenshot, plotter.export_gltf is NOT for PNG—use screenshot).\n"
     "- **Do NOT use matplotlib.pyplot.savefig** or any matplotlib-based figure export. Matplotlib may be imported only for numpy-style helpers if needed, but every PNG must come from a PyVista Plotter screenshot.\n"
     "- For 1D profiles (e.g. U vs y/H), use PyVista Chart2D, or plot polylines in a 2D Plotter view, then screenshot.\n"
@@ -112,6 +149,7 @@ def viz_creator(
     max_retries: int = VIZ_MAX_RETRIES,
     paper_pyvista_only: bool = False,
     strict_quality: bool = True,
+    deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Central visualization creator.
@@ -157,6 +195,12 @@ def viz_creator(
             pass
 
     marker_foam = _ensure_marker_foam(foam_output_dir)
+    try:
+        from cfd_langgraph.case_inventory import collect as _collect_inventory
+
+        case_inventory_text = _collect_inventory(foam_output_dir).describe()
+    except Exception as exc:  # noqa: BLE001 -- best effort
+        case_inventory_text = f"(inventory unavailable: {type(exc).__name__}: {exc})"
 
     llm = create_langchain_llm(model=model, temperature=0.0)
 
@@ -164,8 +208,7 @@ def viz_creator(
         "You write PyVista+matplotlib Python scripts to visualize OpenFOAM cases.\n"
         + _REFERENCE_DATA_RULE + "\n"
         "Requirements (CFD paper-quality figures only):\n"
-        "- Load the case using PyVista from the given foam_output_dir.\n"
-        "- The marker .foam file to load is always the given marker_name.\n"
+        "- A helper module, foam_load.py, is saved next to this script inside viz_dir, so a plain\n  `import foam_load` resolves with no path setup. Load the case with it, never with a\n  reader you construct yourself:\n      from foam_load import load_case, load_patches, cut_plane, face_camera, new_plotter, solved_times\n      mesh  = load_case(foam_output_dir)     # internal mesh, latest solved time\n      plane = cut_plane(foam_output_dir)     # the plane the flow lives in\n      p = new_plotter()                      # off-screen, correct window size\n  load_case enables the fields as point data, so mesh['U'] works and can be\n  contoured or sliced directly. Pass time=<t> for a specific time.\n- Do NOT import vtk, do NOT call OpenFOAMReader, SetFileName, SetDirectoryName or\n  enable_all_*_arrays yourself, and do NOT touch a .foam file. All of that is done.\n- For a field view, plot cut_plane(...) and NOT the raw mesh: a 2-D case is one cell\n  thick, and which direction that is cannot be told from the bounding box, so choosing\n  a slice yourself gives an edge-on view showing no geometry. cut_plane already picked\n  it (for a 3-D case, the plane containing the flow). Follow with face_camera(p, plane)\n  so the plane faces the camera; p.view_xy() shows any plane but z-normal edge-on.\n- Read a wall quantity from its own boundary, never from the interior mesh:\n      walls = load_patches(foam_output_dir)   # {{patch name: mesh}}\n      wss   = walls['<wall patch>']['wallShearStress']\n  Interpolated onto the interior, a wall field is ~0 everywhere off the wall, and the\n  plot comes out as a flat line at ~1e-13.\n- Size the figure to the domain: a long shallow domain in a square canvas leaves the\n  geometry a thin band in the middle. Set window_size to the domain aspect ratio and\n  call p.camera.zoom(...) so the geometry fills the frame.\n"
         "- Use off_screen=True plotters only (no interactive windows).\n"
         "- Save all figures as PNG files into viz_dir.\n"
         "- Use PyVista for field visualizations (filled contour/colormap plots, streamlines, mesh outlines, slices, etc.).\n"
@@ -199,6 +242,9 @@ def viz_creator(
         "{user_requirement}\n\n"
         "What to visualize:\n"
         "{what_to_visualize}\n\n"
+        "What this case contains -- fields, boundaries, and what was written.\n"
+        "Anything derivable from the fields listed is available: compute it rather than calling it missing. PyVista derives vorticity, Q-criterion and gradients from a velocity field, streamlines and magnitudes from it too, and samples any line, plane or point out of the volume at any written time. A wall quantity comes from its boundary patch. Only a quantity the simulation genuinely never produced -- a field it did not solve for, or a time it did not write -- is actually unavailable, and that is the only case to treat as out of reach.\n"
+        "{inventory}\n\n"
         "{reference_block}"
         "foam_output_dir (input data):\n"
         "{foam_output_dir}\n\n"
@@ -206,6 +252,8 @@ def viz_creator(
         "{viz_dir}\n\n"
         "marker_name (.foam file inside foam_output_dir):\n"
         "{marker_name}\n\n"
+        "foam_output_dir, viz_dir (pathlib.Path) and marker_name (str) are ALREADY DEFINED at the\n"
+        "top of the script by the runner. Use those names; never assign them or type the paths.\n\n"
         "Previous feedback / error (if any):\n"
         "{previous_error}\n\n"
         "Previous viz script that failed or was rejected (if any):\n"
@@ -230,6 +278,9 @@ def viz_creator(
         "{user_requirement}\n\n"
         "What to visualize:\n"
         "{what_to_visualize}\n\n"
+        "What this case contains -- fields, boundaries, and what was written.\n"
+        "Anything derivable from the fields listed is available: compute it rather than calling it missing. PyVista derives vorticity, Q-criterion and gradients from a velocity field, streamlines and magnitudes from it too, and samples any line, plane or point out of the volume at any written time. A wall quantity comes from its boundary patch. Only a quantity the simulation genuinely never produced -- a field it did not solve for, or a time it did not write -- is actually unavailable, and that is the only case to treat as out of reach.\n"
+        "{inventory}\n\n"
         "{reference_block}"
         "foam_output_dir (input data):\n"
         "{foam_output_dir}\n\n"
@@ -237,6 +288,8 @@ def viz_creator(
         "{viz_dir}\n\n"
         "marker_name (.foam file inside foam_output_dir):\n"
         "{marker_name}\n\n"
+        "foam_output_dir, viz_dir (pathlib.Path) and marker_name (str) are ALREADY DEFINED at the\n"
+        "top of the script by the runner. Use those names; never assign them or type the paths.\n\n"
         "Previous feedback / error (if any):\n"
         "{previous_error}\n\n"
         "Previous viz script that failed or was rejected (if any):\n"
@@ -303,6 +356,11 @@ def viz_creator(
         "{user_requirement}\n\n"
         "Requested visualizations:\n"
         "{what_to_visualize}\n\n"
+        "What this case contains -- fields, boundaries, and what was written.\n"
+        "Anything derivable from the fields listed is available: compute it rather than calling it missing. PyVista derives vorticity, Q-criterion and gradients from a velocity field, streamlines and magnitudes from it too, and samples any line, plane or point out of the volume at any written time. A wall quantity comes from its boundary patch. Only a quantity the simulation genuinely never produced -- a field it did not solve for, or a time it did not write -- is actually unavailable, and that is the only case to treat as out of reach.\n"
+        "{inventory}\n\n"
+        "What this case contains:\n"
+        "{inventory}\n\n"
         "Previous feedback / error (if any):\n"
         "{previous_error}\n\n"
         "You will see the generated images below. Check: "
@@ -313,6 +371,11 @@ def viz_creator(
         "(5) Are fonts large enough for a paper figure (title, ticks, colorbar labels legible)? "
         "(6) For 2D channel/duct-style plots: can you see **both** wall-normal and streamwise extent (not a single vertical/horizontal sliver)? "
         "If (1)-(6) pass, set viz_acceptable=true. Do NOT reject because physics looks wrong—that is for the interpreter. "
+        "Judge against what this case can produce, not against the request alone. A quantity "
+        "derivable from the fields present counts as available, so its absence is a fair "
+        "rejection. A quantity the simulation never produced is not: treat that as not "
+        "applicable, because no redraw can supply it and the loop will repeat until it runs "
+        "out of attempts. "
         "Reject for bad layout (overlap), illegible typography, or degenerate domain aspect even when a colormap exists.\n"
         "Return ONLY JSON with keys viz_acceptable (bool) and reason (string)."
     )
@@ -342,11 +405,22 @@ def viz_creator(
     else:
         reference_block = ""
 
+    # ``deadline`` (time.monotonic()): no attempt starts that the last one's
+    # length says would end past it, and the last attempt that fits keeps
+    # its images even when rejected. Ten retries of ~5 min each used the
+    # interpreter's whole hour, and it was killed before interpreting
+    # (shelf_demo_olaflow_20261011_1242, cases 005 and 006).
+    took = 0.0
     for attempt in range(1, max_retries + 1):
+        if deadline is not None and attempt > 1 and time.monotonic() + took > deadline:
+            _log(f"attempt {attempt}: not started, too little time left")
+            break
+        started = time.monotonic()
         # Ask LLM for script
         user_prompt = active_user_tpl.format(
             user_requirement=user_requirement,
             what_to_visualize=what_to_visualize,
+            inventory=case_inventory_text,
             reference_block=reference_block,
             foam_output_dir=str(foam_output_dir),
             viz_dir=str(viz_dir),
@@ -371,10 +445,13 @@ def viz_creator(
         lines = script_text.lstrip().splitlines()
         if lines and lines[0].strip().lower() in {"python", "bash", "sh"}:
             script_text = "\n".join(lines[1:])
+        _install_foam_load(viz_dir)
+        script_text = _with_harness_paths(script_text)
         script_path = viz_dir / "viz_script.py"
         script_path.write_text(script_text, encoding="utf-8")
 
-        rc, out, err = _run_script(script_path, cwd=foam_output_dir)
+        rc, out, err = _run_script(script_path, cwd=foam_output_dir,
+                                   args=[str(foam_output_dir), str(viz_dir), marker_foam.name])
         pngs = sorted(p for p in viz_dir.glob("*.png") if p.is_file())
 
         if rc != 0 or not pngs:
@@ -382,6 +459,7 @@ def viz_creator(
             snippet = (err or out or "Unknown error")[-4000:]
             last_error = f"Return code: {rc}\nSTDOUT:\n{out[-1000:]}\nSTDERR:\n{snippet}\n"
             last_script = script_text
+            took = time.monotonic() - started
             # Clean up any partial images
             for p in pngs:
                 try:
@@ -404,6 +482,7 @@ def viz_creator(
         viz_user = viz_check_user_tpl.format(
             user_requirement=user_requirement,
             what_to_visualize=what_to_visualize,
+            inventory=case_inventory_text,
             previous_error=last_error or "(none)",
         )
         content: List[Any] = [{"type": "text", "text": viz_user}]
@@ -437,7 +516,9 @@ def viz_creator(
         # rather than discarding. The reviewer has been observed to hallucinate
         # missing/uniform figures on legitimately usable output; losing the whole
         # case over that wastes the simulation.
-        if attempt >= max_retries:
+        took = time.monotonic() - started
+        last_in_time = deadline is not None and time.monotonic() + took > deadline
+        if attempt >= max_retries or last_in_time:
             _log(
                 f"attempt {attempt}: max retries reached — accepting {len(pngs)} images "
                 f"from final attempt despite reviewer rejection"

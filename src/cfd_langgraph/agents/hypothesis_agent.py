@@ -15,6 +15,91 @@ from cfd_langgraph.llm.reply import reply_text
 _VALIDATOR_PARSE_ATTEMPTS = 3
 
 
+
+def _numbers_in(text: str) -> List[float]:
+    """Every number written in ``text`` (0.10, 3.5, 1.5e-5, ...)."""
+    keep = set("0123456789.-+eE")
+    words = "".join(c if c in keep else " " for c in str(text)).split()
+    found: List[float] = []
+    for w in words:
+        w = w.strip(".+")
+        try:
+            found.append(float(w))
+        except ValueError:
+            continue
+    return found
+
+
+def _missing_parameter_values(requirement: str, parameters: Any, prefix: str = "") -> List[str]:
+    """The experiment's numeric parameter values its requirement never states.
+    Generated from the starter's case, every breakwater requirement of a study
+    said the starter's wave (H 0.10 m, T 3.0 s) instead of its own (0.15-0.30 m),
+    the validator passed them, and four cases ran the same wave
+    (shelf_demo_olaflow_20261011_1242). 0 and 1 are too common to tell."""
+    missing: List[str] = []
+    if isinstance(parameters, dict):
+        for k, v in parameters.items():
+            missing += _missing_parameter_values(requirement, v, f"{prefix}{k}")
+    elif isinstance(parameters, (list, tuple)):
+        for i, v in enumerate(parameters):
+            missing += _missing_parameter_values(requirement, v, f"{prefix}[{i}]")
+    elif isinstance(parameters, (int, float)) and not isinstance(parameters, bool):
+        value = float(parameters)
+        if value not in (0.0, 1.0) and not any(
+                abs(n - value) <= 1e-9 + 1e-6 * abs(value) for n in _numbers_in(requirement)):
+            missing.append(f"{prefix} = {parameters:g}")
+    return missing
+
+
+
+
+def _named_paths(text: str) -> List[str]:
+    """Absolute paths a requirement names. Echoing the topic's own environment
+    lines, regenerated DAFoam requirements still told each case where to work
+    and what to read under /mnt (shelf_demo_dafoam_20261011_1437)."""
+    found: List[str] = []
+    for word in str(text).split():
+        w = word.strip("`'\".,;:()[]{}<>")
+        if w.startswith("/") and w.count("/") >= 2 and w not in found:
+            found.append(w)
+    return found
+
+
+def _physical_parameters(parameters: Any) -> Any:
+    """The parameters a requirement must state: numbers and short settings,
+    without folders, paths or long notes (a requirement names no folder)."""
+    if isinstance(parameters, dict):
+        kept = {k: _physical_parameters(v) for k, v in parameters.items()}
+        return {k: v for k, v in kept.items() if v not in (None, {}, [])}
+    if isinstance(parameters, (list, tuple)):
+        kept = [_physical_parameters(v) for v in parameters]
+        return [v for v in kept if v not in (None, {}, [])]
+    if isinstance(parameters, (int, float)):
+        return parameters
+    if isinstance(parameters, str) and "/" not in parameters and len(parameters) <= 80:
+        return parameters
+    return None
+
+
+# Heading before the starter's case context in the writer's and checker's
+# prompts. Both used to carry the literal text ' + repr(CTX) + ' there.
+_CASE_CONTEXT_HEADING = "\n\nTHE CASE THIS STUDY RUNS (already fixed):\n"
+
+
+def _as_template_text(text: str) -> str:
+    """``text`` for a prompt template, read as it is: its braces are not
+    template fields. Unescaped, a starter summary holding a "{" and a
+    regeneration reason with "10^{-7}" made every requirement fail with
+    "unmatched '{' in format spec" after the old requirements had been set
+    aside (shelf_demo_hystrath_20261022_1030)."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+# Stems of the words a visualization instruction uses; a requirement with none
+# of them has nothing for _strip_visualization_mentions to remove.
+_VISUAL_WORDS = ("visuali", "plot", "contour", "streamline", "figure", "image", "picture",
+                 "render", "paraview", "animation", "snapshot", "chart", "graph")
+
+
 class HypothesisAgent:
     def __init__(self, model: str, prompt_loader: PromptLoader):
         self.model = model
@@ -52,7 +137,7 @@ class HypothesisAgent:
             # paths that do not exist. 13 of 17 requirements failed validation
             # for exactly that, so requirements.json was never published and
             # the manager re-ran the stage forever.
-            sys_t = sys_t + """ + repr(CTX) + """ + case_context
+            sys_t = sys_t + _CASE_CONTEXT_HEADING + _as_template_text(case_context)
         if not sys_t or not usr_t:
             raise ValueError("Missing HypothesisAgent prompts")
 
@@ -107,7 +192,7 @@ class HypothesisAgent:
                 # The validator has to judge against the same reality the
                 # generator writes for, or it rejects correct requirements and
                 # accepts ones that name a case that does not exist.
-                """ + repr(CTX) + """ + case_context + "\n\n" if case_context else ""
+                _CASE_CONTEXT_HEADING + _as_template_text(case_context) + "\n\n" if case_context else ""
             )
             + "You are a strict CFD QA checker for Foam-Agent prompts. "
             "Decide whether this requirement is logically consistent and executable by Foam-Agent. "
@@ -118,7 +203,22 @@ class HypothesisAgent:
             "Also ensure the prompt includes enough detail for Foam-Agent to pick a tutorial/solver and write all required files "
             "(e.g., solver, viscosity/nu or transport properties, initial/boundary conditions, and mesh description). "
             "Also ensure NO visualization instructions are present "
-            "(no 'Visualize', no plotting requests, no figure-generation instructions)."
+            "(no 'Visualize', no plotting requests, no figure-generation instructions). "
+            + (
+                # The writer is told to name no folders, paths or versions (the
+                # framework copies the starter into each case's own folder), and
+                # the checker used to fail requirements for leaving exactly those
+                # out: four of a DAFoam study's ten went through every repair
+                # round for "paths, mesh files and DAFoam revision not
+                # identified" (shelf_demo_dafoam_20261019_1057).
+                "The framework copies the case described above (its mesh, initial fields, "
+                "dictionaries and scripts) into each case's own folder and runs it on the "
+                "installed solver build. A requirement therefore names no folders, paths, file "
+                "names to locate, checksums or software versions, and is not invalid for leaving "
+                "them out or for referring to that case's mesh and files as given; judge what it "
+                "does state against the case above."
+                if case_context else ""
+            )
         )
         user = (
             "Requirement:\n{req}\n\n"
@@ -201,13 +301,24 @@ class HypothesisAgent:
         all_experiment_ideas: str = "",
         current_experiment_idea: str = "",
         previous_requirement: str = "",
+        case_context: str = "",
     ) -> str:
+        # The case the study runs, as the writer and the checker see it. Without
+        # it the repair answered each objection by inventing the missing
+        # setting -- a density, a reference area, a CFL limit for a steady
+        # solve -- where the starter case already fixed them
+        # (nn_airfoil_s814_20261026_1450).
         system = (
-            "You repair CFD prompts for Foam-Agent. "
+            (_CASE_CONTEXT_HEADING + _as_template_text(case_context) + "\n\n" if case_context else "")
+            + "You repair CFD prompts for Foam-Agent. "
             "The repaired requirement must remain a single, executable paragraph that is logically coherent: "
             "include solver, geometry/domain, mesh, boundary conditions, and time controls consistent with the study and topic constraints, in SI units, "
             "and do NOT add any visualization or plotting instructions. "
-            "Output exactly one corrected plain-English requirement paragraph."
+            + ("Where the case above already fixes a setting, the requirement keeps it as the case "
+               "has it, or refers to it as the case's own; never answer an issue by inventing a value "
+               "the case or the study does not give. "
+               if case_context else "")
+            + "Output exactly one corrected plain-English requirement paragraph."
         )
         user = (
             "Requirement:\n{req}\n\n"
@@ -251,25 +362,41 @@ class HypothesisAgent:
         text = str(req or "")
         if not text.strip():
             return text
+        # Nothing to remove without a word for one. Asked anyway, the model
+        # was given the whole requirement to send back verbatim; on a DAFoam
+        # study it often sent back nothing, and each such reply was retried
+        # for minutes (shelf_demo_dafoam_20261019_1057).
+        lowered = text.lower()
+        if not any(word in lowered for word in _VISUAL_WORDS):
+            return text
+        # The model names the sentences; the code removes them. A whole text
+        # sent back verbatim is a long answer to get wrong, and an empty or
+        # unusable reply here simply changes nothing.
+        from cfd_langgraph.llm.factory import quick_empty_replies
+
         try:
-            cleaned = self.llm.invoke(
-                "Remove any sentence that instructs visualization, plotting, contouring, "
-                "streamlines, figure or image generation, or post-processing output.\n"
-                "Change NOTHING else: keep every number, filename, path, newline and "
-                "sentence that remains exactly as written. Do not summarise, reword, or "
-                "reformat. If no such sentence is present, return the text verbatim.\n"
-                "Return only the resulting text.\n\n"
-                f"TEXT:\n{text}"
-            )
-            out = reply_text(cleaned)
-            out = out if isinstance(out, str) else str(out)
-            # A model that returns something drastically shorter has summarised
-            # rather than filtered; keep the original over a lossy rewrite.
-            if out.strip() and len(out) >= 0.5 * len(text):
-                return out.strip()
+            # An empty reply only means no change here, so it is not retried
+            # for minutes.
+            with quick_empty_replies():
+                reply = reply_text(self.llm.invoke(
+                    "List every sentence of the TEXT below that instructs visualization, plotting, "
+                    "contouring, streamlines, or figure or image generation. Copy each one exactly "
+                    "as it appears, one per line, and nothing else. If there is none, reply NONE.\n\n"
+                    f"TEXT:\n{text}"
+                ))
         except Exception:
-            pass
-        return text
+            return text
+        out = text
+        for line in str(reply or "").splitlines():
+            sentence = line.strip().strip("-*\u2022 ").strip()
+            if len(sentence) > 15 and sentence in out:
+                out = out.replace(sentence, "")
+        if out == text:
+            return text
+        out = "\n".join(" ".join(part.split()) for part in out.splitlines()).strip()
+        # A model that names most of the text has misread the task; keep the
+        # original over a gutted requirement.
+        return out if len(out) >= 0.5 * len(text) else text
 
     def generate_validated_requirement(
         self,
@@ -297,14 +424,49 @@ class HypothesisAgent:
             )
         )
         history: List[Dict[str, Any]] = []
+        # A value can appear in the text by coincidence (another quantity of
+        # 0.25), so the checker also compares by name.
+        params = _physical_parameters(simulation.get("parameter_value") or {}) or {}
+        params_note = (
+            "\n\nTHIS CASE'S PARAMETERS (the requirement must use exactly these values "
+            "for these quantities, not the starter's or another case's; if it states a "
+            "different value for any of them, it is invalid):\n"
+            # Its braces are escaped with the rest of case_context.
+            + json.dumps(params, indent=1)[:4000]
+        ) if params else ""
+        checker_context = (validator_context or case_context or "") + params_note
 
         for attempt in range(max(1, max_retries + 1)):
             if verbose and attempt > 0:
                 print("[Hypothesis] Retry %d/%d (validation failed)" % (attempt, max_retries), flush=True)
-            verdict = self.llm_validate_requirement(
-                req, verbose=verbose, case_context=validator_context or case_context
-            )
-            if not verdict.get("valid", False):
+            unstated = _missing_parameter_values(req, simulation.get("parameter_value") or {})
+            paths = _named_paths(req)
+            if paths:
+                unstated = unstated or ["(no folder or path)"]
+                verdict = {
+                    "valid": False,
+                    "issues": [f"The requirement names folders or paths ({', '.join(paths[:6])}); the "
+                               "framework runs this case in its own folder, so a requirement names none."],
+                    "repair_guidance": ["Remove every folder and path, and every instruction to create, "
+                                        "copy, move, preserve or verify folders or files, or about what "
+                                        "may be read or installed. Keep the physics, settings and outputs."],
+                }
+                if verbose:
+                    print(f"[Hypothesis] requirement names paths {paths[:3]}", flush=True)
+            elif unstated:
+                verdict = {
+                    "valid": False,
+                    "issues": [f"This case's parameter {u} is not in the requirement; it must be "
+                               "used as given, not the starter's or another case's value."
+                               for u in unstated],
+                    "repair_guidance": ["State each of these values of this case explicitly: "
+                                        + "; ".join(unstated)],
+                }
+                if verbose:
+                    print(f"[Hypothesis] requirement leaves out this case's {unstated}", flush=True)
+            else:
+                verdict = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
+            if not verdict.get("valid", False) and not unstated:
                 # Confirm before rejecting. This validator is non-deterministic
                 # by design, and it was measured contradicting itself: a
                 # requirement marked valid during a run came back invalid on an
@@ -313,9 +475,7 @@ class HypothesisAgent:
                 # blocks the entire study and the stage silently re-runs for
                 # ever. A genuinely bad requirement fails both times, so the
                 # gate still catches what it is for.
-                second = self.llm_validate_requirement(
-                    req, verbose=verbose, case_context=validator_context or case_context
-                )
+                second = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
                 if second.get("valid", False):
                     verdict = second
                     if verbose:
@@ -345,12 +505,18 @@ class HypothesisAgent:
                 all_experiment_ideas=all_experiment_ideas,
                 current_experiment_idea=current_experiment_idea,
                 previous_requirement=previous_requirement,
+                case_context=case_context,
             )
             req = self._strip_visualization_mentions(req)
 
         if verbose:
             print("[Hypothesis] Final validation...", flush=True)
-        final_verdict = self.llm_validate_requirement(req, verbose=verbose)
+        # With the same case and parameters as every check above. Without them
+        # the last check, the one whose issues are published, faulted an NN
+        # requirement for not supplying DAFoam's regressionModel, the starter's
+        # paths and its boundary conditions -- all fixed by the starter case
+        # (nn_airfoil_s814_20261026_1450).
+        final_verdict = self.llm_validate_requirement(req, verbose=verbose, case_context=checker_context)
         return {
             "requirement": self._strip_visualization_mentions(req),
             "valid": bool(final_verdict.get("valid", False)),

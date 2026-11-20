@@ -80,7 +80,16 @@ def strip_latex_fences(text: str) -> str:
     text = text.strip()
     m = _LATEX_FENCE_RE.search(text)
     if m:
-        return m.group(1).strip()
+        text = m.group(1).strip()
+    # A whole paper that opens with the model's own remark ("I'm checking the
+    # supplied figures ...") before \documentclass does not compile
+    # (shelf_demo_olaflow_20261011_1242). Only comment and command lines may
+    # come before it; any other line there is dropped.
+    start = text.find("\\documentclass")
+    if start > 0:
+        kept = [line for line in text[:start].splitlines()
+                if line.strip().startswith(("%", "\\")) or not line.strip()]
+        text = ("\n".join(kept).strip() + "\n" + text[start:]).strip()
     return text
 
 
@@ -232,7 +241,13 @@ class _RepairingStructured:
 
     def invoke(self, prompt: Any, *args: Any, **kwargs: Any) -> Any:
         try:
-            return self._bound.invoke(prompt, *args, **kwargs)
+            result = self._bound.invoke(prompt, *args, **kwargs)
+            # Some models answer with no structured call at all; the binding
+            # then returns None rather than raising, and the caller fails on
+            # it far from the cause. That is a malformed reply like any other.
+            if result is None:
+                raise ValueError("the reply contained no answer in the required structure")
+            return result
         except Exception as first_error:
             try:
                 return self._repair(prompt, first_error)
@@ -246,8 +261,8 @@ class _RepairingStructured:
         import json as _json
 
         instruction = (
-            "Your previous reply had the right content but did not match the "
-            "required schema, so it was rejected.\n\n"
+            "Your previous reply did not match the required schema, so it was "
+            "rejected.\n\n"
             "REQUIRED JSON SCHEMA:\n"
             + _json.dumps(self._schema.model_json_schema(), indent=2)
             + "\n\nVALIDATION ERROR:\n"

@@ -27,6 +27,11 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
+
+_SRC = str(Path(__file__).resolve().parents[1] / "src")
+if _SRC not in sys.path:
+    sys.path.insert(0, _SRC)
 from typing import List, Optional
 
 
@@ -34,7 +39,11 @@ from typing import List, Optional
 # OpenFOAM-wide directory names (not specific to a study); listing them helps
 # the LLM see real subfamily directory names that exist on disk.
 _FAMILY_DRILLDOWN = [
+    # openfoam.org names first, then the openfoam.com names for the same
+    # families; only those present on this install are listed.
     "MomentumTransportModels",
+    "TurbulenceModels",
+    "fvOptions",
     "ThermophysicalTransportModels",
     "thermophysicalModels",
     "transportModels",
@@ -57,7 +66,10 @@ _FAMILY_DRILLDOWN = [
 _MAKE_OPTIONS_CANDIDATES = [
     "MomentumTransportModels/incompressible/Make/options",
     "MomentumTransportModels/compressible/Make/options",
+    "TurbulenceModels/incompressible/Make/options",
+    "TurbulenceModels/compressible/Make/options",
     "fvModels/Make/options",
+    "fvOptions/Make/options",
     "finiteVolume/Make/options",
 ]
 
@@ -71,25 +83,18 @@ def _detect_wm_project_dir(explicit: Optional[Path] = None) -> Optional[Path]:
         p = Path(env)
         if p.is_dir():
             return p
-    # Fallback: a couple of common install locations.
-    for candidate in ("/opt/openfoam10", "/mnt/sda1/openfoam10",
-                      "/usr/lib/openfoam/openfoam10"):
-        p = Path(candidate)
-        if p.is_dir():
-            return p
-    return None
+    from cfd_langgraph.openfoam_version import find_installation
+
+    found = find_installation()
+    return Path(found) if found else None
 
 
 def _detect_wm_version(wm: Path) -> str:
-    env_v = os.environ.get("WM_PROJECT_VERSION")
-    if env_v:
-        return env_v
-    # Best-effort guess from the install dir name.
-    name = wm.name.lower()
-    for tag in ("openfoam-", "openfoam"):
-        if tag in name:
-            return name.split(tag, 1)[-1] or "(unknown)"
-    return "(unknown)"
+    """The version and fork of the installation, read from it."""
+    from cfd_langgraph.openfoam_version import get_profile
+
+    profile = get_profile(str(wm))
+    return f"{profile['version']} ({profile['fork']})" if profile.get("ok") else "(unknown)"
 
 
 def _detect_libbins() -> List[Path]:

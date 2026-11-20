@@ -266,6 +266,17 @@ def _extract_from_wall_shear(case_dir: Path) -> Dict[str, Any]:
 _LAST_BATCH_ERROR = ""
 
 
+def _run_python_script_args(script_path: Path, args: List[str], cwd: Path,
+                            timeout_s: int = 600) -> tuple[int, str, str]:
+    """``_run_python_script`` with arguments for the script."""
+    try:
+        proc = subprocess.run([sys.executable, str(Path(script_path).resolve()), *args], cwd=str(cwd),
+                              capture_output=True, text=True, timeout=timeout_s)
+        return proc.returncode, proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired as exc:
+        return -1, "", f"timed out after {timeout_s}s: {exc}"
+
+
 def _run_python_script(script_path: Path, cwd: Path, timeout_s: int = 600) -> tuple[int, str, str]:
     """Run a generated script. The path is resolved because ``cwd`` is usually
     the script's own directory: a relative path would be resolved against it a
@@ -284,6 +295,22 @@ def _run_python_script(script_path: Path, cwd: Path, timeout_s: int = 600) -> tu
         return -1, "", str(e)
 
 
+def _install_case_loader(work_dir: Path) -> None:
+    """Put the case loader beside the generated script so it can import it.
+
+    The extractor is a generated script run as a subprocess, so only its own
+    directory is on sys.path. Without this it writes its own OpenFOAM reader
+    and gets the API wrong.
+    """
+    try:
+        from cfd_langgraph.foam_load import install_beside
+
+        install_beside(work_dir)
+    except Exception as exc:  # noqa: BLE001 -- the script can still try its own way
+        print(f"[analyze] could not install the case loader: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+
+
 def _llm_pyvista_batch_qoi(
     case_paths: List[Path],
     metrics: List[str],
@@ -291,10 +318,17 @@ def _llm_pyvista_batch_qoi(
     work_dir: Path,
     max_retries: int = 4,
     metric_hints: Optional[List[Dict[str, Any]]] = None,
+    script_cache: Optional[Path] = None,
+    prior_failure: str = "",
 ) -> Dict[str, Dict[str, Any]]:
     """
     Ask an LLM to write one PyVista script that loads all cases, samples fields, and writes QoIs to JSON.
     Returns map case_path_resolved_str -> qoi dict.
+
+    ``script_cache``: a script that already measured these metrics on other
+    cases. It is run first on these cases (it reads its case list from the
+    input file given as its first argument); only if it does not produce every
+    metric is a new script written, and a script that does is saved there.
     """
     from langchain_core.messages import HumanMessage, SystemMessage
 
@@ -380,10 +414,41 @@ def _llm_pyvista_batch_qoi(
         "for a metric cannot proceed on a different one. Derive them from the fields above, including "
         "standard definitions, for example a skin-friction coefficient from wall shear stress and the "
         "case's reference velocity (Cf = -2 * wallShearStress_x / Ub**2, with Ub read from the case's "
-        "own dictionaries or its documented value — never assumed to be 1). Emit a scalar per case: a summary "
-        "(mean/RMS/extremum) of a profile is fine, but it must be that metric, computed from that field.\n"
+        "own dictionaries or its documented value — never assumed to be 1). Emit a scalar per case, computed "
+        "from that field, exactly as the metric definition says. Where a definition leaves open how "
+        "many values become one number, choose a way that cannot cancel and cannot come out near zero: "
+        "values of opposite sign must not offset each other.\n"
+        "HELPER MODULE. foam_load.py is saved next to this script; import it with no path setup. "
+        "`from foam_load import load_case, load_patches, wall_shear, molecular_viscosity, sample_points, sample_line, main_reverse_flow_region`. "
+        "sample_points(case_dir, points) -> {field name: array with one row per point, 'inside': bool per "
+        "point} -- the value AT each (x, y, z) point, always an array even for one point: "
+        "s = sample_points(case_dir, [[x, y, z]]); s['U'][0] is (Ux, Uy, Uz) there and float(s['p'][0]) "
+        "is p there. sample_line(case_dir, start, end, n=200) -> the same at n points along a line, plus "
+        "'position' and 'distance'. Use these for any value at a point, "
+        "along a line or on a profile; never mesh.interpolate, which is a kernel average over a radius "
+        "and returns nearly the same number everywhere. "
+        "load_case(case_dir, time=None) -> the internal mesh at the latest solved time (fields enabled); "
+        "load_patches(case_dir) -> {patch name: patch mesh}; molecular_viscosity(case_dir) -> nu from the "
+        "case's own dictionary; wall_shear(case_dir, velocity='U') -> {wall patch name: patch mesh with "
+        "cell_data 'wallShearStress'} in OpenFOAM's sign convention, taken from the case when it wrote the "
+        "field and computed from U, nu and nut when it did not (velocity='UMean' for the time-averaged "
+        "stress when UMean exists).\n"
+        "SEPARATION, REATTACHMENT AND RECIRCULATION LENGTH COME FROM main_reverse_flow_region. "
+        "main_reverse_flow_region(position, shear, min_fraction=0.05) -> {'start', 'end', 'length', 'regions'}: "
+        "pass the positions along the wall (x or arc length) and the signed tangential wall shear there, "
+        "positive where the near-wall flow moves downstream (you choose the wall, the part of it, and the "
+        "direction); it returns the ends of the main reversed region, short secondary patches merged or "
+        "dropped. Use it for EVERY separation point, reattachment point or recirculation length; never "
+        "take the first sign change of the shear, which jumps between short patches as the mesh is refined.\n"
+        "A QUANTITY THE CASE DID NOT WRITE BUT CAN BE DERIVED IS NOT MISSING. Derive it from the fields "
+        "that are there: vorticity and any gradient with mesh.compute_derivative; wall shear stress from "
+        "the wall-normal gradient of the tangential velocity between the wall face and the adjacent cell "
+        "centre, times the effective viscosity (the molecular viscosity from the case's transport dictionary "
+        "plus nut where the case has it); a force or force coefficient by integrating pressure and wall "
+        "shear over the patch faces (face normals from patch.compute_normals, areas from "
+        "patch.compute_cell_sizes). Say in a comment which fields you derived it from.\n"
         "Return null for a requested metric ONLY if the underlying field genuinely does not exist in the "
-        "case. In that case also add a key '<metric>__why_null' with a one-line reason naming what you "
+        "case and cannot be derived from those that do. In that case also add a key '<metric>__why_null' with a one-line reason naming what you "
         "looked for and which patches/fields you found — a bare null with no explanation is a defect.\n"
         "DISTINGUISH THE FAILURE MODES in '<metric>__why_null'. 'Reference data not found' must mean the "
         "FILE is absent, and must list the absolute paths tried. If the file opened but you could not "
@@ -425,6 +490,52 @@ def _llm_pyvista_batch_qoi(
     global _LAST_BATCH_ERROR
     last_err = ""
     last_script = ""
+    best: Dict[str, Dict[str, Any]] = {}
+    best_count = -1
+
+    def _parse(payload: Any) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for item in (payload.get("results") if isinstance(payload, dict) else None) or []:
+            if not isinstance(item, dict) or not isinstance(item.get("qoi"), dict):
+                continue
+            q = {}
+            for k, v in item["qoi"].items():
+                if isinstance(v, (int, float)) and not (isinstance(v, float) and v != v):
+                    q[str(k)] = float(v)
+                elif str(k).endswith("__why_null") and str(v).strip():
+                    q[str(k)] = str(v)[:500]
+            out[str(Path(str(item.get("case", ""))).resolve())] = q
+        return out
+
+    def _complete(qm: Dict[str, Dict[str, Any]]) -> bool:
+        return all(c in qm for c in case_strs) and all(
+            isinstance(qm[c].get(m), (int, float)) for m in metrics for c in case_strs)
+
+    # The same metrics on the next mesh level are the same computation: run
+    # the script that already measured them before asking for a new one.
+    if script_cache is not None and Path(script_cache).is_file():
+        cached = Path(script_cache).read_text(encoding="utf-8", errors="ignore")
+        inputs = work_dir / "qoi_batch_inputs.json"
+        inputs.write_text(json.dumps({"case_dirs": case_strs, "foam_markers": foam_markers,
+                                      "out_json": out_json_path_str}))
+        _install_case_loader(work_dir)
+        script_path.write_text(cached, encoding="utf-8")
+        if out_json.exists():
+            out_json.unlink()
+        rc, out, err = _run_python_script_args(script_path, [str(inputs)], cwd=work_dir, timeout_s=900)
+        try:
+            qm = _parse(json.loads(out_json.read_text(encoding="utf-8"))) if out_json.is_file() else {}
+        except Exception:
+            qm = {}
+        if rc == 0 and _complete(qm):
+            print(f"[analyze] reused {script_cache} for these cases; no new script written", file=sys.stderr)
+            return qm
+        last_script = cached
+        last_err = (f"The script below measured these metrics on earlier cases but did not produce all "
+                    f"of them on these (rc={rc}). STDERR:\n{err[-3000:]}")
+
+    if prior_failure and not last_err:
+        last_err = prior_failure
     for attempt in range(1, max_retries + 1):
         user_prompt = (
             "Implement one Python script that extracts QoIs for every OpenFOAM case listed below.\n"
@@ -435,8 +546,16 @@ def _llm_pyvista_batch_qoi(
             f"{hint_block}"
             f"OUT_JSON = pathlib.Path({out_json_path_str!r})\n\n"
             "Start from `import json, pathlib`, `import numpy as np`, `import pyvista as pv`.\n"
-            "Iterate over CASE_DIRS; for each, load via pv.OpenFOAMReader(FOAM_MARKERS[case_dir]).\n"
-            "The .foam markers already exist — do NOT touch/create them.\n\n"
+            "Iterate over CASE_DIRS; for each, load via pv.OpenFOAMReader(FOAM_MARKERS[case_dir]) or the "
+            "foam_load helpers described above.\n"
+            "The .foam markers already exist — do NOT touch/create them.\n"
+            "The script must be reusable on other cases: right after the constants above, add\n"
+            "    import sys\n"
+            "    if len(sys.argv) > 1:\n"
+            "        _inp = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+            "        CASE_DIRS = _inp['case_dirs']; FOAM_MARKERS = _inp['foam_markers']\n"
+            "        OUT_JSON = pathlib.Path(_inp['out_json'])\n"
+            "and use only CASE_DIRS, FOAM_MARKERS and OUT_JSON from then on.\n\n"
             f"Previous error:\n{last_err or '(none)'}\n\n"
             f"Previous script (for repair):\n{last_script[:12000] if last_script else '(none)'}\n"
         )
@@ -450,6 +569,17 @@ def _llm_pyvista_batch_qoi(
             last_err = f"LLM invoke failed: {e}"
             time.sleep(min(2.0, 0.5 * attempt))
             continue
+        # A reply cut off at the output limit is an incomplete script that may
+        # still run and exit 0 having written nothing. Say so, or the next
+        # attempt repairs the wrong thing: on qwen_retest_20261005/cavity_r9
+        # one script degenerated into a repeated comment block until the limit.
+        finish = str((getattr(resp, "response_metadata", None) or {}).get("finish_reason") or "").lower()
+        if finish in ("length", "max_tokens"):
+            last_err = ("Your previous reply was cut off at the output limit before the script "
+                        "ended, so it was not run. Write a shorter, complete script: no repeated "
+                        "comment blocks, no long explanations.")
+            last_script = script_text[:4000]
+            continue
 
         script_text = strip_json_fences(script_text.strip())
         lines = script_text.splitlines()
@@ -459,6 +589,7 @@ def _llm_pyvista_batch_qoi(
         if lines and lines[0].strip().lower() in {"python", "bash", "sh"}:
             script_text = "\n".join(lines[1:])
 
+        _install_case_loader(work_dir)
         script_path.write_text(script_text, encoding="utf-8")
         if out_json.exists():
             try:
@@ -492,6 +623,7 @@ def _llm_pyvista_batch_qoi(
             continue
 
         qmap: Dict[str, Dict[str, Any]] = {}
+        case_errors: Dict[str, str] = {}
         for item in results:
             if not isinstance(item, dict):
                 continue
@@ -499,12 +631,25 @@ def _llm_pyvista_batch_qoi(
             qoi = item.get("qoi")
             if not c or not isinstance(qoi, dict):
                 continue
+            # A script that catches its own exception per case reports it here;
+            # dropping it left the retries with "it reported []" and no cause.
+            if isinstance(qoi.get("error"), str) and qoi["error"].strip():
+                case_errors[Path(c).name] = qoi["error"].strip()[:500]
             qclean: Dict[str, Any] = {}
             for k, v in qoi.items():
                 if v is None:
                     continue
                 if isinstance(v, (int, float)) and not (isinstance(v, float) and (v != v)):
                     qclean[str(k)] = float(v) if isinstance(v, int) else v
+                elif str(k).endswith("__why_null") and str(v).strip():
+                    # The extractor is told, in the prompt above, to report why
+                    # a metric came back empty in "<metric>__why_null". Keeping
+                    # only numeric values deleted exactly that sentence, so the
+                    # one instruction whose whole purpose is to explain a
+                    # failure could never survive to be read: the caller saw
+                    # an absent metric and no cause, which looks identical to
+                    # every other reason a metric can be missing.
+                    qclean[str(k)] = str(v)[:500]
             qmap[str(Path(c).resolve())] = qclean
 
         if len(qmap) < len(case_strs):
@@ -513,10 +658,124 @@ def _llm_pyvista_batch_qoi(
             last_script = script_text
             continue
 
-        return qmap
+        # Every case answered is not the same as the job done. The only test
+        # here used to be that no case was missing, so a script that reported
+        # only mesh statistics counted as success and returned on the first
+        # attempt -- the retries below, which already carry the previous error
+        # and the previous script, were never reached even when the first
+        # attempt had said plainly why it produced nothing.
+        produced = [
+            m for m in metrics
+            if all(isinstance(qmap[c].get(m), (int, float)) for c in case_strs)
+        ]
+        if len(produced) > best_count:
+            best, best_count = qmap, len(produced)
+        missing = [m for m in metrics if m not in produced]
+        if not missing and script_cache is not None and "sys.argv" in script_text:
+            try:
+                Path(script_cache).parent.mkdir(parents=True, exist_ok=True)
+                Path(script_cache).write_text(script_text, encoding="utf-8")
+            except OSError:
+                pass
+        if missing and attempt < max_retries:
+            reasons = sorted({
+                f"{m}: {qmap[c][f'{m}__why_null']}"
+                for m in metrics for c in case_strs
+                if isinstance(qmap[c].get(f"{m}__why_null"), str)
+            })
+            reasons = [r for r in reasons if r.split(":", 1)[0] in missing]
+            last_err = (
+                f"The script ran but did not produce {missing} of REQUESTED_METRIC_NAMES {metrics} on "
+                f"every case. It reported {sorted(set().union(*(set(qmap[c]) for c in case_strs)))}."
+                + ("\nIts own reason for each:\n  " + "\n  ".join(reasons) if reasons else "")
+                + ("\nThe error it caught on each case:\n  "
+                   + "\n  ".join(f"{name}: {err}" for name, err in sorted(case_errors.items()))
+                   if case_errors else "")
+                + "\nFix that cause. If a reference file is not where you looked, or its columns "
+                "are not what you assumed, open it and read its header before writing the script "
+                "again. Do not substitute a different quantity."
+            )
+            last_script = script_text
+            continue
 
+        return best
+
+    if best:
+        return best
     _LAST_BATCH_ERROR = last_err or "(no error recorded)"
     return {}
+
+
+# The harness's own records of a case, not its results.
+_RECORD_SKIP = {"run_result.json", "setup_check.json", "decision.json", "failure.json", "figures.json",
+                ".foamagent_state.json", ".case_scripts.json", "mesh_assessment.json"}
+
+
+# Words a key may carry after a metric's name: its unit (drag_per_span_N_per_m).
+_UNIT_WORDS = {"n", "m", "per", "w", "pa", "s", "kg", "k", "j", "mm", "cm", "m2", "m3", "s2", "nd",
+               "nondim", "dimensionless", "pct", "percent", "deg", "rad", "kpa", "mpa", "kw", "mw"}
+
+
+def _metrics_from_records(case_dir: Path, metrics: List[str], max_bytes: int = 2_000_000) -> Dict[str, Any]:
+    """The requested metrics as the case's own result files give them: every
+    numeric value in its JSON records (up to three folders down, not in
+    processor or time folders) whose key is the metric's name, or the name
+    followed by a unit (Cd, drag_per_span_N_per_m). Without this the analysis
+    read only PyVista's mesh statistics and missed a hyStrath study's drag,
+    heat and Cd, which each case had written (shelf_demo_hystrath_20261022_1030)."""
+    def norm(text: str) -> str:
+        return "".join(ch for ch in str(text).lower() if ch.isalnum())
+
+    wanted = {norm(m): m for m in metrics if norm(m)}
+    own = Path(case_dir).name.lower()
+    found: Dict[str, List[float]] = {}
+    sources: Dict[str, List[str]] = {}
+
+    def walk(node: Any, path: str, source: str) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                walk(value, f"{path}.{key}" if path else str(key), source)
+        elif isinstance(node, list):
+            return
+        elif isinstance(node, (int, float)) and not isinstance(node, bool):
+            segments = [seg.lower() for seg in path.split(".")]
+            # Another case's value or a comparison of two, not this case's own.
+            if any(word in seg for seg in segments[:-1] + [segments[-1]]
+                   for word in ("comparison", "reference", "difference", "delta", "error")):
+                return
+            if any(seg.startswith("case_") and seg != own for seg in segments):
+                return
+            last = str(path.rsplit(".", 1)[-1])
+            for key, metric in wanted.items():
+                rest = last[len(metric):] if last.lower().startswith(metric.lower()) else None
+                unit_only = (rest is not None and rest.startswith("_")
+                             and all(tok.lower() in _UNIT_WORDS for tok in rest.strip("_").split("_")))
+                if norm(last) == key or unit_only:
+                    if float(node) not in found.setdefault(metric, []):
+                        found[metric].append(float(node))
+                        sources.setdefault(metric, []).append(f"{source}:{path}")
+
+    # Newest first: a case can hold an earlier run's or an earlier script's
+    # record of the same quantity, and the current one should lead.
+    def mtime(f: Path) -> float:
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    for f in sorted(Path(case_dir).rglob("*.json"), key=mtime, reverse=True):
+        rel = f.relative_to(case_dir)
+        if (len(rel.parts) > 4 or f.name in _RECORD_SKIP or f.name.startswith(".")
+                or any(part.startswith("processor") for part in rel.parts)
+                or any(part.replace(".", "", 1).replace("e-", "", 1).isdigit() for part in rel.parts[:-1])):
+            continue
+        try:
+            if f.stat().st_size > max_bytes:
+                continue
+            walk(json.loads(f.read_text(errors="ignore")), "", str(rel))
+        except (OSError, ValueError):
+            continue
+    return {"metrics": found, "metric_sources": sources}
 
 
 def extract_metrics(
@@ -545,6 +804,10 @@ def extract_metrics(
         merged.update(precomputed_qoi)
         data["qoi"] = merged
         data["analysis_source"] = "llm_pyvista"
+        records = _metrics_from_records(case_dir, metrics)
+        if records["metrics"]:
+            data["metrics"].update(records["metrics"])
+            data["metric_sources"] = records["metric_sources"]
         return data
 
     if qoi_source == "legacy":
@@ -568,6 +831,10 @@ def extract_metrics(
 
     data["qoi"].update(_extract_from_pyvista_robust(case_dir))
     data["analysis_source"] = "pyvista"
+    records = _metrics_from_records(case_dir, metrics)
+    if records["metrics"]:
+        data["metrics"].update(records["metrics"])
+        data["metric_sources"] = records["metric_sources"]
     return data
 
 
@@ -581,6 +848,12 @@ def main() -> int:
     parser.add_argument("--reference-manifest", type=str, default="",
                         help="Path to reference_data_manifest.json; CSV/tabular reference files are read and included in benchmark context.")
     parser.add_argument("--topic", type=str, default="")
+    parser.add_argument("--measure-only", action="store_true",
+                        help="write the measured quantities and stop: no cross-case write-up")
+    parser.add_argument("--prior-failure", type=str, default="",
+                        help="What an earlier script for these metrics got wrong; the new one starts from it.")
+    parser.add_argument("--script-cache", type=str, default="",
+                        help="reuse/save the extraction script here (same metrics, other cases)")
     parser.add_argument(
         "--cross-objectives-json",
         type=str,
@@ -619,7 +892,9 @@ def main() -> int:
             except Exception as exc:
                 print(f"[analyze] could not read --metric-spec: {exc}", file=sys.stderr)
         llm_map = _llm_pyvista_batch_qoi(
-            resolved, metrics, get_settings().model, work_dir, metric_hints=hints
+            resolved, metrics, get_settings().model, work_dir, metric_hints=hints,
+            script_cache=Path(args.script_cache) if args.script_cache else None,
+            prior_failure=args.prior_failure,
         )
         if not llm_map:
             print(
@@ -688,15 +963,39 @@ def main() -> int:
             except Exception:
                 pass
 
+    # A caller that only needs the numbers (the mesh gate) stops here: the
+    # cross-case write-up below is five model calls whose output it never reads.
+    if args.measure_only:
+        out_path.write_text(json.dumps({"metrics": raw, "benchmark": benchmark,
+                                        "qoi_source": args.qoi_source}, indent=2), encoding="utf-8")
+        return 0
+
+    # Each case's own requirement, from the study's requirements.json beside
+    # the output, so the cross-case step knows what each case was for. Given
+    # none, it read the three gradient checks of shelf_demo_dafoam_20261019_1057
+    # as three regularisation weights of an inversion.
+    requirement_by_case: Dict[str, Dict[str, Any]] = {}
+    requirements_path = out_path.parent / "requirements.json"
+    if requirements_path.is_file():
+        try:
+            entries = json.loads(requirements_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[analyze] warning: could not read {requirements_path}: {e}", file=sys.stderr)
+            entries = []
+        for entry in entries if isinstance(entries, list) else []:
+            if isinstance(entry, dict) and entry.get("case_id"):
+                requirement_by_case[str(entry["case_id"])] = entry
+
     # Run cross-experiment processing so analysis stage can generate true across-case figures/tables.
     experiments_for_cross: List[Dict[str, Any]] = []
     for p in resolved:
+        requirement = requirement_by_case.get(p.name, {})
         experiments_for_cross.append(
             {
                 "simulation_id": p.name,
                 "case_name": p.name,
-                "description": "",
-                "user_requirement": "",
+                "description": str(requirement.get("description") or ""),
+                "user_requirement": str(requirement.get("user_requirement_text") or ""),
                 "sim_dir": str(p),
                 "foam_output_dir": str(p),
             }

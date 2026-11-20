@@ -76,6 +76,11 @@ SYSTEM_MESSAGE = (
     "Work in verified steps: build the smallest piece, check it against the "
     "task's own references, and only then run the larger cases. When a check "
     "fails, find the cause before changing anything else.\n\n"
+    "Before compiling anything that implements a formula from the brief, write "
+    "the formula as the brief states it and the expression your code computes "
+    "one above the other, term by term, with every bracket and sign, and correct "
+    "any difference. Grouping is where transcription goes wrong: x*(y + z) "
+    "and x*y + z differ. Keep this comparison in your report.\n\n"
     "Turns are limited and each tool call costs one turn, so make every call do "
     "as much as it safely can: chain related commands in one run_bash, and split "
     "calls only when a later command depends on output you have not seen yet."
@@ -143,7 +148,15 @@ def build_prompt(*, topic: str, run_dir: Path, starter_root: Path, timeout_s: in
             "and build on it; redo something only if you find it wrong or incomplete.\n"
         )
     if guidance.strip():
-        parts.append(f"# Guidance for this attempt\n{guidance.strip()}\n")
+        # On qwen_retest_20261005/slau_r7 the manager sent two wrong diagnoses
+        # as "CONFIRMED FACTS (do not re-verify)", and two build sessions spent
+        # themselves applying fixes their own runs contradicted.
+        parts.append(
+            "# Guidance for this attempt\n"
+            "From the study manager, who has read your files and the check's verdict but has not "
+            "run anything. Where what you observe contradicts it, trust what you observe and say so "
+            f"in your summary.\n\n{guidance.strip()}\n"
+        )
     if timeout_s:
         parts.append(
             f"# Time\nYou have about {timeout_s}s. Each tool result shows time_left_s. Cost\n"
@@ -200,6 +213,8 @@ def run(*, run_dir: Path, starter_root: Path, topic: str, output_path: Path, mod
                                     timeout_s=timeout_s, prior_attempt=prior_attempt,
                                     guidance=guidance),
         done_fields=DONE_FIELDS,
+        done_check=lambda payload: None if (run_dir / "verification.json").is_file() else (
+            f"{run_dir / 'verification.json'} does not exist yet. Write it as the brief describes."),
     )
     final = loop.get("final_payload") or {}
     manifest = run_dir / "verification.json"
