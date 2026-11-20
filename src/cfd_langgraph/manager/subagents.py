@@ -181,6 +181,7 @@ from cfd_langgraph.llm.caching import (
     build_caching_middleware,
     build_context_middleware,
 )
+from cfd_langgraph.model_requirements import model_requirements_block
 
 from .control import (
     DENY_BUILTIN_FILESYSTEM_TOOLS,
@@ -511,7 +512,10 @@ def build_nn_coupler_subagent(tools: List[Any], model: Any) -> Any:
             "its card (inputs, exact definitions, normalisation, bounds), exports it, runs the parity "
             "and case checks, and says what each case must contain. Does not run cases."
         ),
-        system_prompt=NN_COUPLER_PROMPT,
+        # The network is a solver model, so it carries the same requirements as
+        # a hand-written one; they bite when its inputs, outputs and bounds are chosen.
+        system_prompt=NN_COUPLER_PROMPT + "\n\nWhen you choose a network's inputs, outputs and "
+        "bounds (section A, step 1), these hold for it as for any solver model:\n" + model_requirements_block(),
         tools=tools,
         model=model,
         middleware=build_hide_builtin_filesystem_tools_middleware()

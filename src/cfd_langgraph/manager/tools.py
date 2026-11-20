@@ -25,6 +25,7 @@ from cfd_langgraph.config import Settings, get_settings
 from cfd_langgraph.utils import structured_output
 from cfd_langgraph.hypothesis_pipeline import run_propose_critique_rank
 from cfd_langgraph.knowledge_bundle import KnowledgeBundle
+from cfd_langgraph.model_requirements import model_requirements_block
 from cfd_langgraph.llm.factory import create_langchain_llm
 from cfd_langgraph.scheduling import CaseCoordinator
 from cfd_langgraph.starter_cases import (
@@ -175,6 +176,14 @@ class _OEDCandidateSpec(BaseModel):
         ),
     )
     hypothesis: str = Field(description="The concrete, technical modification — specific equations/terms/coefficients, implementable as-is.")
+    requirements_check: str = Field(
+        default="",
+        description=(
+            "Solver studies only: one or two sentences on how the modification meets the "
+            "MUST HOLD requirements, and which STATED REASON ONLY items it uses and why. "
+            "Empty for fitted-model studies."
+        ),
+    )
     target_family: str = Field(default="", description="The model family this targets, for the manager's own bookkeeping.")
     model_name_to_reuse: str = Field(default="", description="For action_type='experiment' only: the compiled model name to reuse.")
     base_case_dir: str = Field(default="", description="For action_type='experiment' only: case directory containing the compiled model to reuse.")
@@ -9791,6 +9800,14 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 + "\n\n"
                 if directions else ""
             )
+            + (
+                # Solver studies only: a fitted-model study's candidate is not a
+                # solver model, and an implementation study's spec is fixed.
+                model_requirements_block()
+                + "Each candidate must meet the MUST HOLD list for what it modifies; say how "
+                "in `requirements_check`, with any STATED REASON ONLY item it uses and why.\n\n"
+                if _study_mode_value() == "solver" else ""
+            )
             + f"Propose exactly {len(picks)} concrete candidate modifications, one per "
             "instruction below — each must be specific enough to implement directly "
             "(named equations/terms/coefficients, not a vague direction):\n"
@@ -10033,6 +10050,7 @@ def build_manager_tools(settings: Settings, out_dir: Path) -> Dict[str, Any]:
                 "model_name_to_reuse": candidate.get("model_name_to_reuse", ""),
                 "strategy": candidate.get("strategy", ""),
                 "plan": candidate.get("plan", ""),
+                "requirements_check": candidate.get("requirements_check", ""),
                 # Which allocation arm produced this candidate, so its outcome
                 # can be fed back to that arm. Without it the widen/new_family
                 # arms never leave their priors and the refine-versus-explore

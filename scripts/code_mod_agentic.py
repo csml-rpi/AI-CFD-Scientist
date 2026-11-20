@@ -1182,6 +1182,23 @@ def _settled_start_note(starter_case: Path) -> str:
     )
 
 
+def _model_requirements_note() -> str:
+    """The properties a general model must keep (cfd_langgraph.model_requirements),
+    for the choices the hypothesis leaves open: how a term is limited, which
+    direction or input it uses, how a fitted form is clipped. The hypothesis
+    itself is not re-litigated here; that was the proposer's job."""
+    try:
+        from cfd_langgraph.model_requirements import model_requirements_block
+    except Exception:
+        return ""
+    return (
+        model_requirements_block()
+        + "Where the hypothesis leaves a choice open, make it so these hold. If the\n"
+        "hypothesis as written breaks a MUST HOLD item, implement it as written and say\n"
+        "which item in your final report; do not quietly change the model.\n\n"
+    )
+
+
 def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: str = "",
                        starter_case: Path, run_dir: Path,
                        wm_project_dir: Optional[Path],
@@ -1214,6 +1231,7 @@ def build_agent_prompt(*, topic: str, hypothesis: str, variant_name: str, plan: 
         + "============================================================\n\n"
         + f"Topic: {topic.strip()}\n\n"
         + f"Hypothesis to implement (variant_name={variant_name}):\n{hypothesis.strip()}\n\n"
+        + _model_requirements_note()
         + _extension_points_note(hypothesis, wm_project_dir)
         + (
             "HOW TO RUN A FIT, A SWEEP, OR AN OPTIMISER LOOP\n\n"
